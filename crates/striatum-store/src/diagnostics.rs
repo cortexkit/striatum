@@ -183,7 +183,7 @@ impl SqliteRouteStateStore {
         now_ms: i64,
     ) -> RouteStateResult<Vec<DiagnosticAccountHold>> {
         self.with_history_reader(|c| {
-            let source = crate::history::hold_source(c);
+            let source = crate::history::hold_source(c)?;
             let mut statement = c.prepare(&format!(
                 "SELECT provider, account_id, credential_id, basis, reset_at, retry_after_s,
                             created_at

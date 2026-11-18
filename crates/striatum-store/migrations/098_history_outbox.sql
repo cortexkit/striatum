@@ -41,3 +41,28 @@ CREATE TABLE IF NOT EXISTS quota_reading_moved (
   moved_through_observed_at INTEGER NOT NULL,
   PRIMARY KEY (account_key, window_key)
 ) WITHOUT ROWID;
+
+-- A successful split never serves without its archive. Drop the frozen state
+-- copies only after the opener checked they were empty, or the offline tool
+-- copied them.
+CREATE TABLE IF NOT EXISTS history_layout (
+  singleton INTEGER PRIMARY KEY CHECK (singleton = 1)
+);
+INSERT INTO history_layout VALUES (1) ON CONFLICT DO NOTHING;
+DROP VIEW IF EXISTS fence_origin;
+DROP TRIGGER IF EXISTS fence_retire_enforcement;
+DROP TABLE IF EXISTS account_fence;
+DROP TABLE IF EXISTS account_principal_exclusion;
+DROP TABLE IF EXISTS credential_entitlement_fences;
+DROP TABLE IF EXISTS account_size_refusal;
+DROP TABLE IF EXISTS account_route_fence;
+DROP TABLE IF EXISTS account_non_quota_route_fence;
+DROP TABLE IF EXISTS account_non_quota_size_refusal;
+DROP TABLE IF EXISTS account_transient_backoff;
+DROP TABLE IF EXISTS fence_recheck;
+DROP TABLE IF EXISTS fence_probe_authorization;
+DROP TABLE IF EXISTS fence_recheck_route_clear;
+DROP TABLE IF EXISTS fence_success_pool;
+DROP TABLE IF EXISTS fence_retired_origin;
+DROP TABLE IF EXISTS account_hold;
+DROP TABLE IF EXISTS quota_reading_log;

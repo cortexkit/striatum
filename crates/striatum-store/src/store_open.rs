@@ -19,6 +19,13 @@ impl SqliteRouteStateStore {
             history::refuse_unsplit(path)?;
         }
         let store = open_sqlite(descriptor).map_err(err)?;
+        // An interrupted first startup may leave an empty archive, but must
+        // never record in state that its archive exists before it does.
+        let mut archive = if split {
+            Some(history::History::open(path, memory, &descriptor.module_id)?)
+        } else {
+            None
+        };
         migrate_route_state(&store, migrations)?;
         validate_family_spellings(&store)?;
         // Changing temp_store discards existing TEMP objects, so configure it
@@ -55,11 +62,9 @@ impl SqliteRouteStateStore {
             })?;
             nested
         }
-        let archive = if split {
-            Some(history::History::open(path, memory, &descriptor.module_id)?)
-        } else {
-            None
-        };
+        if let Some(history) = archive.as_mut().filter(|_| !memory) {
+            history.open_reader(path)?;
+        }
         prewarm(
             &store,
             if memory {

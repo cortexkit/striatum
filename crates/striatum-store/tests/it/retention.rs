@@ -762,7 +762,14 @@ fn reader_planned_retention_matches_the_original_sql_deletes() {
     let actual_rig = Rig::new("retention-planned-parity");
     let oracle_rig = Rig::new("retention-original-parity");
     let actual = actual_rig.open();
-    let oracle = oracle_rig.open();
+    let oracle = SqliteRouteStateStore::open_at_version_for_test(
+        &striatum_store::dev_descriptor(
+            "retention-original-parity",
+            oracle_rig.db_path().to_string_lossy(),
+        ),
+        97,
+    )
+    .unwrap();
     for store in [&actual, &oracle] {
         insert_conversation(store, "protected", 3, NOW);
         store
@@ -801,6 +808,7 @@ fn reader_planned_retention_matches_the_original_sql_deletes() {
             reference_decision(store, child, id);
         }
     }
+    assert_eq!(actual.move_history_batch(NOW).unwrap(), 1);
     for limit in [0, 2, 4, 256] {
         let expected = oracle
             .account_command(
@@ -815,7 +823,7 @@ fn reader_planned_retention_matches_the_original_sql_deletes() {
                WHERE mode='serve' AND created_at<?1
                  AND NOT EXISTS (SELECT 1 FROM account_pin p WHERE p.decision_id=account_decision.decision_id)
                  AND NOT EXISTS (SELECT 1 FROM account_admission a WHERE a.decision_id=account_decision.decision_id)
-                 AND NOT EXISTS (SELECT 1 FROM pending_account_hold h WHERE h.decision_id=account_decision.decision_id)
+                 AND NOT EXISTS (SELECT 1 FROM account_hold h WHERE h.decision_id=account_decision.decision_id)
                ORDER BY created_at LIMIT ?2)", rusqlite::params![BEFORE, limit as i64])).unwrap();
         assert_eq!(
             actual.prune_serve_decisions(BEFORE, limit).unwrap(),
@@ -1143,4 +1151,70 @@ fn route_decision_retention_is_bounded_per_call() {
     assert_eq!(store.delete_decisions_older_than(2_000, 2).unwrap(), 2);
     assert_eq!(store.delete_decisions_older_than(2_000, 2).unwrap(), 1);
     assert_eq!(store.delete_decisions_older_than(2_000, 2).unwrap(), 0);
+}
+
+#[test]
+fn moved_hold_protects_pin_and_affinity_at_writer_recheck() {
+    let rig = Rig::new("moved-hold-affinity");
+    let store = rig.open();
+    let with_affinity = insert_conversation(&store, "archived", 1, BEFORE - 1);
+    let orphan = pin_row("orphan", "another-conversation", 1, "hold-on-orphan");
+    store
+        .account_transaction(|tx| tx.insert_pin(&orphan))
+        .unwrap();
+    let plan = store
+        .plan_account_affinities(NOW - HOUR, NOW, None, 256)
+        .unwrap();
+    assert_eq!(plan.keys.len(), 1);
+    let pin_keys = store.plan_account_pins(NOW, 256).unwrap();
+    assert_eq!(pin_keys, [orphan.pin_id.clone()]);
+    for pin in [&with_affinity, &orphan] {
+        store
+            .account_transaction(|tx| {
+                tx.insert_hold(&AccountHoldRow {
+                    decision_id: pin.decision_id.clone(),
+                    principal: pin.principal.clone(),
+                    conversation_hash: pin.conversation_hash.clone(),
+                    provider: pin.provider.clone(),
+                    pin_id: pin.pin_id.clone(),
+                    pin_generation: pin.pin_generation,
+                    account_id: pin.account_id.clone(),
+                    credential_id: pin.credential_id.clone(),
+                    basis: "five_hour".into(),
+                    reset_at: NOW + HOUR,
+                    retry_after_s: 60,
+                    created_at: NOW,
+                })
+            })
+            .unwrap();
+    }
+    assert_eq!(store.move_history_batch(NOW).unwrap(), 2);
+    assert!(rig.ids("pending_account_hold", "decision_id").is_empty());
+    assert!(store
+        .plan_account_affinities(NOW - HOUR, NOW, None, 256)
+        .unwrap()
+        .keys
+        .is_empty());
+    assert!(store.plan_account_pins(NOW, 256).unwrap().is_empty());
+    assert_eq!(
+        store
+            .account_command(
+                striatum_store::AccountCommandKind::HistoryMaintenance,
+                move |tx| tx.delete_account_pins(NOW, &pin_keys)
+            )
+            .unwrap(),
+        0
+    );
+    let (deleted, keys) = store
+        .account_command(
+            striatum_store::AccountCommandKind::HistoryMaintenance,
+            move |tx| tx.delete_account_affinities_returning(&plan.keys, NOW - HOUR, NOW),
+        )
+        .unwrap();
+    assert_eq!(deleted, AffinityRetentionBatch::default());
+    assert!(keys.is_empty());
+    assert_eq!(
+        rig.ids("account_affinity", "conversation_hash"),
+        ["archived"]
+    );
 }

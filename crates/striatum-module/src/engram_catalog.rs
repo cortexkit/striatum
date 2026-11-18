@@ -213,15 +213,6 @@ mod tests {
     fn catalog_excluded_tables_exist_in_the_migrated_routing_store_schema() {
         let catalog: Value = serde_json::from_slice(CATALOG_BYTES).expect("valid catalog JSON");
         let entries = catalog["entries"].as_array().expect("entries array");
-        let mut excluded: Vec<_> = entries.iter().flat_map(excluded_tables).collect();
-        let mut backup_excluded: Vec<String> = striatum_store::backup::BACKUP_EXCLUDABLE_TABLES
-            .iter()
-            .map(|(table, _)| (*table).to_owned())
-            .collect();
-        excluded.sort();
-        backup_excluded.sort();
-        assert_eq!(excluded, backup_excluded);
-
         let scratch = cortexkit_test_support::ScratchDir::new("routing-engram-catalog-schema");
         let database = scratch.path().join("store.db");
         let descriptor = striatum_store::dev_descriptor(
@@ -241,7 +232,20 @@ mod tests {
             .filter(|entry| entry["mechanism"] == "page-db")
         {
             let path = scratch.path().join(entry["path"].as_str().unwrap());
-            check_exclusions(&path, &excluded_tables(entry));
+            let mut actual = excluded_tables(entry);
+            check_exclusions(&path, &actual);
+            let expected = match entry["entry_id"].as_str().unwrap() {
+                "striatum/store" => striatum_store::backup::BACKUP_EXCLUDABLE_TABLES,
+                "striatum/history" => striatum_store::backup::BACKUP_HISTORY_EXCLUDABLE_TABLES,
+                id => panic!("unexpected database backup entry {id}"),
+            };
+            let mut expected: Vec<_> = expected
+                .iter()
+                .map(|(table, _)| (*table).to_owned())
+                .collect();
+            actual.sort();
+            expected.sort();
+            assert_eq!(actual, expected);
         }
         drop(store);
     }

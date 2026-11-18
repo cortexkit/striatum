@@ -167,6 +167,18 @@ impl Drop for SqliteRouteStateStore {
         if let Err(error) = self.flush_routing_calls() {
             tracing::warn!(%error, "routing call counts could not be flushed on store close");
         }
+        if let Some(history) = self.history.as_mut() {
+            // Stop queued writes before checkpointing. Drop the read-only
+            // attachment before either writable connection goes away.
+            drop(self.account_writer.take());
+            history.close_reader_and_checkpoint();
+            if let Some(maintenance) = self.maintenance.as_mut() {
+                let conn = maintenance.get_mut().unwrap_or_else(|p| p.into_inner());
+                if let Err(error) = crate::history::checkpoint_on_close(conn) {
+                    tracing::warn!(%error, "could not checkpoint routing state on shutdown");
+                }
+            }
+        }
     }
 }
 

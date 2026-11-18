@@ -149,9 +149,13 @@ const SPLIT_STATE_TABLES: &[&str] = &[
     "pending_account_hold",
     "pending_quota_reading_log",
     "quota_reading_moved",
+    "history_layout",
 ];
 
-pub(super) fn check_tables(conn: &rusqlite::Connection) -> Result<(), String> {
+pub(super) fn check_tables(
+    conn: &rusqlite::Connection,
+    history: &rusqlite::Connection,
+) -> Result<(), String> {
     let included: BTreeSet<_> = INCLUDED_TABLES.iter().copied().collect();
     let excluded: BTreeSet<_> = EXCLUDED_TABLES.iter().map(|(name, _)| *name).collect();
     if included.len() != INCLUDED_TABLES.len()
@@ -160,20 +164,42 @@ pub(super) fn check_tables(conn: &rusqlite::Connection) -> Result<(), String> {
     {
         return Err("replay state classifications must be unique and disjoint".into());
     }
+    let archived: BTreeSet<&str> = frozen_audit::TABLES
+        .iter()
+        .copied()
+        .chain(["account_hold", "quota_reading_log"])
+        .collect();
     let expected: BTreeSet<String> = included
         .union(&excluded)
         .copied()
+        .filter(|table| !archived.contains(table))
         .chain(SPLIT_STATE_TABLES.iter().copied())
         .map(|name| name.to_string())
         .collect();
-    let mut query = conn
-        .prepare("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT GLOB 'sqlite_*'")
-        .map_err(|error| error.to_string())?;
-    let actual = query
-        .query_map([], |row| row.get::<_, String>(0))
-        .map_err(|error| error.to_string())?
-        .collect::<rusqlite::Result<BTreeSet<_>>>()
-        .map_err(|error| error.to_string())?;
+    let read_tables = |database: &rusqlite::Connection| -> Result<BTreeSet<String>, String> {
+        let mut query = database
+            .prepare(
+                "SELECT name FROM sqlite_schema WHERE type='table' AND name NOT GLOB 'sqlite_*'",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = query
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<_, _>>()
+            .map_err(|error| error.to_string())
+    };
+    let actual = read_tables(conn)?;
+    let expected_archive: BTreeSet<String> = archived
+        .into_iter()
+        .chain(["cortexkit_schema_version"])
+        .map(str::to_owned)
+        .collect();
+    let archive_tables = read_tables(history)?;
+    if archive_tables != expected_archive {
+        return Err(format!(
+            "replay archive tables differ: expected {expected_archive:?}, found {archive_tables:?}"
+        ));
+    }
     if actual != expected {
         return Err(format!(
             "replay tables need explicit classification: unknown={:?}, missing={:?}",
@@ -186,8 +212,9 @@ pub(super) fn check_tables(conn: &rusqlite::Connection) -> Result<(), String> {
 
 pub(super) fn snapshot(harness: &Harness) -> Value {
     let connection = rusqlite::Connection::open(harness.store_path()).unwrap();
-    check_tables(&connection).unwrap();
-    frozen_audit::check(harness, &connection);
+    let history = frozen_audit::open_archive(harness);
+    check_tables(&connection, &history).unwrap();
+    frozen_audit::check(harness, &history);
     let mut tables = serde_json::Map::new();
     for name in INCLUDED_TABLES {
         let source = if *name == "account_hold" {
@@ -232,7 +259,12 @@ pub(super) fn snapshot(harness: &Harness) -> Value {
                 .with_history_reader_for_test(collect)
                 .unwrap()
         } else {
-            collect(&connection).unwrap()
+            collect(if frozen_audit::TABLES.contains(name) {
+                &history
+            } else {
+                &connection
+            })
+            .unwrap()
         };
         // Keep the old neutral catalogue-row omission exactly: non-neutral
         // stored health fields are never removed from the comparison.
@@ -265,7 +297,8 @@ pub(super) fn snapshot(harness: &Harness) -> Value {
 fn replay_state_schema_requires_every_table_to_be_explicitly_classified() {
     let harness = Harness::new("replay-state-table-classification");
     let conn = rusqlite::Connection::open(harness.store_path()).unwrap();
-    check_tables(&conn).unwrap();
+    let history = frozen_audit::open_archive(&harness);
+    check_tables(&conn, &history).unwrap();
     assert_eq!((INCLUDED_TABLES.len(), EXCLUDED_TABLES.len()), (38, 22));
     let captured = snapshot(&harness);
     assert_eq!(
@@ -294,11 +327,11 @@ fn replay_state_schema_requires_every_table_to_be_explicitly_classified() {
     ] {
         conn.execute_batch(&format!("CREATE TABLE {table}(id INTEGER)"))
             .unwrap();
-        let error = check_tables(&conn).unwrap_err();
+        let error = check_tables(&conn, &history).unwrap_err();
         assert!(error.contains(table), "{error}");
         conn.execute_batch(&format!("DROP TABLE {table}")).unwrap();
     }
-    check_tables(&conn).unwrap();
+    check_tables(&conn, &history).unwrap();
 }
 
 /// Preserve complete physical state while the historical wire-shape comparison

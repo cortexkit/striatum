@@ -500,12 +500,22 @@ impl AccountWriter {
                             // here would turn one bad read into a restart loop.
                             let result: Result<bool, String> = store
                                 .with_conn(|conn| {
+                                    // SQLite recompiles cached statements once after
+                                    // attachment. Only archive-reference retention
+                                    // uses this lane; state-only maintenance does not.
+                                    // A production-shaped first request cost an extra
+                                    // 0.5–1.0 ms, paid once per attaching batch. A
+                                    // steady pass attaches at most four times/minute
+                                    // including the separate decision-retention writes.
                                     let uri = if history_maintenance {
                                         archive.as_deref()
                                     } else {
                                         None
                                     };
                                     crate::history::with_archive(conn, uri, || {
+                                        if uri.is_some() {
+                                            store.record_archive_attachment();
+                                        }
                                         Ok(run_batch(
                                             conn,
                                             &mut batch,

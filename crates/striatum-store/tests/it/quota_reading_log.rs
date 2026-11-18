@@ -107,7 +107,11 @@ fn usage_row(account_key: String) -> UsageObservation {
 #[test]
 fn migration_038_creates_the_append_only_reading_log() {
     let rig = Rig::new("migration");
-    let store = rig.open();
+    let store = SqliteRouteStateStore::open_at_version_for_test(
+        &dev_descriptor("striatum", rig.db_path()),
+        38,
+    )
+    .unwrap();
     let connection = rusqlite::Connection::open(rig.db_path()).unwrap();
     let columns = connection
         .prepare("PRAGMA table_info(quota_reading_log)")

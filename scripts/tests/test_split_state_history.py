@@ -1,4 +1,8 @@
+from contextlib import closing
 import hashlib
+import os
+import shlex
+import shutil
 from pathlib import Path
 import sqlite3
 import stat
@@ -25,54 +29,58 @@ class SplitStateHistoryTest(unittest.TestCase):
         self.addCleanup(self.scratch.cleanup)
         self.root = Path(self.scratch.name)
         self.state = self.root / 'state.db'
-        self.state.touch(mode=0o600)
         self.archive = self.root / 'history.db'
         self.backup = self.root / 'state.db.pre-split'
-        self.verifier = self.root / 'verify'
-        self.verifier.write_text('#!/bin/sh\nexit 0\n')
-        self.verifier.chmod(0o700)
-        db = sqlite3.connect(self.state)
-        with db:
-            db.executescript((MIGRATIONS / '001_split_baseline.sql').read_text())
-            db.execute('CREATE TABLE cortexkit_schema_version(namespace TEXT, version INTEGER)')
-            db.execute("INSERT INTO cortexkit_schema_version VALUES ('route_state', 97)")
-            for table in sorted(STATE):
-                db.execute(f'CREATE TABLE {table}(sample TEXT)')
-                db.execute(f'INSERT INTO {table} VALUES (?)', (table,))
-            db.execute("INSERT INTO quota_reading_log VALUES ('acct','window',10,4,NULL,NULL,NULL,NULL,NULL,0,NULL,NULL)")
-            db.execute("INSERT INTO quota_reading_log VALUES ('acct','window',11,5,NULL,NULL,NULL,NULL,NULL,0,NULL,NULL)")
-        db.close()
+        self.verifier = Path(os.environ['STRIATUM_SPLIT_VERIFIER']).resolve(strict=True)
+        completed = subprocess.run([self.verifier, '--seed-test-fixture', self.state],
+                                   text=True, capture_output=True, check=False)
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
 
-    def run_script(self):
-        return subprocess.run([str(SCRIPT), str(self.state), '--now-ms', '20', '--verifier',
-                               str(self.verifier)], text=True, capture_output=True, check=False)
+    def run_script(self, verifier=None, env=None):
+        return subprocess.run([str(SCRIPT), str(self.state), '--now-ms', '1800000000000', '--verifier',
+                               str(verifier or self.verifier)], text=True, capture_output=True, check=False, env=env)
+
+    def fake_verifier(self, body):
+        path = self.root / 'verify-wrapper'
+        path.write_text('#!/bin/sh\nset -eu\n' + body + '\n')
+        path.chmod(0o700)
+        return path
 
     def test_places_whole_tables_and_seeds_the_watermark(self):
-        before = digest(self.state)
+        before, inode = digest(self.state), self.state.stat().st_ino
         result = self.run_script()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn('row-count parity', result.stdout)
         self.assertIn('split complete:', result.stdout)
+        self.assertIn('preflight: disk budget', result.stdout)
+        self.assertIn('staging_peak_bytes=', result.stdout)
+        self.assertRegex(result.stdout, r'evaluation parity: [1-9][0-9]* comparisons over [1-9][0-9]* identities; 0 mismatches')
+        self.assertIn('explained 1 decisions referenced by moved holds', result.stdout)
+        self.assertEqual(self.backup.stat().st_ino, inode)
         self.assertEqual(digest(self.backup), before)
         for file in (self.state, self.archive, self.backup):
             self.assertEqual(stat.S_IMODE(file.stat().st_mode), 0o600)
-        with sqlite3.connect(self.state) as state, sqlite3.connect(self.archive) as history:
-            census = 'SELECT name FROM sqlite_schema WHERE type=\'table\''
-            self.assertEqual({name for name, in history.execute(census)}, MOVED)
-            self.assertEqual({name for name, in state.execute(census)}, STATE | {
-                'cortexkit_schema_version', 'pending_account_hold', 'pending_quota_reading_log',
-                'quota_reading_moved'})
+        with closing(sqlite3.connect(self.state)) as state, closing(sqlite3.connect(self.archive)) as history, closing(sqlite3.connect(self.backup)) as original:
+            census = "SELECT name FROM sqlite_schema WHERE type='table'"
+            self.assertEqual({name for name, in history.execute(census)}, MOVED | {'cortexkit_schema_version'})
+            original_tables = {name for name, in original.execute(census)}
+            self.assertTrue(STATE <= original_tables)
+            self.assertEqual({name for name, in state.execute(census)}, original_tables - MOVED | {
+                'history_layout', 'pending_account_hold', 'pending_quota_reading_log', 'quota_reading_moved'})
             for table in sorted(STATE):
-                self.assertEqual(state.execute(f'SELECT * FROM {table}').fetchall(), [(table,)])
+                self.assertEqual(state.execute(f'SELECT * FROM {table}').fetchall(),
+                                 original.execute(f'SELECT * FROM {table}').fetchall())
+            for db, namespace, version in ((state, 'route_state', 98), (history, 'route_history', 1)):
+                self.assertEqual(db.execute('SELECT max(version) FROM cortexkit_schema_version WHERE namespace=?', (namespace,)).fetchone(), (version,))
             self.assertEqual(history.execute('SELECT observed_at,used_percent FROM quota_reading_log').fetchall(),
                              [(10, 4.0), (11, 5.0)])
             self.assertEqual(state.execute('SELECT * FROM quota_reading_moved').fetchall(),
                              [('acct', 'window', 11)])
 
     def test_verifier_failure_keeps_inode_and_bytes_and_publishes_nothing(self):
-        self.verifier.write_text('#!/bin/sh\necho planted-mismatch >&2\nexit 3\n')
+        verifier = self.fake_verifier('echo planted-mismatch >&2\nexit 3')
         before, inode = digest(self.state), self.state.stat().st_ino
-        result = self.run_script()
+        result = self.run_script(verifier)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('planted-mismatch', result.stderr)
         self.assertEqual(digest(self.state), before)
@@ -94,3 +102,45 @@ class SplitStateHistoryTest(unittest.TestCase):
                 self.assertEqual(digest(self.state), before)
                 self.assertFalse(self.backup.exists())
                 obstruction.unlink()
+    def test_refuses_low_space_before_staging(self):
+        (self.root / 'sitecustomize.py').write_text(
+            'import shutil\nshutil.disk_usage = lambda _p: shutil._ntuple_diskusage(0, 0, 1)\n')
+        result = self.run_script(env={**os.environ, 'PYTHONPATH': str(self.root)})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('insufficient free space for split', result.stderr)
+        self.assertFalse(self.backup.exists())
+        self.assertFalse(self.archive.exists())
+
+    def test_refuses_stale_stage_and_explains_half_publish_recovery(self):
+        stale = self.root / '.split-state-history-seeded'
+        stale.mkdir()
+        result = self.run_script()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(str(stale), result.stderr)
+        stale.rmdir()
+        os.link(self.state, self.backup)
+        self.archive.write_bytes(b'archive linked before interruption')
+        result = self.run_script()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('half-published split: original is intact and unsplit.', result.stderr)
+        self.assertIn('cmp --', result.stderr)
+        self.assertIn('rm --', result.stderr)
+        self.assertEqual(self.state.stat().st_ino, self.backup.stat().st_ino)
+
+    def test_refuses_uncheckpointed_verifier_output_before_publish(self):
+        verifier = self.fake_verifier(f'{shlex.quote(str(self.verifier))} "$@"\n' + 'touch "$2-wal"')
+        result = self.run_script(verifier)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('state.db-wal', result.stderr)
+        self.assertFalse(self.backup.exists())
+        self.assertFalse(self.archive.exists())
+
+    def test_explain_verifier_detects_changed_account_decision(self):
+        verifier = self.fake_verifier(
+            'python3 -c ' + shlex.quote('import sqlite3, sys; c=sqlite3.connect(sys.argv[1]); c.execute("UPDATE account_decision SET policy_version=99"); c.commit()') + ' "$2"\n' +
+            shlex.quote(str(self.verifier)) + ' "$@"')
+        result = self.run_script(verifier)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('decision explain changed for moved hold test-hold', result.stderr)
+        self.assertFalse(self.backup.exists())
+        self.assertFalse(self.archive.exists())

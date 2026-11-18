@@ -325,23 +325,64 @@ async fn history_mover_loop(store: SharedStore) {
     let period = std::time::Duration::from_secs(5);
     let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut backlog = BacklogTicks::default();
     loop {
         ticks.tick().await;
-        let store = Arc::clone(&store);
+        if backlog.observe(drain_history_tick(&store, crate::now_ms() as i64).await) {
+            tracing::warn!(
+                ticks = backlog.0,
+                "routing history has exceeded one mover batch on successive ticks"
+            );
+        }
+    }
+}
+
+#[derive(Default)]
+struct BacklogTicks(u32);
+
+impl BacklogTicks {
+    fn observe(&mut self, backlogged: bool) -> bool {
+        self.0 = if backlogged {
+            self.0.saturating_add(1)
+        } else {
+            0
+        };
+        self.0 >= 3 && (self.0 - 3) % 12 == 0
+    }
+}
+
+async fn drain_history_tick(store: &SharedStore, now: i64) -> bool {
+    let mut first_batch = true;
+    let mut backlogged = false;
+    loop {
+        let store = Arc::clone(store);
         let result = striatum_store::job_timing::run(
             "history_move",
-            crate::stage_timing::spawn_job_blocking(move || {
-                store.move_history_batch(crate::now_ms() as i64)
-            }),
+            crate::stage_timing::spawn_job_blocking(move || store.move_history_batch_status(now)),
         )
         .await;
         match result {
-            Ok(Ok(_)) => {}
-            Ok(Err(error)) => tracing::warn!(%error, "history move failed; retrying next tick"),
+            Ok(Ok((_, full, more))) => {
+                if first_batch {
+                    backlogged = more;
+                    first_batch = false;
+                }
+                if !full {
+                    break;
+                }
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "history move failed; retrying next tick");
+                break;
+            }
             Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
-            Err(error) => tracing::warn!(%error, "history mover worker failed"),
+            Err(error) => {
+                tracing::warn!(%error, "history mover worker failed");
+                break;
+            }
         }
     }
+    backlogged
 }
 
 async fn checkpoint_loop(store: SharedStore, period: std::time::Duration) {
@@ -352,7 +393,10 @@ async fn checkpoint_loop(store: SharedStore, period: std::time::Duration) {
         let store = Arc::clone(&store);
         match striatum_store::job_timing::run(
             "wal_checkpoint",
-            crate::stage_timing::spawn_job_blocking(move || store.checkpoint_wal()),
+            crate::stage_timing::spawn_job_blocking(move || {
+                store.checkpoint_wal()?;
+                store.checkpoint_history_wal()
+            }),
         )
         .await
         {
@@ -717,4 +761,43 @@ pub(super) async fn flush_call_counts(store: SharedStore) {
         }
         Err(error) => tracing::warn!(%error, "routing call count flush worker failed"),
     }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn history_mover_drains_full_lanes_without_waiting_for_another_tick() {
+    use striatum_core::{route_state_store::QuotaReadingLogRow, RouteStateStore};
+    let scratch = cortexkit_test_support::ScratchDir::new("history-backlog");
+    let store = Arc::new(
+        striatum_store::SqliteRouteStateStore::open(&striatum_store::dev_descriptor(
+            "history-backlog",
+            scratch.path().join("store.db").to_string_lossy(),
+        ))
+        .unwrap(),
+    );
+    let now = 1_800_000_000_000;
+    let readings = (0..129)
+        .map(|i| QuotaReadingLogRow {
+            account_key: "provider/account".into(),
+            window_key: "w".into(),
+            observed_at: now - 7_200_000 + i,
+            used_percent: 5.0,
+            raw_used_percent: None,
+            resets_at: None,
+            window_minutes: None,
+            banked_credit_count: None,
+            fetched_at: None,
+            stale: None,
+        })
+        .collect::<Vec<_>>();
+    store.append_quota_readings(&readings).unwrap();
+    assert!(drain_history_tick(&store, now).await);
+    assert_eq!(store.move_history_batch(now).unwrap(), 0);
+    let mut backlog = BacklogTicks::default();
+    assert!(!backlog.observe(true));
+    assert!(!backlog.observe(true));
+    assert!(backlog.observe(true));
+    assert!(!backlog.observe(true));
+    assert!(!backlog.observe(false));
+    assert!(!backlog.observe(true));
 }

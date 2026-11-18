@@ -29,10 +29,6 @@ pub const BACKUP_EXCLUDABLE_TABLES: &[(&str, &str)] = &[
          account_observation_event",
     ),
     (
-        "quota_reading_log",
-        "deduplicated quota time series; nothing reads it in production",
-    ),
-    (
         "route_winner_baseline",
         "winner-ladder notice baseline; a missing baseline is saved silently, suppressing \
          at most one change notice",
@@ -56,6 +52,7 @@ pub const BACKUP_EXCLUDABLE_TABLES: &[(&str, &str)] = &[
 
 /// Tables every backup must carry, each with the reason.
 pub const BACKUP_REQUIRED_TABLES: &[(&str, &str)] = &[
+    ("history_layout", "prevents a restore of state alone from silently creating an empty archive"),
     ("pending_account_hold", "committed diagnostic holds not yet durable in history, also protects live references"),
     ("pending_quota_reading_log", "committed quota samples not yet durable in history"),
     ("quota_reading_moved", "deduplication watermark for quota replay across restarts"),
@@ -170,27 +167,10 @@ pub const BACKUP_REQUIRED_TABLES: &[(&str, &str)] = &[
         "account_continue",
         "durable selection replies, decision lineage and continuation reservations",
     ),
-    (
-        "account_hold",
-        "client-visible retry answers within their window",
-    ),
     ("block", "refusal evidence, retry clocks, partial route recovery, classification and source tombstones; losing them repeats refused requests or admits duplicate probes"),
     ("probe_authorization", "links an admitted probe to the exact refusal evidence its success may heal"),
     ("retirement_tombstone", "all retired refusal generations; restoring them empty can re-arm delayed evidence"),
     ("success_proof", "scoped success proofs required to recover whole-account quota without erasing another pool"),
-    ("account_fence", "frozen account-fence audit evidence retained for migration parity and backup verification"),
-    ("credential_entitlement_fences", "frozen credential-refusal audit evidence retained for migration parity and backup verification"),
-    ("account_route_fence", "frozen account-route audit evidence retained for migration parity and backup verification"),
-    ("account_non_quota_route_fence", "frozen non-quota route audit evidence retained for migration parity and backup verification"),
-    ("account_size_refusal", "frozen quota-size audit evidence retained for migration parity and backup verification"),
-    ("account_non_quota_size_refusal", "frozen non-quota size audit evidence retained for migration parity and backup verification"),
-    ("account_principal_exclusion", "frozen principal-exclusion audit evidence retained for migration parity and backup verification"),
-    ("account_transient_backoff", "frozen observation-backoff audit evidence retained for migration parity and backup verification"),
-    ("fence_recheck", "frozen retry-clock audit evidence retained for migration parity and backup verification"),
-    ("fence_probe_authorization", "frozen probe-authorization audit evidence retained for migration parity and backup verification"),
-    ("fence_recheck_route_clear", "frozen partial route-clear audit evidence retained for migration parity and backup verification"),
-    ("fence_success_pool", "frozen scoped-success audit evidence retained for migration parity and backup verification"),
-    ("fence_retired_origin", "frozen retirement audit evidence retained for migration parity and backup verification"),
     (
         "account_eligibility",
         "model/account eligibility facts retained until the credential listing changes; \
@@ -219,3 +199,31 @@ pub const BACKUP_REQUIRED_TABLES: &[(&str, &str)] = &[
     ),
     ("cortexkit_schema_version", "migration ledger"),
 ];
+
+/// Archival relations backed up from `history.db` rather than the state file.
+pub const BACKUP_HISTORY_REQUIRED_TABLES: &[(&str, &str)] = &[
+    (
+        "account_hold",
+        "client-visible retry answers within their window",
+    ),
+    ("account_fence", "frozen account-fence audit evidence retained for migration parity and backup verification"),
+    ("credential_entitlement_fences", "frozen credential-refusal audit evidence retained for migration parity and backup verification"),
+    ("account_route_fence", "frozen account-route audit evidence retained for migration parity and backup verification"),
+    ("account_non_quota_route_fence", "frozen non-quota route audit evidence retained for migration parity and backup verification"),
+    ("account_size_refusal", "frozen quota-size audit evidence retained for migration parity and backup verification"),
+    ("account_non_quota_size_refusal", "frozen non-quota size audit evidence retained for migration parity and backup verification"),
+    ("account_principal_exclusion", "frozen principal-exclusion audit evidence retained for migration parity and backup verification"),
+    ("account_transient_backoff", "frozen observation-backoff audit evidence retained for migration parity and backup verification"),
+    ("fence_recheck", "frozen retry-clock audit evidence retained for migration parity and backup verification"),
+    ("fence_probe_authorization", "frozen probe-authorization audit evidence retained for migration parity and backup verification"),
+    ("fence_recheck_route_clear", "frozen partial route-clear audit evidence retained for migration parity and backup verification"),
+    ("fence_success_pool", "frozen scoped-success audit evidence retained for migration parity and backup verification"),
+    ("fence_retired_origin", "frozen retirement audit evidence retained for migration parity and backup verification"),
+    ("cortexkit_schema_version", "history migration ledger"),
+];
+
+/// Archive tables that may be restored empty.
+pub const BACKUP_HISTORY_EXCLUDABLE_TABLES: &[(&str, &str)] = &[(
+    "quota_reading_log",
+    "deduplicated quota time series; nothing reads it in production",
+)];

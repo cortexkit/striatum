@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::{LazyLock, Mutex};
 
-const TABLES: &[&str] = &[
+pub(super) const TABLES: &[&str] = &[
     "account_fence",
     "credential_entitlement_fences",
     "account_route_fence",
@@ -70,7 +70,7 @@ pub(super) fn begin(harness: &Harness) -> Guard {
     .collect::<BTreeSet<_>>();
     assert_eq!(TABLES.iter().copied().collect::<BTreeSet<_>>(), declared);
     let path = harness.store_path().to_path_buf();
-    let connection = rusqlite::Connection::open(&path).unwrap();
+    let connection = open_archive(harness);
     let tables = TABLES
         .iter()
         .map(|table| ((*table).into(), raw_table(&connection, table)))
@@ -84,6 +84,14 @@ pub(super) fn begin(harness: &Harness) -> Guard {
         "one frozen baseline per fixture"
     );
     Guard { path }
+}
+
+pub(super) fn open_archive(harness: &Harness) -> rusqlite::Connection {
+    rusqlite::Connection::open_with_flags(
+        harness.store_path().with_file_name("history.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap()
 }
 
 pub(super) fn check(harness: &Harness, connection: &rusqlite::Connection) {
@@ -123,7 +131,8 @@ impl Drop for Guard {
 async fn a_frozen_audit_write_is_detected_at_the_next_replay_frame() {
     let (harness, _) = configured().await;
     let guard = begin(&harness);
-    let conn = rusqlite::Connection::open(harness.store_path()).unwrap();
+    let conn =
+        rusqlite::Connection::open(harness.store_path().with_file_name("history.db")).unwrap();
     check(&harness, &conn);
     assert_eq!(guard.frame_checks(), 1);
     conn.execute(

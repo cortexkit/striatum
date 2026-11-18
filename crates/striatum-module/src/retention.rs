@@ -1311,6 +1311,32 @@ mod tests {
     }
 
     #[test]
+    fn steady_state_retention_attaches_at_most_once_per_kind() {
+        let (dir, path, store) = scratch_store("history-attachments");
+        seed_pin_affinity(&path, &store, "expired-affinity", NOW - HOUR_MS - 1);
+        seed_pin_affinity(&path, &store, "orphan-pin", NOW - HOUR_MS - 1);
+        let connection = seeding_connection(&path);
+        connection
+            .execute("DELETE FROM account_affinity WHERE pin_id='orphan-pin'", [])
+            .unwrap();
+        drop(connection);
+        store
+            .account_transaction(|tx| {
+                tx.insert_decision(&shadow_admit("shadow-only".into(), NOW - 31 * DAY_MS))
+            })
+            .unwrap();
+        let before = store.archive_attachment_count_for_test();
+        let report = run_retention_pass(&store, &RetentionWindows::default(), NOW, &no_pause());
+        assert_eq!(report.account_affinities, 1);
+        assert_eq!(report.account_pins, 2);
+        assert_eq!(report.account_decisions, 2);
+        assert_eq!(report.shadow_decisions, 1);
+        assert_eq!(store.archive_attachment_count_for_test() - before, 4);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn affinity_retention_frees_expired_pins_and_decisions_in_the_same_pass() {
         let (dir, path, store) = scratch_store("expired-pin");
         seed_pin_affinity(&path, &store, "expired", NOW - HOUR_MS - 1);

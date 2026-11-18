@@ -25,6 +25,17 @@ fn read_only(path: &std::path::Path) -> rusqlite::Connection {
     )",
     )
     .unwrap();
+    let history = path.with_file_name("history.db");
+    conn.execute("ATTACH DATABASE ?1 AS archive", [history.to_str().unwrap()])
+        .unwrap();
+    conn.execute_batch(
+        "CREATE TEMP VIEW quota_reading_log AS
+        SELECT * FROM main.pending_quota_reading_log
+        UNION ALL SELECT h.* FROM archive.quota_reading_log h
+        WHERE NOT EXISTS (SELECT 1 FROM main.pending_quota_reading_log p WHERE
+            (p.account_key,p.window_key,p.observed_at)=(h.account_key,h.window_key,h.observed_at))",
+    )
+    .unwrap();
     conn
 }
 

@@ -54,6 +54,10 @@ pub(super) fn refuse_unsplit(path: &str) -> RouteStateResult<()> {
     if !Path::new(path).exists() {
         return Ok(());
     }
+    let rollback = PathBuf::from(format!("{path}-journal"));
+    if rollback.exists() {
+        return Err(err(format!("refusing rollback journal {}; recover the unsplit store with the previous binary before opening it", rollback.display())));
+    }
     let wal = PathBuf::from(format!("{path}-wal"));
     let connection = if wal.exists() {
         Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
@@ -61,6 +65,12 @@ pub(super) fn refuse_unsplit(path: &str) -> RouteStateResult<()> {
         open_offline(Path::new(path))
     }
     .map_err(err)?;
+    if has_split_layout(&connection).map_err(err)? {
+        let archive = path_for(Path::new(path));
+        if !archive.is_file() {
+            return Err(err(format!("split routing store is missing {}; restore history.db (the matching archive) before starting routing", archive.display())));
+        }
+    }
     for table in TABLES.lines() {
         let exists = connection
             .query_row(
@@ -84,6 +94,10 @@ pub(super) fn refuse_unsplit(path: &str) -> RouteStateResult<()> {
     Ok(())
 }
 
+fn has_split_layout(conn: &Connection) -> rusqlite::Result<bool> {
+    conn.query_row("SELECT EXISTS(SELECT 1 FROM main.sqlite_schema WHERE type='table' AND name='history_layout')", [], |row| row.get(0))
+}
+
 pub fn open_offline(path: &Path) -> rusqlite::Result<Connection> {
     Connection::open_with_flags(
         format!("{}?mode=ro&immutable=1", file_uri(path)),
@@ -91,29 +105,24 @@ pub fn open_offline(path: &Path) -> rusqlite::Result<Connection> {
     )
 }
 
-fn attach(conn: &Connection, uri: &str) -> rusqlite::Result<()> {
+const HOLD_UNION: &str = "SELECT * FROM main.pending_account_hold
+    UNION ALL SELECT h.* FROM archive.account_hold h
+    WHERE NOT EXISTS (SELECT 1 FROM main.pending_account_hold p WHERE p.decision_id=h.decision_id)";
+
+fn attach_reader(conn: &Connection, uri: &str) -> rusqlite::Result<()> {
     conn.execute("ATTACH DATABASE ?1 AS archive", [uri])?;
-    // Read pending first. The mover commits history before acknowledging state,
-    // so a newer archive snapshot can contain a duplicate but never a gap.
-    let result = conn.execute_batch(
-        "CREATE TEMP VIEW visible_account_holds AS
-           SELECT * FROM main.pending_account_hold
-           UNION ALL SELECT h.* FROM archive.account_hold h
-           WHERE NOT EXISTS (SELECT 1 FROM main.pending_account_hold p WHERE p.decision_id=h.decision_id);
+    conn.execute_batch(&format!(
+        "CREATE TEMP VIEW visible_account_holds AS {HOLD_UNION};
          CREATE TEMP VIEW visible_quota_readings AS
            SELECT * FROM main.pending_quota_reading_log
            UNION ALL SELECT h.* FROM archive.quota_reading_log h
            WHERE NOT EXISTS (SELECT 1 FROM main.pending_quota_reading_log p
-             WHERE (p.account_key,p.window_key,p.observed_at)=(h.account_key,h.window_key,h.observed_at));",
-    );
-    if result.is_err() {
-        detach(conn)?;
-    }
-    result
+             WHERE (p.account_key,p.window_key,p.observed_at)=(h.account_key,h.window_key,h.observed_at));"
+    ))
 }
 
 fn detach(conn: &Connection) -> rusqlite::Result<()> {
-    conn.execute_batch("DROP VIEW IF EXISTS temp.visible_account_holds; DROP VIEW IF EXISTS temp.visible_quota_readings; DETACH DATABASE archive")
+    conn.execute_batch("DETACH DATABASE archive")
 }
 
 pub(super) fn with_archive<T>(
@@ -122,7 +131,7 @@ pub(super) fn with_archive<T>(
     f: impl FnOnce() -> rusqlite::Result<T>,
 ) -> rusqlite::Result<T> {
     let Some(uri) = uri else { return f() };
-    attach(conn, uri)?;
+    conn.execute("ATTACH DATABASE ?1 AS archive", [uri])?;
     // Even a panic must detach after the transaction has rolled back; the
     // state connection may still be used by non-account writers afterward.
     struct Attached<'a>(&'a Connection, bool);
@@ -169,25 +178,45 @@ impl History {
         let mut descriptor = dev_descriptor(&lease_id, source);
         descriptor.storage_namespace = NAMESPACE.into();
         let writer = open_sqlite(&descriptor).map_err(err)?;
+        writer
+            .with_conn(|conn| {
+                conn.pragma_update(None, "journal_size_limit", WAL_SIZE_CAP_BYTES)?;
+                conn.pragma_update(None, "wal_autocheckpoint", 0)
+            })
+            .map_err(err)?;
         let migration = writer.migrate(NAMESPACE, &CHAIN).map_err(err)?;
         if migration.store_ahead() {
             return Err(err(format!("store_ahead: namespace {NAMESPACE} is at version {} but this binary's chain ends at {}", migration.recorded,migration.chain_max)));
         }
-        let reader = if memory {
-            None
-        } else {
-            let conn =
-                Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(err)?;
-            conn.busy_timeout(WAL_TRUNCATE_WAIT_BOUND).map_err(err)?;
-            attach(&conn, &attachment).map_err(err)?;
-            Some(Mutex::new(conn))
-        };
         Ok(Self {
             writer,
-            reader,
+            reader: None,
             attachment,
             mover: Mutex::new(()),
         })
+    }
+
+    pub(super) fn open_reader(&mut self, path: &str) -> RouteStateResult<()> {
+        let conn =
+            Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(err)?;
+        conn.busy_timeout(WAL_TRUNCATE_WAIT_BOUND).map_err(err)?;
+        attach_reader(&conn, &self.attachment).map_err(err)?;
+        self.reader = Some(Mutex::new(conn));
+        Ok(())
+    }
+
+    pub(super) fn checkpoint(&self) -> RouteStateResult<()> {
+        self.writer
+            .with_conn(|conn| conn.query_row("PRAGMA main.wal_checkpoint(PASSIVE)", [], |_| Ok(())))
+            .map_err(err)
+    }
+
+    pub(super) fn close_reader_and_checkpoint(&mut self) {
+        if self.reader.take().is_some() {
+            if let Err(error) = self.writer.with_conn(checkpoint_on_close) {
+                tracing::warn!(%error, "could not checkpoint routing history on shutdown");
+            }
+        }
     }
 }
 
@@ -221,10 +250,9 @@ impl SqliteRouteStateStore {
                     tx.commit().map_err(err)?;
                     Ok(result)
                 }
-                None => self
-                    .store
-                    .with_conn(|conn| with_archive(conn, Some(&history.attachment), || f(conn)))
-                    .map_err(err),
+                // Test-only memory stores have no independent file reader.
+                // Use a disk fixture for tests exercising archived data.
+                None => Err(err("history reads require a file-backed store")),
             },
             None => self.store.with_read(f).map_err(err),
         }
@@ -233,6 +261,13 @@ impl SqliteRouteStateStore {
     /// Copy at most one batch from each outbox. Quota samples stay pending for
     /// an hour, so slightly out-of-order deliveries can still fill gaps.
     pub fn move_history_batch(&self, now_ms: i64) -> RouteStateResult<usize> {
+        self.move_history_batch_status(now_ms)
+            .map(|(moved, _, _)| moved)
+    }
+
+    /// Return rows moved, whether either lane filled its batch, and whether
+    /// the reader saw an eligible row beyond the batch limit.
+    pub fn move_history_batch_status(&self, now_ms: i64) -> RouteStateResult<(usize, bool, bool)> {
         self.move_history_batch_after_commit(now_ms, || Ok(()))
     }
 
@@ -240,21 +275,28 @@ impl SqliteRouteStateStore {
         &self,
         now_ms: i64,
         after_commit: impl FnOnce() -> RouteStateResult<()>,
-    ) -> RouteStateResult<usize> {
+    ) -> RouteStateResult<(usize, bool, bool)> {
         let Some(history) = self.history.as_ref() else {
-            return Ok(0);
+            return Ok((0, false, false));
         };
         let _guard = history.mover.lock().unwrap_or_else(|p| p.into_inner());
-        let holds = self.pending_batch(Kind::Hold, i64::MAX, BATCH)?;
-        let readings =
-            self.pending_batch(Kind::Quota, now_ms.saturating_sub(QUOTA_PENDING_MS), BATCH)?;
+        let mut holds = self.pending_batch(Kind::Hold, i64::MAX, BATCH + 1)?;
+        let mut readings = self.pending_batch(
+            Kind::Quota,
+            now_ms.saturating_sub(QUOTA_PENDING_MS),
+            BATCH + 1,
+        )?;
         if holds.is_empty() && readings.is_empty() {
-            return Ok(0);
+            return Ok((0, false, false));
         }
+        let more = holds.len() > BATCH || readings.len() > BATCH;
+        let full = holds.len() >= BATCH || readings.len() >= BATCH;
+        holds.truncate(BATCH);
+        readings.truncate(BATCH);
         history.copy(&holds, &readings)?;
         after_commit()?;
         self.delete_pending(&holds, &readings, true)?;
-        Ok(holds.len() + readings.len())
+        Ok((holds.len() + readings.len(), full, more))
     }
 
     fn pending_batch(
@@ -422,17 +464,41 @@ pub(super) fn hold_sink(conn: &Connection) -> &'static str {
     "pending_account_hold"
 }
 
-pub(super) fn hold_source(conn: &Connection) -> &'static str {
-    #[cfg(any(test, feature = "test-support"))]
-    if conn
-        .prepare("SELECT 1 FROM temp.visible_account_holds LIMIT 0")
-        .is_err()
-    {
-        return "account_hold";
-    }
-    let _ = conn;
-    "visible_account_holds"
+pub(super) fn hold_source(conn: &Connection) -> rusqlite::Result<String> {
+    // Historical migration rehearsals select their old schema deliberately.
+    // In the split layout, missing attachment is an error, not an empty table.
+    Ok(if has_split_layout(conn)? {
+        format!("({HOLD_UNION})")
+    } else {
+        "account_hold".into()
+    })
 }
+
+pub(super) fn checkpoint_on_close(conn: &Connection) -> rusqlite::Result<()> {
+    let busy: i64 = conn.query_row("PRAGMA main.wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
+    if busy != 0 {
+        return Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            Some("WAL truncate blocked by another connection".into()),
+        ));
+    }
+    Ok(())
+}
+
+const HOLD_PRUNE_KEYS: &str = "SELECT decision_id,
+      EXISTS(SELECT 1 FROM main.pending_account_hold p WHERE p.decision_id=keys.decision_id)
+    FROM (
+      SELECT decision_id,created_at FROM main.pending_account_hold INDEXED BY pending_account_hold_by_created WHERE created_at<?1
+      UNION ALL
+      SELECT h.decision_id,h.created_at FROM archive.account_hold h INDEXED BY account_hold_by_created
+      WHERE h.created_at<?1 AND NOT EXISTS(SELECT 1 FROM main.pending_account_hold p WHERE p.decision_id=h.decision_id)
+      ORDER BY created_at LIMIT ?2
+    ) AS keys";
+const QUOTA_PRUNE_KEYS: &str = "SELECT account_key,window_key,observed_at,
+      EXISTS(SELECT 1 FROM main.pending_quota_reading_log p WHERE
+        (p.account_key,p.window_key,p.observed_at)=(keys.account_key,keys.window_key,keys.observed_at))
+    FROM (SELECT account_key,window_key,observed_at FROM visible_quota_readings
+      WHERE observed_at<?1 ORDER BY observed_at LIMIT ?2) AS keys";
 
 impl SqliteRouteStateStore {
     pub(super) fn prune_history(
@@ -441,54 +507,74 @@ impl SqliteRouteStateStore {
         before: i64,
         limit: usize,
     ) -> RouteStateResult<Option<usize>> {
+        self.prune_history_after_archive_delete(kind, before, limit, || Ok(()))
+    }
+
+    fn prune_history_after_archive_delete(
+        &self,
+        kind: Kind,
+        before: i64,
+        limit: usize,
+        mut after_archive_delete: impl FnMut() -> RouteStateResult<()>,
+    ) -> RouteStateResult<Option<usize>> {
         let Some(history) = &self.history else {
             return Ok(None);
         };
         let _guard = history.mover.lock().unwrap_or_else(|p| p.into_inner());
         let mut total = 0;
         let (candidates, delete) = match kind {
-            Kind::Hold => (
-                "SELECT decision_id FROM visible_account_holds WHERE created_at<?1 ORDER BY created_at LIMIT ?2",
-                "DELETE FROM account_hold WHERE decision_id=?1"),
-            Kind::Quota => (
-                "SELECT account_key,window_key,observed_at FROM visible_quota_readings WHERE observed_at<?1 ORDER BY observed_at LIMIT ?2",
-                "DELETE FROM quota_reading_log WHERE (account_key,window_key,observed_at)=(?1,?2,?3)"),
+            Kind::Hold => (HOLD_PRUNE_KEYS,"DELETE FROM account_hold WHERE decision_id=?1"),
+            Kind::Quota => (QUOTA_PRUNE_KEYS,"DELETE FROM quota_reading_log WHERE (account_key,window_key,observed_at)=(?1,?2,?3)"),
         };
         while total < limit {
             let size = (limit - total).min(BATCH);
-            let keys: Vec<Vec<Value>> = self.with_history_reader(|conn| {
+            let keys: Vec<(Vec<Value>, bool)> = self.with_history_reader(|conn| {
                 let mut statement = conn.prepare(candidates)?;
-                let columns = statement.column_count();
+                let columns = statement.column_count() - 1;
                 let rows = statement.query_map(params![before, size as i64], |row| {
-                    (0..columns).map(|index| row.get(index)).collect()
+                    Ok((
+                        (0..columns)
+                            .map(|index| row.get(index))
+                            .collect::<rusqlite::Result<_>>()?,
+                        row.get(columns)?,
+                    ))
                 })?;
                 rows.collect()
             })?;
             if keys.is_empty() {
                 break;
             }
-            // Remove pending first so retention cannot leave a copy the next
-            // mover would reintroduce. Retention never advances quota watermarks.
-            let (holds, quota) = match kind {
-                Kind::Hold => (keys.as_slice(), &[][..]),
-                Kind::Quota => (&[][..], keys.as_slice()),
-            };
-            self.delete_pending(holds, quota, false)?;
             history
                 .writer
                 .with_conn(|conn| {
                     let tx = write_transaction(conn)?;
                     {
                         let mut statement = tx.prepare(delete)?;
-                        for key in &keys {
+                        for (key, _) in &keys {
                             statement.execute(rusqlite::params_from_iter(key))?;
                         }
                     }
                     tx.commit()
                 })
                 .map_err(err)?;
-            total += keys.len();
-            if keys.len() < size {
+            after_archive_delete()?;
+            // If interrupted, a duplicate not covered by a watermark must
+            // remain pending so a replay cannot reinsert it and count it again.
+            // Retention never advances the watermark.
+            let batch_size = keys.len();
+            let pending: Vec<_> = keys
+                .into_iter()
+                .filter_map(|(key, pending)| pending.then_some(key))
+                .collect();
+            if !pending.is_empty() {
+                let (holds, quota) = match kind {
+                    Kind::Hold => (pending.as_slice(), &[][..]),
+                    Kind::Quota => (&[][..], pending.as_slice()),
+                };
+                self.delete_pending(holds, quota, false)?;
+            }
+            total += batch_size;
+            if batch_size < size {
                 break;
             }
         }
@@ -510,8 +596,8 @@ impl SqliteRouteStateStore {
             .with_read(|conn| {
                 for name in TABLES.lines() {
                     if conn.query_row(
-                        &format!("SELECT EXISTS(SELECT 1 FROM main.{name})"),
-                        [],
+                        "SELECT EXISTS(SELECT 1 FROM main.sqlite_schema WHERE type='table' AND name=?1)",
+                        [name],
                         |row| row.get::<_, bool>(0),
                     )? {
                         return Ok(false);
@@ -531,7 +617,7 @@ impl SqliteRouteStateStore {
     pub fn watch_history_reads_for_test(&self) -> RouteStateResult<Arc<AtomicU64>> {
         use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
         let reads = Arc::new(AtomicU64::new(0));
-        let install = |conn: &Connection| {
+        let install = |conn: &Connection, writer: bool| {
             let reads = Arc::clone(&reads);
             conn.authorizer(Some(move |context: AuthContext<'_>| {
                 if let AuthAction::Read { table_name, .. } = context.action {
@@ -542,14 +628,20 @@ impl SqliteRouteStateStore {
                         return Authorization::Deny;
                     }
                 }
-                Authorization::Allow
+                if writer {
+                    crate::connection_store::writer_authorization(context)
+                } else {
+                    Authorization::Allow
+                }
             }));
             Ok(())
         };
-        self.store.with_conn(&install).map_err(err)?;
-        self.with_history_test_pool(&install)?;
+        self.store
+            .with_conn(|conn| install(conn, true))
+            .map_err(err)?;
+        self.with_history_test_pool(&|conn| install(conn, false))?;
         if let Some(reader) = self.history.as_ref().and_then(|h| h.reader.as_ref()) {
-            install(&reader.lock().unwrap_or_else(|p| p.into_inner())).map_err(err)?;
+            install(&reader.lock().unwrap_or_else(|p| p.into_inner()), false).map_err(err)?;
         }
         Ok(reads)
     }
@@ -597,7 +689,12 @@ impl SqliteRouteStateStore {
             );
             Ok(())
         };
-        self.store.with_conn(&clear).map_err(err)?;
+        self.store
+            .with_conn(|conn| {
+                conn.authorizer(Some(crate::connection_store::writer_authorization));
+                Ok(())
+            })
+            .map_err(err)?;
         self.with_history_test_pool(&clear)?;
         if let Some(reader) = self.history.as_ref().and_then(|h| h.reader.as_ref()) {
             clear(&reader.lock().unwrap_or_else(|p| p.into_inner())).map_err(err)?;
@@ -609,17 +706,12 @@ impl SqliteRouteStateStore {
 #[cfg(any(test, feature = "test-support"))]
 pub fn run_split_for_test(path: &str, now: i64) {
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../script/split-state-history.sh");
-    // This helper tests the file handoff. The rehearsal separately compares
-    // block-evaluation answers across the same original and staged files.
+    let verifier = std::env::var_os("STRIATUM_SPLIT_VERIFIER")
+        .expect("build the verify_history_split example and set STRIATUM_SPLIT_VERIFIER, or use scripts/rust-test-gate.sh");
     let output = std::process::Command::new("bash")
         .arg(script)
-        .args([
-            path,
-            "--now-ms",
-            &now.to_string(),
-            "--verifier",
-            "/usr/bin/true",
-        ])
+        .args([path, "--now-ms", &now.to_string(), "--verifier"])
+        .arg(verifier)
         .output()
         .unwrap();
     assert!(
@@ -638,4 +730,11 @@ pub(super) fn complete_test_upgrade(descriptor: &StorageDescriptor, now: i64) {
     };
     run_split_for_test(path, now);
     drop(SqliteRouteStateStore::open(descriptor).unwrap());
+}
+
+impl SqliteRouteStateStore {
+    /// Checkpoint the archive on its own connection, never on the state writer.
+    pub fn checkpoint_history_wal(&self) -> RouteStateResult<()> {
+        self.history.as_ref().map_or(Ok(()), History::checkpoint)
+    }
 }

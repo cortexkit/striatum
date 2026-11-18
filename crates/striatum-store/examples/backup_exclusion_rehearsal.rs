@@ -15,7 +15,10 @@ use std::time::Instant;
 
 use rusqlite::Connection;
 use striatum_core::{DecisionOutcomeUpdate, FailureBackoffConfig, RouteOutcome, RouteStateStore};
-use striatum_store::backup::{BACKUP_EXCLUDABLE_TABLES, BACKUP_REQUIRED_TABLES};
+use striatum_store::backup::{
+    BACKUP_EXCLUDABLE_TABLES, BACKUP_HISTORY_EXCLUDABLE_TABLES, BACKUP_HISTORY_REQUIRED_TABLES,
+    BACKUP_REQUIRED_TABLES,
+};
 use striatum_store::{dev_descriptor, SqliteRouteStateStore};
 
 fn open(path: &std::path::Path) -> SqliteRouteStateStore {
@@ -89,7 +92,7 @@ fn main() {
     assert_eq!(
         args.len(),
         3,
-        "usage: backup_exclusion_rehearsal SOURCE_DB WORK_DIR"
+        "usage: backup_exclusion_rehearsal SPLIT_STORE_DB WORK_DIR (history.db must be beside SPLIT_STORE_DB)"
     );
     let source = PathBuf::from(&args[1]).canonicalize().unwrap();
     let work = PathBuf::from(&args[2]);
@@ -99,6 +102,9 @@ fn main() {
     let upgraded = work.join("upgraded/store.db");
     let restored = work.join("restored/store.db");
     std::fs::copy(&source, &upgraded).unwrap();
+    let archive = upgraded.with_file_name("history.db");
+    std::fs::copy(source.with_file_name("history.db"), &archive)
+        .expect("supply a cleanly stopped split state database together with history.db");
 
     {
         let conn = Connection::open(&upgraded).unwrap();
@@ -131,17 +137,34 @@ fn main() {
         .collect::<Result<_, _>>()
         .unwrap();
     println!("foreign keys after open: {foreign_keys:?}");
+    let history = Connection::open(&archive).unwrap();
     let mut kept_bytes = 0;
     let mut skipped_bytes = 0;
-    for (table, _) in BACKUP_EXCLUDABLE_TABLES {
-        let bytes = table_bytes(&conn, table);
+    for (database, (table, _)) in BACKUP_EXCLUDABLE_TABLES
+        .iter()
+        .map(|table| (&conn, table))
+        .chain(
+            BACKUP_HISTORY_EXCLUDABLE_TABLES
+                .iter()
+                .map(|table| (&history, table)),
+        )
+    {
+        let bytes = table_bytes(database, table);
         skipped_bytes += bytes;
         println!("  skippable {table}: {bytes} bytes");
     }
-    for (table, _) in BACKUP_REQUIRED_TABLES {
-        let bytes = table_bytes(&conn, table);
+    for (database, (table, _)) in BACKUP_REQUIRED_TABLES
+        .iter()
+        .map(|table| (&conn, table))
+        .chain(
+            BACKUP_HISTORY_REQUIRED_TABLES
+                .iter()
+                .map(|table| (&history, table)),
+        )
+    {
+        let bytes = table_bytes(database, table);
         kept_bytes += bytes;
-        let rows: i64 = scalar(&conn, &format!("SELECT COUNT(*) FROM {table}"));
+        let rows: i64 = scalar(database, &format!("SELECT COUNT(*) FROM {table}"));
         println!("  kept {table}: {rows} rows, {bytes} bytes");
     }
     println!("skippable total {skipped_bytes} bytes; kept total {kept_bytes} bytes");
@@ -173,14 +196,20 @@ fn main() {
         )
         .ok();
     drop(conn);
+    drop(history);
 
+    let restored_archive = restored.with_file_name("history.db");
     std::fs::copy(&upgraded, &restored).unwrap();
+    std::fs::copy(&archive, &restored_archive).unwrap();
     let started = Instant::now();
-    {
-        let mut conn = Connection::open(&restored).unwrap();
+    for (file, exclusions) in [
+        (&restored, BACKUP_EXCLUDABLE_TABLES),
+        (&restored_archive, BACKUP_HISTORY_EXCLUDABLE_TABLES),
+    ] {
+        let mut conn = Connection::open(file).unwrap();
         conn.pragma_update(None, "foreign_keys", false).unwrap();
         let tx = conn.transaction().unwrap();
-        for (table, _) in BACKUP_EXCLUDABLE_TABLES {
+        for (table, _) in exclusions {
             let triggers: Vec<(String, String)> = tx
                 .prepare(
                     "SELECT name, sql FROM sqlite_schema WHERE type = 'trigger' AND tbl_name = ?1",

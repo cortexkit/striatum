@@ -2883,7 +2883,7 @@ impl SqliteRouteStateStore {
                 affinity: count("account_affinity")?,
                 pins: count("account_pin")?,
                 admissions: count("account_admission")?,
-                holds: count(crate::history::hold_source(c))?,
+                holds: count(&crate::history::hold_source(c)?)?,
                 observations: count("account_observation")?,
                 fences,
                 exclusions,

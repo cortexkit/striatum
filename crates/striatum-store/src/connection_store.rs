@@ -28,6 +28,7 @@ enum Backend {
 struct WriterMetrics {
     #[cfg(any(test, feature = "test-support"))]
     writer_hold_ns: AtomicU64,
+    archive_attachments: AtomicU64,
     commits: AtomicU64,
     acquisitions: AtomicU64,
     queue_ns: AtomicU64,
@@ -207,6 +208,22 @@ pub(super) struct ConnectionStore {
     metrics: Arc<WriterMetrics>,
 }
 
+// SQLITE_IGNORE disables SQLite's whole-table delete shortcut, which would
+// otherwise bypass the row hooks that keep the account snapshot current.
+pub(super) fn writer_authorization(
+    context: rusqlite::hooks::AuthContext<'_>,
+) -> rusqlite::hooks::Authorization {
+    use rusqlite::hooks::{AuthAction, Authorization};
+    if matches!(context.action, AuthAction::Delete { table_name }
+        if crate::block_state::table_index(table_name).is_some()
+            || (cfg!(any(test, feature = "test-support")) && ACCOUNT_TABLES.contains(&table_name)))
+    {
+        Authorization::Ignore
+    } else {
+        Authorization::Allow
+    }
+}
+
 impl ConnectionStore {
     pub(crate) fn is_projection(&self) -> bool {
         #[cfg(any(test, feature = "test-support"))]
@@ -225,6 +242,12 @@ impl ConnectionStore {
         Arc::clone(&self.metrics.state_loads)
     }
 
+    pub(crate) fn record_archive_attachment(&self) {
+        self.metrics
+            .archive_attachments
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn record_command_wait(&self, ns: u64) {
         self.metrics
             .command_queue_ns
@@ -234,19 +257,7 @@ impl ConnectionStore {
         let metrics = Arc::new(WriterMetrics::default());
         let install = |conn: &Connection| {
             if matches!(&backend, Backend::Live(_)) {
-                // SQLITE_IGNORE for DELETE disables SQLite's truncate shortcut,
-                // which otherwise skips row hooks for a whole-table delete.
-                // The block state needs every deleted block row reported.
-                conn.authorizer(Some(|context: rusqlite::hooks::AuthContext<'_>| {
-                    if matches!(context.action, rusqlite::hooks::AuthAction::Delete { table_name }
-                        if crate::block_state::table_index(table_name).is_some()
-                            || (cfg!(any(test, feature = "test-support")) && ACCOUNT_TABLES.contains(&table_name)))
-                    {
-                        rusqlite::hooks::Authorization::Ignore
-                    } else {
-                        rusqlite::hooks::Authorization::Allow
-                    }
-                }));
+                conn.authorizer(Some(writer_authorization));
                 let changes = Arc::clone(&metrics);
                 conn.update_hook(Some(move |_, database: &str, table: &str, rowid: i64| {
                     if database == "main" {
@@ -409,6 +420,13 @@ impl ConnectionStore {
 impl SqliteRouteStateStore {
     /// Exclusive writer-callback time, excluding pooled-reader SQL time.
     #[cfg(any(test, feature = "test-support"))]
+    pub fn archive_attachment_count_for_test(&self) -> u64 {
+        self.store
+            .metrics
+            .archive_attachments
+            .load(Ordering::Relaxed)
+    }
+
     pub fn writer_hold_ns_for_test(&self) -> u64 {
         self.store.metrics.writer_hold_ns.load(Ordering::Relaxed)
     }

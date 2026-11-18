@@ -9,7 +9,10 @@ use rusqlite::Connection;
 use striatum_core::{
     DecisionInput, DecisionOutcomeUpdate, FailureBackoffConfig, RouteOutcome, RouteStateStore,
 };
-use striatum_store::backup::{BACKUP_EXCLUDABLE_TABLES, BACKUP_REQUIRED_TABLES};
+use striatum_store::backup::{
+    BACKUP_EXCLUDABLE_TABLES, BACKUP_HISTORY_EXCLUDABLE_TABLES, BACKUP_HISTORY_REQUIRED_TABLES,
+    BACKUP_REQUIRED_TABLES,
+};
 use striatum_store::{
     dev_descriptor, AccountAdmissionRow, AccountDecisionRecord, AccountExclusionRow,
     AccountFenceRow, AccountHoldRow, AccountObservationRow, AccountPinRow, SqliteRouteStateStore,
@@ -140,9 +143,22 @@ fn user_tables(connection: &Connection) -> Vec<String> {
 fn every_routing_table_is_classed_exactly_once_with_a_reason() {
     let rig = Rig::new("classes");
     drop(rig.open());
-    let mut classed: Vec<String> = BACKUP_EXCLUDABLE_TABLES
+    check_classes(
+        &rig.connection(),
+        BACKUP_EXCLUDABLE_TABLES,
+        BACKUP_REQUIRED_TABLES,
+    );
+    check_classes(
+        &Connection::open(rig.dir.join("history.db")).unwrap(),
+        BACKUP_HISTORY_EXCLUDABLE_TABLES,
+        BACKUP_HISTORY_REQUIRED_TABLES,
+    );
+}
+
+fn check_classes(connection: &Connection, excluded: &[(&str, &str)], required: &[(&str, &str)]) {
+    let mut classed: Vec<String> = excluded
         .iter()
-        .chain(BACKUP_REQUIRED_TABLES)
+        .chain(required)
         .map(|(name, reason)| {
             assert!(!reason.trim().is_empty(), "{name} has no reason");
             name.to_string()
@@ -152,7 +168,7 @@ fn every_routing_table_is_classed_exactly_once_with_a_reason() {
     let mut unique = classed.clone();
     unique.dedup();
     assert_eq!(unique, classed, "a table is classed twice");
-    assert_eq!(user_tables(&rig.connection()), classed);
+    assert_eq!(user_tables(connection), classed);
 }
 
 /// A backup tool refuses to skip a table that a table it keeps references by
@@ -161,10 +177,26 @@ fn every_routing_table_is_classed_exactly_once_with_a_reason() {
 fn no_backed_up_table_holds_a_foreign_key_into_a_skippable_one() {
     let rig = Rig::new("foreign-keys");
     drop(rig.open());
-    let connection = rig.connection();
-    let skippable = excludable();
+    check_backup_foreign_keys(
+        &rig.connection(),
+        BACKUP_EXCLUDABLE_TABLES,
+        BACKUP_REQUIRED_TABLES,
+    );
+    check_backup_foreign_keys(
+        &Connection::open(rig.dir.join("history.db")).unwrap(),
+        BACKUP_HISTORY_EXCLUDABLE_TABLES,
+        BACKUP_HISTORY_REQUIRED_TABLES,
+    );
+}
+
+fn check_backup_foreign_keys(
+    connection: &Connection,
+    excluded: &[(&str, &str)],
+    required: &[(&str, &str)],
+) {
+    let skippable: Vec<_> = excluded.iter().map(|(name, _)| *name).collect();
     let mut offending = Vec::new();
-    for (table, _) in BACKUP_REQUIRED_TABLES {
+    for (table, _) in required {
         let mut statement = connection
             .prepare("SELECT \"table\" FROM pragma_foreign_key_list(?1)")
             .unwrap();

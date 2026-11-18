@@ -1484,3 +1484,60 @@ async fn live_select_cpu_round() {
             / samples as f64
     );
 }
+
+#[tokio::test]
+#[ignore = "paired release CPU measurement after archive attachment"]
+async fn history_maintenance_first_request_cpu() {
+    let _clock = crate::InjectedClock::set(FIXTURE_NOW);
+    let fixture = production_fixture();
+    let owner = fixture
+        .harness
+        .bind(reserved(fixture::CONSUMER), None)
+        .await;
+    let runner = fixture
+        .harness
+        .bind(reserved(&fixture.catalog.runners[0].module), None)
+        .await;
+    let select = json!({"consumer":fixture::SUMMARY,"requirements":{"iq":50},"pin":"cpu-provider-0/model-0"});
+    let rounds = 240;
+    for method in ["route.account_for", "route.select"] {
+        let mut totals = [0; 2];
+        for round in 0..rounds {
+            for attach in [round % 2 == 0, round % 2 != 0] {
+                // Warm the same request path before each arm, so the control
+                // also starts with the writer's normal warmed statements.
+                let id = format!("warm-{method}-{round}-{attach}");
+                let request = json!({"provider":"cpu-provider-0","model":"model-0","conversation_key":id,"admission_id":id});
+                let (route, params) = if method == "route.select" {
+                    (&owner, &select)
+                } else {
+                    (&runner, &request)
+                };
+                assert_eq!(route.call(method, params).await.0, FrameType::Response);
+                if attach {
+                    fixture
+                        .store()
+                        .account_command(
+                            striatum_store::AccountCommandKind::HistoryMaintenance,
+                            |_| Ok(()),
+                        )
+                        .unwrap();
+                }
+                let id = format!("sample-{method}-{round}-{attach}");
+                let request = json!({"provider":"cpu-provider-0","model":"model-0","conversation_key":id,"admission_id":id});
+                let params = if method == "route.select" {
+                    &select
+                } else {
+                    &request
+                };
+                let cpu = cpu_us();
+                let response = route.call(method, params).await;
+                totals[usize::from(attach)] += cpu_us() - cpu;
+                assert_eq!(response.0, FrameType::Response, "{}", response.1);
+            }
+        }
+        println!("history attach first request {method}: n={rounds}/arm baseline={:.2} us attached={:.2} us extra={:.2} us",
+            totals[0] as f64 / rounds as f64, totals[1] as f64 / rounds as f64,
+            (totals[1]-totals[0]) as f64 / rounds as f64);
+    }
+}

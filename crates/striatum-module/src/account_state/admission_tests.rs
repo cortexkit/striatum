@@ -898,7 +898,16 @@ fn generated_admission_sequences_with_pruning_match_a_fresh_load() {
     let mut pruned_affinities = 0;
     for seed in seeds {
         let (_scratch, store) = fixture(&format!("admission-state-property-{seed}"));
-        let (_oracle_scratch, oracle) = fixture(&format!("admission-state-oracle-{seed}"));
+        let oracle_name = format!("admission-state-oracle-{seed}");
+        let _oracle_scratch = cortexkit_test_support::ScratchDir::new(&oracle_name);
+        let oracle = SqliteRouteStateStore::open_at_version_for_test(
+            &striatum_store::dev_descriptor(
+                &oracle_name,
+                _oracle_scratch.path().join("state.db").to_string_lossy(),
+            ),
+            97,
+        )
+        .unwrap();
         let owner = install(&store);
         let mut world = World::default();
         let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9));
