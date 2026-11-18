@@ -6,7 +6,7 @@ impl ClassContext {
         provider: &str,
         model: &str,
         priced: bool,
-        policy: AllocatorPolicy,
+        policy: &AllocatorPolicy,
     ) -> Option<AccountBlock> {
         // An empty roster may have lost accounts to route or credential
         // fences. Reuse admission's classification so only a dated account
@@ -30,7 +30,7 @@ impl ClassContext {
                         striatum_core::blocks::LifetimeClass::NonQuota,
                     );
                     block.test_check_at_ms =
-                        self.in_flight_test_check_at(provider, model, priced, &policy);
+                        self.in_flight_test_check_at(provider, model, priced, policy);
                     return Some(block);
                 }
             }
@@ -57,7 +57,7 @@ impl ClassContext {
             &blocked,
             roster.roster.as_ref(),
             self.fences.get(provider).map_or(&[], Vec::as_slice),
-            &policy,
+            policy,
             model,
             self.now_ms,
         );
@@ -71,7 +71,7 @@ impl ClassContext {
             reset,
             striatum_core::blocks::LifetimeClass::Quota,
         );
-        block.test_check_at_ms = self.in_flight_test_check_at(provider, model, priced, &policy);
+        block.test_check_at_ms = self.in_flight_test_check_at(provider, model, priced, policy);
         Some(block)
     }
 

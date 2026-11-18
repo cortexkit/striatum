@@ -2772,6 +2772,10 @@ impl<'a> Selection<'a> {
                 ) {
                     return error;
                 }
+                // Every route reads the same recovery view: building it clones
+                // the whole class context, so it is built at most once per
+                // refusal, and only when a route needs it.
+                let recovery_view = std::cell::OnceCell::new();
                 let account_recoveries: HashMap<_, _> = self
                     .facts
                     .iter()
@@ -2792,12 +2796,13 @@ impl<'a> Selection<'a> {
                         let block = self
                             .classes
                             .and_then(|classes| {
-                                classes.account_recovery_with_keep_free(
-                                    &fact.provider_id,
-                                    &fact.model_id,
-                                    self.priced_per_token,
-                                    0.0,
-                                )
+                                recovery_view
+                                    .get_or_init(|| classes.recovery_view(0.0))
+                                    .account_recovery(
+                                        &fact.provider_id,
+                                        &fact.model_id,
+                                        self.priced_per_token,
+                                    )
                             })
                             .or_else(|| self.account_blocks.get(&key).cloned())?;
                         block.reset_at_ms?;

@@ -631,6 +631,7 @@ impl ClassContext {
 }
 
 mod probe_reservations;
+pub(crate) mod recovery_view;
 mod retry_hints;
 
 #[cfg(test)]
@@ -2733,7 +2734,7 @@ impl ClassContext {
             provider,
             model,
             priced,
-            self.config.allocator_policy_ref(provider).clone(),
+            self.config.allocator_policy_ref(provider),
         )
     }
 
@@ -2755,6 +2756,8 @@ impl ClassContext {
             .and_then(|block| block.reset_at_ms)
     }
 
+    /// One route's recovery in a fresh [`recovery_view::RecoveryView`]. A caller
+    /// reading several routes builds the view once and reads each from it.
     pub(crate) fn account_recovery_with_keep_free(
         &self,
         provider: &str,
@@ -2762,36 +2765,8 @@ impl ClassContext {
         priced: bool,
         keep_free: f64,
     ) -> Option<AccountBlock> {
-        let mut recovered = self.clone();
-        recovered.replace_refusals(
-            self.refusals
-                .iter()
-                .filter(|refusal| {
-                    !self.rechecks.iter().any(|origin| {
-                        origin.quota
-                            && origin.kind == "credential"
-                            && origin.provider == refusal.provider_id
-                            && origin.credential_id.as_deref()
-                                == Some(refusal.credential_id.as_str())
-                    })
-                })
-                .cloned()
-                .collect(),
-        );
-        recovered.replace_rechecks(
-            self.rechecks
-                .iter()
-                .filter(|origin| !origin.quota)
-                .cloned()
-                .collect(),
-        );
-        // The settings keep-free margin for workers (`keep_free_percent`) can
-        // exceed the allocator's own reserve.
-        // Apply it only to this recovery probe, so a weekly reset that frees
-        // that margin is diagnosed without changing account admission policy.
-        let mut policy = self.config.allocator_policy_ref(provider).clone();
-        policy.reserve_seven_day = policy.reserve_seven_day.max(keep_free);
-        recovered.blocked_account_with_policy(provider, model, priced, policy)
+        self.recovery_view(keep_free)
+            .account_recovery(provider, model, priced)
     }
 
     #[allow(clippy::too_many_arguments)]
