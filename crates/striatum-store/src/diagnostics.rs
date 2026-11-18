@@ -614,8 +614,8 @@ mod tests {
 }
 
 pub(crate) fn account_blocks_sql() -> String {
-    "SELECT json_extract(origin_key,'$[0]'),provider,account_id,pool_key_json,
+    format!("SELECT json_extract(origin_key,'$[0]'),provider,account_id,pool_key_json,
         json_extract(source_metadata_json,'$.fence_json'),json_extract(source_metadata_json,'$.source'),observed_at,created_at
-        FROM block WHERE kind='account' AND is_origin=1 AND source_present=1 AND cleared_at IS NULL
-        ORDER BY created_at,json_extract(origin_key,'$[0]')".into()
+        FROM block INDEXED BY block_held_identity WHERE {} AND kind='account' AND is_origin=1 AND source_present=1 AND cleared_at IS NULL
+        ORDER BY created_at,json_extract(origin_key,'$[0]')",crate::block_storage::HELD_SQL)
 }

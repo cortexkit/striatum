@@ -1585,7 +1585,7 @@ fn success_provider_check_sql() -> String {
 }
 
 fn credential_quota_check_sql() -> String {
-    format!("{} SELECT origin_key FROM block WHERE kind='account' AND origin_key>=?1 AND origin_key<?2 AND source_present=1 ORDER BY origin_key",super::STATE_CHECK)
+    format!("{} SELECT origin_key FROM block INDEXED BY block_held_identity WHERE {} AND kind='account' AND origin_key>=?1 AND origin_key<?2 AND source_present=1 ORDER BY origin_key",super::STATE_CHECK,block_storage::HELD_SQL)
 }
 
 fn select(table: usize) -> String {
