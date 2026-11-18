@@ -149,7 +149,12 @@ pub(super) fn rows(harness: &Harness) -> BTreeMap<String, Vec<Vec<SqlValue>>> {
                     .unwrap()
                     .collect::<Result<Vec<_>, _>>()
                     .unwrap();
-                (format!("{schema}.{table}"), rows)
+                let key = if schema == "main" {
+                    table
+                } else {
+                    format!("archive.{table}")
+                };
+                (key, rows)
             })
             .collect::<Vec<_>>()
     })
