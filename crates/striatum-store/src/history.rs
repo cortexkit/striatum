@@ -170,6 +170,14 @@ impl SqliteRouteStateStore {
         &self,
         f: impl FnOnce(&Connection) -> rusqlite::Result<T>,
     ) -> RouteStateResult<T> {
+        self.with_history_reader_pins(|| {}, f)
+    }
+
+    fn with_history_reader_pins<T>(
+        &self,
+        between_pins: impl FnOnce(),
+        f: impl FnOnce(&Connection) -> rusqlite::Result<T>,
+    ) -> RouteStateResult<T> {
         match &self.history {
             Some(history) => match &history.reader {
                 Some(reader) => {
@@ -179,6 +187,9 @@ impl SqliteRouteStateStore {
                     // archive arm. After a state ack is visible, the archive
                     // commit that preceded it must be visible as well.
                     tx.query_row("SELECT count(*) FROM main.sqlite_schema", [], |_| Ok(()))
+                        .map_err(err)?;
+                    between_pins();
+                    tx.query_row("SELECT count(*) FROM archive.sqlite_schema", [], |_| Ok(()))
                         .map_err(err)?;
                     let result = f(&tx).map_err(err)?;
                     tx.commit().map_err(err)?;

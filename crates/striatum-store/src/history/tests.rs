@@ -223,3 +223,25 @@ fn quota_outbox_rolls_back_with_state_and_watermark_lookup_is_keyed() {
         .unwrap()
         .is_empty());
 }
+
+#[test]
+fn history_reader_sees_one_row_when_move_commits_between_snapshot_pins() {
+    let scratch = ScratchDir::new("split-reader-order");
+    let store = open(&scratch.path().join("state.db"));
+    let reading = quota("during-read", NOW - QUOTA_PENDING_MS - 1);
+    assert_eq!(store.append_quota_readings(&[reading]).unwrap(), 1);
+    let copies = store
+        .with_history_reader_pins(
+            || assert_eq!(store.move_history_batch(NOW).unwrap(), 1),
+            |conn| {
+                conn.query_row("SELECT count(*) FROM visible_quota_readings", [], |r| {
+                    r.get::<_, i64>(0)
+                })
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        copies, 1,
+        "the row must remain visible through the copy and ack"
+    );
+}
