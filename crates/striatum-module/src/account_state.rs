@@ -1125,7 +1125,7 @@ impl AccountCommand<'_> {
         &mut self,
         principal: &str,
         admission_id: &str,
-        run_id: &str,
+        run_id: Option<&str>,
         at: i64,
         late: bool,
     ) -> RouteStateResult<bool> {

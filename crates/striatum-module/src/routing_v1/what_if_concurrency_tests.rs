@@ -68,7 +68,7 @@ fn seed(harness: &Harness) {
             })?;
             tx.insert_admission(&row)?;
             if let Some(run) = run {
-                tx.mark_admission_started("p", id, run, T, false)?;
+                tx.mark_admission_started("p", id, Some(run), T, false)?;
             }
         }
         tx.record_continuation(

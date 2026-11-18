@@ -224,7 +224,7 @@ fn live_shaped_writer_cpu() {
         assert!(tx.mark_admission_started(
             &row.principal,
             &row.admission_id,
-            &format!("cpu-run-{}", row.admission_id),
+            Some(&format!("cpu-run-{}", row.admission_id)),
             now + 1,
             false
         )?);

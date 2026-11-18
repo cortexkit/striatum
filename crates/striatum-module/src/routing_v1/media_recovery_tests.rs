@@ -326,3 +326,75 @@ async fn colliculus_typed_served_attempt_heals_before_finish() {
     assert_no_backoff(&harness);
     assert_ordinary(admit(&route, "after-served-attempt", None).await);
 }
+
+#[tokio::test]
+async fn colliculus_started_without_run_id_is_not_an_expired_reservation() {
+    let _clock = crate::InjectedClock::set(BACKOFF_AT);
+    let harness = google();
+    let route = harness.bind(reserved("colliculus"), None).await;
+    let held = claim(&route, &harness).await;
+    {
+        let _clock = crate::InjectedClock::set(START_AT);
+        let started = observe(&route, PROBE, "admission_started", START_AT, json!({})).await;
+        assert_eq!(
+            started["effects"][0]["effect"], "admission_started",
+            "{started}"
+        );
+    }
+    let row = admission_row(&harness, PROBE);
+    assert_eq!(row.state, "started");
+    assert_eq!(row.run_id, None);
+    assert_eq!(row.started_at, Some(START_AT as i64));
+    assert_eq!(row.last_observed_at, row.started_at);
+    assert!(!row.started_late);
+
+    let _clock = crate::InjectedClock::set(row.admission_valid_until as u64 + 1);
+    let inflight = &crate::account_state::snapshot(harness.store())
+        .unwrap()
+        .inflight;
+    let count = |at| {
+        inflight.count(
+            "google",
+            KEY,
+            crate::account_state::InflightScope::Account,
+            at,
+        )
+    };
+    let started_deadline = START_AT as i64 + 30 * 60_000;
+    assert_eq!(count(row.admission_valid_until), 1);
+    assert_eq!(count(started_deadline - 1), 1);
+    assert_eq!(count(started_deadline), 0);
+    assert_refused(admit(&route, "after-reservation-deadline", None).await);
+    assert_eq!(admission_row(&harness, PROBE).state, "started");
+    assert_eq!(origin(&harness).next_recheck_at, held.next_recheck_at);
+}
+
+#[tokio::test]
+async fn colliculus_later_start_does_not_name_an_anonymously_started_run() {
+    for finish_first in [false, true] {
+        let _clock = crate::InjectedClock::set(BACKOFF_AT);
+        let harness = google();
+        let route = harness.bind(reserved("colliculus"), None).await;
+        claim(&route, &harness).await;
+        let first_start = if finish_first {
+            let _clock = crate::InjectedClock::set(FINISH_AT);
+            finish(&route, FINISH_AT).await;
+            FINISH_AT + 1
+        } else {
+            START_AT
+        };
+        for (at, extra) in [
+            (first_start, json!({})),
+            (first_start + 1, json!({"run_id":"later-run"})),
+            (first_start + 2, json!({})),
+        ] {
+            let _clock = crate::InjectedClock::set(at);
+            observe(&route, PROBE, "admission_started", at, extra).await;
+        }
+        let row = admission_row(&harness, PROBE);
+        assert_eq!(row.state, if finish_first { "finished" } else { "started" });
+        assert_eq!(row.run_id, None);
+        assert_eq!(row.started_at, Some(first_start as i64));
+        assert_eq!(row.last_observed_at, row.started_at);
+    }
+}
