@@ -781,7 +781,7 @@ impl crate::AccountTx<'_> {
     ) -> RouteStateResult<Option<ClearedRouteCooldowns>> {
         #[cfg(any(test, feature = "test-support"))]
         let _writer_entry =
-            crate::writer_entry_trace::enter("account_tx::lib::clear_route_cooldowns");
+            crate::writer_entry_trace::enter("account_tx::route_state::clear_route_cooldowns");
         self.command_sql(|conn: &Connection| {
             let tx = conn;
             let known = |key: &str| -> rusqlite::Result<bool> {
@@ -830,7 +830,7 @@ impl crate::AccountTx<'_> {
     ) -> RouteStateResult<()> {
         #[cfg(any(test, feature = "test-support"))]
         let _writer_entry = crate::writer_entry_trace::enter(
-            "account_tx::lib::record_credential_entitlement_fence",
+            "account_tx::route_state::record_credential_entitlement_fence",
         );
         if refusal.provider_id.trim().is_empty() || refusal.credential_id.trim().is_empty() {
             return Ok(());
@@ -847,8 +847,9 @@ impl crate::AccountTx<'_> {
         observed_at_ms: i64,
     ) -> RouteStateResult<usize> {
         #[cfg(any(test, feature = "test-support"))]
-        let _writer_entry =
-            crate::writer_entry_trace::enter("account_tx::lib::touch_credential_entitlement_fence");
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::route_state::touch_credential_entitlement_fence",
+        );
         self.command_sql(|c: &Connection| {
             let tx = c;
             let state = self
@@ -885,7 +886,7 @@ impl crate::AccountTx<'_> {
     ) -> RouteStateResult<usize> {
         #[cfg(any(test, feature = "test-support"))]
         let _writer_entry = crate::writer_entry_trace::enter(
-            "account_tx::lib::clear_credential_entitlement_fence_count",
+            "account_tx::route_state::clear_credential_entitlement_fence_count",
         );
         self.command_sql(|c: &Connection| {
             c.execute(
@@ -903,7 +904,7 @@ impl crate::AccountTx<'_> {
     ) -> RouteStateResult<Vec<striatum_core::route_state_store::CredentialEntitlementFence>> {
         #[cfg(any(test, feature = "test-support"))]
         let _writer_entry = crate::writer_entry_trace::enter(
-            "account_tx::lib::clear_credential_entitlement_fences_for_credential",
+            "account_tx::route_state::clear_credential_entitlement_fences_for_credential",
         );
         self.command_sql(|c: &Connection| {
             keyed_updates::clear_credential_for_id(self, c, credential_id)
@@ -918,7 +919,7 @@ impl crate::AccountTx<'_> {
     ) -> RouteStateResult<usize> {
         #[cfg(any(test, feature = "test-support"))]
         let _writer_entry = crate::writer_entry_trace::enter(
-            "account_tx::lib::clear_credential_entitlement_fences",
+            "account_tx::route_state::clear_credential_entitlement_fences",
         );
         self.command_sql(|c: &Connection| {
             c.execute(
@@ -936,7 +937,7 @@ impl crate::AccountTx<'_> {
     ) -> RouteStateResult<()> {
         #[cfg(any(test, feature = "test-support"))]
         let _writer_entry = crate::writer_entry_trace::enter(
-            "account_tx::lib::adopt_credential_entitlement_fingerprint",
+            "account_tx::route_state::adopt_credential_entitlement_fingerprint",
         );
         self.command_sql(|c: &Connection| {
             c.execute(
@@ -957,7 +958,7 @@ impl crate::AccountTx<'_> {
     ) -> RouteStateResult<()> {
         #[cfg(any(test, feature = "test-support"))]
         let _writer_entry =
-            crate::writer_entry_trace::enter("account_tx::lib::record_provider_cooldown");
+            crate::writer_entry_trace::enter("account_tx::route_state::record_provider_cooldown");
         let observed_at = update.observed_at_ms.unwrap_or_else(now_ms);
         let mut bounded = update.clone();
         {
@@ -1129,7 +1130,8 @@ impl crate::AccountTx<'_> {
         update: &RouteStateUpdate,
     ) -> RouteStateResult<()> {
         #[cfg(any(test, feature = "test-support"))]
-        let _writer_entry = crate::writer_entry_trace::enter("account_tx::lib::update_route_state");
+        let _writer_entry =
+            crate::writer_entry_trace::enter("account_tx::route_state::update_route_state");
         let observed_at = update.observed_at_ms.unwrap_or_else(now_ms);
         let mut bounded = update.clone();
         {
@@ -1291,7 +1293,7 @@ impl crate::AccountTx<'_> {
     ) -> RouteStateResult<()> {
         #[cfg(any(test, feature = "test-support"))]
         let _writer_entry =
-            crate::writer_entry_trace::enter("account_tx::lib::set_decision_outcome");
+            crate::writer_entry_trace::enter("account_tx::route_state::set_decision_outcome");
         // Retain the full error in the audit, but treat an explicitly
         // account-scoped failure as neutral model-health evidence.
         // It must neither record a route-wide quota wall nor change the
@@ -1510,7 +1512,7 @@ impl crate::AccountTx<'_> {
     ) -> RouteStateResult<Option<FailureBackoffState>> {
         #[cfg(any(test, feature = "test-support"))]
         let _writer_entry =
-            crate::writer_entry_trace::enter("account_tx::lib::clear_failure_backoff");
+            crate::writer_entry_trace::enter("account_tx::route_state::clear_failure_backoff");
         self.command_sql(|c: &Connection| {
             let tx = c;
             let prior = tx

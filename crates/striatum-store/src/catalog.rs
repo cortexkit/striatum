@@ -1099,7 +1099,7 @@ impl crate::AccountTx<'_> {
     ) -> RouteStateResult<()> {
         #[cfg(any(test, feature = "test-support"))]
         let _writer_entry =
-            crate::writer_entry_trace::enter("account_tx::lib::apply_fusiform_catalog");
+            crate::writer_entry_trace::enter("account_tx::catalog::apply_fusiform_catalog");
         self.apply_fusiform_catalog_for_providers(facts, cursor, &HashSet::new())
     }
 
@@ -1111,7 +1111,7 @@ impl crate::AccountTx<'_> {
     ) -> RouteStateResult<()> {
         #[cfg(any(test, feature = "test-support"))]
         let _writer_entry = crate::writer_entry_trace::enter(
-            "account_tx::lib::apply_fusiform_catalog_for_providers",
+            "account_tx::catalog::apply_fusiform_catalog_for_providers",
         );
         self.apply_fusiform_catalog_for_providers_inner(
             facts,
@@ -1131,7 +1131,7 @@ impl crate::AccountTx<'_> {
     ) -> RouteStateResult<()> {
         #[cfg(any(test, feature = "test-support"))]
         let _writer_entry = crate::writer_entry_trace::enter(
-            "account_tx::lib::apply_fusiform_catalog_snapshot_for_providers",
+            "account_tx::catalog::apply_fusiform_catalog_snapshot_for_providers",
         );
         self.apply_fusiform_catalog_for_providers_inner(
             facts,
@@ -1393,7 +1393,7 @@ impl crate::AccountTx<'_> {
 
     pub fn upsert_fact(&self, fact: &ModelFact, source: FactSource) -> RouteStateResult<()> {
         #[cfg(any(test, feature = "test-support"))]
-        let _writer_entry = crate::writer_entry_trace::enter("account_tx::lib::upsert_fact");
+        let _writer_entry = crate::writer_entry_trace::enter("account_tx::catalog::upsert_fact");
         let route = fact_to_route(fact);
         derive_provider_key(&fact.provider_id)
             .ok_or_else(|| err("model fact has no canonical provider key"))?;

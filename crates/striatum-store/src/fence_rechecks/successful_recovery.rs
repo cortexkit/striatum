@@ -15,8 +15,9 @@ impl AccountTx<'_> {
         now: i64,
     ) -> RouteStateResult<()> {
         #[cfg(any(test, feature = "test-support"))]
-        let _writer_entry =
-            crate::writer_entry_trace::enter("account_tx::fence_rechecks::heal_authorized_probe");
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::fence_rechecks::successful_recovery::heal_authorized_probe",
+        );
         if !enabled(self.conn).map_err(err)? {
             return Ok(());
         }
@@ -259,8 +260,9 @@ impl AccountTx<'_> {
         now: i64,
     ) -> RouteStateResult<()> {
         #[cfg(any(test, feature = "test-support"))]
-        let _writer_entry =
-            crate::writer_entry_trace::enter("account_tx::fence_rechecks::heal_serving_fences");
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::fence_rechecks::successful_recovery::heal_serving_fences",
+        );
         self.heal_serving_fences_in_scope(
             provider,
             account,
@@ -287,7 +289,7 @@ impl AccountTx<'_> {
     ) -> RouteStateResult<()> {
         #[cfg(any(test, feature = "test-support"))]
         let _writer_entry = crate::writer_entry_trace::enter(
-            "account_tx::fence_rechecks::heal_serving_fences_in_scope",
+            "account_tx::fence_rechecks::successful_recovery::heal_serving_fences_in_scope",
         );
         let origins = self.fence_rechecks()?;
         let origins: Vec<_> = origins

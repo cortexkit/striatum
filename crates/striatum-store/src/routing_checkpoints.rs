@@ -273,8 +273,9 @@ impl SqliteRouteStateStore {
 impl crate::AccountTx<'_> {
     pub fn put_account_vault_roster(&self, roster: &PersistedVaultRoster) -> RouteStateResult<()> {
         #[cfg(any(test, feature = "test-support"))]
-        let _writer_entry =
-            crate::writer_entry_trace::enter("account_tx::lib::put_account_vault_roster");
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::routing_checkpoints::put_account_vault_roster",
+        );
         self.command_sql(|c: &Connection| {
             c.execute(
                 "INSERT INTO account_vault_roster (singleton, view, roster_json, fetched_at)
