@@ -94,9 +94,14 @@ def stage_state(original, state, history, compact):
         db.execute('''INSERT INTO quota_reading_moved
                       SELECT account_key, window_key, max(observed_at)
                       FROM archive.quota_reading_log GROUP BY account_key, window_key''')
-    compact.touch(mode=0o600, exist_ok=False)
-    with closing(connect(state)) as db:
-        db.execute('VACUUM INTO ?', (str(compact),))
+    # Some SQLite builds reject a pre-created destination, even if empty.
+    # Let SQLite create the file privately instead.
+    previous_umask = os.umask(0o077)
+    try:
+        with closing(connect(state)) as db:
+            db.execute('VACUUM INTO ?', (str(compact),))
+    finally:
+        os.umask(previous_umask)
 
 
 def sync(path):

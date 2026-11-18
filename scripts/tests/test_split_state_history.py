@@ -77,6 +77,34 @@ class SplitStateHistoryTest(unittest.TestCase):
             self.assertEqual(state.execute('SELECT * FROM quota_reading_moved').fetchall(),
                              [('acct', 'window', 11)])
 
+    def test_compaction_creates_private_output_without_precreating_it(self):
+        # Some SQLite versions accept an empty destination. Model the stricter
+        # behavior so this regression also runs on those versions.
+        (self.root / 'sitecustomize.py').write_text('''\
+import os
+import sqlite3
+
+os.umask(0o022)
+real_connect = sqlite3.connect
+
+class StrictVacuumConnection(sqlite3.Connection):
+    def execute(self, sql, parameters=()):
+        if sql == 'VACUUM INTO ?':
+            if os.path.lexists(parameters[0]):
+                raise sqlite3.OperationalError('VACUUM INTO output file already exists')
+            print('tested VACUUM INTO with an absent destination', flush=True)
+        return super().execute(sql, parameters)
+
+def connect(*args, **kwargs):
+    return real_connect(*args, factory=StrictVacuumConnection, **kwargs)
+
+sqlite3.connect = connect
+''')
+        result = self.run_script(env={**os.environ, 'PYTHONPATH': str(self.root)})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('tested VACUUM INTO with an absent destination', result.stdout)
+        self.assertEqual(stat.S_IMODE(self.state.stat().st_mode), 0o600)
+
     def test_verifier_failure_keeps_inode_and_bytes_and_publishes_nothing(self):
         verifier = self.fake_verifier('echo planted-mismatch >&2\nexit 3')
         before, inode = digest(self.state), self.state.stat().st_ino
