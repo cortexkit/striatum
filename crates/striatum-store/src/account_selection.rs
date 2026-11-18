@@ -21,6 +21,8 @@ use striatum_core::{
 
 use super::{err, SqliteRouteStateStore};
 
+mod admission_verdicts;
+
 fn observation_event_sql(logged: bool) -> String {
     let (columns, table) = if logged {
         (OBSERVATION_COLUMNS, "account_observation")
@@ -928,27 +930,6 @@ impl AccountTx<'_> {
             )
             .optional()
             .map(|context| context.flatten())
-            .map_err(err)
-    }
-
-    /// A failed attempt must not be healed by its later run_finished event.
-    pub fn admission_reported_failure(
-        &self,
-        principal: &str,
-        admission_id: &str,
-    ) -> RouteStateResult<bool> {
-        #[cfg(any(test, feature = "test-support"))]
-        let _writer_entry = crate::writer_entry_trace::enter(
-            "account_tx::account_selection::admission_reported_failure",
-        );
-        self.conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM account_observation
-                 WHERE principal = ?1 AND admission_id = ?2
-                 AND kind IN ('credential_refused', 'transient_backoff', 'account_limit_exhausted'))",
-                params![principal, admission_id],
-                |row| row.get(0),
-            )
             .map_err(err)
     }
 

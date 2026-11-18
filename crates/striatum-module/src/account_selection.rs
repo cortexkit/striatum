@@ -9000,7 +9000,7 @@ fn apply_bound_observation(
         "run_finished" => {
             // Read while the admission is still open: finishing closes it.
             let size_class = tx.admission_size_class(principal, id)?;
-            if tx.mark_admission_finished(principal, id, now)? {
+            let release_unanswered = if tx.mark_admission_finished(principal, id, now)? {
                 effects.push(json!({ "effect": "admission_finished" }));
                 let lease_ended = tx.end_lease(&admission.pin_id, now)?;
                 effects.push(json!({ "effect": "lease_ended", "lease_ended": lease_ended }));
@@ -9054,9 +9054,11 @@ fn apply_bound_observation(
                         &admission.admission_id,
                     ))?;
                 }
+                !media_success
             } else {
                 effects.push(json!({ "effect": "none", "state": admission.state }));
-            }
+                false
+            };
             if parsed
                 .served_account_id
                 .as_deref()
@@ -9071,6 +9073,9 @@ fn apply_bound_observation(
                     observation_id,
                     effects,
                 )?;
+            }
+            if release_unanswered && !effects.iter().any(|effect| effect["effect"] == "fence") {
+                tx.release_unanswered_admission_probes(admission, now)?;
             }
         }
         "attempt" => {

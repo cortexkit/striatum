@@ -14,6 +14,7 @@ pub use striatum_core::fence_lifetimes::{NON_QUOTA_FENCE_MAX_MS, QUOTA_FENCE_REC
 
 mod probe_authorizations;
 mod provider_healing;
+mod unanswered_admission;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FenceRecheck {
