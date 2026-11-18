@@ -11,8 +11,8 @@ use super::admissions::{AdmissionState, Effect, ShardedMap};
 
 const STARTED_WINDOW_MS: i64 = 30 * 60 * 1_000;
 type AccountKey = (String, String);
-// Unlike historical admission indexes, inflight identities are bounded by the
-// active runs and reservations, so their text stays owned rather than interned.
+// Only active runs and reservations need these keys, so keep their strings
+// owned rather than interning them.
 type RowKey = (String, String);
 
 #[cfg(test)]
@@ -157,8 +157,8 @@ impl InflightLedger {
         }
     }
 
-    /// Sweep only cached runs, not admission history. Collect expired keys in
-    /// one walk so a Tick copies and changes only affected account shards.
+    /// Remove entries at or past `until_ms` from `accounts` without changing admission
+    /// rows. Collect keys first so only affected account shards are copied.
     pub(crate) fn expire_lapsed(&mut self, now: i64) -> usize {
         let expired: Vec<_> = self
             .accounts

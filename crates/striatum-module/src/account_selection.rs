@@ -260,7 +260,7 @@ pub(crate) enum ProbeBinding {
 #[derive(Clone, Debug)]
 pub(crate) struct AccountBlock {
     pub reset_at_ms: Option<i64>,
-    /// A status check for another request's test, not a change to its clock.
+    /// When to check again if another request is testing whether the account can serve traffic.
     pub test_check_at_ms: Option<i64>,
     pub lifetime: striatum_core::blocks::LifetimeClass,
     pub credential_code: Option<String>,

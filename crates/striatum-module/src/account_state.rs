@@ -355,9 +355,9 @@ pub(crate) fn snapshot(store: &SqliteRouteStateStore) -> RouteStateResult<Arc<Ac
     initialize(store)?;
     #[cfg(test)]
     {
-        // A block-table write outside an account command that no test
-        // seeding seam made is a bypass of the account writer: fail the test
-        // rather than answer from a state that missed it.
+        // Fail the test on block-table writes that bypass the account writer.
+        // Writes marked as fixture setup (for example, by `with_writer_for_test`)
+        // are not violations; reload the state below if those writes changed it.
         let bypasses = store.block_tables_written_outside_command();
         assert!(
             bypasses.is_empty(),
@@ -373,9 +373,10 @@ pub(crate) fn snapshot(store: &SqliteRouteStateStore) -> RouteStateResult<Arc<Ac
         .map_err(|_| RouteStateStoreError("account state publisher has the wrong type".into()))
 }
 
-/// Compare every bounded state field except publication generation. Dropped
-/// block rows are intentionally absent from both sides; their physical clock
-/// fields need separate test/maintenance validation at source transitions.
+/// Compare published `AccountState` with a fresh SQL load, ignoring `generation`.
+/// Neither includes recheck clocks for non-observation blocks whose source is
+/// absent or no longer an origin; `assert_canonical_block_clocks_for_test`
+/// checks that those rows have no leftover claim state.
 #[cfg(test)]
 pub(crate) fn assert_fresh_load_for_test(store: &SqliteRouteStateStore, now: i64, context: &str) {
     // Capture memory first: loading SQL must not repair the value being checked.

@@ -862,9 +862,9 @@ impl crate::AccountTx<'_> {
                         params![decision.decision_id, selection_json])?;
                 }
                 if let Some(affinity) = &decision.affinity {
-                    // An alternate principal or consumer spelling may match. Reuse its stored key
-                    // rather than create a second live spelling; retire any
-                    // parallel row so a failed new decision cannot revive it.
+                    // Reuse the newest matching affinity row across principal
+                    // and consumer spellings. End the other matches before
+                    // updating the chosen row so only one binding stays active.
                     let existing: Option<i64> = if alternate(&decision.principal) != decision.principal || alternate(&decision.consumer) != decision.consumer { tx.query_row(
                         "SELECT rowid FROM routing_v1_affinity WHERE principal IN (?1,?4) AND consumer IN (?2,?5) AND affinity=?3 ORDER BY updated_at_ms DESC, (principal=?6) DESC, (consumer=?7) DESC, rowid DESC LIMIT 1",
                         params![decision.principal, decision.consumer, affinity, alternate(&decision.principal).as_ref(), alternate(&decision.consumer).as_ref(), striatum_core::module_identity::canonical(&decision.principal).as_ref(), striatum_core::module_identity::canonical(&decision.consumer).as_ref()],

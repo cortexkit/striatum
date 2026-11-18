@@ -401,10 +401,9 @@ impl SqliteRouteStateStore {
         self.read_first_key_states(provider, now_ms, after_read)
     }
 
-    /// Test control for the former always-repair path: always enter a write
-    /// transaction and synchronize before reading native key rows. The current
-    /// path instead checks published state before deciding to repair. Their
-    /// replay compares rows and routing answers, not independent SQL policies.
+    /// Always synchronize recheck clocks in a write transaction before reading
+    /// key rows. Tests compare rows and routing answers against
+    /// [`Self::pool_key_states_from`], which checks whether synchronization is needed.
     #[cfg(feature = "test-support")]
     pub fn pre_read_first_pool_key_states_for_test(
         &self,

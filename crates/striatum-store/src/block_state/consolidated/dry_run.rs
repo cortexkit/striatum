@@ -46,9 +46,8 @@ impl BlockState {
                 .unwrap_or(0)
                 + 1;
         }
-        // Match SQL decode's held-row filter after a private clear. Keeping an
-        // absent source here would leave its retry clock active in later
-        // what-if evaluations.
+        // Apply the same `HELD_SQL` filter as the SQL load so a what-if repair
+        // that removes a source also removes its recheck schedule from the view.
         self.tables[0].put(
             row.rowid,
             key,

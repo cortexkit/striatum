@@ -1191,9 +1191,8 @@ impl crate::AccountTx<'_> {
         let _writer_entry =
             crate::writer_entry_trace::enter("account_tx::retention::prune_retired_fence_origins");
         self.retention_write(|tx| {
-            // A cleared account fence's id remains a replay barrier forever,
-            // as on the old schema. Only absent, non-held non-account residue
-            // joins the existing age cutoff and short per-relation batches.
+            // Never prune account block rows: even a cleared fence ID must
+            // prevent replay. Delete other eligible rows in age-limited batches.
             tx.execute(
                 &crate::block_storage::keyed_updates::retired_block_prune_sql(),
                 params![before, limit_param(limit)],

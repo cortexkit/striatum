@@ -568,7 +568,6 @@ impl SqliteRouteStateStore {
                     indexes.extend(statement.query_map([table], |row| row.get::<_,String>(0))?
                         .collect::<rusqlite::Result<Vec<_>>>()?);
                 }
-                // Copy enforcement only after restoring rows, so restoration cannot retire evidence.
                 let mut statement = source.prepare(
                     "SELECT sql FROM sqlite_schema WHERE type='trigger' AND name IN
                      ('model_facts_inherit_provider_cooldown','retirement_tombstone_enforce',
@@ -599,6 +598,8 @@ impl SqliteRouteStateStore {
                 for index in indexes {
                     tx.execute_batch(&index)?;
                 }
+                // Install triggers after loading the copied rows so the inserts
+                // cannot fire retirement or clock-reset logic in the copy.
                 for trigger in fence_triggers {
                     tx.execute_batch(&trigger)?;
                 }
