@@ -1,6 +1,9 @@
 //! One report claim and all its durable effects share the connection transaction.
 
 use super::*;
+use crate::usage_measurements::{
+    floored_i64, stored_output_tokens, stored_token_count, stored_workload_class,
+};
 use striatum_core::{route_state_store::CredentialRefusal, RouteOutcome};
 
 #[derive(Clone, Default)]

@@ -134,7 +134,10 @@ fn quarantine_write(rig: &Rig, input: &Input, kind: &str) -> bool {
                 &input.update(),
             )
             .unwrap();
-        (input.route.as_str(), "account_tx::lib::update_route_state")
+        (
+            input.route.as_str(),
+            "account_tx::route_state::update_route_state",
+        )
     } else {
         rig.store
             .record_provider_cooldown(
@@ -146,7 +149,7 @@ fn quarantine_write(rig: &Rig, input: &Input, kind: &str) -> bool {
             .unwrap();
         (
             input.provider.as_str(),
-            "account_tx::lib::record_provider_cooldown",
+            "account_tx::route_state::record_provider_cooldown",
         )
     };
     drop(installed);
