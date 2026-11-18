@@ -191,7 +191,7 @@ pub(super) fn check_tables(
     let actual = read_tables(conn)?;
     let expected_archive: BTreeSet<String> = archived
         .into_iter()
-        .chain(["cortexkit_schema_version"])
+        .chain(["cortexkit_schema_version", "history_binding"])
         .map(str::to_owned)
         .collect();
     let archive_tables = read_tables(history)?;

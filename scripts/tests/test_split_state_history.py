@@ -62,7 +62,7 @@ class SplitStateHistoryTest(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(file.stat().st_mode), 0o600)
         with closing(sqlite3.connect(self.state)) as state, closing(sqlite3.connect(self.archive)) as history, closing(sqlite3.connect(self.backup)) as original:
             census = "SELECT name FROM sqlite_schema WHERE type='table'"
-            self.assertEqual({name for name, in history.execute(census)}, MOVED | {'cortexkit_schema_version'})
+            self.assertEqual({name for name, in history.execute(census)}, MOVED | {'cortexkit_schema_version', 'history_binding'})
             original_tables = {name for name, in original.execute(census)}
             self.assertTrue(STATE <= original_tables)
             self.assertEqual({name for name, in state.execute(census)}, original_tables - MOVED | {
@@ -72,6 +72,12 @@ class SplitStateHistoryTest(unittest.TestCase):
                                  original.execute(f'SELECT * FROM {table}').fetchall())
             for db, namespace, version in ((state, 'route_state', 98), (history, 'route_history', 1)):
                 self.assertEqual(db.execute('SELECT max(version) FROM cortexkit_schema_version WHERE namespace=?', (namespace,)).fetchone(), (version,))
+            bindings = [db.execute(f'SELECT split_identity, move_generation FROM {table}').fetchall()
+                        for db, table in ((state, 'history_layout'), (history, 'history_binding'))]
+            self.assertEqual(bindings[0], bindings[1])
+            [(split_identity, generation)] = bindings[0]
+            self.assertRegex(split_identity, r'^[0-9a-f]{32}$')
+            self.assertEqual(generation, 0)
             self.assertEqual(history.execute('SELECT observed_at,used_percent FROM quota_reading_log').fetchall(),
                              [(10, 4.0), (11, 5.0)])
             self.assertEqual(state.execute('SELECT * FROM quota_reading_moved').fetchall(),
@@ -148,12 +154,55 @@ sqlite3.connect = connect
         stale.rmdir()
         os.link(self.state, self.backup)
         self.archive.write_bytes(b'archive linked before interruption')
+        self.archive.chmod(0o600)
         result = self.run_script()
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('half-published split: original is intact and unsplit.', result.stderr)
         self.assertIn('cmp --', result.stderr)
         self.assertIn('rm --', result.stderr)
         self.assertEqual(self.state.stat().st_ino, self.backup.stat().st_ino)
+
+    def test_backup_only_interruption_names_the_link_to_remove(self):
+        os.link(self.state, self.backup)
+        result = self.run_script()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('backup-only interruption', result.stderr)
+        self.assertIn(shlex.join(['rm', '--', str(self.backup)]), result.stderr)
+        self.assertFalse(self.archive.exists())
+        self.assertEqual(self.state.stat().st_ino, self.backup.stat().st_ino)
+
+    def test_half_publish_with_a_byte_equal_copy_refuses_recovery(self):
+        shutil.copyfile(self.state, self.backup)
+        self.backup.chmod(0o600)
+        self.archive.write_bytes(b'planted archive')
+        result = self.run_script()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('original and rollback link are not the same inode and size', result.stderr)
+        self.assertNotIn('rm --', result.stderr)
+
+    def test_directory_sync_failure_after_replace_reports_publication(self):
+        (self.root / 'sitecustomize.py').write_text('''\
+import os
+import stat
+
+real_fsync = os.fsync
+directory_syncs = 0
+
+def fsync(fd):
+    global directory_syncs
+    if stat.S_ISDIR(os.fstat(fd).st_mode):
+        directory_syncs += 1
+        if directory_syncs == 2:
+            raise OSError('planted final directory sync failure')
+    return real_fsync(fd)
+
+os.fsync = fsync
+''')
+        result = self.run_script(env={**os.environ, 'PYTHONPATH': str(self.root)})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('published; directory sync failed, run `sync` and verify', result.stderr)
+        self.assertTrue(self.archive.exists() and self.backup.exists())
+        self.assertNotEqual(self.state.stat().st_ino, self.backup.stat().st_ino)
 
     def test_refuses_uncheckpointed_verifier_output_before_publish(self):
         verifier = self.fake_verifier(f'{shlex.quote(str(self.verifier))} "$@"\n' + 'touch "$2-wal"')

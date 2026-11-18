@@ -16,17 +16,45 @@ impl SqliteRouteStateStore {
             .iter()
             .any(|migration| migration.version == history::STATE_MIGRATION.version);
         if split && !memory {
-            history::refuse_unsplit(path)?;
+            history::inspect_files(path)?;
         }
         let store = open_sqlite(descriptor).map_err(err)?;
-        // An interrupted first startup may leave an empty archive, but must
-        // never record in state that its archive exists before it does.
         let mut archive = if split {
-            Some(history::History::open(path, memory, &descriptor.module_id)?)
+            let recorded = store
+                .with_conn(|conn| history::version(conn, ROUTE_STATE_NAMESPACE))
+                .map_err(err)?;
+            if recorded > 0 && recorded < history::STATE_MIGRATION.version {
+                let before_split = migrations
+                    .iter()
+                    .position(|migration| migration.version == history::STATE_MIGRATION.version)
+                    .unwrap();
+                migrate_route_state(&store, &migrations[..before_split])?;
+            }
+            // Check again with the state writer lease held. For example,
+            // migration 082 can create archived retry clocks in fence_recheck.
+            store
+                .with_conn(|conn| {
+                    history::refuse_moved_rows(conn)
+                        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+                })
+                .map_err(err)?;
+            let state = store
+                .with_conn(|conn| {
+                    history::state_binding(conn, path, recorded)
+                        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+                })
+                .map_err(err)?;
+            let archive_path = history::path_for(std::path::Path::new(path));
+            let archive = history::History::open(path, memory, &descriptor.module_id)?;
+            let identity = archive.bind(&archive_path, state.as_ref())?;
+            // Binding history first makes an interrupted first open retryable
+            // only while its archive is still empty.
+            history::migrate_split(&store, migrations, identity)?;
+            Some(archive)
         } else {
+            migrate_route_state(&store, migrations)?;
             None
         };
-        migrate_route_state(&store, migrations)?;
         validate_family_spellings(&store)?;
         // Changing temp_store discards existing TEMP objects, so configure it
         // before installing the catalog write counter and its TEMP triggers.

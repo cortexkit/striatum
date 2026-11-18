@@ -186,3 +186,10 @@ CREATE TABLE IF NOT EXISTS fence_retired_origin (
 CREATE INDEX IF NOT EXISTS fence_retired_origin_by_retired ON fence_retired_origin(retired_at);
 
 CREATE INDEX IF NOT EXISTS account_hold_by_pin ON account_hold(pin_id);
+
+-- The first open or the offline split binds this archive to its state file.
+CREATE TABLE IF NOT EXISTS history_binding (
+  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+  split_identity TEXT NOT NULL CHECK (length(split_identity) = 32),
+  move_generation INTEGER NOT NULL CHECK (move_generation >= 0)
+);

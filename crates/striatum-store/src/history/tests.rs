@@ -86,12 +86,34 @@ fn history_mover_crash_does_not_drop_or_duplicate_readings_or_advance_watermark(
             store.get_quota_readings(&reading.account_key).unwrap(),
             vec![reading.clone()]
         );
+        assert_eq!(
+            quota_count(&store, "SELECT move_generation FROM history_layout"),
+            0
+        );
+        assert_eq!(
+            quota_count(
+                &store,
+                "SELECT move_generation FROM archive.history_binding"
+            ),
+            1
+        );
         Err(err("stop before ack"))
     });
     assert!(crashed.unwrap_err().to_string().contains("stop before ack"));
     drop(store);
     let store = open(&path);
     assert_eq!(store.move_history_batch(NOW).unwrap(), 1);
+    assert_eq!(
+        quota_count(&store, "SELECT move_generation FROM history_layout"),
+        2
+    );
+    assert_eq!(
+        quota_count(
+            &store,
+            "SELECT move_generation FROM archive.history_binding"
+        ),
+        2
+    );
     assert_eq!(
         quota_count(&store, "SELECT count(*) FROM pending_quota_reading_log"),
         0
@@ -615,4 +637,295 @@ fn history_trace_retains_writer_delete_authorizer() {
         .with_writer_for_test(|conn| conn.execute_batch("DELETE FROM account_observation_event"))
         .unwrap();
     assert_eq!(store.outside_account_writer_count_for_test() - before, 2);
+}
+
+#[test]
+fn rejects_a_stale_archive_but_accepts_a_newer_archive_from_the_same_store() {
+    let scratch = ScratchDir::new("archive-generation");
+    let path = scratch.path().join("store.db");
+    let archive = scratch.path().join("history.db");
+    let older_state = scratch.path().join("older-state");
+    let older_archive = scratch.path().join("older-archive");
+    let current_archive = scratch.path().join("current-archive");
+    let store = open(&path);
+    store
+        .append_quota_readings(&[quota("first", NOW - QUOTA_PENDING_MS - 2)])
+        .unwrap();
+    assert_eq!(store.move_history_batch(NOW).unwrap(), 1);
+    drop(store);
+    std::fs::copy(&path, &older_state).unwrap();
+    std::fs::copy(&archive, &older_archive).unwrap();
+    let store = open(&path);
+    store
+        .append_quota_readings(&[quota("second", NOW - QUOTA_PENDING_MS - 1)])
+        .unwrap();
+    assert_eq!(store.move_history_batch(NOW).unwrap(), 1);
+    drop(store);
+    std::fs::copy(&archive, &current_archive).unwrap();
+    std::fs::copy(&older_archive, &archive).unwrap();
+    let descriptor = dev_descriptor("split-test", path.to_str().unwrap());
+    let error = SqliteRouteStateStore::open(&descriptor)
+        .err()
+        .expect("stale archive must be refused");
+    assert!(
+        error
+            .to_string()
+            .contains("state generation 2, history generation 1"),
+        "{error}"
+    );
+    std::fs::copy(&older_state, &path).unwrap();
+    std::fs::copy(&current_archive, &archive).unwrap();
+    assert_eq!(
+        open(&path)
+            .get_quota_readings("provider/account")
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn refuses_orphaned_archive_with_rows_before_creating_state() {
+    let scratch = ScratchDir::new("archive-no-state");
+    let path = scratch.path().join("store.db");
+    let store = open(&path);
+    store
+        .append_quota_readings(&[quota("first", NOW - QUOTA_PENDING_MS - 1)])
+        .unwrap();
+    assert_eq!(store.move_history_batch(NOW).unwrap(), 1);
+    drop(store);
+    std::fs::rename(&path, scratch.path().join("lost-state")).unwrap();
+    let descriptor = dev_descriptor("split-test", path.to_str().unwrap());
+    let error = SqliteRouteStateStore::open(&descriptor)
+        .err()
+        .expect("fresh state must not adopt data");
+    let error = error.to_string();
+    assert!(
+        error.contains("history.db") && error.contains("state identity none, history identity "),
+        "{error}"
+    );
+    assert!(!path.exists());
+}
+
+#[test]
+fn empty_legacy_archive_tables_are_rechecked_after_migrating_through_97() {
+    let scratch = ScratchDir::new("split-recheck-81");
+    let path = scratch.path().join("store.db");
+    let descriptor = dev_descriptor("split-test", path.to_str().unwrap());
+    let old = SqliteRouteStateStore::open_at_version_for_test(&descriptor, 81).unwrap();
+    old.with_writer_for_test(|conn| {
+        assert_eq!(conn.execute("UPDATE model_route_state SET failure_backoff_until=?1 WHERE route_key=(SELECT min(route_key) FROM model_route_state)", [crate::now_ms()+3_600_000])?, 1);
+        Ok(())
+    }).unwrap();
+    drop(old);
+    let error = SqliteRouteStateStore::open(&descriptor)
+        .err()
+        .expect("migrated frozen evidence cannot be dropped");
+    assert!(
+        error
+            .to_string()
+            .contains("unsplit state database has rows in fence_recheck"),
+        "{error}"
+    );
+    let old = SqliteRouteStateStore::open_at_version_for_test(&descriptor, 97).unwrap();
+    old.with_reader_for_test(|conn| {
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM fence_recheck", [], |r| r
+                .get::<_, i64>(0))?,
+            1
+        );
+        Ok(())
+    })
+    .unwrap();
+    assert!(!scratch.path().join("history.db").exists());
+}
+
+#[test]
+fn refuses_recorded_098_without_a_complete_layout() {
+    for ddl in ["", "CREATE TABLE history_layout(singleton INTEGER PRIMARY KEY); INSERT INTO history_layout VALUES(1);"] {
+        let scratch = ScratchDir::new("old-098-layout");
+        let path = scratch.path().join("store.db");
+        let descriptor = dev_descriptor("split-test", path.to_str().unwrap());
+        let old = SqliteRouteStateStore::open_at_version_for_test(&descriptor, 97).unwrap();
+        old.with_writer_for_test(|conn| {
+            conn.execute_batch(ddl)?;
+            conn.execute("INSERT INTO cortexkit_schema_version VALUES ('route_state',98,0)", [])?;
+            Ok(())
+        }).unwrap();
+        drop(old);
+        let error = SqliteRouteStateStore::open(&descriptor).err().expect("old on-disk 098 shape must be refused");
+        let error = error.to_string();
+        assert!(error.contains("store.db") && error.contains("incomplete history_layout"), "{error}");
+        assert!(!scratch.path().join("history.db").exists());
+    }
+}
+
+#[test]
+fn shutdown_history_checkpoint_uses_the_state_wait_bound() {
+    let scratch = ScratchDir::new("history-close-timeout");
+    let mut store = open(&scratch.path().join("store.db"));
+    let outsider = Connection::open(scratch.path().join("history.db")).unwrap();
+    outsider
+        .execute_batch("BEGIN; SELECT * FROM history_binding;")
+        .unwrap();
+    assert_eq!(
+        store
+            .append_quota_readings(&[quota("shutdown", NOW - QUOTA_PENDING_MS - 1)])
+            .unwrap(),
+        1
+    );
+    assert_eq!(store.move_history_batch(NOW).unwrap(), 1);
+    let history = store.history.as_mut().unwrap();
+    history.close_reader_and_checkpoint();
+    let timeout: u64 = history
+        .writer
+        .with_conn(|c| c.pragma_query_value(None, "busy_timeout", |r| r.get(0)))
+        .unwrap();
+    assert_eq!(timeout, WAL_TRUNCATE_WAIT_BOUND.as_millis() as u64);
+}
+
+#[test]
+fn history_copy_uses_full_sync_while_state_ack_uses_normal() {
+    let scratch = ScratchDir::new("split-durability");
+    let store = open(&scratch.path().join("store.db"));
+    let sync = |c: &Connection| c.pragma_query_value(None, "synchronous", |r| r.get::<_, i64>(0));
+    assert_eq!(store.with_writer_for_test(sync).unwrap(), 1); // NORMAL
+    assert_eq!(
+        store
+            .history
+            .as_ref()
+            .unwrap()
+            .writer
+            .with_conn(sync)
+            .unwrap(),
+        2
+    ); // FULL
+}
+
+#[test]
+fn empty_archive_bound_before_state_is_retryable() {
+    for existing_state in [false, true] {
+        let scratch = ScratchDir::new("split-bound-before-state");
+        let path = scratch.path().join("store.db");
+        let descriptor = dev_descriptor("split-test", path.to_str().unwrap());
+        if existing_state {
+            drop(SqliteRouteStateStore::open_at_version_for_test(&descriptor, 97).unwrap());
+        }
+        let archive_path = scratch.path().join("history.db");
+        let archive = History::open(path.to_str().unwrap(), false, &descriptor.module_id).unwrap();
+        let old_id = archive.bind(&archive_path, None).unwrap();
+        drop(archive);
+        let store = open(&path);
+        let pair = store.with_history_reader(|c| c.query_row(
+            "SELECT s.split_identity, h.split_identity, s.move_generation, h.move_generation
+             FROM main.history_layout s CROSS JOIN archive.history_binding h",
+            [], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?,r.get::<_,i64>(3)?)),
+        )).unwrap();
+        assert_eq!(pair.0, pair.1);
+        assert_ne!(pair.0, old_id);
+        assert_eq!((pair.2, pair.3), (0, 0));
+    }
+}
+
+#[test]
+fn refuses_a_different_archive_or_one_without_binding() {
+    let scratch = ScratchDir::new("split-mismatched-pair");
+    let path = scratch.path().join("store.db");
+    let store = open(&path);
+    let real_id = store
+        .with_reader_for_test(|c| {
+            c.query_row("SELECT split_identity FROM history_layout", [], |r| {
+                r.get::<_, String>(0)
+            })
+        })
+        .unwrap();
+    drop(store);
+    let history = scratch.path().join("history.db");
+    let descriptor = dev_descriptor("split-test", path.to_str().unwrap());
+    for (sql, expected) in [
+        (
+            "UPDATE history_binding SET split_identity='0123456789abcdef0123456789abcdef'",
+            "0123456789abcdef0123456789abcdef",
+        ),
+        ("DELETE FROM history_binding", "none"),
+    ] {
+        Connection::open(&history)
+            .unwrap()
+            .execute(sql, [])
+            .unwrap();
+        let error = SqliteRouteStateStore::open(&descriptor)
+            .err()
+            .expect("mismatched pair must be refused");
+        assert!(
+            error.to_string().contains(&format!(
+                "state identity {real_id}, history identity {expected}"
+            )),
+            "{error}"
+        );
+    }
+    Connection::open(&history)
+        .unwrap()
+        .execute("DROP TABLE history_binding", [])
+        .unwrap();
+    let error = SqliteRouteStateStore::open(&descriptor)
+        .err()
+        .expect("old archive schema must be refused");
+    assert!(
+        error
+            .to_string()
+            .contains("history.db: route_history version 1 has incomplete history_binding"),
+        "{error}"
+    );
+}
+
+#[test]
+fn archive_with_no_rows_but_prior_moves_is_not_adopted() {
+    let scratch = ScratchDir::new("archive-empty-after-moves");
+    let path = scratch.path().join("store.db");
+    let store = open(&path);
+    let reading = quota("first", NOW - QUOTA_PENDING_MS - 1);
+    store.append_quota_readings(&[reading]).unwrap();
+    assert_eq!(store.move_history_batch(NOW).unwrap(), 1);
+    assert_eq!(store.prune_quota_reading_log(NOW, 1).unwrap(), 1);
+    drop(store);
+    std::fs::rename(&path, scratch.path().join("lost-state")).unwrap();
+    let desc = dev_descriptor("split-test", path.to_str().unwrap());
+    assert!(SqliteRouteStateStore::open(&desc)
+        .err()
+        .unwrap()
+        .to_string()
+        .contains("state identity none, history identity"));
+    assert!(!path.exists());
+}
+
+#[test]
+fn state_first_backup_replays_a_move_included_in_both_captures() {
+    let scratch = ScratchDir::new("state-first-backup");
+    let restore = ScratchDir::new("state-first-restore");
+    let path = scratch.path().join("store.db");
+    let store = open(&path);
+    let reading = quota("copied-during-capture", NOW - QUOTA_PENDING_MS - 1);
+    assert_eq!(store.append_quota_readings(&[reading.clone()]).unwrap(), 1);
+    drop(store);
+    let restored_path = restore.path().join("store.db");
+    std::fs::copy(&path, &restored_path).unwrap();
+    let store = open(&path);
+    assert_eq!(store.move_history_batch(NOW).unwrap(), 1);
+    drop(store);
+    std::fs::copy(
+        scratch.path().join("history.db"),
+        restore.path().join("history.db"),
+    )
+    .unwrap();
+    let restored = open(&restored_path);
+    assert_eq!(
+        restored.get_quota_readings(&reading.account_key).unwrap(),
+        vec![reading.clone()]
+    );
+    assert_eq!(
+        restored.append_quota_readings(&[reading.clone()]).unwrap(),
+        0
+    );
+    assert_eq!(restored.move_history_batch(NOW).unwrap(), 1);
+    assert_eq!(restored.append_quota_readings(&[reading]).unwrap(), 0);
 }

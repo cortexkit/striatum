@@ -351,10 +351,11 @@ impl BacklogTicks {
     }
 }
 
+const HISTORY_BATCHES_PER_TICK: usize = 64;
+
 async fn drain_history_tick(store: &SharedStore, now: i64) -> bool {
-    let mut first_batch = true;
     let mut backlogged = false;
-    loop {
+    for batch in 0..HISTORY_BATCHES_PER_TICK {
         let store = Arc::clone(store);
         let result = striatum_store::job_timing::run(
             "history_move",
@@ -363,9 +364,8 @@ async fn drain_history_tick(store: &SharedStore, now: i64) -> bool {
         .await;
         match result {
             Ok(Ok((_, full, more))) => {
-                if first_batch {
+                if batch == 0 {
                     backlogged = more;
-                    first_batch = false;
                 }
                 if !full {
                     break;
@@ -385,6 +385,13 @@ async fn drain_history_tick(store: &SharedStore, now: i64) -> bool {
     backlogged
 }
 
+fn checkpoint_files<E>(
+    state: impl FnOnce() -> Result<(), E>,
+    history: impl FnOnce() -> Result<(), E>,
+) -> (Result<(), E>, Result<(), E>) {
+    (state(), history())
+}
+
 async fn checkpoint_loop(store: SharedStore, period: std::time::Duration) {
     let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -394,14 +401,19 @@ async fn checkpoint_loop(store: SharedStore, period: std::time::Duration) {
         match striatum_store::job_timing::run(
             "wal_checkpoint",
             crate::stage_timing::spawn_job_blocking(move || {
-                store.checkpoint_wal()?;
-                store.checkpoint_history_wal()
+                checkpoint_files(|| store.checkpoint_wal(), || store.checkpoint_history_wal())
             }),
         )
         .await
         {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => tracing::warn!(%error, "WAL checkpoint failed; retrying next tick"),
+            Ok((state, history)) => {
+                if let Err(error) = state {
+                    tracing::warn!(%error, "state WAL checkpoint failed; retrying next tick");
+                }
+                if let Err(error) = history {
+                    tracing::warn!(%error, "history WAL checkpoint failed; retrying next tick");
+                }
+            }
             Err(error) => tracing::warn!(%error, "WAL checkpoint worker failed"),
         }
     }
@@ -800,4 +812,48 @@ async fn history_mover_drains_full_lanes_without_waiting_for_another_tick() {
     assert!(!backlog.observe(true));
     assert!(!backlog.observe(false));
     assert!(!backlog.observe(true));
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn history_mover_yields_after_sixty_four_full_batches() {
+    use striatum_core::{route_state_store::QuotaReadingLogRow, RouteStateStore};
+    let scratch = cortexkit_test_support::ScratchDir::new("history-tick-cap");
+    let store = Arc::new(
+        striatum_store::SqliteRouteStateStore::open(&striatum_store::dev_descriptor(
+            "history-tick-cap",
+            scratch.path().join("store.db").to_string_lossy(),
+        ))
+        .unwrap(),
+    );
+    let now = 1_800_000_000_000;
+    let rows = (0..(64 * 64 + 1))
+        .map(|index| QuotaReadingLogRow {
+            account_key: "provider/account".into(),
+            window_key: "w".into(),
+            observed_at: now - 7_200_000 + index,
+            used_percent: 5.0,
+            raw_used_percent: None,
+            resets_at: None,
+            window_minutes: None,
+            banked_credit_count: None,
+            fetched_at: None,
+            stale: None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(store.append_quota_readings(&rows).unwrap(), rows.len());
+    assert!(drain_history_tick(&store, now).await);
+    assert_eq!(
+        store.move_history_batch(now).unwrap(),
+        1,
+        "the next tick must get the remainder"
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn history_checkpoint_runs_after_state_checkpoint_error() {
+    let (state, history) = checkpoint_files(|| Err("state failed"), || Err("history failed"));
+    assert_eq!(state, Err("state failed"));
+    assert_eq!(history, Err("history failed"));
 }

@@ -5,8 +5,8 @@ root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 exec python3 - "$root" "$@" <<'PY'
 import argparse
 from contextlib import closing
-import filecmp
 import shlex
+import secrets
 import os
 from pathlib import Path
 import shutil
@@ -67,10 +67,11 @@ def check_integrity(path):
         return counts(db)
 
 
-def copy_history(original, history):
+def copy_history(original, history, split_identity):
     history.touch(mode=0o600, exist_ok=False)
     with connect(history) as db:
         db.executescript((MIGRATIONS / 'history-migrations/001_split_baseline.sql').read_text())
+        db.execute('INSERT INTO history_binding VALUES (1, ?, 0)', (split_identity,))
         db.execute('ATTACH DATABASE ? AS source', (original.as_uri() + '?mode=ro&immutable=1',))
         for name in HISTORY_TABLES:
             table = quote(name)
@@ -84,11 +85,12 @@ def copy_history(original, history):
             db.execute(f'INSERT INTO main.{table} ({columns}) SELECT {columns} FROM source.{table}')
 
 
-def stage_state(original, state, history, compact):
+def stage_state(original, state, history, compact, split_identity):
     state.touch(mode=0o600, exist_ok=False)
     shutil.copyfile(original, state)
     with closing(connect(state)) as db, db:
         db.execute('PRAGMA journal_mode=DELETE')
+        db.create_function('history_split_identity', 0, lambda: split_identity, deterministic=True)
         db.executescript((MIGRATIONS / 'migrations/098_history_outbox.sql').read_text())
         db.execute('ATTACH DATABASE ? AS archive', (history.as_uri() + '?mode=ro&immutable=1',))
         db.execute('''INSERT INTO quota_reading_moved
@@ -126,16 +128,20 @@ def history_bytes(db, state_bytes):
 
 
 def check_partial_publish(original, history, backup):
-    if not (history.is_file() and backup.is_file()):
+    if not backup.is_file() or backup.is_symlink():
         return
-    if history.is_symlink() or backup.is_symlink():
+    if os.path.lexists(history) and (history.is_symlink() or not history.is_file()):
         return
     with connect(original, read_only=True) as db:
         version = db.execute("SELECT max(version) FROM cortexkit_schema_version WHERE namespace='route_state'").fetchone()[0]
         names = {row[0] for row in db.execute("SELECT name FROM sqlite_schema WHERE type='table'")}
     if version == STATE_VERSION and set(HISTORY_TABLES) <= names:
-        require(filecmp.cmp(original, backup, shallow=False),
-                'partial publish: original and backup differ; preserve all files and investigate')
+        require(identity(original)[:3] == identity(backup)[:3],
+                'partial publish: original and rollback link are not the same inode and size; preserve all files and investigate')
+        if not history.exists():
+            rm_cmd = shlex.join(['rm', '--', str(backup)])
+            raise RuntimeError(f'backup-only interruption: original is intact and unsplit. Keep routing stopped, run `{rm_cmd}`, then rerun the split. Do not replace the original.')
+        identity(history)
         paths = [str(path) for path in (original, backup, history)]
         cmp_cmd = shlex.join(['cmp', '--', paths[0], paths[1]])
         rm_cmd = shlex.join(['rm', '--', paths[1], paths[2]])
@@ -172,8 +178,9 @@ def main(args):
         scratch = work / 'build'
         scratch.mkdir()
         state_work = scratch / original.name
-        copy_history(original, history_stage)
-        stage_state(original, state_work, history_stage, state_stage)
+        split_identity = secrets.token_hex(16)
+        copy_history(original, history_stage, split_identity)
+        stage_state(original, state_work, history_stage, state_stage, split_identity)
         peak_bytes = sum(path.stat().st_size for path in (state_work, state_stage, history_stage))
         state_work.unlink()
         state_counts = check_integrity(state_stage)
@@ -183,18 +190,21 @@ def main(args):
         # This is new state, derived from the shipped history rows rather than copied.
         state_counts.pop('quota_reading_moved')
         require(state_counts == state_expected, 'state table inventory or row-count parity failed')
-        require(history_counts == {name: expected[name] for name in HISTORY_TABLES},
+        require(history_counts == {**{name: expected[name] for name in HISTORY_TABLES}, 'history_binding': 1},
                 'history table inventory or row-count parity failed')
         print(f'row-count parity: {len(expected)} tables; {sum(expected.values())} rows', flush=True)
         subprocess.run([args.verifier, str(original), str(state_stage), str(args.now_ms)], check=True)
 
-        for path, namespace, expected_version in (
-            (state_stage, 'route_state', 98), (history_stage, 'route_history', 1),
+        for path, namespace, expected_version, binding_table in (
+            (state_stage, 'route_state', 98, 'history_layout'),
+            (history_stage, 'route_history', 1, 'history_binding'),
         ):
             identity(path)
             check_integrity(path)
             with closing(connect(path, read_only=True)) as conn:
                 version = conn.execute('SELECT max(version) FROM cortexkit_schema_version WHERE namespace=?', (namespace,)).fetchone()[0]
+                binding = conn.execute(f'SELECT split_identity, move_generation FROM {binding_table} WHERE singleton=1').fetchone()
+            require(binding == (split_identity, 0), f'verifier did not preserve initial split identity and generation in {path.name}')
             require(version == expected_version, f'verifier did not persist {namespace} version {expected_version}: {version}')
             sync(path)
         require(identity(original) == before, 'source changed during checks; nothing published')
@@ -210,14 +220,17 @@ def main(args):
             published.append(history)
             sync(original.parent)
             os.replace(state_stage, original)
-        except BaseException:
+            sync(original.parent)
+        except BaseException as error:
             # A signal can land immediately after the atomic replace. Keep the
             # matching archive and rollback link if state has already switched.
             if original.stat().st_ino == before[1]:
                 for path in reversed(published):
                     path.unlink()
-            raise
-        sync(original.parent)
+                raise
+            if not isinstance(error, OSError):
+                raise
+            print(f'split-state-history: published; directory sync failed, run `sync` and verify both files before starting routing: {error}', file=sys.stderr)
     print(f'split complete: state_bytes={original.stat().st_size} history_bytes={history.stat().st_size} '
           f'staging_peak_bytes={peak_bytes} duration_s={time.monotonic() - started:.3f}; original backup: {backup}')
     print('To roll back or restore, stop routing and remove the replaced database -wal and -shm sidecars before replacing either database file.')

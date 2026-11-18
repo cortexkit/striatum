@@ -5,6 +5,9 @@ use super::*;
 use rusqlite::{types::Value, OpenFlags};
 use std::path::{Path, PathBuf};
 
+mod pair;
+pub(super) use pair::{inspect_files, migrate_split, refuse_moved_rows, state_binding, version};
+
 pub(super) const STATE_MIGRATION: Migration = Migration {
     version: 98,
     statements: include_str!("../migrations/098_history_outbox.sql"),
@@ -48,50 +51,6 @@ pub(super) fn path_for(state: &Path) -> PathBuf {
         name.push(".history.db");
         state.with_file_name(name)
     }
-}
-
-pub(super) fn refuse_unsplit(path: &str) -> RouteStateResult<()> {
-    if !Path::new(path).exists() {
-        return Ok(());
-    }
-    let rollback = PathBuf::from(format!("{path}-journal"));
-    if rollback.exists() {
-        return Err(err(format!("refusing rollback journal {}; recover the unsplit store with the previous binary before opening it", rollback.display())));
-    }
-    let wal = PathBuf::from(format!("{path}-wal"));
-    let connection = if wal.exists() {
-        Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-    } else {
-        open_offline(Path::new(path))
-    }
-    .map_err(err)?;
-    if has_split_layout(&connection).map_err(err)? {
-        let archive = path_for(Path::new(path));
-        if !archive.is_file() {
-            return Err(err(format!("split routing store is missing {}; restore history.db (the matching archive) before starting routing", archive.display())));
-        }
-    }
-    for table in TABLES.lines() {
-        let exists = connection
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM main.sqlite_schema WHERE type='table' AND name=?1)",
-                [table],
-                |row| row.get::<_, bool>(0),
-            )
-            .map_err(err)?;
-        if exists
-            && connection
-                .query_row(
-                    &format!("SELECT EXISTS(SELECT 1 FROM main.{table})"),
-                    [],
-                    |row| row.get::<_, bool>(0),
-                )
-                .map_err(err)?
-        {
-            return Err(err(format!("unsplit state database has rows in {table}; stop routing and run script/split-state-history.sh on an offline copy before opening it")));
-        }
-    }
-    Ok(())
 }
 
 fn has_split_layout(conn: &Connection) -> rusqlite::Result<bool> {
@@ -180,6 +139,9 @@ impl History {
         let writer = open_sqlite(&descriptor).map_err(err)?;
         writer
             .with_conn(|conn| {
+                // A state acknowledgement must never outlive its archive
+                // copy after power loss. State can still commit at NORMAL.
+                conn.pragma_update(None, "synchronous", "FULL")?;
                 conn.pragma_update(None, "journal_size_limit", WAL_SIZE_CAP_BYTES)?;
                 conn.pragma_update(None, "wal_autocheckpoint", 0)
             })
@@ -213,7 +175,10 @@ impl History {
 
     pub(super) fn close_reader_and_checkpoint(&mut self) {
         if self.reader.take().is_some() {
-            if let Err(error) = self.writer.with_conn(checkpoint_on_close) {
+            if let Err(error) = self.writer.with_conn(|conn| {
+                conn.busy_timeout(WAL_TRUNCATE_WAIT_BOUND)?;
+                checkpoint_on_close(conn)
+            }) {
                 tracing::warn!(%error, "could not checkpoint routing history on shutdown");
             }
         }
@@ -293,9 +258,9 @@ impl SqliteRouteStateStore {
         let full = holds.len() >= BATCH || readings.len() >= BATCH;
         holds.truncate(BATCH);
         readings.truncate(BATCH);
-        history.copy(&holds, &readings)?;
+        let generation = history.copy(&holds, &readings)?;
         after_commit()?;
-        self.delete_pending(&holds, &readings, true)?;
+        self.delete_pending(&holds, &readings, Some(generation))?;
         Ok((holds.len() + readings.len(), full, more))
     }
 
@@ -321,7 +286,7 @@ impl SqliteRouteStateStore {
         &self,
         holds: &[Vec<Value>],
         readings: &[Vec<Value>],
-        advance_watermarks: bool,
+        generation: Option<i64>,
     ) -> RouteStateResult<()> {
         self.store.with_conn(|conn| {
             let tx = write_transaction(conn)?;
@@ -334,8 +299,11 @@ impl SqliteRouteStateStore {
                 for row in readings {
                     let key = [&row[0],&row[1],&row[2]];
                     delete_quota.execute(key)?;
-                    if advance_watermarks { advance.execute(key)?; }
+                    if generation.is_some() { advance.execute(key)?; }
                 }
+            }
+            if let Some(generation) = generation {
+                tx.execute("UPDATE history_layout SET move_generation=?1 WHERE singleton=1", [generation])?;
             }
             tx.commit()
         }).map_err(err)
@@ -359,7 +327,7 @@ impl Kind {
 }
 
 impl History {
-    fn copy(&self, holds: &[Vec<Value>], readings: &[Vec<Value>]) -> RouteStateResult<()> {
+    fn copy(&self, holds: &[Vec<Value>], readings: &[Vec<Value>]) -> RouteStateResult<i64> {
         self.writer.with_conn(|conn| {
             let tx = write_transaction(conn)?;
             {
@@ -371,7 +339,12 @@ impl History {
                     for row in rows { insert.execute(rusqlite::params_from_iter(row))?; }
                 }
             }
-            tx.commit()
+            let generation = tx.query_row(
+                "UPDATE history_binding SET move_generation=move_generation+1 WHERE singleton=1 RETURNING move_generation",
+                [], |row| row.get(0),
+            )?;
+            tx.commit()?;
+            Ok(generation)
         }).map_err(err)
     }
 }
@@ -571,7 +544,7 @@ impl SqliteRouteStateStore {
                     Kind::Hold => (pending.as_slice(), &[][..]),
                     Kind::Quota => (&[][..], pending.as_slice()),
                 };
-                self.delete_pending(holds, quota, false)?;
+                self.delete_pending(holds, quota, None)?;
             }
             total += batch_size;
             if batch_size < size {

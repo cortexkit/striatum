@@ -52,7 +52,7 @@ pub const BACKUP_EXCLUDABLE_TABLES: &[(&str, &str)] = &[
 
 /// Tables every backup must carry, each with the reason.
 pub const BACKUP_REQUIRED_TABLES: &[(&str, &str)] = &[
-    ("history_layout", "prevents a restore of state alone from silently creating an empty archive"),
+    ("history_layout", "pairs state with the matching archive and records the last acknowledged move"),
     ("pending_account_hold", "committed diagnostic holds not yet durable in history, also protects live references"),
     ("pending_quota_reading_log", "committed quota samples not yet durable in history"),
     ("quota_reading_moved", "deduplication watermark for quota replay across restarts"),
@@ -219,6 +219,7 @@ pub const BACKUP_HISTORY_REQUIRED_TABLES: &[(&str, &str)] = &[
     ("fence_recheck_route_clear", "frozen partial route-clear audit evidence retained for migration parity and backup verification"),
     ("fence_success_pool", "frozen scoped-success audit evidence retained for migration parity and backup verification"),
     ("fence_retired_origin", "frozen retirement audit evidence retained for migration parity and backup verification"),
+    ("history_binding", "pairs the archive with state and records its last committed move"),
     ("cortexkit_schema_version", "history migration ledger"),
 ];
 

@@ -46,9 +46,11 @@ CREATE TABLE IF NOT EXISTS quota_reading_moved (
 -- copies only after the opener checked they were empty, or the offline tool
 -- copied them.
 CREATE TABLE IF NOT EXISTS history_layout (
-  singleton INTEGER PRIMARY KEY CHECK (singleton = 1)
+  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+  split_identity TEXT NOT NULL CHECK (length(split_identity) = 32),
+  move_generation INTEGER NOT NULL CHECK (move_generation >= 0)
 );
-INSERT INTO history_layout VALUES (1) ON CONFLICT DO NOTHING;
+INSERT INTO history_layout VALUES (1, history_split_identity(), 0) ON CONFLICT DO NOTHING;
 DROP VIEW IF EXISTS fence_origin;
 DROP TRIGGER IF EXISTS fence_retire_enforcement;
 DROP TABLE IF EXISTS account_fence;
