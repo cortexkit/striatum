@@ -64,6 +64,7 @@ fn fusiform_golden_workload_facts_survive_store_reopen() {
 fn invalid_and_unoffered_effort_keys_are_skipped_without_refusing_the_row() {
     let mut payload = golden_complete();
     let row = &mut payload["models"][MODEL];
+    row["capability.reasoning_options"][0]["values"] = json!(["low", "high", "turbo"]);
     row["quality.graded_effort"] = json!("max");
     row["capability.reasoning_default"] = json!("medium");
     row["quality.elo.effort.xhigh"] = json!(2000);
@@ -79,6 +80,11 @@ fn invalid_and_unoffered_effort_keys_are_skipped_without_refusing_the_row() {
         .unwrap();
     let efforts = row.catalog_efforts.as_ref().unwrap();
     assert!(row.present);
+    assert_eq!(
+        row.reasoning_efforts,
+        Some(vec!["low".into(), "high".into(), "turbo".into()])
+    );
+    assert_eq!(efforts.offered, Some(vec!["low".into(), "high".into()]));
     assert_eq!(efforts.graded, None);
     assert_eq!(efforts.vendor_default, None);
     assert_eq!(efforts.elo, [("low".into(), 1200.0)].into());

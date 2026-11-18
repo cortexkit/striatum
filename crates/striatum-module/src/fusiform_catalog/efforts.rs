@@ -16,8 +16,19 @@ pub(crate) fn rank(effort: &str) -> Option<usize> {
 pub(super) fn decode(
     route: &str,
     row: &Value,
-    offered: Option<Vec<String>>,
+    mut offered: Option<Vec<String>>,
 ) -> Option<CatalogEfforts> {
+    // Leave the original options available to live pin validation. The
+    // what-if preview can compare only known ranks against a workload minimum.
+    if let Some(list) = &mut offered {
+        list.retain(|effort| {
+            if rank(effort).is_some() {
+                return true;
+            }
+            tracing::warn!(route, effort, "ignoring unknown catalog reasoning option");
+            false
+        });
+    }
     let valid = |key: &str, effort: &str| {
         let threshold = key.ends_with(".effort_minimum");
         if rank(effort).is_some()
