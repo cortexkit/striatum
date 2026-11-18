@@ -73,6 +73,14 @@ async fn paused_with_pin(pinned: bool) -> (KitSubject, Route, Route, Value) {
 }
 
 async fn paused_in_scope(pinned: bool, scope: Option<&str>) -> (KitSubject, Route, Route, Value) {
+    paused_with_start_run(pinned, scope, Some("run")).await
+}
+
+async fn paused_with_start_run(
+    pinned: bool,
+    scope: Option<&str>,
+    start_run: Option<&str>,
+) -> (KitSubject, Route, Route, Value) {
     let subject = KitSubject {
         observe_blocks: Mutex::new(false),
         media: Mutex::new(Default::default()),
@@ -99,7 +107,12 @@ async fn paused_in_scope(pinned: bool, scope: Option<&str>) -> (KitSubject, Rout
         admission["requested_account"] = json!({"account_id":"account-1"});
     }
     let admitted = result(runner.call("route.account_for", &admission).await);
-    result(runner.call("route.account_observe",&json!({"event_id":"started","kind":"admission_started","admission_id":"admission","run_id":"run"})).await);
+    let mut start =
+        json!({"event_id":"started","kind":"admission_started","admission_id":"admission"});
+    if let Some(run) = start_run {
+        start["run_id"] = json!(run);
+    }
+    result(runner.call("route.account_observe", &start).await);
     subject
         .configure_continue_credentials(&fixture::continue_credentials())
         .await
@@ -107,6 +120,28 @@ async fn paused_in_scope(pinned: bool, scope: Option<&str>) -> (KitSubject, Rout
     let request = json!({"mode":"continue","run_id":"run","admission_id":"admission","conversation_key":"conversation","previous_decision_id":selected["decision_id"],"selection_id":"selection",
         "exhausted":{"credential_id":admitted["account"]["credential_id"],"account":admitted["account"]["account_id"],"limit_window":"five_hour","observed_at_ms":account_selection::now_ms(),"resets_at_ms":account_selection::now_ms()+300000}});
     (subject, consumer, runner, request)
+}
+
+#[tokio::test]
+async fn anonymous_start_does_not_authorize_a_continuation_move() {
+    let (subject, _, runner, request) = paused_with_start_run(false, None, None).await;
+    let answer = result(runner.call("route.account_for", &request).await);
+    assert_eq!(answer["kind"], "refuse", "{answer}");
+    assert_eq!(answer["routing_code"], "unknown_decision", "{answer}");
+
+    let harness = subject.harness();
+    let store = harness.store();
+    let previous = store
+        .v1_decision(request["previous_decision_id"].as_str().unwrap())
+        .unwrap()
+        .unwrap();
+    let principal = format!("reserved:{}", previous.runner_module);
+    let admission = store
+        .account_read(|tx| tx.admission(&principal, "admission"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(admission.state, "started");
+    assert_eq!(admission.run_id, None);
 }
 
 #[tokio::test]

@@ -38,7 +38,7 @@ impl World {
         let now = i64::try_from(self.now).unwrap();
         let (p, a, r) = (principal.clone(), original.clone(), run.clone());
         assert!(self.command("continuation/start original run", move |tx| tx
-            .mark_admission_started(&p, &a, &r, now, false)));
+            .mark_admission_started(&p, &a, Some(&r), now, false)));
         self.ok(Caller::Runner,"route.account_for",json!({"provider":provider,"model":"model-c","conversation_key":reservation,"admission_id":reservation,"requested_account":{"account_id":accounts[1]}})).await;
         let (p, a) = (principal.clone(), reservation.clone());
         let reserved = self

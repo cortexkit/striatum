@@ -17,6 +17,8 @@ use striatum_core::fence_lifetimes::QUOTA_FENCE_RECHECK_MS;
 use super::conformance_tests::{reserved, Harness};
 use crate::broca_credentials::BrocaCredentials;
 
+mod allocator_tests;
+
 const NOW: i64 = 1_794_828_400_000;
 const CARBON: &str = "antigravity-gemini-4-carbon";
 const OPEN: &str = "antigravity:google";

@@ -942,13 +942,13 @@ impl AdmissionState {
         &mut self,
         principal: &str,
         admission_id: &str,
-        run_id: &str,
+        run_id: Option<&str>,
         at: i64,
         late: bool,
     ) -> bool {
         self.transition(principal, admission_id, &["reserved", "expired"], |row| {
             row.state = "started".into();
-            row.run_id = Some(run_id.to_owned());
+            row.run_id = run_id.map(str::to_owned);
             row.started_at = Some(at);
             row.last_observed_at = Some(row.last_observed_at.unwrap_or(at).max(at));
             row.started_late = late;

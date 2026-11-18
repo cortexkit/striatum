@@ -243,6 +243,7 @@ pub(crate) struct ClassContext {
     pool_walls: BTreeSet<(String, String)>,
     catalog: crate::broca_credentials::AuthCatalog,
     targets: BTreeMap<String, String>,
+    vendorless_quota: quota_route::VendorlessQuota,
     tier_accounts: Option<BTreeMap<String, Vec<String>>>,
     continuation_credential: Option<String>,
     media_route: bool,
@@ -633,6 +634,7 @@ impl ClassContext {
 
 mod fact_index;
 mod probe_reservations;
+mod quota_route;
 pub(crate) mod recovery_view;
 mod retry_hints;
 
@@ -1311,6 +1313,7 @@ impl ClassContext {
         let quota = accounts
             .and_then(|accounts| accounts.lock().ok().map(|state| state.clone()))
             .unwrap_or_default();
+        let vendorless_quota = quota_route::vendorless_quota(&quota, &catalog_snapshot.facts);
         let account_ids = credentials.quota_account_ids(&quota);
         let size_clocks = dry_run::published(store, sweep, now_ms)
             .and_then(|blocks| blocks.fence_rechecks())
@@ -1479,6 +1482,7 @@ impl ClassContext {
             facts,
             refusals,
             quota,
+            vendorless_quota,
             fences,
             now_ms,
             eligibility,
@@ -1894,15 +1898,7 @@ impl ClassContext {
             .get(&account_id)
             .into_iter()
             .flatten()
-            .filter(|reading| {
-                reading.reading.routing_provider().is_some_and(|vendor| {
-                    vendor == fact.provider_id
-                        || self
-                            .targets
-                            .get(&fact.provider_id)
-                            .is_some_and(|target| target == vendor)
-                })
-            })
+            .filter(|reading| self.quota_serves(&reading.reading, row, fact, &capacity))
             .max_by_key(|reading| reading.fetched);
         let usage = reading
             .and_then(|reading| reading.decoded.as_ref())
@@ -8986,12 +8982,8 @@ fn apply_bound_observation(
     let id = &admission.admission_id;
     match parsed.kind.as_str() {
         "admission_started" => {
-            let Some(run_id) = parsed.run_id.as_deref() else {
-                effects.push(json!({ "effect": "none", "why": "admission_started needs run_id" }));
-                return Ok(());
-            };
             let late = now >= admission.admission_valid_until;
-            if tx.mark_admission_started(principal, id, run_id, now, late)? {
+            if tx.mark_admission_started(principal, id, parsed.run_id.as_deref(), now, late)? {
                 effects.push(json!({ "effect": "admission_started", "late": late }));
             } else {
                 effects.push(json!({ "effect": "none", "state": admission.state }));
@@ -9000,7 +8992,7 @@ fn apply_bound_observation(
         "run_finished" => {
             // Read while the admission is still open: finishing closes it.
             let size_class = tx.admission_size_class(principal, id)?;
-            if tx.mark_admission_finished(principal, id, now)? {
+            let release_unanswered = if tx.mark_admission_finished(principal, id, now)? {
                 effects.push(json!({ "effect": "admission_finished" }));
                 let lease_ended = tx.end_lease(&admission.pin_id, now)?;
                 effects.push(json!({ "effect": "lease_ended", "lease_ended": lease_ended }));
@@ -9054,9 +9046,11 @@ fn apply_bound_observation(
                         &admission.admission_id,
                     ))?;
                 }
+                !media_success
             } else {
                 effects.push(json!({ "effect": "none", "state": admission.state }));
-            }
+                false
+            };
             if parsed
                 .served_account_id
                 .as_deref()
@@ -9071,6 +9065,9 @@ fn apply_bound_observation(
                     observation_id,
                     effects,
                 )?;
+            }
+            if release_unanswered && !effects.iter().any(|effect| effect["effect"] == "fence") {
+                tx.release_unanswered_admission_probes(admission, now)?;
             }
         }
         "attempt" => {
@@ -12690,7 +12687,7 @@ mod tests {
                 reservation.account_id = other_account.into();
                 tx.insert_admission(&reservation)?;
                 if id == "other-admission" {
-                    tx.mark_admission_started(BROCA, id, "run", NOW, false)?;
+                    tx.mark_admission_started(BROCA, id, Some("run"), NOW, false)?;
                 } else {
                     tx.record_continuation(
                         BROCA,

@@ -12,6 +12,9 @@ mod measurements;
 #[path = "engine_credentials_tests.rs"]
 mod credentials;
 
+#[path = "media_recovery_tests.rs"]
+mod recovery;
+
 #[path = "select_media_tests.rs"]
 mod media;
 

@@ -527,12 +527,18 @@ pub fn quota_route_join<'a>(
     entry: &'a ProviderUsage,
     facts: &'a [ModelFact],
 ) -> Option<QuotaRouteJoin<'a>> {
-    let antigravity = entry.provider == ANTIGRAVITY_QUOTA_JOIN.insula_provider;
-    if let Some(provider_id) = entry
-        .api_provider
-        .as_deref()
-        .filter(|slug| !slug.trim().is_empty())
-    {
+    quota_route_join_for_source(&entry.provider, entry.api_provider.as_deref(), facts)
+}
+
+/// Resolve just the identity fields so account readers can share the join
+/// without decoding the producer's spend balances.
+pub fn quota_route_join_for_source<'a>(
+    provider: &str,
+    api_provider: Option<&'a str>,
+    facts: &'a [ModelFact],
+) -> Option<QuotaRouteJoin<'a>> {
+    let antigravity = provider == ANTIGRAVITY_QUOTA_JOIN.insula_provider;
+    if let Some(provider_id) = api_provider.filter(|slug| !slug.trim().is_empty()) {
         return Some(QuotaRouteJoin {
             provider_id,
             antigravity_family_only: antigravity,

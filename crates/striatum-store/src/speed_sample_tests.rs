@@ -172,11 +172,14 @@ fn speed_sample_migration_preserves_existing_usage() {
         scratch.path().join("routing.db").to_string_lossy(),
     );
     let legacy = open_sqlite(&descriptor).unwrap();
-    let migrations = route_state_migrations()
-        .into_iter()
-        .filter(|migration| migration.version < 96)
-        .collect::<Vec<_>>();
-    legacy.migrate(ROUTE_STATE_NAMESPACE, &migrations).unwrap();
+    let migrations = route_state_migrations();
+    let block = migrations
+        .iter()
+        .position(|migration| migration.version == 96)
+        .unwrap();
+    legacy
+        .migrate(ROUTE_STATE_NAMESPACE, &migrations[..block])
+        .unwrap();
     legacy
         .with_conn(|c| {
             c.execute(
