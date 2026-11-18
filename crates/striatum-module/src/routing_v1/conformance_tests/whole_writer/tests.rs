@@ -57,8 +57,8 @@ const POOL_PROVIDER: &str = "pool-provider";
 const POOL_MODEL: &str = "model-pool";
 
 thread_local! {
-    // Witnesses open additional worlds on the same test thread. Count those
-    // comparisons too, not just the ones on the seed's original world.
+    // Some checks create extra stores after the generated requests. Count
+    // their comparisons as well as those against the first store for each seed.
     static COMPARED_STATES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
