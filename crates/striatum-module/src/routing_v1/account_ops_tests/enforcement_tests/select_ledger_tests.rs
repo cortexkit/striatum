@@ -46,7 +46,8 @@ async fn select_ledger_cap_reload_is_immediate_and_uncapped_routes_skip_eligibil
         harness.edit_config(|config| {
             config["concurrency"]["providers"] = providers;
         });
-        crate::account_selection::SELECT_ELIGIBILITY_PROBES.store(0, Ordering::Relaxed);
+        crate::account_selection::class_context::SELECT_ELIGIBILITY_PROBES
+            .store(0, Ordering::Relaxed);
         for legacy in [false] {
             assert_eq!(
                 consumer.call("route.select", &select_body(legacy)).await.0,
@@ -54,7 +55,8 @@ async fn select_ledger_cap_reload_is_immediate_and_uncapped_routes_skip_eligibil
             );
         }
         assert_eq!(
-            crate::account_selection::SELECT_ELIGIBILITY_PROBES.load(Ordering::Relaxed),
+            crate::account_selection::class_context::SELECT_ELIGIBILITY_PROBES
+                .load(Ordering::Relaxed),
             0
         );
     }

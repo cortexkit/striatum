@@ -236,7 +236,7 @@ fn assert_only_finished_charge_differs(
             .clone()
     );
     let quota = crate::ACCOUNT_QUOTA.get().unwrap().lock().unwrap();
-    let roster = crate::account_selection::allocator_roster(
+    let roster = crate::account_selection::roster::allocator_roster(
         &quota,
         fixture::SUBSCRIPTION_PROVIDER,
         control.now as i64,

@@ -1089,7 +1089,7 @@ impl CredentialData {
         self.serving = facts
             .iter()
             .map(|fact| {
-                let roster = crate::account_selection::billing_roster(
+                let roster = crate::account_selection::roster::billing_roster(
                     state,
                     &fact.provider_id,
                     &fact.model_id,

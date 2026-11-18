@@ -568,7 +568,7 @@ fn one_batch(harness: &Harness, routes: [&Route; 2], bodies: [Value; 2]) -> Vec<
     let go = Arc::new(std::sync::Barrier::new(3));
     for body in &bodies {
         let (arrived, go) = (arrived.clone(), go.clone());
-        crate::account_selection::after_roster_prepared(
+        crate::account_selection::admission::after_roster_prepared(
             body["admission_id"].as_str().unwrap(),
             move || {
                 arrived.wait();

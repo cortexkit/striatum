@@ -1,5 +1,10 @@
 //! Payment class is fixed by selection; account exhaustion never grants spending.
 
+use crate::account_selection::admission::after_roster_prepared;
+use crate::account_selection::block_recovery::repair_route_fences;
+use crate::account_selection::class_context::{
+    before_launch_command, CONTEXT_LOADS, LEGACY_CONTEXT_REPAIRS,
+};
 use std::sync::Arc;
 
 use cortexkit_claustrum_client::{ListedCredential, ScopedCredentialListing};
@@ -2300,7 +2305,7 @@ async fn select_past_held_ladder_entry() -> (u64, u64, u64, u64) {
     harness.edit_config(|config| config["consumers"]["mason"]=json!({"owner":OWNER,"mode":"ladder","ladder":["synthetic/model","secondary/model"]}));
     exhaust_oauth(&harness, "synthetic");
     let caller = harness.bind(reserved(OWNER), None).await;
-    let loads = crate::account_selection::CONTEXT_LOADS.with(|loads| loads.get());
+    let loads = CONTEXT_LOADS.with(|loads| loads.get());
     let writes = harness.store().account_write_transaction_count_for_test();
     let repairs = harness
         .store()
@@ -2329,7 +2334,7 @@ async fn select_past_held_ladder_entry() -> (u64, u64, u64, u64) {
         "model selection must not create account admissions"
     );
     (
-        crate::account_selection::CONTEXT_LOADS.with(|loads| loads.get()) - loads,
+        CONTEXT_LOADS.with(|loads| loads.get()) - loads,
         harness.store().account_write_transaction_count_for_test() - writes,
         harness
             .store()
@@ -4711,7 +4716,7 @@ async fn a_decision_owned_probe_answers_other_admissions_with_a_timed_wait() {
             let principal_hook = principal.clone();
             let mut contender = loser.clone();
             contender["admission_id"] = json!("during-owner-admission");
-            crate::account_selection::after_roster_prepared("race-probe-winner", move || {
+            after_roster_prepared("race-probe-winner", move || {
                 *raced_hook.lock().unwrap() = Some(admit_directly(
                     &harness_hook,
                     &principal_hook,
@@ -5249,7 +5254,7 @@ async fn account_writer_fresh_admit_is_one_command_and_probe_retry_skips_roster(
     let claims = format!("{:?}", harness.store().fence_rechecks().unwrap());
     let prepared = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let sentinel = prepared.clone();
-    crate::account_selection::after_roster_prepared("writer-probe-replay", move || {
+    after_roster_prepared("writer-probe-replay", move || {
         sentinel.store(true, std::sync::atomic::Ordering::Relaxed);
     });
     let retried = runner.call("route.account_for", &request).await;
@@ -5345,7 +5350,7 @@ fn s4b_route_recovery_unchanged_does_not_acquire_writer() {
     crate::account_state::initialize(harness.store()).unwrap();
     let commits = harness.store().writer_commit_count_for_test();
     let acquisitions = harness.store().writer_acquisition_count_for_test();
-    crate::account_selection::repair_route_fences(
+    repair_route_fences(
         harness.store(),
         &ids,
         &quota,
@@ -5383,7 +5388,7 @@ fn s4b_route_recovery_rechecks_newer_sibling_report_under_writer() {
     oauth_weekly_reading_at(10.0, now + 3_600_000, now);
     let quota = crate::ACCOUNT_QUOTA.get().unwrap().lock().unwrap().clone();
     let ids = credentials.quota_account_ids(&quota);
-    crate::account_selection::repair_route_fences(
+    repair_route_fences(
         harness.store(),
         &ids,
         &quota,
@@ -5400,7 +5405,7 @@ fn s4b_route_recovery_rechecks_newer_sibling_report_under_writer() {
     oauth_weekly_reading_at(10.0, now + 3_600_000, now + 10_000);
     let quota = crate::ACCOUNT_QUOTA.get().unwrap().lock().unwrap().clone();
     let commits = harness.store().writer_commit_count_for_test();
-    crate::account_selection::repair_route_fences(
+    repair_route_fences(
         harness.store(),
         &ids,
         &quota,
@@ -5416,7 +5421,7 @@ fn s4b_route_recovery_rechecks_newer_sibling_report_under_writer() {
         .is_empty());
     assert_eq!(harness.store().writer_commit_count_for_test() - commits, 1);
     let acquisitions = harness.store().writer_acquisition_count_for_test();
-    crate::account_selection::repair_route_fences(
+    repair_route_fences(
         harness.store(),
         &ids,
         &quota,
@@ -5753,13 +5758,11 @@ async fn s4b_replay(legacy: bool) -> Vec<S4bReplayStep> {
     struct ResetLegacy;
     impl Drop for ResetLegacy {
         fn drop(&mut self) {
-            crate::account_selection::LEGACY_CONTEXT_REPAIRS
-                .store(false, std::sync::atomic::Ordering::SeqCst);
+            LEGACY_CONTEXT_REPAIRS.store(false, std::sync::atomic::Ordering::SeqCst);
         }
     }
     let _reset = ResetLegacy;
-    crate::account_selection::LEGACY_CONTEXT_REPAIRS
-        .store(legacy, std::sync::atomic::Ordering::SeqCst);
+    LEGACY_CONTEXT_REPAIRS.store(legacy, std::sync::atomic::Ordering::SeqCst);
     let (harness, mut credentials) = setup("synthetic", false);
     let caller = harness.bind(reserved(OWNER), None).await;
     let runner = harness.bind(reserved(RUNNER), None).await;
@@ -5853,8 +5856,7 @@ async fn s4b_selection_reserving_a_probe_keeps_its_commit_count() {
             NOW as i64 - 7_200_000,
         )
         .unwrap();
-        crate::account_selection::LEGACY_CONTEXT_REPAIRS
-            .store(legacy, std::sync::atomic::Ordering::SeqCst);
+        LEGACY_CONTEXT_REPAIRS.store(legacy, std::sync::atomic::Ordering::SeqCst);
         let caller = harness.bind(reserved(OWNER), None).await;
         let commits = harness.store().writer_commit_count_for_test();
         let selected = caller
@@ -5863,8 +5865,7 @@ async fn s4b_selection_reserving_a_probe_keeps_its_commit_count() {
                 &json!({"consumer":"mason","requirements":{"iq":30}}),
             )
             .await;
-        crate::account_selection::LEGACY_CONTEXT_REPAIRS
-            .store(false, std::sync::atomic::Ordering::SeqCst);
+        LEGACY_CONTEXT_REPAIRS.store(false, std::sync::atomic::Ordering::SeqCst);
         assert_eq!(selected.0, FrameType::Response, "{}", selected.1);
         counts.push(harness.store().writer_commit_count_for_test() - commits);
         let runner = harness.bind(reserved(RUNNER), None).await;
@@ -6367,7 +6368,7 @@ fn another_logins_block_after_the_launch_read_does_not_stop_a_non_pinning_launch
     let context = selection_read(&harness);
     due_provider_block(&harness);
     let shared = harness.clone();
-    crate::account_selection::before_launch_command(&harness.credentials(), move |_| {
+    before_launch_command(&harness.credentials(), move |_| {
         fence_account_until(&shared, "apikey-account", NOW as i64 + 3_600_000);
     });
     let answer = selection_step(&context, &harness, "launch without one");
@@ -6402,7 +6403,7 @@ fn a_block_on_the_launch_login_gives_a_non_pinning_launch_one_timed_wait_either_
             fence_account_until(&harness, "oauth-account", reset);
         } else {
             let shared = harness.clone();
-            crate::account_selection::before_launch_command(&harness.credentials(), move |_| {
+            before_launch_command(&harness.credentials(), move |_| {
                 fence_account_until(&shared, "oauth-account", reset);
             });
         }

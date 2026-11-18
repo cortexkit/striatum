@@ -518,7 +518,7 @@ struct Before {
 }
 impl Before {
     fn new(store: &striatum_store::SqliteRouteStateStore) -> Self {
-        crate::account_selection::take_index_build_counts();
+        crate::account_selection::class_context::take_index_build_counts();
         Self {
             cpu: cpu_us(),
             started: Instant::now(),
@@ -543,7 +543,7 @@ impl Before {
         for (total, count) in samples
             .index_builds
             .iter_mut()
-            .zip(crate::account_selection::take_index_build_counts())
+            .zip(crate::account_selection::class_context::take_index_build_counts())
         {
             *total += count;
         }

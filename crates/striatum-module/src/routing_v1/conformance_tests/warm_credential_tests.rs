@@ -84,8 +84,13 @@ pub(super) fn quota_used_reset_on(
     // Quota evidence is written through the same up-front writer helper used
     // by live refreshes, so tests exercise the allocator's durable block path.
     let state = crate::ACCOUNT_QUOTA.get().unwrap().lock().unwrap().clone();
-    account_selection::refresh_all_blocks(harness.store(), &state, &harness.operator_config(), now)
-        .unwrap();
+    account_selection::block_recovery::refresh_all_blocks(
+        harness.store(),
+        &state,
+        &harness.operator_config(),
+        now,
+    )
+    .unwrap();
 }
 
 #[tokio::test]

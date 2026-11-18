@@ -478,7 +478,7 @@ fn a_selection_claiming_its_launch_probe_twice_keeps_it() {
 }
 
 fn steal_selected_probe(harness: &Harness) {
-    crate::account_selection::before_probe_bind(&harness.credentials(), |store| {
+    crate::account_selection::class_context::before_probe_bind(&harness.credentials(), |store| {
         store
             .account_transaction(|tx| {
                 let origins = tx.fence_rechecks()?;

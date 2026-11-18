@@ -431,7 +431,9 @@ fn select_request(
                 row.provider_ids
                     .iter()
                     .filter(|provider| {
-                        crate::account_selection::media_credential_serves(row, provider)
+                        crate::account_selection::class_context::media_credential_serves(
+                            row, provider,
+                        )
                     })
                     .cloned()
             })

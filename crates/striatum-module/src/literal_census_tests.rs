@@ -54,7 +54,7 @@ const EXEMPTIONS: &[Exemption] = &[
     // Local exhaustion evidence still parses raw Anthropic header names until
     // runners send normalized readings.
     Exemption {
-        file: "striatum-module/src/account_selection.rs",
+        file: "striatum-module/src/account_selection/observations.rs",
         item: ExemptItem::Function {
             impl_type: None,
             name: "header_fences",
@@ -991,7 +991,7 @@ fn test_code_exempt_functions_and_data_files_pass() {
     let exempt = census(
         &[
             (
-                "striatum-module/src/account_selection.rs".to_string(),
+                "striatum-module/src/account_selection/observations.rs".to_string(),
                 "fn header_fences() { let _ = \"anthropic\"; }\n\
                  fn other() { let _ = \"anthropic\"; }\n"
                     .to_string(),

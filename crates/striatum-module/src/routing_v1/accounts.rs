@@ -358,7 +358,7 @@ fn account_for_inner(
         return replay_admission(first, &body_json, &request, &authority, deps);
     }
     #[cfg(test)]
-    account_selection::run_after_roster_hook(&format!(
+    account_selection::admission::run_after_roster_hook(&format!(
         "v1-replay-checked:{}",
         request.admission_id
     ));
@@ -436,7 +436,7 @@ fn account_for_inner(
             }
         }
 
-        let mut parsed = account_selection::AccountForParams::from_v1(
+        let mut parsed = account_selection::admission::AccountForParams::from_v1(
             &request,
             authority.admission_key(&request.admission_id),
             authority.module.to_owned(),
@@ -471,7 +471,10 @@ fn account_for_inner(
                 ));
             }
             if !credentials.listed_credentials().iter().any(|row| {
-                crate::account_selection::media_credential_serves(row, &request.provider)
+                crate::account_selection::class_context::media_credential_serves(
+                    row,
+                    &request.provider,
+                )
             }) {
                 return Err(super::provider_refusal(
                     "auth_required",
@@ -493,7 +496,7 @@ fn account_for_inner(
             body_json,
             bound_tier,
         };
-        match account_selection::account_for_parsed(
+        match account_selection::admission::account_for_parsed(
             parsed,
             &authority.principal,
             &ctx,
@@ -1174,7 +1177,7 @@ fn account_observe_inner(
     let policy = config_overrides::live_config(deps.routing_config_path).allocator_policy("");
     checking("account_context");
     let ctx = account_ctx(deps, flags, &policy)?;
-    let reply = account_selection::observe_authorized(
+    let reply = account_selection::observations::observe_authorized(
         &legacy,
         &authority.principal,
         &admission_principal,

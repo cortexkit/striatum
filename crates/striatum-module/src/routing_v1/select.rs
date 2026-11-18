@@ -14,6 +14,8 @@
 //! What it answers is exactly what runs: the decision it records names the
 //! route and runner of the answer, and nothing selects a second time.
 
+use crate::account_selection::admission::preflight_model_for_class_with_reset;
+use crate::account_selection::class_context::AccountBlock;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
@@ -2620,7 +2622,7 @@ struct Selection<'a> {
     rejections: &'a HashMap<String, String>,
     runtime_unavailable: &'a HashSet<String>,
     recovery_available: &'a HashSet<String>,
-    account_blocks: &'a HashMap<String, account_selection::AccountBlock>,
+    account_blocks: &'a HashMap<String, AccountBlock>,
     routing_config: &'a RoutingConfig,
     slots: Option<&'a ConcurrencySlots>,
     min_band: Option<f64>,
@@ -3391,7 +3393,7 @@ impl<'a> Selection<'a> {
         variant: Option<&str>,
         available: &HashSet<String>,
         snapshot: &ModelRouteStateSnapshot,
-    ) -> Option<account_selection::AccountBlock> {
+    ) -> Option<AccountBlock> {
         if ![pin_key, pin_capacity]
             .iter()
             .any(|key| available.contains(*key) || self.runtime_unavailable.contains(*key))
@@ -3561,7 +3563,7 @@ impl<'a> Selection<'a> {
                 .map_or((self.now * 1000.0) as i64, |classes| classes.now_ms),
             classes: self.classes.cloned(),
         };
-        account_selection::preflight_model_for_class_with_reset(
+        preflight_model_for_class_with_reset(
             &ctx,
             &selected.model.provider_id,
             &selected.model.model_id,
@@ -3702,7 +3704,7 @@ fn quota_account_limit_refusal(pin: Option<&str>, reset: Option<i64>, now: u64) 
     refusal
 }
 
-fn account_block_pin_reason(block: &account_selection::AccountBlock) -> PinUnavailableReason {
+fn account_block_pin_reason(block: &AccountBlock) -> PinUnavailableReason {
     if block.lifetime == striatum_core::blocks::LifetimeClass::Quota {
         return PinUnavailableReason::QuotaExhausted;
     }

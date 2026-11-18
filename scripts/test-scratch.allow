@@ -6,5 +6,5 @@ crates/striatum-module/src/main.rs resolve_storage_descriptor 1
 crates/striatum-module/src/main.rs quota_refresh_loop 1
 crates/striatum-module/src/account_quota.rs account_quota_loop 1
 crates/striatum-module/src/fusiform_catalog.rs ingest_before_upsert 1
-crates/striatum-module/src/main.rs account_quota_dry_run 1
+crates/striatum-module/src/operator_commands.rs account_quota_dry_run 1
 crates/striatum-module/src/quota_events.rs run 1

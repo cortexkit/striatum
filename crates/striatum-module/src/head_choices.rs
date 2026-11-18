@@ -229,7 +229,7 @@ pub(crate) fn choices_for_harness_preview(
         }
         // A picker pin can use any covered account, regardless of temporary
         // quota or refusal fences; use account selection's coverage rule.
-        let class = account_selection::resolve_class(
+        let class = account_selection::class_context::resolve_class(
             &reachable_credentials,
             fact,
             &providers,
