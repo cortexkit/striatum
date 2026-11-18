@@ -549,8 +549,8 @@ impl AccountTx<'_> {
 
     fn retire_observation_origin(&self, origin: &FenceRecheck, now: i64) -> RouteStateResult<()> {
         // Retain the receipt time so replayed effects cannot restore this
-        // backoff or an older one. The native retirement trigger clears the
-        // block, while the observations and frozen audit copy stay untouched.
+        // backoff or an older one. The database trigger on tombstone insertion
+        // clears the block, while observations and the frozen audit copy remain.
         self.conn
             .execute(
                 "INSERT INTO retirement_tombstone(kind,origin_key,evidence,evidence_at,retired_at)

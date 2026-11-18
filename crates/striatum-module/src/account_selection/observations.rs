@@ -37,8 +37,8 @@ fn tracked_providers(ctx: &Ctx<'_>) -> BTreeSet<String> {
 /// verbatim with the observation.
 #[derive(Debug, Clone, Deserialize)]
 pub(super) struct ObserveParams {
-    /// Broca uses `<lineage_id>:<wal_seq>`; a repeat from the same runner
-    /// and principal is recognized and changes nothing.
+    /// Broca uses `<lineage_id>:<wal_seq>`, where `wal_seq` is the write-ahead
+    /// log sequence number. A repeat from the same runner and principal changes nothing.
     pub(super) event_id: String,
     pub(super) caller: CallerParams,
     /// `admission_started`, `run_finished`, `attempt`, `scoped_not_found`,
@@ -129,8 +129,8 @@ pub(crate) fn observe_authorized(
     checking("account_observe_parse");
     // Legacy callers send an older request shape that this handler reads
     // leniently. An `attempt_outcome` member still goes through the published
-    // routing/v1 parser, which refuses it unless routing advertises the success
-    // capability and the member is well formed.
+    // routing/v1 parser, which refuses it unless routing advertises the
+    // `account_observe_success` capability and the member is well formed.
     if params.get("attempt_outcome").is_some() {
         if let Err(refusal) = cortexkit_role_routing::observe::parse_account_observe_request_serving(
             params,
@@ -321,9 +321,9 @@ pub(super) fn record_observation(
                     }
                 }
             }
-            // Attempts after a move name the original admission but are stored
-            // unbound. Refresh its started reservations before the bound-only
-            // effects, including a reservation this observation just started.
+            // Attempts served by a different account name the original admission
+            // but are stored unbound. Refresh its started reservations before the
+            // bound-only effects, including one this observation just started.
             if parsed.kind == "attempt" {
                 tx.observe_admission(row, now)?;
             }

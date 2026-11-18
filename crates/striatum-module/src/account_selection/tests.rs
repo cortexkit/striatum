@@ -3217,11 +3217,11 @@ fn a_fence_stored_before_pool_keys_blocks_by_its_migrated_key() {
     }
 }
 
-/// Demand is read per roster account from the commit time the allocator
-/// still charges: after the account's reading less the reflection lag, or
-/// from the start when the account has no reading, may go on paid
-/// credits, or the strategy counts admissions of any age. Accounts outside
-/// the roster are not read.
+/// Demand is read per roster account from the commit time the allocator still
+/// charges: the quota reading time minus the delay allowed for admissions to
+/// appear in that reading. Read all history when the account has no reading,
+/// may use paid credits, or the strategy counts admissions of any age. Accounts
+/// outside the roster are not read.
 #[test]
 fn demand_reads_each_roster_account_only_from_the_admissions_that_can_count() {
     use striatum_core::accounts::AllocationContext;

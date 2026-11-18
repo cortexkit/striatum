@@ -159,11 +159,10 @@ pub(super) fn merge_model_upsert(
     if let Some(eq) = params.eq {
         fact.scores.eq = eq;
     }
-    // A Fusiform-discovered row is minted with unknown confidence because it has
-    // no scores. An operator placing both scores is the confirmation that flag
-    // asks for; left unknown, the row kept the adequacy penalty and lost every
-    // free-bucket comparison to a confirmed route, so a placed model was never
-    // run (glm-5.3 and deepseek-v4.1-flash, 2026-09-18).
+    // A Fusiform-discovered row starts with unknown confidence because it has no
+    // scores. Supplying both scores confirms it; otherwise the adequacy penalty
+    // can make it lose to confirmed routes when the free bucket groups routes
+    // with negligible selection cost and compares their adequacy, so it never runs.
     if params.elo.is_some() && params.eq.is_some() {
         fact.confidence = Confidence::Curated;
         fact.score_provenance = ScoreProvenance::Curated;
@@ -200,7 +199,7 @@ pub(super) fn merge_model_upsert(
 /// route.model_upsert: live catalog write. Merges the partial params over the
 /// stored fact when the route exists; a new route requires elo and eq (the
 /// operator-judgment axes). Writes land as FactSource::Override so re-seeds
-/// never revert them. This op retires the add-a-model migration path.
+/// never revert them. Operators can add models without writing a migration.
 pub(super) async fn handle_model_upsert(
     frame: Frame,
     writer: &mpsc::Sender<Frame>,

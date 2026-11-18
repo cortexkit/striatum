@@ -6,10 +6,11 @@ use super::*;
 /// Age past which the cached quota snapshot no longer steers selection. The
 /// backstop runs every ten minutes, so a snapshot this old has missed a backstop
 /// refresh. Quota windows move within that time:
-/// insula spends banked resets, five-hour windows roll over, and a wall read an
-/// hour ago is no evidence of a wall now. Past this bound selection treats quota
-/// as unknown (neutral pressure, no quota walls), each decision says so, and
-/// health reports degraded with the snapshot's age.
+/// saved resets (credits that reset effective utilization) can be spent,
+/// five-hour windows roll over, and an exhausted quota reading from an hour ago
+/// is no evidence of exhaustion now. Past this bound selection neither adjusts
+/// ranking pressure nor blocks routes based on quota; each decision says quota
+/// is unknown, and health reports degraded with the snapshot's age.
 pub(super) const QUOTA_STALE_AFTER_MS: u64 = 15 * 60_000;
 
 /// Latest quota snapshot, shared between the background refresh task (writer) and
@@ -143,15 +144,13 @@ pub(super) fn merge_quota_windows(
         if let Some(replacement) = fresh_by_key.remove(&key) {
             // Three classes will not self-recover, so a retained "last healthy"
             // window is a fiction that can only mislead: credential_absent
-            // (nobody configured the credential on this host), credential_unusable
-            // (QTA 2026-08-15: a revoked OAuth grant - Google answers
-            // invalid_grant, permanent under RFC 6749, only a re-authorisation
-            // recovers it), and no_quota_reported (QTA 2026-08-24, qwen
-            // subscription-end incident: valid credential, gateway affirms
-            // success and reports NO plan block - the plan is gone; the retained
-            // healthy window routed workers to a dead subscription for a day
-            // before this arm learned the class). Drop retention for all three
-            // and take the degraded entry as the truth. Every other class keeps
+            // (no credential is configured on this host), credential_unusable
+            // (a revoked OAuth grant yields invalid_grant and needs a new
+            // authorisation), and no_quota_reported (the gateway succeeds but
+            // reports no plan, as when a subscription has ended). Retaining a
+            // healthy window can route workers to a dead subscription. Drop it
+            // for all three classes and take the degraded entry as the truth.
+            // Every other class keeps
             // its last healthy window only until that key's degraded age reaches
             // the stale bound; refreshes for other keys cannot extend its lifetime.
             let dead_credential = replacement.error_class.as_deref().is_some_and(|class| {

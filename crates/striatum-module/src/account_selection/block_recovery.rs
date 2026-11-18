@@ -544,8 +544,9 @@ pub(crate) fn repair_route_fences(
         let quota = &quota;
         let config = &config;
 
-        // Re-read reports and pool requirements under the IMMEDIATE writer.
-        // A newer report can invalidate the read snapshot's recovery entirely.
+        // Re-read reports and pool requirements in the SQLite IMMEDIATE
+        // transaction, which takes the write lock up front. A newer report can
+        // invalidate the earlier read snapshot's recovery entirely.
         for (provider, credential, model, at) in
             route_fence_recoveries(&*tx, account_ids, quota, config, now_ms)?
         {

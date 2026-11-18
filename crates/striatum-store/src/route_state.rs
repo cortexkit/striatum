@@ -1440,8 +1440,9 @@ impl crate::AccountTx<'_> {
                 match transition {
                     FailureBackoffTransition::Unchanged => {}
                     FailureBackoffTransition::Reset => {
-                        // KEYED_EXCEPTION: use the decision's admission index
-                        // because closed admissions may no longer be in memory.
+                        // KEYED_EXCEPTION: this indexed database read is an exception
+                        // to serving admissions from memory; closed admissions may
+                        // no longer be there. Look them up by decision instead.
                         account_selection::note_keyed_exception();
                         let admitted_at:i64=tx.query_row("SELECT COALESCE(
                             (SELECT MAX(committed_at) FROM account_admission /* keyed exception */ a WHERE a.model_decision_id=d.id

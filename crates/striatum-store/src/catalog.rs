@@ -419,8 +419,8 @@ fn confidence_str(c: Confidence) -> &'static str {
 }
 
 impl SqliteRouteStateStore {
-    /// Stored providers only; score aliases added to a request are not catalog
-    /// identities and must not be used to resolve credential ownership.
+    /// Stored providers only; request-time rows that borrow another provider's
+    /// model scores are not catalog identities for resolving credential ownership.
     pub fn catalog_providers(&self) -> RouteStateResult<std::collections::BTreeSet<String>> {
         self.store
             .with_read(|conn: &Connection| {

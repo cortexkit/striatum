@@ -1131,9 +1131,9 @@ pub(super) fn prepare_roster(
                         vec![],
                     ));
                 }
-                // A decision made by the older select (every core mason launch)
-                // has no v1 row naming its runner. The runner asking is then the
-                // one that will serve the run, so its tier support is checked.
+                // A decision from the older model-selection API has no routing/v1
+                // row naming its runner. The requesting runner will serve the run,
+                // so check that runner's tier support instead.
                 let runner = Some(selection.as_ref().map_or_else(
                     || normalize(&parsed.caller.runner),
                     |decision| decision.runner_module.clone(),
