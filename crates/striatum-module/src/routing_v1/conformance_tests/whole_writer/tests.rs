@@ -242,15 +242,24 @@ impl World {
             + Send
             + 'static,
     ) -> T {
+        self.command_with_kind(name, striatum_store::AccountCommandKind::Repair, change)
+    }
+
+    fn command_with_kind<T: Send + 'static>(
+        &mut self,
+        name: &str,
+        kind: striatum_store::AccountCommandKind,
+        change: impl FnMut(
+                &mut crate::account_state::AccountCommand<'_>,
+            ) -> striatum_core::RouteStateResult<T>
+            + Send
+            + 'static,
+    ) -> T {
         let _inputs = self.install_replay_inputs();
         let _trace = self.trace.install();
         let _clock = crate::InjectedClock::set(self.now);
-        let value = crate::account_writer::execute(
-            &self.harness.store(),
-            striatum_store::AccountCommandKind::Repair,
-            change,
-        )
-        .unwrap_or_else(|error| panic!("{name}: {error}"));
+        let value = crate::account_writer::execute(&self.harness.store(), kind, change)
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
         self.sequence += 1;
         self.commands.insert(name.into());
         self.compare(name);

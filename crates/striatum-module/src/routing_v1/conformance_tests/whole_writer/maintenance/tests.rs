@@ -96,8 +96,9 @@ impl World {
             1
         );
         assert_eq!(
-            self.command(
+            self.command_with_kind(
                 "retention/delete the remaining pin through the native producer",
+                striatum_store::AccountCommandKind::HistoryMaintenance,
                 move |tx| striatum_store::AccountTx::prune_account_pins(tx, before, 10)
             ),
             1
