@@ -617,6 +617,23 @@ async fn effect_case(status: Option<&str>, outcome: &str, extra: Value, seed: bo
         .id
         .clone();
     let conn = rusqlite::Connection::open(harness.store_path()).unwrap();
+    // The twins need identical input cells, including the normally random
+    // file identity. Leave it in the whole-state comparison after seeding.
+    let identity = format!("{EFFECT_NOW:032x}");
+    let archive =
+        rusqlite::Connection::open(harness.store_path().with_file_name("history.db")).unwrap();
+    assert_eq!(
+        archive
+            .execute("UPDATE history_binding SET split_identity=?1", [&identity])
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        conn.execute("UPDATE history_layout SET split_identity=?1", [&identity])
+            .unwrap(),
+        1
+    );
+    drop(archive);
     // Catalog migrations use SQLite's clock rather than the injected report clock.
     conn.execute("UPDATE model_facts SET updated_at=?1", [EFFECT_NOW as i64])
         .unwrap();
