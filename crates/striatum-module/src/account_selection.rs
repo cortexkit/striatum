@@ -243,6 +243,7 @@ pub(crate) struct ClassContext {
     pool_walls: BTreeSet<(String, String)>,
     catalog: crate::broca_credentials::AuthCatalog,
     targets: BTreeMap<String, String>,
+    vendorless_quota: quota_route::VendorlessQuota,
     tier_accounts: Option<BTreeMap<String, Vec<String>>>,
     continuation_credential: Option<String>,
     media_route: bool,
@@ -633,6 +634,7 @@ impl ClassContext {
 
 mod fact_index;
 mod probe_reservations;
+mod quota_route;
 pub(crate) mod recovery_view;
 mod retry_hints;
 
@@ -1311,6 +1313,7 @@ impl ClassContext {
         let quota = accounts
             .and_then(|accounts| accounts.lock().ok().map(|state| state.clone()))
             .unwrap_or_default();
+        let vendorless_quota = quota_route::vendorless_quota(&quota, &catalog_snapshot.facts);
         let account_ids = credentials.quota_account_ids(&quota);
         let size_clocks = dry_run::published(store, sweep, now_ms)
             .and_then(|blocks| blocks.fence_rechecks())
@@ -1479,6 +1482,7 @@ impl ClassContext {
             facts,
             refusals,
             quota,
+            vendorless_quota,
             fences,
             now_ms,
             eligibility,
@@ -1894,15 +1898,7 @@ impl ClassContext {
             .get(&account_id)
             .into_iter()
             .flatten()
-            .filter(|reading| {
-                reading.reading.routing_provider().is_some_and(|vendor| {
-                    vendor == fact.provider_id
-                        || self
-                            .targets
-                            .get(&fact.provider_id)
-                            .is_some_and(|target| target == vendor)
-                })
-            })
+            .filter(|reading| self.quota_serves(&reading.reading, row, fact, &capacity))
             .max_by_key(|reading| reading.fetched);
         let usage = reading
             .and_then(|reading| reading.decoded.as_ref())
