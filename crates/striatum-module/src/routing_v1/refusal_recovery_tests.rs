@@ -179,6 +179,22 @@ async fn a_refusal_builds_one_recovery_view_for_all_its_walled_routes() {
     );
 }
 
+#[tokio::test]
+async fn an_all_walled_refusal_checks_one_walled_route_to_name_the_account_block() {
+    let _clock = crate::InjectedClock::set(FIXTURE_NOW);
+    let fixture = walled_fixture(FACTS, CREDENTIALS, None);
+    let config = fixture.harness.config_path_for_test();
+    let route = bind(&fixture).await;
+    let before = super::select::account_block_checks(&config);
+    let body = refusal_bytes(&fixture, &route).await;
+    let parsed: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(parsed["detail"]["reason"], "accounts_blocked", "{parsed}");
+    // Any of the 320 walled routes would be selected without its account
+    // block, so the first one checked settles the reason; checking each
+    // walled route would count 320, each a full scoring pass.
+    assert_eq!(super::select::account_block_checks(&config) - before, 1);
+}
+
 /// Process CPU of one all-walled refusal on the production-sized fixture that
 /// `request_cpu_bench` measures (800 routes, 40 accounts).
 #[tokio::test]
@@ -200,5 +216,37 @@ async fn walled_refusal_request_cpu() {
         "walled_refusal facts=800 credentials=40 n={samples} cpu_us/op={:.0} body={:?}",
         cpu as f64 / samples as f64,
         fingerprint(&warm)
+    );
+}
+
+/// Process CPU of one ordinary successful selection on the same fixture with
+/// healthy accounts, so a refusal fix can be checked not to slow it down.
+#[tokio::test]
+#[ignore = "release select CPU: cargo test --release ordinary_select_request_cpu -- --ignored --nocapture"]
+async fn ordinary_select_request_cpu() {
+    let _clock = crate::InjectedClock::set(FIXTURE_NOW);
+    let fixture = build_fixture(800, 40);
+    let samples: usize = std::env::var("STRIATUM_SELECT_SAMPLES")
+        .map(|n| n.parse().unwrap())
+        .unwrap_or(200);
+    let route = bind(&fixture).await;
+    let request = json!({"consumer":fixture::SUMMARY, "requirements":{"iq":50}});
+    let mut routes = std::collections::BTreeSet::new();
+    let select = || async {
+        let (ty, body) = route.call("route.select", &request).await;
+        assert_eq!(ty, subc_protocol::FrameType::Response, "{body}");
+        body["result"]["route"].clone()
+    };
+    for _ in 0..10 {
+        select().await;
+    }
+    let started = cpu_us();
+    for _ in 0..samples {
+        routes.insert(select().await.to_string());
+    }
+    let cpu = cpu_us() - started;
+    println!(
+        "ordinary_select facts=800 credentials=40 n={samples} cpu_us/op={:.0} routes={routes:?}",
+        cpu as f64 / samples as f64
     );
 }

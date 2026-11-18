@@ -82,10 +82,7 @@ impl ClassContext {
         priced: bool,
         policy: &AllocatorPolicy,
     ) -> Option<i64> {
-        let fact = self
-            .facts
-            .iter()
-            .find(|fact| fact.provider_id == provider && fact.model_id == model)?;
+        let fact = self.fact_for(provider, model)?;
         self.class(fact, priced)
             .rows
             .into_iter()
@@ -182,11 +179,7 @@ impl ClassContext {
             lifetime: fallback,
             credential_code: None,
         };
-        let Some(fact) = self
-            .facts
-            .iter()
-            .find(|fact| fact.provider_id == provider && fact.model_id == model)
-        else {
+        let Some(fact) = self.fact_for(provider, model) else {
             return block;
         };
         let mut non_quota = false;

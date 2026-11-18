@@ -327,6 +327,7 @@ struct RequestIndexes {
     blocks: std::sync::OnceLock<BlockIndex>,
     readings: std::sync::OnceLock<ReadingIndex>,
     rechecks: std::sync::OnceLock<RecheckIndex>,
+    facts: std::sync::OnceLock<fact_index::FactIndex>,
     probe_holds: std::sync::Mutex<std::collections::HashMap<ProbeHoldKey, i64>>,
 }
 
@@ -630,6 +631,7 @@ impl ClassContext {
     }
 }
 
+mod fact_index;
 mod probe_reservations;
 pub(crate) mod recovery_view;
 mod retry_hints;
@@ -921,6 +923,7 @@ impl ClassContext {
         self.facts
             .retain(|fact| fact.provider_id != provider || fact.model_id != model);
         self.facts.push(fact);
+        self.indexes.facts.take();
         self.media_route = true;
         Ok(())
     }
@@ -2502,10 +2505,7 @@ impl ClassContext {
         model: &str,
         priced_per_token: bool,
     ) -> (RosterBuild, BTreeMap<String, i64>) {
-        let fact = self
-            .facts
-            .iter()
-            .find(|fact| fact.provider_id == provider && fact.model_id == model);
+        let fact = self.fact_for(provider, model);
         let fenced = self.route_fenced_accounts(provider, model);
         let mut skipped = BTreeMap::new();
         let mut accounts: BTreeMap<String, AccountView> = BTreeMap::new();
@@ -3221,10 +3221,7 @@ impl ClassContext {
                 crate::credential_fences::probe_note(provider, &row.id),
             );
         }
-        let class = self
-            .facts
-            .iter()
-            .find(|fact| fact.provider_id == provider && fact.model_id == model);
+        let class = self.fact_for(provider, model);
         if let Some(fact) = class {
             let serving = self.serving_index.fact(
                 &self.config,
@@ -6878,10 +6875,7 @@ fn empty_roster_refusal(
             }),
         ))
     };
-    let fact = classes
-        .facts
-        .iter()
-        .find(|fact| fact.provider_id == provider && fact.model_id == model);
+    let fact = classes.fact_for(provider, model);
     let route_class = fact.map(|fact| classes.class(fact, priced));
     let paid_rows = if params.is_some_and(|params| params.model_decision_id.is_none())
         && route_class.as_ref().is_some_and(|class| class.subscription)

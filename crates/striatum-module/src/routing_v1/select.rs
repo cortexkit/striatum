@@ -775,6 +775,17 @@ pub(super) fn evidence_passes(path: &std::path::Path) -> usize {
     *EVIDENCE_PASSES.lock().unwrap().get(path).unwrap_or(&0)
 }
 
+// Routes a refusal checked for an account block it may name, by settings path.
+#[cfg(test)]
+static ACCOUNT_BLOCK_CHECKS: std::sync::Mutex<
+    std::collections::BTreeMap<std::path::PathBuf, usize>,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+#[cfg(test)]
+pub(super) fn account_block_checks(path: &std::path::Path) -> usize {
+    *ACCOUNT_BLOCK_CHECKS.lock().unwrap().get(path).unwrap_or(&0)
+}
+
 #[cfg(test)]
 fn count_input_build(config: &std::sync::Arc<config_overrides::LiveConfig>, stage: usize) {
     INPUT_BUILDS
@@ -2052,55 +2063,61 @@ async fn select_at_tier_attempt(
             });
             // Account preflight is separate from model scoring. Only name an
             // account block when an otherwise adequate, policy-allowed model
-            // would have been selected without that block.
-            let blocked: HashSet<_> = account_blocks
-                .iter()
-                .filter_map(|(key, _)| {
-                    if consumer_policy.mode == Some(crate::config_policy::ConsumerMode::Ladder)
-                        && !consumer_policy.ladder.iter().flatten().any(|entry| {
-                            RouteRef::parse_pin(entry)
-                                .is_some_and(|route| route.route_key() == *key)
+            // would have been selected without that block. One such route is
+            // enough, and each check scores the catalog again, so stop at the
+            // first: checking every walled route cost seconds per refusal.
+            let blocked = account_blocks.keys().any(|key| {
+                #[cfg(test)]
+                {
+                    *ACCOUNT_BLOCK_CHECKS
+                        .lock()
+                        .unwrap()
+                        .entry(selection.sources.operator_config_path.to_path_buf())
+                        .or_default() += 1;
+                }
+                if consumer_policy.mode == Some(crate::config_policy::ConsumerMode::Ladder)
+                    && !consumer_policy.ladder.iter().flatten().any(|entry| {
+                        RouteRef::parse_pin(entry).is_some_and(|route| route.route_key() == *key)
+                    })
+                {
+                    return false;
+                }
+                let variant = consumer_policy
+                    .operator_ladder()
+                    .then(|| {
+                        consumer_policy.ladder.iter().flatten().find_map(|entry| {
+                            let route = RouteRef::parse_pin(entry)?;
+                            (format!("{}/{}", route.provider, route.model) == *key)
+                                .then_some(route.variant)
+                                .flatten()
                         })
-                    {
-                        return None;
-                    }
-                    let variant = consumer_policy
-                        .operator_ladder()
-                        .then(|| {
-                            consumer_policy.ladder.iter().flatten().find_map(|entry| {
-                                let route = RouteRef::parse_pin(entry)?;
-                                (format!("{}/{}", route.provider, route.model) == *key)
-                                    .then_some(route.variant)
-                                    .flatten()
-                            })
-                        })
-                        .flatten();
-                    let named_non_quota = no_route.earliest_reset_route.as_ref() == Some(key)
-                        && !matches!(
-                            no_route.reason,
-                            RouteFailureReason::NoAdequateRoute
-                                | RouteFailureReason::AllRoutesInadequate
-                        )
-                        && account_blocks.get(key).is_some_and(|block| {
-                            block.lifetime == striatum_core::blocks::LifetimeClass::NonQuota
-                        });
-                    if !named_non_quota
-                        && (!available.contains(key)
-                            || selection
-                                .score_ladder(
-                                    &HashSet::from([key.clone()]),
-                                    &consumer_policy,
-                                    variant.as_deref(),
-                                    Some(key),
-                                )
-                                .is_err())
-                    {
-                        return None;
-                    }
-                    Some(key.clone())
-                })
-                .collect();
-            if !blocked.is_empty() {
+                    })
+                    .flatten();
+                let named_non_quota = no_route.earliest_reset_route.as_ref() == Some(key)
+                    && !matches!(
+                        no_route.reason,
+                        RouteFailureReason::NoAdequateRoute
+                            | RouteFailureReason::AllRoutesInadequate
+                    )
+                    && account_blocks.get(key).is_some_and(|block| {
+                        block.lifetime == striatum_core::blocks::LifetimeClass::NonQuota
+                    });
+                if !named_non_quota
+                    && (!available.contains(key)
+                        || selection
+                            .score_ladder(
+                                &HashSet::from([key.clone()]),
+                                &consumer_policy,
+                                variant.as_deref(),
+                                Some(key),
+                            )
+                            .is_err())
+                {
+                    return false;
+                }
+                true
+            });
+            if blocked {
                 let reset = no_route.earliest_reset.map(|reset| reset as u64);
                 let quota = no_route
                     .earliest_reset_route
