@@ -481,8 +481,7 @@ impl SqliteRouteStateStore {
                 } else {
                     None
                 };
-                let rows = self.load_resolved_facts(connection)?;
-                let efforts = crate::catalog_efforts::read(connection)?;
+                let (rows, efforts) = self.load_resolved_facts(connection)?;
                 if let Some(tx) = tx {
                     crate::connection_store::timed_commit(tx)?;
                 }
@@ -802,8 +801,8 @@ impl SqliteRouteStateStore {
                     } else {
                         None
                     };
-                    let facts = self.load_resolved_facts(c)?;
-                    let efforts = Arc::new(crate::catalog_efforts::read(c)?);
+                    let (facts, efforts) = self.load_resolved_facts(c)?;
+                    let efforts = Arc::new(efforts);
                     if let Some(tx) = tx {
                         crate::connection_store::timed_commit(tx)?;
                     }
@@ -831,16 +830,43 @@ impl SqliteRouteStateStore {
             .map_err(err)
     }
 
-    fn load_resolved_facts(&self, c: &Connection) -> rusqlite::Result<Vec<(ModelFact, bool)>> {
+    fn load_resolved_facts(
+        &self,
+        c: &Connection,
+    ) -> rusqlite::Result<(
+        Vec<(ModelFact, bool)>,
+        BTreeMap<String, crate::CatalogEfforts>,
+    )> {
+        let mut efforts = BTreeMap::new();
         let rows = {
             let mut stmt = c.prepare(
                     "SELECT *,
                             (COALESCE(fusiform_present, 1) = 1 OR source = 'override') AS present_now
                      FROM model_facts",
                 )?;
+            // Upgrade rehearsals deliberately read stores from before the
+            // catalog had effort facts. Those stores have no catalog defaults.
+            let effort_column = stmt.column_index("catalog_efforts_json").ok();
             let rows = stmt.query_map([], |row| {
+                let fact = row_to_fact(row)?;
+                if let Some(index) = effort_column {
+                    if row.get::<_, Option<bool>>("fusiform_present")? == Some(true) {
+                        if let Some(value) = row.get::<_, Option<String>>(index)? {
+                            let key = striatum_core::make_route_key(
+                                &fact.provider_id,
+                                &fact.model_id,
+                                None,
+                            );
+                            if let std::collections::btree_map::Entry::Vacant(entry) =
+                                efforts.entry(key)
+                            {
+                                entry.insert(crate::catalog_efforts::decode(index, &value)?);
+                            }
+                        }
+                    }
+                }
                 Ok((
-                    row_to_fact(row)?,
+                    fact,
                     row.get::<_, Option<String>>("canonical_id")?,
                     row.get::<_, bool>("present_now")?,
                 ))
@@ -857,7 +883,7 @@ impl SqliteRouteStateStore {
         }
         self.share_canonical_scores(&mut facts, &canonical_ids);
         operator_quality::overlay_operator_quality(c, &mut facts, &canonical_ids)?;
-        Ok(facts.into_iter().zip(present).collect())
+        Ok((facts.into_iter().zip(present).collect(), efforts))
     }
 
     /// Give routes without an operator score the score of a route serving the
