@@ -486,6 +486,12 @@
             "type": "string"
           },
           "default": null
+        },
+        "workload": {
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "additionalProperties": false

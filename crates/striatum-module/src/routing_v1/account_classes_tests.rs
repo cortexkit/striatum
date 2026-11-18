@@ -624,6 +624,7 @@ pub(super) fn catalog_fact(harness: &Harness, fact: &striatum_core::ModelFact) {
                 supports_vision: fact.supports_vision,
                 supports_tool_use: fact.supports_tool_use,
                 reasoning_efforts: None,
+                catalog_efforts: None,
                 canonical_id: None,
                 upstream_status: None,
                 model_type: None,

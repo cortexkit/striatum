@@ -15,6 +15,9 @@ mod concurrency;
 #[path = "what_if_sweep_tests.rs"]
 mod sweep;
 
+#[path = "what_if_effort_tests.rs"]
+mod effort;
+
 pub(super) fn seed_open_offer(
     harness: &Harness,
     provider: &str,

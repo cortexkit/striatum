@@ -67,6 +67,7 @@ pub(super) async fn select_panel(
             accounts: &accounts,
             inputs: &inputs,
             profile_lookup: &super::select::live_profile_lookup,
+            catalog_efforts: None,
         };
         let evaluated = evaluate_panel(&request, policy, caller, deps, &dry).await?;
         let seats = evaluated
@@ -86,7 +87,7 @@ pub(super) async fn select_panel(
         answer.shortfall = evaluated.shortfall;
         return serde_json::to_value(answer).map_err(store_refusal);
     }
-    let (_, seats, shortfall) = seat_panel(&request, policy, caller, deps, None).await?;
+    let (_, seats, shortfall, _) = seat_panel(&request, policy, caller, deps, None).await?;
     // A live pass admits every seat through `route.select`, so each is `Live`.
     let seats = seats
         .into_iter()
@@ -161,6 +162,7 @@ pub(super) struct DryRun<'a> {
     pub accounts: &'a crate::account_selection::Sweep,
     pub inputs: &'a super::select::RequestInputs,
     pub profile_lookup: &'a super::select::ProfileLookup,
+    pub catalog_efforts: Option<&'a super::effort_preview::Preview>,
 }
 
 /// A seat a dry-run panel would fill. No decision backs it.
@@ -174,6 +176,7 @@ pub(super) struct EvaluatedSeat {
     pub family: Option<String>,
     /// The scorer's rank within the seat's phase; absent for a random extra draw.
     pub rank: Option<usize>,
+    pub catalog_choice: Option<super::effort_preview::Choice>,
 }
 
 /// What a dry-run panel would seat, with the scorer's admission evidence.
@@ -181,6 +184,7 @@ pub(super) struct PanelEvaluation {
     pub seats: Vec<EvaluatedSeat>,
     pub shortfall: Option<PanelShortfall>,
     pub funnel: Option<scoring::PanelCandidateFunnel>,
+    pub effort_diagnostics: Option<super::effort_preview::Diagnostics>,
 }
 
 /// Seat a new panel exactly as live selection does, against call-local
@@ -192,7 +196,8 @@ pub(super) async fn evaluate_panel(
     deps: &Deps<'_>,
     dry: &DryRun<'_>,
 ) -> Result<PanelEvaluation, Refusal> {
-    let (panel, seats, shortfall) = seat_panel(request, policy, caller, deps, Some(dry)).await?;
+    let (panel, seats, shortfall, effort_diagnostics) =
+        seat_panel(request, policy, caller, deps, Some(dry)).await?;
     Ok(PanelEvaluation {
         // A dry pass checks every seat through select's evaluation path.
         seats: seats
@@ -204,6 +209,7 @@ pub(super) async fn evaluate_panel(
             .collect(),
         shortfall,
         funnel: panel.policy.and_then(|policy| policy.funnel),
+        effort_diagnostics,
     })
 }
 
@@ -229,9 +235,17 @@ async fn seat_panel(
     caller: &Caller,
     deps: &Deps<'_>,
     dry: Option<&DryRun<'_>>,
-) -> Result<(scoring::SelectedPanel, Vec<Seat>, Option<PanelShortfall>), Refusal> {
+) -> Result<
+    (
+        scoring::SelectedPanel,
+        Vec<Seat>,
+        Option<PanelShortfall>,
+        Option<super::effort_preview::Diagnostics>,
+    ),
+    Refusal,
+> {
     let shared = panel_inputs(deps, dry)?;
-    let (panel, _, mut rejected, canonical_ids) =
+    let (panel, _, mut rejected, canonical_ids, catalog) =
         candidates(request, &[], &[], caller, deps, dry, &shared).await?;
     let mut seats = Vec::new();
     let mut families = HashSet::new();
@@ -261,9 +275,22 @@ async fn seat_panel(
                 .map(Seat::Live),
             Some(dry) => {
                 let rank = scored.and_then(|seat| seat.rank);
-                evaluate_seat(request, member, slot, top, rank, caller, deps, dry, &shared)
-                    .await?
-                    .map(Seat::Evaluated)
+                evaluate_seat(
+                    request,
+                    member,
+                    slot,
+                    top,
+                    rank,
+                    caller,
+                    deps,
+                    dry,
+                    &shared,
+                    catalog
+                        .as_ref()
+                        .and_then(|catalog| catalog.choices.get(&member.route_key)),
+                )
+                .await?
+                .map(Seat::Evaluated)
             }
         };
         match admission {
@@ -336,6 +363,9 @@ async fn seat_panel(
                     deps,
                     dry,
                     &shared,
+                    catalog
+                        .as_ref()
+                        .and_then(|catalog| catalog.choices.get(&member.route_key)),
                 )
                 .await?
                 .map(Seat::Evaluated),
@@ -366,7 +396,12 @@ async fn seat_panel(
             rejected,
         )
     });
-    Ok((panel, seats, shortfall))
+    Ok((
+        panel,
+        seats,
+        shortfall,
+        catalog.map(|catalog| catalog.diagnostics),
+    ))
 }
 
 fn concurrency_rejection(cause: &PanelRejectedCandidate) -> bool {
@@ -552,8 +587,15 @@ async fn evaluate_seat(
     deps: &Deps<'_>,
     dry: &DryRun<'_>,
     shared: &super::select::RequestInputs,
+    catalog_choice: Option<&super::effort_preview::Choice>,
 ) -> Result<SeatAdmission<EvaluatedSeat>, Refusal> {
-    let (select, route) = seat_select(request, member)?;
+    let (mut select, mut route) = seat_select(request, member)?;
+    // Admission uses a pin to check the exact scored seat, but the preview
+    // reports why the automatic panel scorer chose that effort.
+    if let Some(choice) = catalog_choice {
+        route.variant = choice.variant.clone();
+        select["pin"] = json!(route.pin());
+    }
     // The seat request's requirements are the inert `iq: 0`; the evaluation's
     // demand must match it, as the live seat check reads it from the request.
     let view = super::select::Evaluation {
@@ -564,6 +606,8 @@ async fn evaluate_seat(
         iq: 0.0,
         eq: None,
         evidence: Mutex::new(Default::default()),
+        catalog_efforts: dry.catalog_efforts,
+        effort_diagnostics: Mutex::new(Default::default()),
     };
     let evaluated = super::select::evaluate_with_inputs(
         &select,
@@ -594,6 +638,7 @@ async fn evaluate_seat(
         answer: serde_json::from_value(answer["selection"].clone()).map_err(store_refusal)?,
         family: member.family.clone(),
         rank,
+        catalog_choice: catalog_choice.cloned(),
     }))
 }
 
@@ -631,7 +676,7 @@ async fn replace(
         .map(|s| family(s.family.as_deref()))
         .collect();
     let shared = panel_inputs(deps, None)?;
-    let (panel, package_blocked, mut rejected, _) = candidates(
+    let (panel, package_blocked, mut rejected, _, _) = candidates(
         &state.request,
         &exclude,
         &families,
@@ -706,6 +751,12 @@ fn panel_inputs(
     )
 }
 
+#[derive(Default)]
+struct CatalogSeats {
+    choices: HashMap<String, super::effort_preview::Choice>,
+    diagnostics: super::effort_preview::Diagnostics,
+}
+
 async fn candidates(
     request: &SelectPanelRequest,
     extra_exclude: &[String],
@@ -720,6 +771,7 @@ async fn candidates(
         bool,
         Vec<PanelRejectedCandidate>,
         HashMap<String, String>,
+        Option<CatalogSeats>,
     ),
     Refusal,
 > {
@@ -952,6 +1004,41 @@ async fn candidates(
         .map(|fact| (fact_to_route(fact).capacity_key, fact.family.clone()))
         .collect();
     let outcome = live.apply(&mut facts);
+    let catalog = dry.and_then(|dry| dry.catalog_efforts).map(|preview| {
+        let workload = preview.workload(&request.consumer, config);
+        let mut catalog = CatalogSeats::default();
+        facts.retain_mut(|fact| {
+            if fact.decommissioned {
+                return true;
+            }
+            let route = fact_to_route(fact);
+            match preview.resolve(fact, aliases, workload, false, None) {
+                Ok(choice) => {
+                    choice.apply_scores(fact);
+                    if choice.minimum_unverified.is_some()
+                        && fact.score_provenance != striatum_core::ScoreProvenance::Unscored
+                        && !operator_exclude.contains(&route.route_key)
+                    {
+                        catalog
+                            .diagnostics
+                            .minimum_unverified
+                            .insert(route.route_key.clone(), route.capacity_key);
+                    }
+                    catalog.choices.insert(route.route_key, choice);
+                    true
+                }
+                Err(reason) => {
+                    let mut candidate =
+                        PanelRejectedCandidate::new(&route.route_key, reason.code());
+                    candidate.detail = Some(json!(reason));
+                    rejected.push(candidate);
+                    catalog.diagnostics.rejected.insert(route.route_key, reason);
+                    false
+                }
+            }
+        });
+        catalog
+    });
     // Panel ranking can reject an account-blocked route before the final account
     // admission check. Status-check hints must also respect the route's own
     // cooldown, quota and backoff limits, panel exclusions, the quality floor and
@@ -1072,14 +1159,16 @@ async fn candidates(
             crate::select_policy::Consumer::Athena
         },
     );
-    crate::select::apply_panel_variant_policy(
-        &mut panel,
-        &config,
-        deps.operator_config_path,
-        &aliases,
-        variant_consumer,
-        &models,
-    );
+    if catalog.is_none() {
+        crate::select::apply_panel_variant_policy(
+            &mut panel,
+            &config,
+            deps.operator_config_path,
+            &aliases,
+            variant_consumer,
+            &models,
+        );
+    }
     rejected.extend(panel.rejected_causes.iter().map(|cause| {
         let reason = serde_json::to_value(cause.reason).expect("panel reason is JSON");
         let mut candidate = PanelRejectedCandidate::new(
@@ -1122,7 +1211,13 @@ async fn candidates(
         }
         candidate
     }));
-    Ok((panel, package_blocked, rejected, context.canonical_ids))
+    Ok((
+        panel,
+        package_blocked,
+        rejected,
+        context.canonical_ids,
+        catalog,
+    ))
 }
 
 fn package_fit(tokens: u64, fact: &striatum_core::ModelFact) -> PanelPackageFit {

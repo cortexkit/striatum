@@ -130,6 +130,17 @@ pub(crate) fn choices_for_harness(
     module: &str,
     harness: Option<&str>,
 ) -> Result<serde_json::Value, ErrorBody> {
+    choices_for_harness_preview(store, config, credentials, module, harness, None)
+}
+
+pub(crate) fn choices_for_harness_preview(
+    store: &SqliteRouteStateStore,
+    config: &config_overrides::LiveConfig,
+    credentials: &BrocaCredentials,
+    module: &str,
+    harness: Option<&str>,
+    preview: Option<&routing_v1::effort_preview::Preview>,
+) -> Result<serde_json::Value, ErrorBody> {
     if credentials.listing_version().is_none() {
         return Err(not_ready());
     }
@@ -244,21 +255,28 @@ pub(crate) fn choices_for_harness(
             .as_ref()
             .and_then(|defaults| defaults.variant.as_deref())
             .or(fact.variant.as_deref());
-        let default_variant = variant_policy::resolve(
-            config.variant_groups(),
-            &aliases,
-            Some(&reasoning),
-            &variant_policy::VariantRequest {
-                route_key: &striatum_core::fact_to_route(fact).route_key,
-                provider_id: provider,
-                model_id: model,
-                explicit: None,
-                curated,
-                consumer: Some("head"),
-            },
-        )
-        .variant
-        .filter(|variant| allowed(Some(variant), true));
+        let catalog_choice = preview.map(|preview| {
+            preview.head_default(fact, &aliases, |variant| allowed(Some(variant), true))
+        });
+        let default_variant = if let Some(choice) = &catalog_choice {
+            choice.variant.clone()
+        } else {
+            variant_policy::resolve(
+                config.variant_groups(),
+                &aliases,
+                Some(&reasoning),
+                &variant_policy::VariantRequest {
+                    route_key: &striatum_core::fact_to_route(fact).route_key,
+                    provider_id: provider,
+                    model_id: model,
+                    explicit: None,
+                    curated,
+                    consumer: Some("head"),
+                },
+            )
+            .variant
+            .filter(|variant| allowed(Some(variant), true))
+        };
         if !matches!(published, Some(PublishedEfforts::Published(_))) {
             variants.extend(default_variant.iter().cloned());
         }
@@ -306,7 +324,7 @@ pub(crate) fn choices_for_harness(
             }
         }
         service_tiers.sort();
-        models.push(ModelChoice {
+        let mut choice = json!(ModelChoice {
             provider: provider.into(),
             model: model.into(),
             pin_only,
@@ -315,6 +333,10 @@ pub(crate) fn choices_for_harness(
             default_variant,
             service_tiers,
         });
+        if let Some(catalog_choice) = &catalog_choice {
+            catalog_choice.append_to(&mut choice);
+        }
+        models.push(choice);
     }
     Ok(json!({"catalog_version": catalog_version, "runner_module": module, "models": models}))
 }

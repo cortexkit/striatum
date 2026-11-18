@@ -63,11 +63,13 @@ mod prune_facts;
 pub use operator_quality::{OperatorQuality, UnscoredAdmissibleModel};
 mod block_state;
 mod block_storage;
+mod catalog_efforts;
 mod engine_measurements;
 mod fence_rechecks;
 #[cfg(any(test, feature = "test-support"))]
 #[path = "frozen_block_data/tests.rs"]
 mod frozen_block_data;
+pub use catalog_efforts::{CatalogEfforts, CatalogWorkload, FusiformFactUpdate};
 mod history;
 #[cfg(any(test, feature = "test-support"))]
 pub use fence_rechecks::parity::verify_split_evaluation;
@@ -364,7 +366,7 @@ struct ObservedSpeedAggregate {
     speed: Option<f64>,
 }
 
-fn route_state_migrations() -> [Migration; 97] {
+fn route_state_migrations() -> [Migration; 98] {
     [
         Migration {
             version: 1,
@@ -751,6 +753,10 @@ fn route_state_migrations() -> [Migration; 97] {
             statements: include_str!("../migrations/097_admission_verdict_index.sql"),
         },
         history::STATE_MIGRATION,
+        Migration {
+            version: 99,
+            statements: include_str!("../migrations/099_catalog_efforts.sql"),
+        },
     ]
 }
 
@@ -944,42 +950,6 @@ pub struct CatalogFact {
 pub struct FusiformCatalogCursor {
     pub catalog_version: i64,
     pub resolved_at_ms: i64,
-}
-
-/// The factual fields Fusiform may author. No score, variant, exclusion, speed
-/// multiplier, or prompt-default field exists in this type by construction.
-#[derive(Debug, Clone, PartialEq)]
-pub struct FusiformFactUpdate {
-    pub provider_id: String,
-    pub model_id: String,
-    pub auth_methods: Option<Vec<String>>,
-    pub login_methods_documented: bool,
-    pub present: bool,
-    pub context_window: Option<f64>,
-    pub max_output_tokens: Option<u64>,
-    pub cost_tier: Option<f64>,
-    pub cost_per_mtok_out: Option<f64>,
-    pub input_rate: Option<f64>,
-    pub cache_read_rate: Option<f64>,
-    pub cache_write_rate: Option<f64>,
-    pub reasoning_rate: Option<f64>,
-    pub supports_vision: Option<bool>,
-    pub supports_tool_use: Option<bool>,
-    /// Effort values from the model's `capability.reasoning_options`: an empty
-    /// list when the catalog serves the key with no effort entry (or `null`).
-    /// `None` only when the catalog did not serve the key at all, which leaves
-    /// the row unread for reasoning purposes.
-    pub reasoning_efforts: Option<Vec<String>>,
-    /// Fusiform's `model.canonical_id`, verbatim. `None` when the catalog served
-    /// `null` or no value: the upstream states no identity for this route.
-    pub canonical_id: Option<String>,
-    /// Fusiform's `model.status` verbatim (`deprecated`, `beta`, `alpha`), or
-    /// `None` when the catalog states no status.
-    pub upstream_status: Option<String>,
-    /// Fusiform's `model.lineage`, without rewriting or inferring a value.
-    pub lineage: Option<String>,
-    pub model_type: Option<String>,
-    pub model_kind: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -6610,6 +6580,7 @@ mod tests {
                     supports_vision: Some(false),
                     supports_tool_use: Some(true),
                     reasoning_efforts: None,
+                    catalog_efforts: None,
                     canonical_id: None,
                     upstream_status: None,
                     model_type: None,
@@ -7233,14 +7204,18 @@ impl crate::AccountTx<'_> {
                     }
                     // Lineage is catalog-owned even when a row previously carried
                     // an operator family or a glob-derived family. Update variants too.
+                    let catalog_efforts_json = fact.catalog_efforts.as_ref()
+                        .map(serde_json::to_string).transpose()
+                        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
                     tx.execute(
-                        "UPDATE model_facts SET family = ?1, family_source = ?2
+                        "UPDATE model_facts SET family = ?1, family_source = ?2, catalog_efforts_json = ?5
                          WHERE provider_id = ?3 AND model_id = ?4",
                         params![
                             fact.lineage,
                             if fact.lineage.is_some() { "curated" } else { "absent" },
                             fact.provider_id,
                             fact.model_id,
+                            catalog_efforts_json,
                         ],
                     )?;
                 }

@@ -10219,6 +10219,7 @@ mod tests {
                 supports_vision: None,
                 supports_tool_use: None,
                 reasoning_efforts: None,
+                catalog_efforts: None,
                 canonical_id: canonical.map(str::to_string),
                 upstream_status: None,
                 model_type: None,

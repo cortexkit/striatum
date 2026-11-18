@@ -353,6 +353,7 @@ fn install_catalog(
             supports_vision: fact.supports_vision,
             supports_tool_use: fact.supports_tool_use,
             reasoning_efforts: list("reasoning_efforts"),
+            catalog_efforts: None,
             canonical_id: text("canonical_id"),
             upstream_status: None,
             model_type: None,

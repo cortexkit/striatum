@@ -2900,6 +2900,7 @@ fn every_production_block_writer_writes_inside_an_account_command() {
                 supports_vision: Some(false),
                 supports_tool_use: Some(true),
                 reasoning_efforts: None,
+                catalog_efforts: None,
                 canonical_id: None,
                 upstream_status: None,
                 model_type: None,

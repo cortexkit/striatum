@@ -1212,6 +1212,7 @@ fn unwrap_tool_result(bytes: &[u8]) -> Result<Value, FusiformCatalogError> {
 #[cfg(test)]
 pub(crate) mod allocation_tests;
 mod decode;
+pub(crate) mod efforts;
 mod media_grades;
 #[cfg(test)]
 pub(crate) use media_grades::{count_calls, inherit_calls};
@@ -1407,6 +1408,14 @@ fn decode_model_entry(
         model.cache_write_rate.as_ref(),
     );
     let reasoning_rate = decoded_rate(served_key, "rate.reasoning", model.reasoning_rate.as_ref());
+    let reasoning_efforts = published_efforts(&model.reasoning_options);
+    let catalog_efforts = efforts::decode(
+        served_key,
+        entry,
+        reasoning_efforts
+            .clone()
+            .filter(|_| matches!(model.reasoning_options, Some(Some(_)))),
+    );
     let fact = FusiformFactUpdate {
         provider_id: provider_id.to_string(),
         model_id: model_id.to_string(),
@@ -1423,7 +1432,8 @@ fn decode_model_entry(
         reasoning_rate,
         supports_vision,
         supports_tool_use: model.tool_call,
-        reasoning_efforts: published_efforts(&model.reasoning_options),
+        reasoning_efforts,
+        catalog_efforts,
         // A blank id names no model; keep it out so it cannot group
         // unrelated routes together.
         canonical_id: model

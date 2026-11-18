@@ -575,6 +575,8 @@ pub struct ProjectPolicy {
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct ConsumerPolicy {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workload: Option<String>,
     pub service_tier: Option<crate::tier_settings::Tier>,
     pub service_tiers: Option<BTreeMap<String, crate::tier_settings::Tier>>,
     pub mode: Option<ConsumerMode>,

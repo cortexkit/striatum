@@ -11,7 +11,9 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use striatum_core::panel::{ClassPanelPolicy, PanelExtraOrder};
 
-use super::{operator_config, provider_refusal, select, store_refusal, Caller, Deps};
+use super::{
+    effort_preview, operator_config, provider_refusal, select, store_refusal, Caller, Deps,
+};
 
 #[path = "concurrency_snapshot.rs"]
 mod concurrency;
@@ -30,6 +32,14 @@ struct Params {
     runner_declarations: Option<BTreeMap<String, Value>>,
     head_choices: Option<Value>,
     panel: Option<PanelParams>,
+    effort_source: Option<EffortSource>,
+    workloads: Option<BTreeMap<String, String>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum EffortSource {
+    Catalog,
 }
 
 /// A dry-run panel. Member values are passed to `route.select_panel`'s own
@@ -175,10 +185,25 @@ pub(super) async fn what_if_with_profile_lookup(
         routing_config_path: deps.routing_config_path,
         operator_config_path: deps.operator_config_path,
     };
+    let catalog_efforts = if params.effort_source.is_some() {
+        Some(effort_preview::Preview {
+            models: deps.store.catalog_efforts().map_err(store_refusal)?,
+            workloads: params.workloads.unwrap_or_default(),
+        })
+    } else {
+        None
+    };
     let head_choices = params
         .head_choices
         .as_ref()
-        .map(|request| super::reads::head_choices_with_config(request, &deps, &operator))
+        .map(|request| {
+            super::reads::head_choices_with_preview(
+                request,
+                &deps,
+                &operator,
+                catalog_efforts.as_ref(),
+            )
+        })
         .transpose()?;
     // Retain repairs in a private account-state copy for the whole sweep.
     // Never publish preview classification or healing into the live state.
@@ -213,10 +238,24 @@ pub(super) async fn what_if_with_profile_lookup(
             iq,
             eq: params.eq,
             evidence: Mutex::new(Default::default()),
+            catalog_efforts: catalog_efforts.as_ref(),
+            effort_diagnostics: Mutex::new(Default::default()),
         };
         let result = select::evaluate(&request, caller, &deps, &view, profile_lookup).await;
         let evidence = view.evidence.into_inner().unwrap();
-        let excluded: Vec<_> = evidence
+        let effort_diagnostics = view.effort_diagnostics.into_inner().unwrap();
+        let minimum_unverified_count = catalog_efforts.as_ref().map(|_| {
+            // The count describes candidates that reached the quality check,
+            // including candidates whose grade missed the current floor.
+            let blocked = evidence
+                .excluded
+                .iter()
+                .filter(|rejected| rejected.reason != "below_floor")
+                .map(|rejected| rejected.route_key.as_str())
+                .collect();
+            effort_diagnostics.unverified_models(&blocked)
+        });
+        let mut excluded: Vec<_> = evidence
             .excluded
             .into_iter()
             .map(|rejected| {
@@ -230,8 +269,12 @@ pub(super) async fn what_if_with_profile_lookup(
                 json!({"route": rejected.route_key, "reason": reason})
             })
             .collect();
+        excluded.extend(effort_diagnostics.exclusions());
         let mut row = json!({"iq": iq, "bar": evidence.bar, "top_routable": evidence.top_routable,
             "adequate": evidence.adequate, "pick": null, "excluded": excluded});
+        if let Some(count) = minimum_unverified_count {
+            row["minimum_unverified_count"] = json!(count);
+        }
         match result {
             Ok(pick) => row["pick"] = pick,
             Err(refusal) => {
@@ -250,6 +293,7 @@ pub(super) async fn what_if_with_profile_lookup(
             accounts: &accounts,
             inputs: &inputs,
             profile_lookup,
+            catalog_efforts: catalog_efforts.as_ref(),
         };
         let mut rows = Vec::with_capacity(panels.len());
         for panel in panels {
@@ -374,7 +418,7 @@ fn panel_row(
                 .seats
                 .iter()
                 .map(|seat| {
-                    json!({
+                    let mut pick = json!({
                         "slot": seat.slot,
                         "phase": seat.phase,
                         "route": seat.route,
@@ -383,11 +427,20 @@ fn panel_row(
                         "rank": seat.rank,
                         "cost_usd": seat.cost_usd,
                         "chosen_by": chosen_by(seat, policy, seed),
-                    })
+                    });
+                    if let Some(choice) = &seat.catalog_choice {
+                        choice.append_to(&mut pick);
+                    }
+                    pick
                 })
                 .collect();
             row["shortfall"] = json!(evaluated.shortfall);
             row["funnel"] = json!(evaluated.funnel);
+            if let Some(diagnostics) = evaluated.effort_diagnostics {
+                row["excluded"] = diagnostics.exclusions().collect();
+                row["minimum_unverified_count"] =
+                    json!(diagnostics.unverified_models(&Default::default()));
+            }
         }
         Err(refusal) => {
             row["refusal"] = json!({"code": refusal.code, "detail": refusal.detail});

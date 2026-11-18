@@ -1,0 +1,43 @@
+{
+  "request": {
+    "arguments": {
+      "fact_prefixes": [
+        "quality.",
+        "workload."
+      ],
+      "provider_id": "synthetic-quality-reseller"
+    },
+    "name": "catalog.get"
+  },
+  "response": {
+    "catalog_version": 123,
+    "models": {
+      "synthetic-quality-reseller/synthetic-excluded": {
+        "workload.code.excluded": true
+      },
+      "synthetic-quality-reseller/synthetic-model": {
+        "quality.elo": 1284,
+        "quality.elo.effort.low": 1200,
+        "quality.eq": 1599.8,
+        "quality.eq.effort.low": 1400,
+        "quality.graded_effort": "high",
+        "workload.code.effort_default": "high",
+        "workload.code.effort_minimum": "low",
+        "workload.lookup.effort_default": "high",
+        "workload.lookup.effort_minimum": "low",
+        "workload.quick.effort_default": "high",
+        "workload.quick.effort_minimum": "low",
+        "workload.reason.effort_default": "high",
+        "workload.reason.effort_minimum": "low",
+        "workload.synthesize.effort_default": "high",
+        "workload.synthesize.effort_minimum": "low"
+      }
+    },
+    "quality_scores": {
+      "graded_at_ms": 123,
+      "graded_by": "operator"
+    },
+    "resolved_at_ms": -1,
+    "source": "models.dev"
+  }
+}

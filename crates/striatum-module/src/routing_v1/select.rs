@@ -32,6 +32,7 @@ use striatum_core::slot_saturation::{ConcurrencySlotState, ConcurrencySlots};
 use striatum_core::{fact_to_route, ModelFact, ModelRequirements, RoutingConfig};
 use striatum_store::V1Decision;
 
+use super::effort_preview;
 use super::{now_ms, operator_config, provider_refusal, store_refusal, Caller, Deps};
 use crate::config_policy::RunnerPolicy;
 use crate::{
@@ -242,6 +243,8 @@ pub(super) struct Evaluation<'a> {
     pub iq: f64,
     pub eq: Option<f64>,
     pub evidence: std::sync::Mutex<striatum_core::model_router::RouteEvaluation>,
+    pub catalog_efforts: Option<&'a effort_preview::Preview>,
+    pub effort_diagnostics: std::sync::Mutex<effort_preview::Diagnostics>,
 }
 
 pub(super) async fn evaluate(
@@ -1682,6 +1685,8 @@ async fn select_at_tier_attempt(
     .map_err(store_refusal)?;
     let use_concurrency = std::cell::Cell::new(!concurrency.full_routes.is_empty());
     let selection = Selection {
+        catalog_efforts: evaluation.and_then(|view| view.catalog_efforts),
+        effort_diagnostics: evaluation.map(|view| &view.effort_diagnostics),
         policy_memo: &shared.policy_memo,
         concurrency: &concurrency,
         use_concurrency: &use_concurrency,
@@ -1729,7 +1734,7 @@ async fn select_at_tier_attempt(
         let mut evidence = view.evidence.lock().unwrap();
         let _ = selection.score_candidates_evaluated(
             &usable,
-            consumer_policy.operator_ladder(),
+            consumer_policy.operator_ladder() && selection.catalog_efforts.is_none(),
             None,
             None,
             Some(&mut evidence),
@@ -2152,14 +2157,42 @@ async fn select_at_tier_attempt(
     if consumer_policy.operator_ladder() {
         selection.check_ladder_variant(&selected, explicit_variant.as_deref())?;
     }
-    let variant_choice = crate::apply_variant_policy(
-        &mut selected,
-        &operator_config,
-        deps.operator_config_path,
-        &catalog_targets,
-        Some(&consumer),
-        explicit_variant.as_deref(),
-    );
+    let catalog_choice = selection.catalog_efforts.map(|preview| {
+        let fact = facts
+            .iter()
+            .filter(|fact| {
+                fact.provider_id == selected.model.provider_id
+                    && fact.model_id == selected.model.model_id
+            })
+            .min_by_key(|fact| fact_to_route(fact).route_key != selected.route_key)
+            .expect("selection has a model fact");
+        let pinned = matches!(
+            basis,
+            Basis::RequestPin | Basis::ConsumerPin | Basis::ProjectPin
+        ) || consumer_policy.operator_ladder();
+        preview
+            .resolve(
+                fact,
+                catalog_targets,
+                preview.workload(&consumer, operator_config),
+                pinned,
+                explicit_variant.as_deref(),
+            )
+            .expect("the catalog scorer removed workload-ineligible models")
+    });
+    let variant_choice = if let Some(choice) = &catalog_choice {
+        selected.prompt_params.variant = choice.variant.clone();
+        None
+    } else {
+        Some(crate::apply_variant_policy(
+            &mut selected,
+            &operator_config,
+            deps.operator_config_path,
+            &catalog_targets,
+            Some(&consumer),
+            explicit_variant.as_deref(),
+        ))
+    };
 
     let runner = select_policy::choose_runner(
         &runners,
@@ -2176,6 +2209,9 @@ async fn select_at_tier_attempt(
             "variant": selected.prompt_params.variant,
             "cost_usd": selected.score.objective.task_pricing.as_ref().filter(|price| price.price_unit == "task").and_then(|price| price.final_cost_usd),
         });
+        if let Some(choice) = &catalog_choice {
+            choice.append_to(&mut preview);
+        }
         if selected
             .explanation
             .iter()
@@ -2557,6 +2593,8 @@ fn concurrency_rejected_routes(refusal: &Refusal) -> Vec<String> {
 
 /// Everything one select's automatic and pinned attempts share.
 struct Selection<'a> {
+    catalog_efforts: Option<&'a effort_preview::Preview>,
+    effort_diagnostics: Option<&'a std::sync::Mutex<effort_preview::Diagnostics>>,
     policy_memo: &'a config_overrides::SelectionPolicyMemo,
     concurrency: &'a striatum_core::concurrency_availability::ConcurrencyAvailability,
     use_concurrency: &'a std::cell::Cell<bool>,
@@ -2780,7 +2818,14 @@ impl<'a> Selection<'a> {
         let mut input = self.pass().input_with_policy(&allowed, snapshot, pinned);
         select_policy::apply_explicit_variant(&mut input, explicit_variant);
         let result = self
-            .score_input_evaluated(input, self.consumer_exclude, explicit_variant, evaluation)
+            .score_input_evaluated(
+                input,
+                self.consumer_exclude,
+                explicit_variant,
+                pinned,
+                recovery_key,
+                evaluation,
+            )
             .map_err(select_policy::describe_filter_refusal)
             .map_err(|mut error| {
                 if matches!(
@@ -2902,6 +2947,13 @@ impl<'a> Selection<'a> {
                     self.pass()
                         .input_with_policy(&recovery_available, recovery_snapshot, pinned);
                 select_policy::apply_explicit_variant(&mut recovery_input, explicit_variant);
+                self.catalog_scoring(
+                    &mut recovery_input,
+                    pinned,
+                    recovery_key,
+                    explicit_variant,
+                    false,
+                );
                 let mut recovery_rejections =
                     self.eligible_rejections(&recovery_input.facts, explicit_variant);
                 recovery_rejections.to_mut().retain(|key, reason| {
@@ -2947,7 +2999,7 @@ impl<'a> Selection<'a> {
         consumer_exclude: &[String],
         explicit_variant: Option<&str>,
     ) -> Result<SelectedModelRoute, NoRouteError> {
-        self.score_input_evaluated(input, consumer_exclude, explicit_variant, None)
+        self.score_input_evaluated(input, consumer_exclude, explicit_variant, true, None, None)
     }
 
     fn score_input_evaluated(
@@ -2955,9 +3007,21 @@ impl<'a> Selection<'a> {
         mut input: striatum_core::SelectModelRouteInput<'_>,
         consumer_exclude: &[String],
         explicit_variant: Option<&str>,
+        pinned: bool,
+        pinned_route: Option<&str>,
         evaluation: Option<&mut striatum_core::model_router::RouteEvaluation>,
     ) -> Result<SelectedModelRoute, NoRouteError> {
-        let catalog = config_overrides::reasoning_catalog_for(self.sources.operator_config_path);
+        let catalog_variants = self.catalog_scoring(
+            &mut input,
+            pinned,
+            pinned_route,
+            explicit_variant,
+            evaluation.is_some(),
+        );
+        let catalog = catalog_variants
+            .is_none()
+            .then(|| config_overrides::reasoning_catalog_for(self.sources.operator_config_path))
+            .flatten();
         let rejections = self.eligible_rejections(&input.facts, explicit_variant);
         let groups = self.sources.operator_config.variant_groups();
         let mut identities = Vec::new();
@@ -2969,25 +3033,30 @@ impl<'a> Selection<'a> {
             {
                 continue;
             }
-            let choice = crate::variant_policy::resolve(
-                groups,
-                self.sources.catalog_targets,
-                catalog.as_ref(),
-                &crate::variant_policy::VariantRequest {
-                    route_key: &route.route_key,
-                    provider_id: &fact.provider_id,
-                    model_id: &fact.model_id,
-                    explicit: explicit_variant,
-                    curated: fact
-                        .prompt_defaults
-                        .as_ref()
-                        .and_then(|p| p.variant.as_deref())
-                        .or(fact.variant.as_deref()),
-                    consumer: Some(self.consumer),
-                },
-            );
+            let variant = if let Some(variants) = &catalog_variants {
+                variants.get(&route.route_key).cloned().flatten()
+            } else {
+                crate::variant_policy::resolve(
+                    groups,
+                    self.sources.catalog_targets,
+                    catalog.as_ref(),
+                    &crate::variant_policy::VariantRequest {
+                        route_key: &route.route_key,
+                        provider_id: &fact.provider_id,
+                        model_id: &fact.model_id,
+                        explicit: explicit_variant,
+                        curated: fact
+                            .prompt_defaults
+                            .as_ref()
+                            .and_then(|p| p.variant.as_deref())
+                            .or(fact.variant.as_deref()),
+                        consumer: Some(self.consumer),
+                    },
+                )
+                .variant
+            };
             let mut served = fact.clone();
-            served.variant = choice.variant;
+            served.variant = variant;
             // Profiles follow the variant that will run, while routing keeps
             // the original keys for exclusions, availability and reservations.
             identities.push((route.route_key, fact_to_route(&served).route_key));
@@ -3015,6 +3084,62 @@ impl<'a> Selection<'a> {
             evaluation,
             self.use_concurrency.get().then_some(self.concurrency),
         )
+    }
+
+    fn catalog_scoring(
+        &self,
+        input: &mut striatum_core::SelectModelRouteInput<'_>,
+        pinned: bool,
+        pinned_route: Option<&str>,
+        explicit_variant: Option<&str>,
+        record: bool,
+    ) -> Option<HashMap<String, Option<String>>> {
+        let preview = self.catalog_efforts?;
+        let workload = preview.workload(self.consumer, self.sources.operator_config);
+        let mut diagnostics = if record {
+            self.effort_diagnostics.map(|lock| lock.lock().unwrap())
+        } else {
+            None
+        };
+        let mut variants = HashMap::new();
+        let available = &input.available_models;
+        input.facts.retain_mut(|fact| {
+            let route = fact_to_route(fact);
+            let pinned = pinned && pinned_route.is_none_or(|key| route.capacity_key == key);
+            let explicit = pinned.then_some(explicit_variant).flatten();
+            match preview.resolve(
+                fact,
+                self.sources.catalog_targets,
+                workload,
+                pinned,
+                explicit,
+            ) {
+                Ok(choice) => {
+                    if available.contains(&route.route_key)
+                        || available.contains(&route.capacity_key)
+                    {
+                        if let Some(diag) = &mut diagnostics {
+                            if choice.minimum_unverified.is_some()
+                                && fact.score_provenance != striatum_core::ScoreProvenance::Unscored
+                            {
+                                diag.minimum_unverified
+                                    .insert(route.route_key.clone(), route.capacity_key);
+                            }
+                        }
+                        variants.insert(route.route_key, choice.variant.clone());
+                    }
+                    choice.apply_scores(fact);
+                    true
+                }
+                Err(reason) => {
+                    if let Some(diag) = &mut diagnostics {
+                        diag.rejected.insert(route.route_key, reason);
+                    }
+                    false
+                }
+            }
+        });
+        Some(variants)
     }
 
     fn pass(&self) -> select_policy::SelectionPass<'_> {

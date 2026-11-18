@@ -575,6 +575,16 @@ impl LiveConfig {
         resolve_consumer_policy(consumer, &self.config.consumers, request, declared)
     }
 
+    pub(crate) fn consumer_workload(&self, consumer: &str) -> Option<&str> {
+        self.config
+            .consumers
+            .iter()
+            .filter(|(name, _)| crate::config_policy::consumer_matches(name, consumer))
+            .filter_map(|(name, policy)| Some((name, policy.workload.as_deref()?)))
+            .max_by_key(|(name, _)| crate::config_policy::consumer_specificity(name))
+            .map(|(_, workload)| workload)
+    }
+
     /// Explicit pins bypass `pin_only` and `pin_only_for`, but never a
     /// provider/model `only_for` or `not_for` restriction.
     pub fn route_allowed(&self, consumer: &str, route: &str, pinned: bool) -> bool {
