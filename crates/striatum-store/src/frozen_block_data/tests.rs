@@ -160,8 +160,8 @@ fn read_at_boundary(
                     Some(*kind),
                     "frozen audit object missing or replaced: {name}"
                 );
-                let mut schema=conn.prepare(&format!("SELECT type,name,tbl_name,sql FROM {schema}.sqlite_schema WHERE name=?1 OR tbl_name=?1 ORDER BY name"))?;
-                for row in schema.query_map([name], |row| {
+                let mut objects=conn.prepare(&format!("SELECT type,name,tbl_name,sql FROM {schema}.sqlite_schema WHERE name=?1 OR tbl_name=?1 ORDER BY name"))?;
+                for row in objects.query_map([name], |row| {
                     Ok((
                         row.get::<_, String>(1)?,
                         (0..4)
