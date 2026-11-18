@@ -18,8 +18,9 @@ pub(super) fn decode(
     row: &Value,
     mut offered: Option<Vec<String>>,
 ) -> Option<CatalogEfforts> {
-    // Leave the original options available to live pin validation. The
-    // what-if preview can compare only known ranks against a workload minimum.
+    // This filtered copy is the preview's own: a workload minimum can only be
+    // compared against efforts with a known rank. Live selection keeps checking
+    // a pinned effort against the full published list, unknown names included.
     if let Some(list) = &mut offered {
         list.retain(|effort| {
             if rank(effort).is_some() {
