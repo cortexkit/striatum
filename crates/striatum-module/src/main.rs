@@ -996,16 +996,6 @@ fn resolve_storage_descriptor(
     Ok(dev_descriptor(module_id, path))
 }
 
-/// Open the route-state store from the resolved descriptor (applies migrations:
-/// DDL + the 33-fact seed, run-once). The lib derives the single-writer lease
-/// location from the descriptor's db path (one lease per database, by
-/// construction), so there is nothing to pass or get wrong here.
-fn open_route_state_store(descriptor: &StorageDescriptor) -> Result<SharedStore, ModuleError> {
-    let store = SqliteRouteStateStore::open(descriptor)
-        .map_err(|e| ModuleError::Message(format!("open route-state store: {e}")))?;
-    Ok(Arc::new(store))
-}
-
 fn check_config_at(path: &Path) -> Result<(), ModuleError> {
     config_overrides::initialize_config(path).map_err(ModuleError::Message)
 }
@@ -1067,7 +1057,6 @@ async fn async_main() -> Result<(), ModuleError> {
         } => return account_quota_dry_run(connection_file_path, capture_dir).await,
         StartupMode::Serve(connection_file_path) => connection_file_path,
     };
-    engram_catalog::write_startup_catalog();
     let config = ModuleConfig::from_env(connection_file_path)?;
     run(config).await
 }
@@ -1239,7 +1228,7 @@ where
     // fallback). Opening acquires the single-writer lease and runs migrations (the
     // 33-fact seed, once). The store backs route.select's facts + runtime snapshot.
     let descriptor = resolve_storage_descriptor(&ack.storage, &config.module_id)?;
-    let store = open_route_state_store(&descriptor)?;
+    let store = engram_catalog::open_route_state_store(&descriptor)?;
     // HELLO negotiates the storage descriptor supplied by HELLO_ACK, so it
     // cannot wait for loading. Do not start background tasks or dispatch queued
     // requests until account state is published; early requests wait, not fail.

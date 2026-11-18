@@ -12,12 +12,19 @@
         "model_route_decisions",
         "account_observation",
         "account_decision",
-        "quota_reading_log",
         "route_winner_baseline",
         "fusiform_catalog_cursor",
         "routing_operator_quality_state",
         "routing_operator_quality"
       ]
+    },
+    {
+      "entry_id": "striatum/history",
+      "class": "portable",
+      "mechanism": "page-db",
+      "path": "history.db",
+      "writer_interaction": "read-transaction-live",
+      "exclude_tables": ["quota_reading_log"]
     },
     {
       "entry_id": "striatum/engram-catalog",

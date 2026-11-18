@@ -1,17 +1,47 @@
+use crate::{ModuleError, SharedStore};
+use cortexkit_store_types::{StorageBackend, StorageDescriptor};
 use std::io::{self, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use striatum_store::SqliteRouteStateStore;
 
 const CATALOG_FILE_NAME: &str = "engram-catalog.json";
 const CATALOG_BYTES: &[u8] = include_bytes!("../engram-catalog.json");
 
-/// Write the engram catalog at startup; file I/O failures must not prevent routing from booting.
-pub fn write_startup_catalog() {
-    let directory = crate::config_overrides::default_store_path()
-        .and_then(|store| store.parent().map(Path::to_path_buf));
-    let result = directory
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "routing data home is unavailable"))
-        .and_then(|directory| write_catalog_at(&directory, CATALOG_BYTES));
+/// Publish backup sources only after both SQLite files are ready. Engram
+/// skips absent sources for the whole capture, so opening them later is too late.
+pub(crate) fn open_route_state_store(
+    descriptor: &StorageDescriptor,
+) -> Result<SharedStore, ModuleError> {
+    let store = SqliteRouteStateStore::open(descriptor)
+        .map_err(|error| ModuleError::Message(format!("open route-state store: {error}")))?;
+    write_startup_catalog(descriptor);
+    Ok(Arc::new(store))
+}
+
+fn write_startup_catalog(descriptor: &StorageDescriptor) {
+    let StorageBackend::Sqlite { path } = &descriptor.backend else {
+        return;
+    };
+    let state = Path::new(path);
+    // The catalogue uses fixed relative filenames. Do not publish it beside
+    // an in-memory or differently named store that it would not describe.
+    if state.file_name().and_then(|name| name.to_str()) != Some("store.db") {
+        return;
+    }
+    let directory = state
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let result = if state.is_file() && directory.join("history.db").is_file() {
+        write_catalog_at(directory, CATALOG_BYTES)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "state or history backup source is missing",
+        ))
+    };
     if let Err(error) = result {
         eprintln!("[striatum] WARN: could not write engram catalog: {error}");
     }
@@ -96,12 +126,19 @@ mod tests {
         "model_route_decisions",
         "account_observation",
         "account_decision",
-        "quota_reading_log",
         "route_winner_baseline",
         "fusiform_catalog_cursor",
         "routing_operator_quality_state",
         "routing_operator_quality"
       ]
+    },
+    {
+      "entry_id": "striatum/history",
+      "class": "portable",
+      "mechanism": "page-db",
+      "path": "history.db",
+      "writer_interaction": "read-transaction-live",
+      "exclude_tables": ["quota_reading_log"]
     },
     {
       "entry_id": "striatum/engram-catalog",
@@ -129,19 +166,12 @@ mod tests {
             .collect()
     }
 
-    fn excluded_tables(bytes: &[u8]) -> Vec<String> {
-        let catalog: Value = serde_json::from_slice(bytes).expect("valid catalog JSON");
-        catalog["entries"]
+    fn excluded_tables(entry: &Value) -> Vec<String> {
+        entry["exclude_tables"]
             .as_array()
-            .expect("entries array")
-            .iter()
-            .flat_map(|entry| {
-                entry["exclude_tables"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .map(|table| table.as_str().expect("excluded table name").to_owned())
-            })
+            .into_iter()
+            .flatten()
+            .map(|table| table.as_str().expect("excluded table name").to_owned())
             .collect()
     }
 
@@ -161,8 +191,29 @@ mod tests {
     }
 
     #[test]
+    fn catalog_captures_state_before_history() {
+        // Engram reads one file at a time. If the mover copies a pending row
+        // to history and deletes it from state between captures, both captures
+        // include the row. In the opposite order, neither would include it.
+        let ids: Vec<_> = entries(CATALOG_BYTES)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                "striatum/store",
+                "striatum/history",
+                "striatum/engram-catalog"
+            ]
+        );
+    }
+
+    #[test]
     fn catalog_excluded_tables_exist_in_the_migrated_routing_store_schema() {
-        let mut excluded = excluded_tables(CATALOG_BYTES);
+        let catalog: Value = serde_json::from_slice(CATALOG_BYTES).expect("valid catalog JSON");
+        let entries = catalog["entries"].as_array().expect("entries array");
+        let mut excluded: Vec<_> = entries.iter().flat_map(excluded_tables).collect();
         let mut backup_excluded: Vec<String> = striatum_store::backup::BACKUP_EXCLUDABLE_TABLES
             .iter()
             .map(|(table, _)| (*table).to_owned())
@@ -173,19 +224,33 @@ mod tests {
 
         let scratch = cortexkit_test_support::ScratchDir::new("routing-engram-catalog-schema");
         let database = scratch.path().join("store.db");
-        let store = striatum_store::SqliteRouteStateStore::open(&striatum_store::dev_descriptor(
+        let descriptor = striatum_store::dev_descriptor(
             "routing-engram-catalog-schema",
             database.to_string_lossy().into_owned(),
-        ))
-        .expect("open store after migrations");
+        );
+        drop(
+            SqliteRouteStateStore::open_at_version_for_test(&descriptor, 97)
+                .expect("open pre-split store"),
+        );
+        // A fresh state schema retains empty legacy tables. Check the split
+        // layout too, or a quota log exclusion against state would falsely pass.
+        striatum_store::run_split_for_test(database.to_str().unwrap(), 1_800_000_000_000);
+        let store = open_route_state_store(&descriptor).expect("open store after migrations");
+        for entry in entries
+            .iter()
+            .filter(|entry| entry["mechanism"] == "page-db")
+        {
+            let path = scratch.path().join(entry["path"].as_str().unwrap());
+            check_exclusions(&path, &excluded_tables(entry));
+        }
         drop(store);
+    }
 
-        let connection = rusqlite::Connection::open_with_flags(
-            &database,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .expect("open migrated store read-only");
-        for table in &excluded {
+    fn check_exclusions(path: &Path, excluded: &[String]) {
+        let connection =
+            rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .expect("open migrated backup source read-only");
+        for table in excluded {
             let exists: bool = connection
                 .query_row(
                     "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
@@ -193,7 +258,11 @@ mod tests {
                     |row| row.get(0),
                 )
                 .expect("query migrated schema");
-            assert!(exists, "catalog excludes missing routing table {table}");
+            assert!(
+                exists,
+                "{} excludes missing routing table {table}",
+                path.display()
+            );
         }
 
         let tables: Vec<String> = connection
@@ -220,7 +289,8 @@ mod tests {
             for parent in parents {
                 assert!(
                     !excluded.contains(&parent),
-                    "retained routing table {table} references excluded table {parent}"
+                    "{}: retained routing table {table} references excluded table {parent}",
+                    path.display()
                 );
             }
         }
@@ -270,6 +340,25 @@ mod tests {
         assert_eq!(opened_path.file_name().unwrap().to_string_lossy(), path);
         assert!(opened_path.ends_with("cortexkit/striatum/store.db"));
         assert_eq!(path, "store.db");
+    }
+
+    #[test]
+    fn fresh_start_opens_history_before_publishing_catalog() {
+        let scratch = cortexkit_test_support::ScratchDir::new("routing-engram-catalog-startup");
+        let state = scratch.path().join("store.db");
+        let history = scratch.path().join("history.db");
+        let catalog = scratch.path().join(CATALOG_FILE_NAME);
+        assert!(!state.exists() && !history.exists() && !catalog.exists());
+
+        let descriptor = striatum_store::dev_descriptor(
+            "routing-engram-catalog-startup",
+            state.to_str().unwrap(),
+        );
+        let _store = open_route_state_store(&descriptor).expect("fresh startup");
+        // Publication itself refuses missing sources, so the catalog cannot
+        // appear unless history was already created when startup wrote it.
+        assert_eq!(std::fs::read(&catalog).unwrap(), CATALOG_BYTES);
+        check_exclusions(&history, &["quota_reading_log".into()]);
     }
 
     #[test]
