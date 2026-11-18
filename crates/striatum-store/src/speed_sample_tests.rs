@@ -173,8 +173,12 @@ fn speed_sample_migration_preserves_existing_usage() {
     );
     let legacy = open_sqlite(&descriptor).unwrap();
     let migrations = route_state_migrations();
+    let block = migrations
+        .iter()
+        .position(|migration| migration.version == 96)
+        .unwrap();
     legacy
-        .migrate(ROUTE_STATE_NAMESPACE, &migrations[..migrations.len() - 1])
+        .migrate(ROUTE_STATE_NAMESPACE, &migrations[..block])
         .unwrap();
     legacy
         .with_conn(|c| {
