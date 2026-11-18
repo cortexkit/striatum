@@ -852,6 +852,244 @@ on its own, but admissions and observations each exceed it and tables outside
 this slice are held fixed. This inventory does not shorten any floor, change
 any retention predicate or claim a conversion rehearsal has passed the target.
 
+### Additional slim pass with today's behavior unchanged
+
+This is a sizing case, not a change to the store. For the five tables below,
+keep the same rows and guards as today's default retention. In particular,
+an admission that can still replay today keeps its reply for that entire
+lifetime; the seven-day *aging* floor is not a replacement for that lifetime.
+Move only the record data that live readers do not need. Full record readers
+must still see the original values and the same retention in history. A
+state placeholder is not an answer or effect to return to a caller.
+
+**`account_decision`.** Keep `decision_id`, `mode` and `created_at` for the
+keyed retention recheck (serve: **30 days**; shadow: no minimum age); the
+pin, admission, and hold references keep decisions even past that cutoff
+(`S/retention.rs:79–88,192–242,259–275`; `M/retention.rs:556–575,634–637`).
+The continuation fallback also needs `principal`, `admission_id`, `mode`,
+`outcome`, `provider`, and `model` to authorize a model-pinned predecessor
+(`M/account_selection/continuation.rs:164–192`); linking the successor sets
+`admission_id` by `decision_id` (`S/account_selection/continuation.rs:317–332`).
+Keep `context_json`: continuation preflight reads its `continuation_input`,
+and the finish effect reads `media_admission` before deciding whether to
+heal the serving credential (`M/account_selection/continuation/inputs.rs:145–184`;
+`S/account_selection.rs:921–934`; `M/account_selection.rs:8992–9029`). Neither
+reader can substitute a placeholder or fetch a history record on the account
+path. Keep mutable `service_tier_requested` and `service_tier_chosen` with
+the keyed write in the admission command and the matching store accessor
+(`M/account_selection.rs:8059–8064`; `S/account_selection.rs:770–790,968–981`);
+the accessor has test callers, not a separate daemon request-path tier read.
+The admission-group loader does not load this ledger
+(`S/account_selection/state_rows.rs:139–153,275–316`). `decision_json`,
+`trigger`, `request_mode`, `family`, `code`, `account_id`, `credential_id`,
+and `policy_version` are record fields: the broad by-id and by-mode record
+getters materialize them, but the runtime continuation callers use only the
+subsets above (`S/account_selection.rs:1477–1501,2809–2846`). The sizing case
+moves those fields, including the large `decision_json`, not `context_json`.
+
+**`account_admission`.** Keep `principal`, `admission_id`,
+`request_fingerprint`, `request_mode`, `state`, and `reply_json`: the
+pre-roster check authenticates the replay key and fingerprint before it
+returns the original or current-reservation reply
+(`M/account_selection.rs:5974–6007,8222–8257`). Continuation also parses the
+current admission's `reply_json` for the admitted authentication method,
+and the public replay overlay can render the used reservation's reply
+(`M/account_selection/continuation.rs:451–460`;
+`M/routing_v1/accounts.rs:744–775`). The in-memory open-state loader reads
+the entire admission plus `input_size_class`,
+`model_decision_id`, and `rowid`; its all-row scan uses `principal`,
+`conversation_hash`, `provider`, `admission_id`, `committed_at`, `rowid`,
+`pin_id`, `pin_generation`, `state`, `admission_valid_until`,
+`lease_valid_until`, `account_id`, `charged`, `request_bytes`, and the
+presence of `started_at` for latest admission, pin starts and demand
+(`S/account_selection.rs:1528–1532`;
+`S/account_selection/state_rows.rs:155–174,275–315`;
+`M/account_state/admissions.rs:458–515,550–595`). Retain `decision_id` for the
+ledger and continuation/effect lookup, `model`, `credential_id`, `run_id`,
+`input_size_class`, and `model_decision_id` for matching starts, successor
+reservations and reports, and `started_at`, `last_observed_at`, `released_at`,
+and `finished_at` for liveness and retention. Renewals check the current
+pin and have their own inflight treatment (`M/account_selection.rs:7548–7556,8395–8400,8443–8469`;
+`M/account_state/inflight.rs:204–228,471–492`). Report settlement can read a
+closed row by key or a decision/run pair; it needs the binding and commit
+time to match the serving identity and bound the evidence it can clear
+(`S/account_selection/state_rows.rs:323–372,780–849`;
+`S/report_delivery.rs:229–255,282–308,326–365`;
+`M/account_selection.rs:8731–8744,8785–8796,8986–9040`;
+`S/retention.rs:675–743,915–929`).
+`request_bytes_estimated` and `started_late` travel in the open and keyed
+typed row even though the demand calculation uses bytes and start presence,
+not those flags. They are small; this case keeps all 28 columns and does not
+split `reply_json` by open/closed state.
+
+**`routing_v1_admission`.** Keep all five columns. The state-only replay
+keys on `principal` and `admission_id`, compares the complete normalized
+`body_json`, and decodes the original `answer_json` before any run-started
+overlay (`S/routing_v1.rs:20–21,202–217,369–427`;
+`M/routing_v1/accounts.rs:345–358,510–517,596–606,702–775`). The body supplies
+provider fallback, observation ownership's `decision_id`, and original
+continuation input when the frozen account context has none
+(`M/routing_v1/accounts.rs:203–222,1114–1134`;
+`M/account_selection/continuation/inputs.rs:153–184`). Explain also finds
+the last admission via the body's decision id and `created_at_ms`/`rowid`
+and reads the served account and credential from the answer
+(`S/routing_v1.rs:203–217`; `M/routing_v1/reads.rs:120–136`). Retention is
+**seven days** from `created_at_ms`, protected by a `reserved` or `started`
+admission joined either by the pair of keys or by `body_json.decision_id`
+(`M/retention.rs:121–127,717–746`; `S/retention.rs:100–102,1106–1129`). Neither
+JSON column is diagnostic-only, and neither is bulk-loaded into account state.
+
+**`account_observation`.** Event replay needs `principal`, `runner`,
+`event_id`, `observation_id`, `bound`, and `effects_json`, not
+`observation_json`: the event projection can return the duplicate answer
+with an empty body, and an attempt duplicate returns no effects. Keep the
+same full-log-first lookup and six-hour restore backstop
+(`S/account_selection.rs:2449–2524`; `M/account_selection.rs:8707–8730`;
+`SQL/092_triggers_without_replace.sql:25–38`; `SQL/056_restorable_history.sql:51–59`).
+New effects use the in-flight parsed input; they do not reparse every stored
+report (`M/account_selection.rs:8731–8758,8873–8876`). The writer persists
+`bound` and `effects_json` by `observation_id` and uses the bound effect
+data to materialize transient-backoff block sources
+(`S/account_selection.rs:2527–2626,3295–3305`); startup loads those blocks,
+not the full log (`M/account_state.rs:88–100`). `kind`, `admission_id`,
+`bound`, `received_at`, `observation_id`, and `effects_json` are also needed
+for the seven-day retention predicate, block links, signed-out guard and
+bound backoff deadline (`S/retention.rs:1003–1023`). Failure evidence for
+`run_finished` uses principal, admission and kind
+(`S/account_selection/admission_verdicts.rs:3–15,26–41`;
+`M/account_selection.rs:9008–9011`). There are two live readers of the raw body:
+
+1. A bound `signed_out` naming an admission supplies the run and exhausted
+   credential to continuation exclusion. The startup loader and writer's
+   bind path also parse that body (`S/account_selection/continuation.rs:5–30`;
+   `S/account_selection/state_rows.rs:120–137`;
+   `M/account_state/admissions.rs:512–515,1597–1640`;
+   `M/account_state.rs:846–861,894–948`;
+   `M/account_selection/continuation.rs:430–434`).
+2. A bound `attempt` naming an admission can supply a successful verdict
+   (`served` or `served_empty`, matching served account and credential).
+   That verdict stops a decisionless finish from reopening an already
+   answered non-quota probe (`S/account_selection/admission_verdicts.rs:17–23,43–64`;
+   `S/fence_rechecks/unanswered_admission.rs:4–38`).
+
+Keep the raw bodies for both classes in this estimate, and move all other
+raw bodies to their full records. The first-bind command still receives
+the actual incoming body. The export has lengths, not the individual
+values nested inside the bodies, so it cannot price a smaller lossless
+projection of just the fields those two readers use. `effects_json`
+stays in state for original-answer replay and the retention guards.
+
+**`model_route_usage`.** Keep the keyed live row whole in this case. `id`
+is the first-delivery/enrichment key; the writer compares the stored
+`output_tokens` and `duration_ms` before and after enrichment, and fills
+nulls in `task_id`, token counts, duration, `workload_class`, `task_workload`,
+and `account_key` without overwriting earlier measurements
+(`S/lib.rs:3487–3575`). The report writes `service_tier_applied`,
+`service_tier_served`, `service_tier_price_status`, and `service_tier_cost_usd`
+by id in its payload transaction (`S/report_delivery.rs:698–735`;
+`S/routing_v1.rs:131–154`). `route_key`, `output_tokens`, `duration_ms`,
+and `observed_at` feed seven-day observed speed; `workload_class`,
+`observed_at`, `input_tokens`, `output_tokens`, `reasoning_tokens`,
+`cached_read_tokens`, and `cache_write_tokens` feed the seven-day class
+vector (`S/lib.rs:311–344,4048–4080`). `task_workload`, `task_id`,
+`provider_id`, timestamps and token counts supply task-profile grouping,
+provider reporting presence, complete task totals, and closure detection
+(`S/task_usage.rs:50–94,113–123,136–167`;
+`M/task_profile_refresh.rs:246–269`). `capacity_key` is persisted route
+provenance with a capacity/time index (`S/lib.rs:3503–3509`;
+`SQL/002_usage.sql:19–20`); no current daemon sample query reads it from this
+table. The four price/tier fields are ledger values written, not a current
+input to the speed or class queries. None is a large record payload. The
+whole-row update boundary and **30-day** `observed_at` retention stay put
+(`M/retention.rs:676–679`; `S/retention.rs:430–449`); moving whole rows while
+they can still be enriched needs a separate update-lifetime proof.
+
+#### State-size projection for the slim pass
+
+Same capture, byte scaling and units as above. Count SQLite value payload
+using UTF-8 lengths and the recorded lengths of redacted values; numeric
+fields use their encoded integer/real widths. Use `{}` for an archived
+non-null JSON value and empty/null/zero values as the existing record-only
+columns allow. This calculation keeps current index bytes per retained row;
+it does not credit possible index redesigns or price a new outbox/marker.
+The earlier model-decision projection and unchanged relations remain in
+the total. In the five tables, retention uses today's defaults and guards,
+not an accelerated prune.
+
+| State table | Captured MB incl. indexes | Retained rows | Kept value payload MB | Slim state MB incl. indexes |
+|---|---:|---:|---:|---:|
+| `account_decision` | 1,022.231 | 255,029 | 100.643 | 166.283 |
+| `account_observation` | 685.838 | 667,365 | 382.371 | 628.582 |
+| `account_admission` | 444.416 | 254,709 | 258.169 | 444.413 |
+| `routing_v1_admission` | 81.404 | 72,674–72,676 | 67.915–67.916 | 81.402–81.404 |
+| `model_route_usage` | 219.656 | 671,204 | 82.989 | 219.650 |
+| Remaining state, including slim route decisions | | | | 269.669 |
+| **Total state** | | | | **1,809.999–1,810.002** |
+
+All 132 over-age account decisions are still referenced by state rows, so an
+archive-only hold cannot change that count. For v1 admission replay, 565
+of the 567 over-age rows match a live admission by the exact pair of keys;
+the other two have redacted bodies, so the decision-id guard could keep
+either or both. The byte range reflects only that ambiguity. The observation
+pass moves **50.222 MB** of raw bodies and keeps **252.969 MB** used by the
+two live reader classes. The payload-only savings are substantial, but the
+five tables still project to about **1.54 GB** before the rest of state.
+
+### What the 100 MB budget would require
+
+No choice of windows for just those five tables can meet the budget: even
+removing their projected rows entirely leaves **269.669 MB**, including
+**111.027 MB** of route decisions, v1 bindings, reports and deliveries;
+**93.221 MB** of pins and affinities; and **37.847 MB** of panel state. Nor
+does moving the window without moving the guards solve it. In this capture,
+the pin/affinity/grace predicate alone protects **153,275** admissions
+against a shorter cutoff (about **62.500 MB** in their indexes alone).
+With the captured pin and admission references still present, **254,780**
+slim account decisions remain protected, projecting to **166.109 MB** even
+before accounting for any hold-only references. Charging/release and
+continuation guards would also need to be respected or explicitly changed.
+
+The following is a **time-only budget sensitivity**, not a proposed policy
+or a claim that those guard changes are safe. On the same snapshot, apply
+one common cutoff to the five slim tables and the other large relations
+listed below. Count the admission's latest lifecycle timestamp, the later
+of binding creation/expiry for the v1 report bundle (own creation time for
+orphans), `last_used_at` for affinity and creation time for pins and panels.
+Ignore the non-time guards for this calculation and leave **27.574 MB** of
+other relations fixed, including the six-hour observation event projection.
+The resulting estimate is **88.959 MB at five hours**, **101.801 MB at six
+hours**, crossing 100 MB at about **5 h 53 min** in this capture. These are
+retrospective cutoffs on one traffic sample, not a file-size guarantee or
+unique minimum. For example, leaving a seven-day usage population while
+cutting the other listed relations to two hours would be **90.191 MB** in
+the same guard-free calculation. A rebuilt database would need headroom
+for traffic variation, the outbox, and page overhead.
+
+| State window changed in the five-hour case | Today → time-only example | What would change if those rows stopped being available to today's readers |
+|---|---|---|
+| `account_decision` | 30 days plus references → 5 h without old reference protection (**7.042 MB**) | Older account explanations would be missing from a state-only diagnostic read. A model-pinned continuation can lose its predecessor or frozen inputs; a delayed media finish can lose the context marker used for healing. Moving only the diagnostic fields, as above, does not have these effects. |
+| `account_admission` | 30 days with activity, pin and continuation guards; demand stays for the retained lifetime → 5 h by latest activity/validity (**9.787 MB**) | An older resend can allocate anew rather than replay or reject a changed fingerprint; observations/reports may no longer bind, and a fork or continuation can lose its parent. Dropping demand-bearing rows changes which account has capacity. Removing the guards has a cost distinct from changing the cutoff. |
+| `routing_v1_admission` | 7 days plus both live-admission guards → 5 h since creation (**4.364 MB**) | Older public resends lose their original answer and body-conflict check; observation authorization and continuation can lose the original decision binding, and explain may no longer name the actual serving account. |
+| `account_observation` | 7 days plus block, sign-out and backoff guards → 5 h since receipt (**35.886 MB**) | For keys still in the fixed six-hour projection, a duplicate can replay there instead. Once both copies expire, a resend can be handled as new and reapply effects. A still-open run that loses older evidence can reuse a signed-out credential or reopen an answered probe; raw diagnostic evidence also disappears unless served from history. |
+| `model_route_usage` | 30 days retained, with 7-day speed/class and 30-day task-profile readers → 5 h since observation (**0.470 MB**) | A late usage delivery can miss the row it should enrich or create another row. With only five hours visible, speed and class vectors lose samples and fall back more often. The closed-task reader has a **24-hour** closure delay, so it gets **no eligible tasks** from five hours of rows; provider reporting presence also loses older samples. At seven days, speed/class keep their time window but task profiles still lose days 8–30 and older contributions to retained tasks. |
+| Slim `model_route_decisions` | 30-day catalogue lookback → 5 h since decision (**0.452 MB**) | The unchanged state-only prune can forget a still-recent pick and remove its catalogue fact. Late outcomes can lose their bound route. Explain and diagnostics lose older records only if their history readers also lose access to those records. |
+| `routing_v1_decision`, `routing_v1_report`, `routing_v1_report_delivery` | 7 days after binding creation/expiry, with live admission and continuation references → 5 h without those protections (**2.273 MB** combined) | Late runs can lose report authorization and replay answers; a surviving binding without its report key can reapply first-report effects. A continuation can lose a named decision even while its offer or run still exists. The three tables cannot have independent cutoffs that leave a replay hole. |
+| `account_affinity`, `account_pin` | 7 idle days plus 1-hour grace, leases and references for affinity-linked pins; 30 days plus reference checks for unneeded pins → 5 h since last use or pin creation without those protections (**0.869 MB** combined) | A returning conversation can cold-admit with another account/tier instead of reusing its cached pin; old forks can lose pin/lease proof. Deleting a pin still referenced by an admission is also forbidden by the FK, so a five-hour pin cut entails changing which dependent rows remain, not just tuning a setting (`M/account_selection.rs:68–73,8318–8326,8364–8369`; `M/retention.rs:131–136,626–633`; `S/retention.rs:90–94,711–743,837–858,952–993`). |
+| `routing_v1_panel` | 30 days → 5 h since creation (**0.243 MB**) | A request to replace a seat on an older panel can return `unknown_decision` instead of finding the stored panel and its prior seats/exclusions (`S/lib.rs:3969–3973`; `M/routing_v1/panels.rs:600–636`). |
+
+If moving rows rather than deleting them, merged history readers can still
+preserve diagnostic and profile windows. That does not preserve state-only
+replay, reference checks, or late writes by itself. In particular the
+inventory does not assume a history lookup on account requests, a changed
+catalogue prune, or a cross-file mutation path for usage. Several example
+cutoffs are also below today's configurable minima
+(`M/retention.rs:230–267`). The seven-day continuation window is not itself
+cut in the calculation. Discarding the rows it names early can break replay
+or resume before the offer expires; keeping those references would retain
+more than the time-only estimate (`M/retention.rs:128–130`;
+`S/retention.rs:1169–1197`). No window reduction or override of a guard is
+approved by this sizing exercise.
+
 ## S8c: coverage of the former dry-run SQL copy
 
 The production copy is replaced by `account_selection::Sweep`: one published
