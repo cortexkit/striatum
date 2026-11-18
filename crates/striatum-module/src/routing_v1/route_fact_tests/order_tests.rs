@@ -185,11 +185,20 @@ async fn assert_every_order(legacy: bool, test: &str) {
     // the entire migration chain for each order. Each copy still gets its own
     // setup, selection, admission, caches and six production frame-handler calls.
     let fresh = Harness::new("admission-order-template");
-    let template = fresh.store_path().with_file_name("template.db");
-    rusqlite::Connection::open(fresh.store_path())
-        .unwrap()
-        .execute("VACUUM INTO ?1", [template.to_str().unwrap()])
-        .unwrap();
+    let template_dir = cortexkit_test_support::ScratchDir::new("admission-order-paired-template");
+    let template = template_dir.path().join("store.db");
+    for (source, target) in [
+        (fresh.store_path(), template.clone()),
+        (
+            fresh.store_path().with_file_name("history.db"),
+            template.with_file_name("history.db"),
+        ),
+    ] {
+        rusqlite::Connection::open(source)
+            .unwrap()
+            .execute("VACUUM INTO ?1", [target.to_str().unwrap()])
+            .unwrap();
+    }
     let copy = Harness::from_template("admission-order-schema-check", &template);
     assert_eq!(schema(&copy.store_path()), schema(&fresh.store_path()));
     drop(copy);
