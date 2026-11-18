@@ -55,7 +55,7 @@ impl Pair {
             }).unwrap();
         }
         drop(staged);
-        let native = crate::SqliteRouteStateStore::open(&new).unwrap();
+        let native = crate::SqliteRouteStateStore::open_at_version_for_test(&new, 96).unwrap();
         Self {
             legacy,
             native,
@@ -504,7 +504,7 @@ fn migration_can_keep_newer_provider_above_a_model_healed_by_older_success() {
         Ok(())
     }).unwrap();
     drop(old);
-    let store = crate::SqliteRouteStateStore::open(&descriptor).unwrap();
+    let store = crate::SqliteRouteStateStore::open_at_version_for_test(&descriptor, 96).unwrap();
     store.with_reader_for_test(|conn| {
         let sources: (bool,bool,bool) = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM block WHERE kind='provider' AND provider='migrated-reach' AND source_present=1),

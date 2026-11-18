@@ -259,6 +259,7 @@ pub enum AccountCommandKind {
     Tick,
     Repair,
     Selection,
+    HistoryMaintenance,
 }
 
 impl AccountCommandKind {
@@ -274,6 +275,7 @@ impl AccountCommandKind {
             Self::Tick => "tick",
             Self::Repair => "repair",
             Self::Selection => "selection",
+            Self::HistoryMaintenance => "history_maintenance",
         }
     }
 }
@@ -355,6 +357,7 @@ struct Queued {
     label: &'static str,
     background: bool,
     initialize_only: bool,
+    history_maintenance: bool,
     command: Box<dyn Command>,
 }
 
@@ -413,7 +416,7 @@ pub(crate) struct AccountWriter {
     #[cfg(any(test, feature = "test-support"))]
     batch_sizes: Arc<Mutex<Vec<usize>>>,
     #[cfg(any(test, feature = "test-support"))]
-    commands: [AtomicU64; 10],
+    commands: [AtomicU64; 11],
     #[cfg(any(test, feature = "test-support"))]
     command_changes: Arc<Mutex<Vec<(AccountCommandKind, u64)>>>,
 }
@@ -422,6 +425,7 @@ impl AccountWriter {
     fn start(
         store: Arc<connection_store::ConnectionStore>,
         bridge: Arc<std::sync::OnceLock<Arc<dyn crate::AccountStateBridge>>>,
+        archive: Option<String>,
         #[cfg(any(test, feature = "test-support"))] transactions: Arc<AtomicU64>,
         exit: Arc<dyn Fn() + Send + Sync>,
     ) -> Self {
@@ -446,13 +450,29 @@ impl AccountWriter {
                             store.block_reload_flag(),
                             store.state_load_counter(),
                         );
-                        while let Ok(first) = receiver.recv() {
+                        let mut deferred = None;
+                        loop {
+                            let first = match deferred.take().map_or_else(|| receiver.recv(), Ok) {
+                                Ok(first) => first,
+                                Err(_) => break,
+                            };
+                            let history_maintenance = first.history_maintenance;
                             let mut batch = vec![first];
                             // No linger: an idle writer begins immediately. After a
                             // commit, drain only commands already queued, up to 32.
                             while batch.len() < MAX_BATCH {
                                 match receiver.try_recv() {
-                                    Ok(command) => batch.push(command),
+                                    Ok(command)
+                                        if command.history_maintenance == history_maintenance =>
+                                    {
+                                        batch.push(command)
+                                    }
+                                    // Do not expose the archive to request commands mixed
+                                    // into a maintenance batch. Preserve queue order.
+                                    Ok(command) => {
+                                        deferred = Some(command);
+                                        break;
+                                    }
                                     Err(_) => break,
                                 }
                             }
@@ -480,13 +500,20 @@ impl AccountWriter {
                             // here would turn one bad read into a restart loop.
                             let result: Result<bool, String> = store
                                 .with_conn(|conn| {
-                                    Ok(run_batch(
-                                        conn,
-                                        &mut batch,
-                                        &mut state,
-                                        #[cfg(any(test, feature = "test-support"))]
-                                        &transactions,
-                                    ))
+                                    let uri = if history_maintenance {
+                                        archive.as_deref()
+                                    } else {
+                                        None
+                                    };
+                                    crate::history::with_archive(conn, uri, || {
+                                        Ok(run_batch(
+                                            conn,
+                                            &mut batch,
+                                            &mut state,
+                                            #[cfg(any(test, feature = "test-support"))]
+                                            &transactions,
+                                        ))
+                                    })
                                 })
                                 .unwrap_or_else(|error| Err(error.to_string()));
                             let after = SqliteRouteStateStore::thread_stage_timing();
@@ -562,7 +589,12 @@ impl AccountWriter {
             + Send
             + 'static,
     ) -> RouteStateResult<AccountReply<T, E>> {
-        self.enqueue_inner_with_error(f, false, kind.label())
+        self.enqueue_inner_with_error(
+            f,
+            false,
+            kind.label(),
+            kind == AccountCommandKind::HistoryMaintenance,
+        )
     }
 
     pub(crate) fn enqueue_inner<T: Send + 'static>(
@@ -575,7 +607,7 @@ impl AccountWriter {
             + 'static,
         initialize_only: bool,
     ) -> RouteStateResult<AccountReply<T>> {
-        self.enqueue_inner_with_error(f, initialize_only, "initialize")
+        self.enqueue_inner_with_error(f, initialize_only, "initialize", false)
     }
 
     fn enqueue_inner_with_error<T: Send + 'static, E: AccountCommandError>(
@@ -588,6 +620,7 @@ impl AccountWriter {
             + 'static,
         initialize_only: bool,
         operation: &'static str,
+        history_maintenance: bool,
     ) -> RouteStateResult<AccountReply<T, E>> {
         if self.dead.load(Ordering::Acquire) {
             return Err(stopped());
@@ -602,6 +635,7 @@ impl AccountWriter {
                 label: crate::job_timing::label().unwrap_or(operation),
                 background: crate::job_timing::label().is_some(),
                 initialize_only,
+                history_maintenance,
                 command: Box::new(TypedCommand {
                     run: f,
                     result: None,
@@ -659,6 +693,9 @@ impl SqliteRouteStateStore {
             AccountWriter::start(
                 self.store.clone(),
                 self.account_state.clone(),
+                self.history
+                    .as_ref()
+                    .map(|history| history.attachment.clone()),
                 #[cfg(any(test, feature = "test-support"))]
                 self.account_write_transactions.clone(),
                 Arc::new(|| {

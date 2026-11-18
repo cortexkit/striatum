@@ -245,3 +245,40 @@ fn history_reader_sees_one_row_when_move_commits_between_snapshot_pins() {
         "the row must remain visible through the copy and ack"
     );
 }
+
+#[test]
+fn history_maintenance_never_leaves_an_archive_on_the_state_writer() {
+    use crate::AccountCommandKind::{HistoryMaintenance, Selection};
+    let scratch = ScratchDir::new("split-attach-scope");
+    let store = open(&scratch.path().join("state.db"));
+    let before = store.writer_hold_ns_for_test();
+    let archive_count = |tx: &crate::AccountTx<'_>| {
+        tx.conn
+            .query_row(
+                "SELECT count(*) FROM pragma_database_list WHERE name='archive'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .map_err(err)
+    };
+    for fail in [false, true] {
+        let completed = store.account_command(HistoryMaintenance, move |tx| {
+            assert_eq!(archive_count(tx)?, 1);
+            if fail {
+                tx.conn.execute_batch("ROLLBACK").map_err(err)?;
+                return Err(err("planted failed transaction"));
+            }
+            Ok(())
+        });
+        assert_eq!(completed.is_err(), fail);
+        assert_eq!(store.account_command(Selection, archive_count).unwrap(), 0);
+    }
+    println!(
+        "history_maintenance_checked_writer_hold_ns={}",
+        store.writer_hold_ns_for_test() - before
+    );
+    store
+        .with_writer_for_test(|conn| conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)"))
+        .unwrap();
+    store.checkpoint_wal().unwrap();
+}

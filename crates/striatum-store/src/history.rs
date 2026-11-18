@@ -21,6 +21,7 @@ const QUOTA_PENDING_MS: i64 = 60 * 60 * 1000;
 pub(super) struct History {
     writer: SqliteStore,
     reader: Option<Mutex<Connection>>,
+    pub(super) attachment: String,
     // Serializes copy/ack with history retention, not with state requests.
     mover: Mutex<()>,
 }
@@ -94,7 +95,7 @@ fn attach(conn: &Connection, uri: &str) -> rusqlite::Result<()> {
     conn.execute("ATTACH DATABASE ?1 AS archive", [uri])?;
     // Read pending first. The mover commits history before acknowledging state,
     // so a newer archive snapshot can contain a duplicate but never a gap.
-    conn.execute_batch(
+    let result = conn.execute_batch(
         "CREATE TEMP VIEW visible_account_holds AS
            SELECT * FROM main.pending_account_hold
            UNION ALL SELECT h.* FROM archive.account_hold h
@@ -104,16 +105,43 @@ fn attach(conn: &Connection, uri: &str) -> rusqlite::Result<()> {
            UNION ALL SELECT h.* FROM archive.quota_reading_log h
            WHERE NOT EXISTS (SELECT 1 FROM main.pending_quota_reading_log p
              WHERE (p.account_key,p.window_key,p.observed_at)=(h.account_key,h.window_key,h.observed_at));",
-    )
+    );
+    if result.is_err() {
+        detach(conn)?;
+    }
+    result
+}
+
+fn detach(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch("DROP VIEW IF EXISTS temp.visible_account_holds; DROP VIEW IF EXISTS temp.visible_quota_readings; DETACH DATABASE archive")
+}
+
+pub(super) fn with_archive<T>(
+    conn: &Connection,
+    uri: Option<&str>,
+    f: impl FnOnce() -> rusqlite::Result<T>,
+) -> rusqlite::Result<T> {
+    let Some(uri) = uri else { return f() };
+    attach(conn, uri)?;
+    // Even a panic must detach after the transaction has rolled back; the
+    // state connection may still be used by non-account writers afterward.
+    struct Attached<'a>(&'a Connection, bool);
+    impl Drop for Attached<'_> {
+        fn drop(&mut self) {
+            if self.1 {
+                detach(self.0).expect("detach history after unwinding");
+            }
+        }
+    }
+    let mut guard = Attached(conn, true);
+    let result = f();
+    detach(conn).expect("detach history before releasing state writer");
+    guard.1 = false;
+    result
 }
 
 impl History {
-    pub(super) fn open(
-        state: &SqliteStore,
-        path: &str,
-        memory: bool,
-        module_id: &str,
-    ) -> RouteStateResult<Self> {
+    pub(super) fn open(path: &str, memory: bool, module_id: &str) -> RouteStateResult<Self> {
         static NEXT_MEMORY: AtomicU64 = AtomicU64::new(0);
         let (source, attachment) = if memory {
             let next = NEXT_MEMORY.fetch_add(1, Ordering::Relaxed);
@@ -145,9 +173,6 @@ impl History {
         if migration.store_ahead() {
             return Err(err(format!("store_ahead: namespace {NAMESPACE} is at version {} but this binary's chain ends at {}", migration.recorded,migration.chain_max)));
         }
-        state
-            .with_conn(|conn| attach(conn, &attachment))
-            .map_err(err)?;
         let reader = if memory {
             None
         } else {
@@ -160,6 +185,7 @@ impl History {
         Ok(Self {
             writer,
             reader,
+            attachment,
             mover: Mutex::new(()),
         })
     }
@@ -195,7 +221,10 @@ impl SqliteRouteStateStore {
                     tx.commit().map_err(err)?;
                     Ok(result)
                 }
-                None => self.store.with_conn(f).map_err(err),
+                None => self
+                    .store
+                    .with_conn(|conn| with_archive(conn, Some(&history.attachment), || f(conn)))
+                    .map_err(err),
             },
             None => self.store.with_read(f).map_err(err),
         }

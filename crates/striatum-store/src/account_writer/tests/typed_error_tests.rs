@@ -26,7 +26,7 @@ fn typed_queued(
 ) -> (Queued, mpsc::Receiver<Result<String, TestError>>) {
     let (reply, receiver) = mpsc::channel();
     (Queued {
-        enqueued: Instant::now(), initialize_only: false,
+        enqueued: Instant::now(), initialize_only: false, history_maintenance: false,
         label: "test_command", background: false,
         command: Box::new(TypedCommand {
             run: move |tx: &AccountTx<'_>, _: Option<&mut (dyn crate::AccountWorkingState + 'static)>| run(tx),

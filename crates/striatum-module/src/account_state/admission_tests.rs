@@ -783,7 +783,7 @@ fn measure_affinity_retention_load(prune: bool) {
                 let keys = keys.to_vec();
                 let batch_start = std::time::Instant::now();
                 let batch = store
-                    .account_command(AccountCommandKind::Maintenance, move |tx| {
+                    .account_command(AccountCommandKind::HistoryMaintenance, move |tx| {
                         tx.delete_account_affinities_returning(&keys, NOW - 3_600_000, NOW)
                             .map(|(batch, _)| batch)
                     })
@@ -1316,7 +1316,7 @@ fn live_sized_admission_state_costs() {
         let before = store.writer_hold_ns_for_test();
         let started = std::time::Instant::now();
         let pruned = if reference {
-            store.account_command(AccountCommandKind::Maintenance, move |tx| {
+            store.account_command(AccountCommandKind::HistoryMaintenance, move |tx| {
                 tx.prune_account_pins(now, 256)
             })
         } else {

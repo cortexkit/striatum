@@ -4386,9 +4386,9 @@ mod tests {
         let old_fences = legacy_fixture_inputs::legacy_fences(&legacy, "anthropic");
         drop(legacy);
 
-        let migrated = SqliteRouteStateStore::open(&descriptor).unwrap();
+        let migrated = SqliteRouteStateStore::open_at_version_for_test(&descriptor, 96).unwrap();
         drop(migrated);
-        let restarted = SqliteRouteStateStore::open(&descriptor).unwrap();
+        let restarted = SqliteRouteStateStore::open_at_version_for_test(&descriptor, 96).unwrap();
         assert_eq!(
             restarted
                 .store
@@ -6263,13 +6263,18 @@ mod tests {
         );
         assert!(legacy_shape.iter().any(|line| line.contains(" index ")));
 
-        let migrated = SqliteRouteStateStore::open(&descriptor).unwrap();
+        let migrated = SqliteRouteStateStore::open_at_version_for_test(&descriptor, 96).unwrap();
         migrated
             .store
             .with_conn(|c| {
                 assert_eq!(
                     route_state_version(c)?,
-                    route_state_migrations().last().unwrap().version as i64
+                    route_state_migrations()
+                        .iter()
+                        .rev()
+                        .find(|migration| migration.version < history::STATE_MIGRATION.version)
+                        .unwrap()
+                        .version as i64
                 );
                 assert_eq!(
                     history_foreign_keys(c),
@@ -6389,7 +6394,7 @@ mod tests {
             .unwrap();
         drop(legacy);
 
-        let refused = SqliteRouteStateStore::open(&descriptor)
+        let refused = SqliteRouteStateStore::open_at_version_for_test(&descriptor, 96)
             .err()
             .expect("open refused");
         assert!(refused.0.contains("migration 58"), "{}", refused.0);

@@ -118,7 +118,13 @@ fn compare_applied(bytes: Vec<u8>, expected_rows: usize) {
     // Copy one initialized store, including migration/seed timestamps, so the
     // comparison has identical inputs and does not mask any changed SQL values.
     for name in ["before.db", "after.db"] {
-        std::fs::copy(scratch.path().join("seed.db"), scratch.path().join(name)).unwrap();
+        let template = rusqlite::Connection::open(scratch.path().join("seed.db")).unwrap();
+        template
+            .execute(
+                "VACUUM INTO ?1",
+                [scratch.path().join(name).to_string_lossy().as_ref()],
+            )
+            .unwrap();
     }
     let apply = |name: &str, snapshot: &Arc<CatalogSnapshot>| {
         let store = open(name);

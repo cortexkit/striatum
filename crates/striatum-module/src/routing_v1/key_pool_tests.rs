@@ -52,7 +52,7 @@ mod account_writer {
         let history_reads = store.watch_history_reads_for_test().unwrap();
         assert!(
             store
-                .with_writer_for_test(|conn| conn.query_row(
+                .with_history_reader_for_test(|conn| conn.query_row(
                     "SELECT count(*) FROM archive.account_hold",
                     [],
                     |row| row.get::<_, i64>(0),

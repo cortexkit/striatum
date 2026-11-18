@@ -3220,7 +3220,7 @@ fn stale_sync_drop_migration_representability_probe() {
             "stale-sync-drop-migration",
             scratch.path().join("state.db").to_string_lossy(),
         );
-        let preceding_version = crate::route_state_migrations().last().unwrap().version - 1;
+        let preceding_version = 95;
         let store = SqliteRouteStateStore::open_at_version_for_test(&descriptor, preceding_version)
             .unwrap();
         store
@@ -3260,7 +3260,7 @@ fn stale_sync_drop_migration_representability_probe() {
             })
             .unwrap();
         drop(store);
-        let store = SqliteRouteStateStore::open(&descriptor).unwrap();
+        let store = SqliteRouteStateStore::open_at_version_for_test(&descriptor, 96).unwrap();
         store
             .with_reader_for_test(|conn| {
                 let native: (String, bool, bool, Option<String>) = conn.query_row(
@@ -3365,7 +3365,7 @@ fn stale_sync_renew_guard_migration_representability_probe() {
         let scratch = cortexkit_test_support::ScratchDir::new(name);
         let descriptor =
             crate::dev_descriptor(name, scratch.path().join("state.db").to_string_lossy());
-        let preceding_version = crate::route_state_migrations().last().unwrap().version - 1;
+        let preceding_version = 95;
         let store = SqliteRouteStateStore::open_at_version_for_test(&descriptor, preceding_version)
             .unwrap();
         let legacy_clock = store.with_writer_for_test(|conn| {
@@ -3390,7 +3390,7 @@ fn stale_sync_renew_guard_migration_representability_probe() {
             Ok(clock)
         }).unwrap();
         drop(store);
-        let store = SqliteRouteStateStore::open(&descriptor).unwrap();
+        let store = SqliteRouteStateStore::open_at_version_for_test(&descriptor, 96).unwrap();
         let native: String = store.with_reader_for_test(|conn| conn.query_row(
             "SELECT json_array(evidence,next_recheck_at,last_claimed_at,claim_generation,claim_owner,source_present,managed)
              FROM block WHERE kind='provider' AND origin_key=json_array('p0')",
@@ -3458,7 +3458,7 @@ fn stale_sync_renew_guard_migration_representability_probe() {
 fn legacy_sync_rig(name: &str) -> Rig {
     let scratch = cortexkit_test_support::ScratchDir::new(name);
     let descriptor = crate::dev_descriptor(name, scratch.path().join("state.db").to_string_lossy());
-    let version = crate::route_state_migrations().last().unwrap().version - 1;
+    let version = 95;
     let store = SqliteRouteStateStore::open_at_version_for_test(&descriptor, version).unwrap();
     Rig {
         store,
@@ -3701,7 +3701,7 @@ fn upgrade_sync_rig(rig: Rig, name: &str) -> Rig {
     } = rig;
     drop(store);
     let descriptor = crate::dev_descriptor(name, scratch.path().join("state.db").to_string_lossy());
-    let store = SqliteRouteStateStore::open(&descriptor).unwrap();
+    let store = SqliteRouteStateStore::open_at_version_for_test(&descriptor, 96).unwrap();
     store.install_account_state_bridge(owner.clone()).unwrap();
     Rig {
         store,

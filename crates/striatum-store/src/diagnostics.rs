@@ -420,7 +420,7 @@ mod tests {
         execute(
             &store,
             &format!(
-                "INSERT INTO account_hold (decision_id, principal, conversation_hash, provider,
+                "INSERT INTO pending_account_hold (decision_id, principal, conversation_hash, provider,
                    pin_id, pin_generation, account_id, credential_id, basis, reset_at,
                    retry_after_s, created_at) VALUES
                  ('d-live', 'p', 'h', 'prov', 'pin', 1, 'acct', 'cred', 'reset_soon', {reset}, 30, {live}),

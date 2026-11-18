@@ -26,9 +26,13 @@ fn migration_function_is_absent(conn: &Connection) {
 }
 
 #[test]
-fn registered_migration_opens_fresh_and_older_chains_without_leaving_its_function() {
+fn registered_block_migration_opens_fresh_and_older_chains_without_leaving_its_function() {
     assert_eq!(
-        crate::SqliteRouteStateStore::latest_migration_version_for_test(),
+        crate::route_state_migrations()
+            .iter()
+            .find(|migration| migration.statements == crate::block_storage::MIGRATION)
+            .unwrap()
+            .version,
         96
     );
     let versions = std::iter::once(0).chain(
@@ -78,7 +82,11 @@ fn failed_registered_migration_is_atomic_and_removes_the_function_on_its_writer(
     );
     let store = crate::open_sqlite(&descriptor).unwrap();
     let chain = crate::route_state_migrations();
-    crate::migrate_route_state(&store, &chain[..chain.len() - 1]).unwrap();
+    let block = chain
+        .iter()
+        .position(|migration| migration.statements == crate::block_storage::MIGRATION)
+        .unwrap();
+    crate::migrate_route_state(&store, &chain[..block]).unwrap();
     store.with_conn(|conn| {
         conn.execute("INSERT INTO pool_key_state(provider,credential_id,walled_until,wall_observed_at,updated_at) VALUES ('bad-real','key',1.5,1,1)",[])?;
         Ok(())
@@ -95,7 +103,7 @@ fn failed_registered_migration_is_atomic_and_removes_the_function_on_its_writer(
             rows.collect::<rusqlite::Result<Vec<_>>>()
         })
         .unwrap();
-    let error = crate::migrate_route_state(&store, &chain).unwrap_err();
+    let error = crate::migrate_route_state(&store, &chain[..=block]).unwrap_err();
     assert!(
         error.to_string().contains("CHECK constraint failed"),
         "{error}"

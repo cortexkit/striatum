@@ -647,7 +647,7 @@ fn hold_retention_deletes_only_old_holds_and_is_bounded() {
     assert_eq!(store.prune_account_holds(BEFORE, 2).unwrap(), 1);
     assert_eq!(store.prune_account_holds(BEFORE, 2).unwrap(), 0);
     assert_eq!(
-        rig.ids("account_hold", "decision_id"),
+        rig.ids("pending_account_hold", "decision_id"),
         vec!["at-cutoff", "young"]
     );
     // No hold references those decisions any more, so the serve-decision
@@ -728,9 +728,10 @@ fn planned_pin_delete_rechecks_a_new_reference() {
         .account_transaction(|tx| tx.put_affinity(&affinity_row("conversation", &pin, NOW), None))
         .unwrap();
     let deleted = store
-        .account_command(striatum_store::AccountCommandKind::Maintenance, move |tx| {
-            tx.delete_account_pins(NOW, &keys)
-        })
+        .account_command(
+            striatum_store::AccountCommandKind::HistoryMaintenance,
+            move |tx| tx.delete_account_pins(NOW, &keys),
+        )
         .unwrap();
     assert_eq!(deleted, 0);
     assert_eq!(rig.ids("account_pin", "pin_id"), ["orphan"]);
@@ -802,9 +803,10 @@ fn reader_planned_retention_matches_the_original_sql_deletes() {
     }
     for limit in [0, 2, 4, 256] {
         let expected = oracle
-            .account_command(striatum_store::AccountCommandKind::Maintenance, move |tx| {
-                tx.prune_account_pins(BEFORE, limit)
-            })
+            .account_command(
+                striatum_store::AccountCommandKind::HistoryMaintenance,
+                move |tx| tx.prune_account_pins(BEFORE, limit),
+            )
             .unwrap();
         assert_eq!(actual.prune_account_pins(BEFORE, limit).unwrap(), expected);
         let expected = oracle.with_writer_for_test(|conn| conn.execute(
@@ -813,7 +815,7 @@ fn reader_planned_retention_matches_the_original_sql_deletes() {
                WHERE mode='serve' AND created_at<?1
                  AND NOT EXISTS (SELECT 1 FROM account_pin p WHERE p.decision_id=account_decision.decision_id)
                  AND NOT EXISTS (SELECT 1 FROM account_admission a WHERE a.decision_id=account_decision.decision_id)
-                 AND NOT EXISTS (SELECT 1 FROM account_hold h WHERE h.decision_id=account_decision.decision_id)
+                 AND NOT EXISTS (SELECT 1 FROM pending_account_hold h WHERE h.decision_id=account_decision.decision_id)
                ORDER BY created_at LIMIT ?2)", rusqlite::params![BEFORE, limit as i64])).unwrap();
         assert_eq!(
             actual.prune_serve_decisions(BEFORE, limit).unwrap(),
@@ -856,9 +858,10 @@ fn affinity_plan_rechecks_a_hold_added_before_delete() {
         })
         .unwrap();
     let (batch, deleted) = store
-        .account_command(striatum_store::AccountCommandKind::Maintenance, move |tx| {
-            tx.delete_account_affinities_returning(&plan.keys, NOW - HOUR, NOW)
-        })
+        .account_command(
+            striatum_store::AccountCommandKind::HistoryMaintenance,
+            move |tx| tx.delete_account_affinities_returning(&plan.keys, NOW - HOUR, NOW),
+        )
         .unwrap();
     assert_eq!(batch, AffinityRetentionBatch::default());
     assert!(deleted.is_empty());

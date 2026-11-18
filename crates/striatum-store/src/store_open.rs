@@ -56,12 +56,7 @@ impl SqliteRouteStateStore {
             nested
         }
         let archive = if split {
-            Some(history::History::open(
-                &store,
-                path,
-                memory,
-                &descriptor.module_id,
-            )?)
+            Some(history::History::open(path, memory, &descriptor.module_id)?)
         } else {
             None
         };

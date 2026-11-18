@@ -413,7 +413,7 @@ pub(crate) fn prune_account_pins(
     if keys.is_empty() {
         return Ok(0);
     }
-    execute(store, AccountCommandKind::Maintenance, move |tx| {
+    execute(store, AccountCommandKind::HistoryMaintenance, move |tx| {
         tx.delete_account_pins(before, &keys)
     })
 }
@@ -428,7 +428,7 @@ pub(crate) fn prune_account_affinities(
     let _writer_entry =
         striatum_store::writer_entry_trace::enter("module_adapter::prune_account_affinities");
     // Pruning is a writer command so the admission state drops the same rows.
-    execute(store, AccountCommandKind::Maintenance, move |tx| {
+    execute(store, AccountCommandKind::HistoryMaintenance, move |tx| {
         tx.prune_account_affinities(&keys, before, lease_before)
     })
 }

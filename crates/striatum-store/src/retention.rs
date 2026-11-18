@@ -214,18 +214,29 @@ impl SqliteRouteStateStore {
             return Ok(0);
         }
         let keys = serde_json::to_string(&keys).map_err(err)?;
-        self.retention_write(|tx| {
-            let holds = crate::history::hold_source(tx);
-            tx.execute(
-                &format!(
-                    "DELETE FROM account_decision \
+        self.store
+            .with_conn(|conn| {
+                let uri = self
+                    .history
+                    .as_ref()
+                    .map(|history| history.attachment.as_str());
+                crate::history::with_archive(conn, uri, || {
+                    let tx = crate::write_transaction(conn)?;
+                    let holds = crate::history::hold_source(&tx);
+                    let count = tx.execute(
+                        &format!(
+                            "DELETE FROM account_decision \
                          WHERE decision_id IN (SELECT value FROM json_each(?3)) \
                            AND mode = ?1 AND created_at < ?2 AND {}",
-                    DECISION_UNREFERENCED.replace("{holds}", holds)
-                ),
-                params![mode, created_before, keys],
-            )
-        })
+                            DECISION_UNREFERENCED.replace("{holds}", holds)
+                        ),
+                        params![mode, created_before, keys],
+                    )?;
+                    tx.commit()?;
+                    Ok(count)
+                })
+            })
+            .map_err(err)
     }
 
     fn retention_write<T>(
@@ -313,7 +324,7 @@ impl SqliteRouteStateStore {
         if keys.is_empty() {
             return Ok(0);
         }
-        self.account_command(crate::AccountCommandKind::Maintenance, move |tx| {
+        self.account_command(crate::AccountCommandKind::HistoryMaintenance, move |tx| {
             tx.delete_account_pins(before, &keys)
         })
     }
@@ -352,7 +363,7 @@ impl SqliteRouteStateStore {
         if keys.is_empty() {
             return Ok(AffinityRetentionBatch::default());
         }
-        self.account_command(crate::AccountCommandKind::Maintenance, move |tx| {
+        self.account_command(crate::AccountCommandKind::HistoryMaintenance, move |tx| {
             tx.delete_account_affinities_returning(&keys, before, before)
                 .map(|(batch, _)| batch)
         })

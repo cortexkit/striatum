@@ -26,6 +26,7 @@ fn queued<T: Send + 'static>(
             label: "test_command",
             background: false,
             initialize_only: false,
+            history_maintenance: false,
             command:
                 Box::new(
                     TypedCommand {
@@ -325,6 +326,7 @@ fn writer_death_wakes_pending_and_later_callers_and_fires_exit_hook() {
     let writer = AccountWriter::start(
         store.store.clone(),
         store.account_state.clone(),
+        None,
         store.account_write_transactions.clone(),
         Arc::new(move || {
             exit.send(()).unwrap();

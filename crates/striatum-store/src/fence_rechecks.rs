@@ -5030,7 +5030,7 @@ mod tests {
             .map(|clock| (clock.kind.clone(), clock.next_recheck_at))
             .collect();
         drop(store);
-        let store = SqliteRouteStateStore::open(&descriptor).unwrap();
+        let store = SqliteRouteStateStore::open_at_version_for_test(&descriptor, 96).unwrap();
         assert_eq!(
             first,
             store

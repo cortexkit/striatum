@@ -31,7 +31,7 @@ pub(super) fn seed(fixture: &bench::RequestFixture, now: i64) {
         "the complete old fixture has two account origins and thirteen other kinds"
     );
     drop(source);
-    let source = SqliteRouteStateStore::open(&descriptor).unwrap();
+    let source = SqliteRouteStateStore::open_at_version_for_test(&descriptor, 96).unwrap();
     let actual = canonical(source.effective_blocks_oracle_for_test(now).unwrap());
     assert_eq!(actual,expected,"independent scalar SQL after registered095->096 migration must equal the captured pre096effective rows");
     let native_times: BTreeSet<_> = source
