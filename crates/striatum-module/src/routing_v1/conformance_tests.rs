@@ -111,6 +111,11 @@ impl Harness {
         std::fs::create_dir_all(&dir).unwrap();
         if let Some(template) = template {
             std::fs::copy(template, dir.join("store.db")).unwrap();
+            std::fs::copy(
+                template.with_file_name("history.db"),
+                dir.join("history.db"),
+            )
+            .unwrap();
         }
         let descriptor = striatum_store::dev_descriptor(
             DEFAULT_MODULE_ID,

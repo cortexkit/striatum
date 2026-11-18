@@ -125,6 +125,11 @@ fn compare_applied(bytes: Vec<u8>, expected_rows: usize) {
                 [scratch.path().join(name).to_string_lossy().as_ref()],
             )
             .unwrap();
+        std::fs::copy(
+            scratch.path().join("seed.db.history.db"),
+            scratch.path().join(format!("{name}.history.db")),
+        )
+        .unwrap();
     }
     let apply = |name: &str, snapshot: &Arc<CatalogSnapshot>| {
         let store = open(name);

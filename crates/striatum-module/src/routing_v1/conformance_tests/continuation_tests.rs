@@ -354,6 +354,15 @@ async fn continuation_first_usageless_report_consumes_reservation_for_every_end_
         ));
         conn.execute("VACUUM INTO ?1", [restart_path.to_str().unwrap()])
             .unwrap();
+        let archive = harness.store_path().with_file_name("history.db");
+        let target = restart_path.with_file_name(format!(
+            "{}.history.db",
+            restart_path.file_name().unwrap().to_string_lossy()
+        ));
+        rusqlite::Connection::open(&archive)
+            .unwrap()
+            .execute("VACUUM INTO ?1", [target.to_str().unwrap()])
+            .unwrap();
         if outcome == "completed" {
             let mut next = request.clone();
             next["previous_decision_id"] = offer["decision_id"].clone();
