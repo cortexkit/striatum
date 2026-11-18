@@ -73,7 +73,8 @@ use crate::config_overrides::read_routing_config_value;
 pub const RETENTION_INTERVAL: Duration = Duration::from_secs(60);
 /// Most rows one batch deletes. Each batch is one short transaction.
 pub const RETENTION_BATCH_ROWS: usize = 256;
-/// Admission cleanup copies demand and latest-admission indexes as it deletes.
+/// Deleting an admission can copy affected shards of the in-memory demand
+/// index (by provider and account) and latest-admission index (by conversation).
 /// Eight keyed rows keep those writer commands below ten milliseconds on the
 /// live-sized admission fixture; candidate discovery runs on a pooled reader.
 pub const ADMISSION_DELETE_BATCH_ROWS: usize = 8;
@@ -1809,9 +1810,10 @@ mod tests {
         );
         assert_eq!(left("routing_v1_affinity", "affinity"), ["warm"]);
 
-        // Used moves remain fork bindings while their parent admission is
-        // retained. Age the finished admissions past their thirty-day window
-        // before expecting the old move and its replay records to retire.
+        // Keep an `account_continue` row with `used_at_ms` set while its parent
+        // `account_admission` exists, so the parent cannot start a second
+        // successor. Age the finished admissions past thirty days before
+        // expecting the continuation and its replay records to be deleted.
         let history_old = NOW - 31 * DAY_MS;
         connection
             .execute_batch(&format!(

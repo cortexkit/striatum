@@ -118,9 +118,9 @@ impl crate::AccountTx<'_> {
                     |row| row.get::<_, bool>(0),
                 )?;
                 if eligible {
-                    // These origins used to live in the route row. End their
-                    // sources and clocks before deleting that catalogue row so
-                    // rediscovering the route cannot restore those old refusals.
+                    // Mark the route's `route` and `failure` blocks absent before
+                    // deleting `model_route_state` so rediscovery cannot revive
+                    // the refusals. `block_clock_drop` resets their claim state.
                     let key = serde_json::json!([route]).to_string();
                     for kind in ["route", "failure"] {
                         crate::block_storage::remove_source(

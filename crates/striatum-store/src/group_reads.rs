@@ -261,10 +261,8 @@ pub const REVIEWED_TRIGGERS: [(&str, &str); 4] = [
     ),
 ];
 
-/// These read only insertion-order bookkeeping, never refusal policy.
-/// The exact statements are exempt only while a writer command is executing;
-/// copying a comment onto another read, or running a catalogued statement from
-/// a request, exempts nothing.
+/// The trace counts these exact `source_order` lookups separately from ordinary
+/// block-table reads, and only on the writer inside a writer command.
 pub const REVIEWED_WRITER_BOOKKEEPING: [(&str, &str); 2] = [
     (
         crate::block_storage::NEXT_SOURCE_ORDER,
@@ -276,17 +274,16 @@ pub const REVIEWED_WRITER_BOOKKEEPING: [(&str, &str); 2] = [
     ),
 ];
 
-/// A rare observation-effect insert checks one origin's retirement receipts.
-/// The archive is not loaded. Only the exact guarded insert inside a writer
-/// command gets this category; neither its marker nor its lookup grants an
-/// exemption to a request read or another connection.
+/// A `block` insert for transient backoff from an account observation checks
+/// `retirement_tombstone` for that origin. Count only this exact insert on the
+/// writer inside a writer command, not other SQL with the same marker or lookup.
 pub const REVIEWED_OBSERVATION_RETIREMENT_GUARD: (&str, &str) = (
     crate::block_storage::OBSERVATION_RETIREMENT_GUARD_MARKER,
     "retirement guard on the observation-effect insert: one covering keyed seek, LIMIT 1",
 );
 
-/// Only the source-transition trigger's own primary-key lookup is reviewed
-/// here. It is separate from ordinary request reads and the other triggers.
+/// Count the `block_clock_drop` trigger's primary-key lookup separately from
+/// ordinary request reads and other triggers.
 pub const REVIEWED_CLOCK_NORMALIZATION_TRIGGER: (&str, &str) = (
     "block_clock_drop",
     "block by its primary key kind = NEW.kind and origin_key = NEW.origin_key",
@@ -356,8 +353,8 @@ pub struct BlockReads {
     pub route_write_rows: Vec<String>,
     /// Exact catalogued insertion-order reads made inside a writer command.
     pub writer_bookkeeping: Vec<String>,
-    /// Exact observation-effect inserts that make one keyed retirement lookup
-    /// inside the writer. These are distinct from own-row and bookkeeping reads.
+    /// Writer inserts into `block` for account-observation backoff that match
+    /// the exact SQL and check `retirement_tombstone` for that origin.
     pub observation_retirement_guards: Vec<String>,
     /// Executed normalization bodies with the reviewed primary-key lookup,
     /// only on the writer connection inside a writer command.

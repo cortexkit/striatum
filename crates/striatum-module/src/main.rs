@@ -1167,8 +1167,9 @@ async fn run(config: ModuleConfig) -> Result<(), ModuleError> {
 
     // Quota delivery runs off the selection hot path. Bus notices fetch bodies
     // over independent outbound insula connections; route.select only reads the
-    // cache. An unbound reader switches delivery to 60-second usage.get snapshots,
-    // even when the SDK waits for a replacement connection without returning an error.
+    // cache. Without a subscription to quota events, refresh from `usage.get`
+    // every 60 seconds, even if the SDK waits for a replacement connection
+    // without returning an error.
     let quota_cache: SharedQuotaCache = Arc::new(Mutex::new(QuotaCache::default()));
     let catalog_health: SharedCatalogHealth = Arc::new(Mutex::new(CatalogReachHealth::new(
         config_overrides::DEFAULT_CATALOG_POLL_MS,
@@ -1513,8 +1514,6 @@ async fn handle_frame(
                             )
                             .await;
                         }
-                        // Account requests with a caller member keep their legacy parser;
-                        // every route.select body uses the closed v1 parser.
                         routing_v1::runners::refresh_admission_tiers(
                             &frame.body,
                             &routing_v1::Caller::for_route(channel, route_epoch),
@@ -1527,6 +1526,8 @@ async fn handle_frame(
                             },
                         )
                         .await;
+                        // `routing_v1::claims` sends every `route.select` request
+                        // to the v1 parser, which rejects unknown parameters.
                         if routing_v1::claims(&frame.body) {
                             return routing_v1::serve(
                                 frame,
@@ -4538,8 +4539,7 @@ pub(crate) fn served_operations() -> Vec<ManagementOperation> {
             kind: ManagementOperationKind::Mutate,
             description: Some("Choose the engine for one media job (transcription, synthesis, image, video, realtime) and record the decision: privacy and reachability filters first, then measured accuracy, then cost from Fusiform's prices.".to_string()),
         },
-        // route.select records the decision returned by its closed routing/v1
-        // request, so the operation is a mutation.
+        // `route.select` records the routing decision it returns.
         ManagementOperation {
             name: ROUTE_SELECT_OP.to_string(),
             kind: ManagementOperationKind::Mutate,

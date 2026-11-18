@@ -2350,8 +2350,8 @@ impl AccountTx<'_> {
         Ok(())
     }
 
-    /// The current command's captured rows, or a SQL read for a cold store
-    /// without a publisher. Both paths use the same keyed healing checks.
+    /// Use the command's working `BlockState` if available; otherwise load it
+    /// from SQL. `heal_origin` checks the rows it updates in either case.
     fn working(&self) -> RouteStateResult<std::borrow::Cow<'_, crate::BlockState>> {
         match self.working_blocks()? {
             Some(state) => Ok(state),
