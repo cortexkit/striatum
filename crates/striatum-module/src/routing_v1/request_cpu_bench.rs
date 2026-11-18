@@ -318,7 +318,7 @@ async fn select_concurrency_request_cpu() {
     }
 }
 
-fn build_fixture(catalog_facts: usize, listed_credentials: usize) -> RequestFixture {
+pub(crate) fn build_fixture(catalog_facts: usize, listed_credentials: usize) -> RequestFixture {
     let now = FIXTURE_NOW;
     let harness = Harness::new("request-cpu");
     // The measured catalog size excludes the store's unserved seed catalog.

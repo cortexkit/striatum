@@ -120,6 +120,8 @@ pub(crate) fn exercise_normal_traffic_for_logging() {
     report_delivery_tests::report_run_repeat_returns_first_answer_and_usage_but_new_runs_count();
 }
 
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod refusal_recovery_tests;
 #[cfg(test)]
 mod report_fence_tests;
 #[cfg(test)]
