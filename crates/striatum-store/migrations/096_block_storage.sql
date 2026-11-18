@@ -322,7 +322,8 @@ BEGIN
 END;
 
 -- Earlier successful observation probes only cleared their clocks, including
--- clocks whose sparse source was already pruned. Retire that exact evidence
+-- clocks whose source row retention had already deleted (cleared_by='removed').
+-- Retire that exact evidence
 -- and delete matching permissions from probe_authorization,
 -- without changing the retained source, clock or authorization audit tables.
 INSERT INTO retirement_tombstone(kind,origin_key,evidence,evidence_at,retired_at)
