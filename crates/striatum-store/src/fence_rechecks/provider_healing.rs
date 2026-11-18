@@ -1,6 +1,8 @@
 use super::*;
 use rusqlite::params;
 
+use crate::block_state::expect_changes;
+
 pub(super) fn heal_provider(
     tx: &AccountTx<'_>,
     blocks: &crate::BlockState,
