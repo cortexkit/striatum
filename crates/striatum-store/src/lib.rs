@@ -1314,6 +1314,8 @@ pub use account_state::{AccountStateBridge, AccountWorkingState, ACCOUNT_STATE_L
 pub use connection_store::record_stage_timing_for_test;
 pub use connection_store::{scope_stage_timing, StoreStageTiming};
 
+use crate::block_storage::keyed_updates;
+
 /// What a cached catalog fingerprint is valid for: this connection's count of
 /// `model_facts` writes (bumped by the temporary triggers that
 /// `install_catalog_change_tracking` creates) and SQLite's `data_version`,
@@ -7471,10 +7473,7 @@ impl crate::AccountTx<'_> {
             "account_tx::lib::clear_credential_entitlement_fences_for_credential",
         );
         self.command_sql(|c: &Connection| {
-            let lifted=self.current_blocks().map_err(fence_rechecks::command_error)?.entitlement_fences().into_iter().filter(|row|row.credential_id==credential_id).collect();
-            c.execute("UPDATE block SET source_present=0,cleared_at=?2,cleared_by='removed',claim_owner=NULL
-                WHERE kind='credential' AND is_origin=1 AND source_present=1 AND credential_id=?1",params![credential_id,now_ms()])?;
-            Ok(lifted)
+            keyed_updates::clear_credential_for_id(self, c, credential_id)
         })
         .map_err(err)
     }
@@ -7490,9 +7489,8 @@ impl crate::AccountTx<'_> {
         );
         self.command_sql(|c: &Connection| {
             c.execute(
-                "UPDATE block SET source_present=0,cleared_at=?3,cleared_by='removed',claim_owner=NULL
-                     WHERE kind='credential' AND is_origin=1 AND source_present=1 AND credential_id=?1 AND listing_fingerprint IS ?2",
-                params![credential_id, fingerprint,now_ms()],
+                &keyed_updates::clear_matching_credential_sql(),
+                params![credential_id, fingerprint, now_ms()],
             )
         })
         .map_err(err)
@@ -7509,8 +7507,7 @@ impl crate::AccountTx<'_> {
         );
         self.command_sql(|c: &Connection| {
             c.execute(
-                "UPDATE block SET listing_fingerprint=?2
-                     WHERE kind='credential' AND is_origin=1 AND source_present=1 AND credential_id=?1 AND listing_fingerprint IS NULL",
+                &keyed_updates::adopt_credential_fingerprint_sql(),
                 params![credential_id, fingerprint],
             )
             .map(|_| ())

@@ -223,7 +223,7 @@ impl BlockState {
             if table == 3 {
                 continue;
             }
-            let mut statement = conn.prepare(&format!("{marker} {}", select(table)))?;
+            let mut statement = conn.prepare(&format!("{marker} {}", load_select(table)))?;
             let mut rows = statement.query([])?;
             while let Some(row) = rows.next()? {
                 let (rowid, key, record) = decode(table, row)?;
@@ -1322,12 +1322,21 @@ impl BlockState {
 
     pub fn check_provider_rows(&self, conn: &Connection, provider: &str) -> rusqlite::Result<()> {
         if provider.is_empty() {
-            let mut sql = conn.prepare_cached(&format!("{} SELECT rowid,{},cleared_models FROM block WHERE provider=?1 AND is_origin=1 AND managed=1 AND (cleared_by IS NULL OR cleared_by='kept') AND (source_present=1 OR kind='observation')",super::STATE_CHECK,block_storage::CLOCK_COLUMNS))?.query_map([provider],|row| {
-                let (block,cleared) = fence_rechecks::clock_row(row,1)?;
-                let json: String = row.get(20)?;
-                let models: Vec<String> = serde_json::from_str(&json).map_err(|e| rusqlite::Error::FromSqlConversionFailure(20,rusqlite::types::Type::Text,Box::new(e)))?;
-                Ok((row.get::<_,i64>(0)?,block,cleared,models))
-            })?.collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut sql = conn
+                .prepare_cached(&principal_clock_check_sql())?
+                .query_map([provider], |row| {
+                    let (block, cleared) = fence_rechecks::clock_row(row, 1)?;
+                    let json: String = row.get(20)?;
+                    let models: Vec<String> = serde_json::from_str(&json).map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            20,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })?;
+                    Ok((row.get::<_, i64>(0)?, block, cleared, models))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
             let mut state: Vec<_> = self.tables[0]
                 .scoped(&provider_scope(provider))
                 .filter_map(|(rowid, record)| match record {
@@ -1359,7 +1368,7 @@ impl BlockState {
             self.compare_rows(
                 conn,
                 table,
-                &format!("{} {} WHERE {column}=?1", super::STATE_CHECK, select(table)),
+                &provider_check_sql(table, column),
                 [provider],
                 self.tables[table].scoped(&provider_scope(provider)),
             )?;
@@ -1530,6 +1539,18 @@ impl StoredBlock {
             recorded_at: self.recorded_at?,
         })
     }
+}
+
+fn load_select(table: usize) -> String {
+    select(table)
+}
+
+fn principal_clock_check_sql() -> String {
+    format!("{} SELECT rowid,{},cleared_models FROM block WHERE provider=?1 AND is_origin=1 AND managed=1 AND (cleared_by IS NULL OR cleared_by='kept') AND (source_present=1 OR kind='observation')",super::STATE_CHECK,block_storage::CLOCK_COLUMNS)
+}
+
+fn provider_check_sql(table: usize, column: &str) -> String {
+    format!("{} {} WHERE {column}=?1", super::STATE_CHECK, select(table))
 }
 
 fn select(table: usize) -> String {

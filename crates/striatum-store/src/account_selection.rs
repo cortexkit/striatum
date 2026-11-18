@@ -3278,10 +3278,19 @@ impl crate::AccountTx<'_> {
         let _writer_entry = crate::writer_entry_trace::enter(
             "account_tx::account_selection::clear_all_account_route_fences_for_credential",
         );
-        let cleared=self.conn.execute("UPDATE block SET source_present=0,cleared_at=COALESCE(cleared_at,?2),cleared_by='removed',claim_owner=NULL
-            WHERE credential_id=?1 AND source_present=1 AND kind IN ('account_route','non_quota_route','transient_route')",params![credential_id,crate::now_ms()]).map_err(err)?;
-        self.conn.execute("UPDATE block SET managed=0,claim_owner=NULL,last_claimed_at=NULL,claim_generation=0
-            WHERE credential_id=?1 AND kind IN ('account_route','non_quota_route','transient_route')",[credential_id]).map_err(err)?;
+        let cleared = self
+            .conn
+            .execute(
+                &crate::block_storage::keyed_updates::clear_credential_routes_sql(),
+                params![credential_id, crate::now_ms()],
+            )
+            .map_err(err)?;
+        self.conn
+            .execute(
+                &crate::block_storage::keyed_updates::drop_credential_route_clocks_sql(),
+                [credential_id],
+            )
+            .map_err(err)?;
         Ok(cleared)
     }
 }

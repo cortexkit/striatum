@@ -1346,7 +1346,7 @@ impl AccountTx<'_> {
         let Some(blocks) = self.working_blocks()? else {
             self.conn
                 .execute(
-                    "UPDATE block SET claim_owner=?2 WHERE claim_owner=?1 AND is_origin=1 AND managed=1",
+                    &crate::block_storage::keyed_updates::rebind_claim_owner_sql(),
                     params![from, to],
                 )
                 .map_err(err)?;
@@ -1380,7 +1380,7 @@ impl AccountTx<'_> {
         let left = self
             .conn
             .execute(
-                "UPDATE block SET claim_owner=?2 WHERE claim_owner=?1 AND is_origin=1 AND managed=1",
+                &crate::block_storage::keyed_updates::rebind_claim_owner_sql(),
                 params![from, to],
             )
             .map_err(err)?;
@@ -5189,7 +5189,7 @@ impl crate::AccountTx<'_> {
             tx.transfer_probe_authorization(from, to)?;
             tx.conn
                 .execute(
-                    "UPDATE block SET claim_owner=?2 WHERE is_origin=1 AND managed=1 AND claim_owner=?1",
+                    &crate::block_storage::keyed_updates::bind_claim_owner_sql(),
                     params![from, to],
                 )
                 .map(|_| ())

@@ -7,6 +7,8 @@ mod credential;
 mod decisions;
 #[path = "frozen/tests.rs"]
 mod frozen;
+#[path = "held_history/tests.rs"]
+mod held_history;
 #[path = "observation/tests.rs"]
 mod observation;
 #[path = "operator/tests.rs"]

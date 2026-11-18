@@ -26,15 +26,25 @@ pub(crate) const MAINTENANCE_READ: &str = "/* block state maintenance */";
 pub(crate) const STATE_CHECK: &str = "/* block state check */";
 
 pub(crate) fn sql_fingerprints(conn: &Connection) -> rusqlite::Result<Vec<(usize, Option<i64>)>> {
-    BLOCK_TABLES.iter().enumerate().map(|(table,name)| {
-        let held=match table {
-            0 => "(cleared_by IS NULL OR cleared_by='kept') AND (source_present=1 OR kind='observation')",
-            3 => "0",
-            _ => "1",
-        };
-        conn.prepare_cached(&format!("{MAINTENANCE_READ} SELECT count(*),max(rowid) FROM {name} WHERE {held}"))?
-            .query_row([],|row|Ok((row.get::<_,i64>(0)? as usize,row.get(1)?)))
-    }).collect()
+    BLOCK_TABLES
+        .iter()
+        .enumerate()
+        .map(|(table, name)| {
+            conn.prepare_cached(&fingerprint_sql(table, name))?
+                .query_row([], |row| Ok((row.get::<_, i64>(0)? as usize, row.get(1)?)))
+        })
+        .collect()
+}
+
+pub(crate) fn fingerprint_sql(table: usize, name: &str) -> String {
+    let held = match table {
+        0 => {
+            "(cleared_by IS NULL OR cleared_by='kept') AND (source_present=1 OR kind='observation')"
+        }
+        3 => "0",
+        _ => "1",
+    };
+    format!("{MAINTENANCE_READ} SELECT count(*),max(rowid) FROM {name} WHERE {held}")
 }
 
 #[cfg(any(test, feature = "test-support"))]

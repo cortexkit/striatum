@@ -6,6 +6,8 @@ use rusqlite::{Connection, Row};
 use serde::{Deserialize, Serialize};
 use striatum_core::blocks::Block;
 
+pub(crate) mod keyed_updates;
+
 pub(crate) const MIGRATION: &str = include_str!("../migrations/096_block_storage.sql");
 
 #[cfg(any(test, feature = "test-support"))]
