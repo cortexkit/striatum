@@ -858,7 +858,7 @@ pub(crate) fn authorization_check_sql() -> String {
 /// The keyed check of the clock an authorization names against the state.
 pub(crate) fn probe_clock_check_sql() -> String {
     format!(
-        "{} SELECT evidence,evidence_at,claim_generation,credential_id,model,cleared_at,claim_owner
+        "{} SELECT evidence,evidence_at,claim_generation,credential_id,model,cleared_at,claim_owner,quota
                     FROM block WHERE kind=?1 AND origin_key=?2 AND is_origin=1 AND managed=1",
         crate::block_state::STATE_CHECK
     )
@@ -1492,6 +1492,7 @@ impl AccountTx<'_> {
                         clock.scope.model.clone(),
                         cleared,
                         clock.claim_owner.clone(),
+                        clock.lifetime == LifetimeClass::Quota,
                     )
                 });
             let stored = self
@@ -1507,6 +1508,7 @@ impl AccountTx<'_> {
                         r.get(4)?,
                         r.get(5)?,
                         r.get(6)?,
+                        r.get(7)?,
                     ))
                 })
                 .optional()

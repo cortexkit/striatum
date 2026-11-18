@@ -4,7 +4,8 @@ use crate::{block_state::ProbeAuthorization, AccountAdmissionRow};
 impl AccountTx<'_> {
     /// A finished admission without a select decision has no later report to
     /// settle its test. If its observations supply no verdict, reopen only
-    /// the exact claims it still holds; leave the refusal evidence in place.
+    /// its exact non-quota claims; leave the refusal evidence and quota probe
+    /// cadence in place.
     pub fn release_unanswered_admission_probes(
         &self,
         admission: &AccountAdmissionRow,
@@ -23,7 +24,7 @@ impl AccountTx<'_> {
             admission.admission_id
         ])
         .to_string();
-        let claims = self.current_admission_claims(&owner)?;
+        let claims = self.current_non_quota_admission_claims(&owner)?;
         if claims.is_empty() {
             return Ok(());
         }
@@ -39,7 +40,7 @@ impl AccountTx<'_> {
             let changed = self.conn.execute(
                 "UPDATE block SET next_recheck_at=?3, last_claimed_at=NULL, claim_owner=NULL,
                     claim_generation=claim_generation+1
-                 WHERE kind=?1 AND origin_key=?2 AND is_origin=1 AND managed=1 AND cleared_at IS NULL
+                 WHERE kind=?1 AND origin_key=?2 AND is_origin=1 AND managed=1 AND cleared_at IS NULL AND quota=0
                    AND evidence=?4 AND evidence_at=?5 AND claim_generation=?6
                    AND (claim_owner IS NULL OR claim_owner=?7)",
                 params![claim.kind, claim.origin_key, now, claim.evidence, claim.evidence_at,
@@ -59,7 +60,10 @@ impl AccountTx<'_> {
         Ok(())
     }
 
-    fn current_admission_claims(&self, owner: &str) -> RouteStateResult<Vec<ProbeAuthorization>> {
+    fn current_non_quota_admission_claims(
+        &self,
+        owner: &str,
+    ) -> RouteStateResult<Vec<ProbeAuthorization>> {
         if let Some(blocks) = self.working_blocks()? {
             // A replay of a committed run_finished observation cannot retry
             // its release. Check both the test permission and its block.
@@ -67,13 +71,18 @@ impl AccountTx<'_> {
             return Ok(blocks
                 .authorizations_of(owner)
                 .into_iter()
-                .filter(|row| test_is_current(&blocks, row, false))
+                .filter(|row| {
+                    blocks
+                        .clock(&row.kind, &row.origin_key)
+                        .is_some_and(|(clock, _)| clock.lifetime != LifetimeClass::Quota)
+                        && test_is_current(&blocks, row, false)
+                })
                 .collect());
         }
         self.conn
             .prepare_cached(&format!(
             "SELECT a.kind,a.origin_key,a.evidence,a.evidence_at,a.claimed_at,a.claim_generation
-             FROM probe_authorization a {} WHERE a.owner=?1",
+             FROM probe_authorization a {} WHERE a.owner=?1 AND r.quota=0",
             current_test_join(2),
         ))
             .map_err(err)?
