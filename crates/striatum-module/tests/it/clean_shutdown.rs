@@ -3,11 +3,12 @@
 use std::{
     io,
     os::unix::fs::PermissionsExt,
+    path::Path,
     process::Stdio,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use cortexkit_test_support::{fenced_command, ScratchDir};
+use cortexkit_test_support::{fenced_command, stage_test_binary, ScratchDir};
 use serde_json::json;
 use subc_protocol::{Flags, Frame, FrameType, ModuleHelloAckBody, Priority};
 use subc_transport::{authenticate_server, read_frame, write_frame};
@@ -59,7 +60,8 @@ async fn assert_store_closed(stop: Stop) {
     .unwrap();
     std::fs::set_permissions(&connection_file, std::fs::Permissions::from_mode(0o600)).unwrap();
 
-    let mut module = Command::from(fenced_command(env!("CARGO_BIN_EXE_ck-striatum"), root))
+    let binary = stage_test_binary(Path::new(env!("CARGO_BIN_EXE_ck-striatum")));
+    let mut module = Command::from(fenced_command(&binary, root))
         .current_dir(root)
         .arg("--subc")
         .arg(&connection_file)
