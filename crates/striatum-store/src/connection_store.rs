@@ -418,7 +418,7 @@ impl ConnectionStore {
 }
 
 impl SqliteRouteStateStore {
-    /// Exclusive writer-callback time, excluding pooled-reader SQL time.
+    /// Number of maintenance acquisitions that attached the archive.
     #[cfg(any(test, feature = "test-support"))]
     pub fn archive_attachment_count_for_test(&self) -> u64 {
         self.store
@@ -427,6 +427,8 @@ impl SqliteRouteStateStore {
             .load(Ordering::Relaxed)
     }
 
+    /// Exclusive writer-callback time, excluding pooled-reader SQL time.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn writer_hold_ns_for_test(&self) -> u64 {
         self.store.metrics.writer_hold_ns.load(Ordering::Relaxed)
     }

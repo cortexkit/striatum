@@ -503,10 +503,10 @@ impl AccountWriter {
                                     // SQLite recompiles cached statements once after
                                     // attachment. Only archive-reference retention
                                     // uses this lane; state-only maintenance does not.
-                                    // A production-shaped first request cost an extra
-                                    // 0.5–1.0 ms, paid once per attaching batch. A
-                                    // steady pass attaches at most four times/minute
-                                    // including the separate decision-retention writes.
+                                    // In a fixture with 800 facts and 40 credentials,
+                                    // the first request paid 0.5–1.0 ms per attachment.
+                                    // A steady retention pass runs once a minute and
+                                    // attaches at most four times, including decision deletes.
                                     let uri = if history_maintenance {
                                         archive.as_deref()
                                     } else {
