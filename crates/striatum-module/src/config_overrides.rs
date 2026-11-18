@@ -346,6 +346,21 @@ pub fn attach_reasoning_catalog(path: &Path, source: ReasoningCatalogSource) -> 
     check_variants_against_catalog(path, &active.config)
 }
 
+pub(super) fn attach_store_catalog(path: &Path, store: &crate::SharedStore) -> Result<(), String> {
+    // The process-global catalog registry must not keep SQLite open after serving ends.
+    let store = Arc::downgrade(store);
+    attach_reasoning_catalog(
+        path,
+        Arc::new(move || {
+            store
+                .upgrade()
+                .ok_or("routing store has closed")?
+                .reasoning_catalog()
+                .map_err(|error| error.to_string())
+        }),
+    )
+}
+
 /// The live catalog attached to `path`, read now. `None` before the store opens.
 pub fn reasoning_catalog_for(path: &Path) -> Option<ReasoningCatalog> {
     let source = catalog_sources().lock().unwrap().get(path).cloned()?;

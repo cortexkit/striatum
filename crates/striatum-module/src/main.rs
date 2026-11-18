@@ -60,6 +60,7 @@ mod select_concurrency;
 mod select_policy;
 mod service_tiers;
 mod serving_index;
+mod shutdown;
 mod stage_timing;
 mod subscription_economics;
 mod task_profile_refresh;
@@ -1002,18 +1003,17 @@ fn check_config_at(path: &Path) -> Result<(), ModuleError> {
 
 fn main() -> Result<(), ModuleError> {
     initialize_logging();
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| ModuleError::Message(error.to_string()))?
-        .block_on(async_main())
+    shutdown::run_main()
 }
 
 fn initialize_logging() {
     logging::install();
 }
 
-async fn async_main() -> Result<(), ModuleError> {
+async fn async_main(
+    shutdown: &shutdown::Shutdown,
+    store: &mut Option<SharedStore>,
+) -> Result<(), ModuleError> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     if args.first().is_some_and(|arg| arg == "config-convert") {
         if args.len() != 3 {
@@ -1058,7 +1058,9 @@ async fn async_main() -> Result<(), ModuleError> {
         StartupMode::Serve(connection_file_path) => connection_file_path,
     };
     let config = ModuleConfig::from_env(connection_file_path)?;
-    run(config).await
+    let result = run(config, shutdown, store).await;
+    shutdown.begin();
+    result
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1142,7 +1144,11 @@ impl ModuleConfig {
     }
 }
 
-async fn run(config: ModuleConfig) -> Result<(), ModuleError> {
+async fn run(
+    config: ModuleConfig,
+    shutdown: &shutdown::Shutdown,
+    store: &mut Option<SharedStore>,
+) -> Result<(), ModuleError> {
     check_config_at(&config_overrides::config_path())?;
     project_settings::initialize(
         &config.connection_file_path,
@@ -1170,8 +1176,12 @@ async fn run(config: ModuleConfig) -> Result<(), ModuleError> {
         &config,
         quota_cache,
         catalog_health,
+        shutdown,
+        store,
     )
     .await;
+    shutdown.begin();
+    drop(read_half);
     drop(tx);
 
     let writer_result = writer
@@ -1179,13 +1189,9 @@ async fn run(config: ModuleConfig) -> Result<(), ModuleError> {
         .map_err(|e| ModuleError::Message(e.to_string()));
     // The writer closes only after the in-flight request handlers have dropped
     // their reply senders. Flush their final diagnostic increments together.
-    let loop_result = match loop_result {
-        Ok(store) => {
-            background::flush_call_counts(store).await;
-            Ok(())
-        }
-        Err(error) => Err(error),
-    };
+    if let Some(store) = store {
+        background::flush_call_counts(Arc::clone(store)).await;
+    }
     match (loop_result, writer_result) {
         (Err(loop_err), _) => Err(loop_err),
         (Ok(()), Ok(Ok(()))) => Ok(()),
@@ -1217,7 +1223,9 @@ async fn module_loop<R>(
     config: &ModuleConfig,
     quota_cache: SharedQuotaCache,
     catalog_health: SharedCatalogHealth,
-) -> Result<SharedStore, ModuleError>
+    shutdown: &shutdown::Shutdown,
+    store: &mut Option<SharedStore>,
+) -> Result<(), ModuleError>
 where
     R: AsyncRead + Unpin,
 {
@@ -1228,14 +1236,14 @@ where
     // fallback). Opening acquires the single-writer lease and runs migrations (the
     // 33-fact seed, once). The store backs route.select's facts + runtime snapshot.
     let descriptor = resolve_storage_descriptor(&ack.storage, &config.module_id)?;
-    let store = engram_catalog::open_route_state_store(&descriptor)?;
+    let store = &*store.insert(engram_catalog::open_route_state_store(&descriptor)?);
     // HELLO negotiates the storage descriptor supplied by HELLO_ACK, so it
     // cannot wait for loading. Do not start background tasks or dispatch queued
     // requests until account state is published; early requests wait, not fail.
     // The load blocks on the account writer, so it runs on the blocking pool,
     // never on a runtime worker. A failed load does not stop the module: the
     // writer stays up, and each account request or Tick loads again.
-    let loading = Arc::clone(&store);
+    let loading = Arc::clone(store);
     match tokio::task::spawn_blocking(move || account_state::initialize(loading.as_ref())).await {
         Ok(Ok(())) => {}
         Ok(Err(error)) => tracing::error!(
@@ -1249,23 +1257,9 @@ where
     // Variant overrides name efforts the catalog must publish. Config loaded
     // before the store opened got only shape checks; check it now, and every
     // later reload, against the stored catalog.
-    {
-        let catalog_store = Arc::clone(&store);
-        config_overrides::attach_reasoning_catalog(
-            &config_overrides::config_path(),
-            Arc::new(move || {
-                catalog_store
-                    .reasoning_catalog()
-                    .map_err(|error| error.to_string())
-            }),
-        )
-        .map_err(|error| {
-            ModuleError::Message(format!(
-                "{}: {error}",
-                config_overrides::config_path().display()
-            ))
-        })?;
-    }
+    let config_path = config_overrides::config_path();
+    config_overrides::attach_store_catalog(&config_path, store)
+        .map_err(|error| ModuleError::Message(format!("{}: {error}", config_path.display())))?;
     // Seed the cache from the last persisted snapshot before anything can serve a
     // selection, so a restart does not select with no quota reading until the
     // first live quota update lands.
@@ -1277,7 +1271,7 @@ where
         broca_credentials,
         override_path,
         operator_config_path,
-    } = background::start(config, &store, &quota_cache, &catalog_health).await?;
+    } = background::start(config, store, &quota_cache, &catalog_health).await?;
 
     let min_band: SharedMinBand = Arc::new(std::sync::Mutex::new(
         config_overrides::live_config(&override_path).min_band(),
@@ -1285,18 +1279,17 @@ where
 
     let mut route_epochs = RouteEpochs::new();
     let mut profiles_started = false;
-    loop {
-        let Some(frame) = next_frame_or_loop_stop(read_half, &mut loops).await? else {
-            // Clean EOF: stop quota publications before capturing the final cache.
-            return quota_events::finish_clean_exit(loops, Arc::clone(&quota_cache), store)
-                .await
-                .map_err(ModuleError::Message);
+    let result = loop {
+        let frame = match next_frame_or_loop_stop(read_half, &mut loops).await {
+            Ok(Some(frame)) => frame,
+            Ok(None) => break Ok(()),
+            Err(error) => break Err(error),
         };
-        if !handle_frame(
+        match handle_frame(
             frame,
             &writer,
             &quota_cache,
-            &store,
+            store,
             &mut route_epochs,
             &min_band,
             &override_path,
@@ -1304,25 +1297,30 @@ where
             &broca_credentials,
             &catalog_health,
         )
-        .await?
+        .await
         {
-            return quota_events::finish_clean_exit(loops, Arc::clone(&quota_cache), store)
-                .await
-                .map_err(ModuleError::Message);
+            Ok(true) => {}
+            Ok(false) => break Ok(()),
+            Err(error) => break Err(error),
         }
         if !profiles_started && !route_epochs.is_empty() {
             // Start only after the first bind ACK is queued, never during store open.
             loops.spawn(
                 "task profile refresh",
                 task_profile_refresh::refresh_loop(
-                    Arc::clone(&store),
+                    Arc::clone(store),
                     override_path.clone(),
                     Arc::clone(&broca_credentials),
                 ),
             );
             profiles_started = true;
         }
-    }
+    };
+    shutdown.begin();
+    let flushed = quota_events::finish_clean_exit(loops, quota_cache, Arc::clone(store))
+        .await
+        .map_err(ModuleError::Message);
+    result.and(flushed)
 }
 
 async fn drain_writer<W>(write_half: W, mut rx: mpsc::Receiver<Frame>) -> Result<(), ModuleError>

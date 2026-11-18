@@ -769,10 +769,9 @@ pub(super) async fn finish_clean_exit(
     loops: crate::background::BackgroundLoops,
     cache: SharedQuotaCache,
     store: SharedStore,
-) -> Result<SharedStore, String> {
+) -> Result<(), String> {
     loops.shutdown().await;
-    flush_snapshot(cache, Arc::clone(&store)).await?;
-    Ok(store)
+    flush_snapshot(cache, store).await
 }
 
 pub(super) async fn run(

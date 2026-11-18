@@ -32,23 +32,12 @@ pub(super) struct BackgroundLoops {
     names: HashMap<tokio::task::Id, &'static str>,
 }
 
-const CLEAN_SHUTDOWN_DRAIN_LIMIT: std::time::Duration = std::time::Duration::from_secs(3);
-
 impl BackgroundLoops {
     /// Stop delivery before the final cache flush. Aborting alone does not wait
     /// for a task already polling to finish its publication and acknowledgement.
     pub(super) async fn shutdown(mut self) {
         self.tasks.abort_all();
-        if tokio::time::timeout(CLEAN_SHUTDOWN_DRAIN_LIMIT, async {
-            while self.tasks.join_next().await.is_some() {}
-        })
-        .await
-        .is_err()
-        {
-            tracing::warn!(
-                "routing clean shutdown background drain timed out; flushing quota cache anyway"
-            );
-        }
+        while self.tasks.join_next().await.is_some() {}
     }
 
     pub(super) fn spawn<F>(&mut self, name: &'static str, task: F)
