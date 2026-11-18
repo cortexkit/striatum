@@ -4434,6 +4434,7 @@ mod tests {
             Ok(())
         }).unwrap();
         drop(old);
+        crate::history::complete_test_upgrade(&descriptor, now);
         let store = SqliteRouteStateStore::open(&descriptor).unwrap();
         let origins = store.fence_rechecks().unwrap();
         assert_eq!(origins.len(), 1);
@@ -4634,6 +4635,7 @@ mod tests {
         old.store.with_conn(|conn| conn.execute("INSERT INTO model_route_state(route_key,capacity_key,provider_id,model_id,updated_at,last_error_at,quota_exhausted_until)
             VALUES ('p/m','p/m','p','m',?1,?1,?2)", params![now-100,now+86_400_000])).unwrap();
         drop(old);
+        crate::history::complete_test_upgrade(&descriptor, now);
         let store = SqliteRouteStateStore::open(&descriptor).unwrap();
         let report = |at, seconds| {
             let id = store

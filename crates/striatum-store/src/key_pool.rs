@@ -640,6 +640,7 @@ mod wall_generation_tests {
         old.store.with_conn(|conn|conn.execute("INSERT INTO pool_key_state(provider,credential_id,walled_until,cooldown_until,updated_at)
             VALUES ('p','key',?1,?1,?2)",params![now+86_400_000,now-100])).unwrap();
         drop(old);
+        crate::history::complete_test_upgrade(&descriptor, now);
         let store = SqliteRouteStateStore::open(&descriptor).unwrap();
         let origins = store.fence_rechecks().unwrap();
         let probe_at = origins.iter().map(|origin| origin.due_at()).max().unwrap();
