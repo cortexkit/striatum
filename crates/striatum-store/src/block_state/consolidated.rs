@@ -1302,8 +1302,12 @@ impl BlockState {
                 let json = serde_json::to_string(value).expect("a string is valid JSON");
                 format!("[{}", &json[..json.len() - 1])
             };
-            let mut sql = conn.prepare_cached(&format!("{} SELECT origin_key FROM block WHERE kind='account' AND origin_key>=?1 AND origin_key<?2 AND source_present=1 ORDER BY origin_key",super::STATE_CHECK))?
-                .query_map([prefix_bound(&prefix),prefix_bound(&upper)],|row| row.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut sql = conn
+                .prepare_cached(&credential_quota_check_sql())?
+                .query_map([prefix_bound(&prefix), prefix_bound(&upper)], |row| {
+                    row.get::<_, String>(0)
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
             let mut state: Vec<_> = self
                 .block_rows()
                 .filter(|row| {
@@ -1580,6 +1584,10 @@ fn success_provider_check_sql() -> String {
     format!("{} {} WHERE fence_id IN (SELECT json_extract(origin_key,'$[0]') FROM block INDEXED BY block_held_provider WHERE {} AND kind='account' AND provider=?1 AND source_present=1)",super::STATE_CHECK,select(2),block_storage::HELD_SQL)
 }
 
+fn credential_quota_check_sql() -> String {
+    format!("{} SELECT origin_key FROM block WHERE kind='account' AND origin_key>=?1 AND origin_key<?2 AND source_present=1 ORDER BY origin_key",super::STATE_CHECK)
+}
+
 fn select(table: usize) -> String {
     match table {
         0 => block_storage::select(),
@@ -1694,7 +1702,7 @@ pub(super) fn reviewed_exempt_reads() -> Vec<String> {
     let mut reads=vec![
         format!("{mark} {} WHERE kind=?1 AND origin_key=?2",select(0)),
         format!("{mark} SELECT {} FROM block WHERE kind=?1 AND origin_key=?2 AND is_origin=1 AND managed=1 AND (cleared_by IS NULL OR cleared_by='kept') AND (source_present=1 OR kind='observation')",block_storage::CLOCK_COLUMNS),
-        format!("{mark} SELECT origin_key FROM block WHERE kind='account' AND origin_key>=?1 AND origin_key<?2 AND source_present=1 ORDER BY origin_key"),
+        credential_quota_check_sql(),
         principal_clock_check_sql(),
         success_provider_check_sql(),
         format!("{mark} {} WHERE kind='principal' AND principal=?1 AND admission_id=?2",select(0)),

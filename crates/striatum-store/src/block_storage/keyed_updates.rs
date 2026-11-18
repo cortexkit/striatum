@@ -15,6 +15,11 @@ pub(crate) fn bind_claim_owner_sql() -> String {
     )
 }
 
+pub(crate) fn operator_account_routes_sql() -> String {
+    "UPDATE block SET source_present=0,cleared_at=?3,cleared_by='removed',claim_owner=NULL
+        WHERE kind IN ('account_route','non_quota_route','transient_route') AND source_present=1 AND provider=?1 AND model=?2".into()
+}
+
 // Use `block_held_credential` here and in the other credential updates below
 // so SQLite seeks by `credential_id` instead of scanning every row of a `kind`.
 pub(crate) fn clear_credential_sql() -> String {

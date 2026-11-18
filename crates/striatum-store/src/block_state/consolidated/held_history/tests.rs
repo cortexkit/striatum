@@ -521,3 +521,121 @@ fn full_provider_check_does_not_materialize_permanent_history_with_zero_or_one_s
         })
         .unwrap();
 }
+
+#[test]
+fn operator_route_clear_seeks_only_held_provider_rows_not_permanent_account_history() {
+    let (_scratch, store, now) = fixture("operator-history-plan");
+    store
+        .with_writer_for_test(|conn| seed_account_history(conn, now))
+        .unwrap();
+    store
+        .with_reader_for_test(|conn| {
+            keyed_plan(
+                conn,
+                &keyed_updates::operator_account_routes_sql(),
+                "block_held_provider",
+            );
+            Ok(())
+        })
+        .unwrap();
+}
+
+fn statement_steps(conn: &Connection, sql: &str) -> rusqlite::Result<(usize, i32)> {
+    let mut statement = conn.prepare(sql)?;
+    let mut rows = statement.query([])?;
+    let mut count = 0;
+    while rows.next()?.is_some() {
+        count += 1;
+    }
+    drop(rows);
+    Ok((
+        count,
+        statement.get_status(rusqlite::StatementStatus::VmStep),
+    ))
+}
+
+#[test]
+fn diagnostic_account_query_visits_only_held_accounts_after_history_growth() {
+    let (_scratch, store, now) = fixture("diagnostic-account-history-plan");
+    let sql = crate::diagnostics::account_blocks_sql();
+    let before = store
+        .with_reader_for_test(|conn| statement_steps(conn, &sql))
+        .unwrap();
+    store
+        .with_writer_for_test(|conn| seed_account_history(conn, now))
+        .unwrap();
+    let after = store
+        .with_reader_for_test(|conn| statement_steps(conn, &sql))
+        .unwrap();
+    eprintln!(
+        "diagnostic account query baseline_vm_steps={} history10000_vm_steps={}",
+        before.1, after.1
+    );
+    assert_eq!(after.0, before.0);
+    assert!(after.1<before.1+1000,"diagnostic routing state must not walk permanently cleared ids: before={before:?},after={after:?}");
+    store
+        .with_reader_for_test(|conn| {
+            let steps = plan(conn, &sql);
+            assert!(
+                steps
+                    .iter()
+                    .any(|step| step.contains("SEARCH block")
+                        && step.contains("block_held_identity")),
+                "active account diagnosis must search the held-kind index: {steps:?}"
+            );
+            Ok(())
+        })
+        .unwrap();
+}
+
+fn credential_check_vm_steps(conn: &Connection, key: &str) -> rusqlite::Result<usize> {
+    let state = BlockState::load(conn)?;
+    let steps = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = steps.clone();
+    conn.progress_handler(
+        1,
+        Some(move || {
+            counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            false
+        }),
+    );
+    let result = state.check_source(conn, "credential", key, "cpu-provider-0");
+    conn.progress_handler(0, None::<fn() -> bool>);
+    result?;
+    Ok(steps.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+#[test]
+fn credential_quota_prefix_check_does_not_walk_its_own_permanent_history() {
+    let (_scratch, store, now) = fixture("credential-prefix-history-plan");
+    let key = serde_json::json!(["cpu-provider-0", "oauth:cpu-0"]).to_string();
+    let before = store
+        .with_reader_for_test(|conn| credential_check_vm_steps(conn, &key))
+        .unwrap();
+    store.with_writer_for_test(|conn| {
+        seed_account_history(conn,now)?;
+        let prefix=format!("credential-quota:{key}:");
+        conn.execute("UPDATE block SET origin_key=json_array(?1||json_extract(origin_key,'$[0]')) WHERE kind='account' AND source_present=0 AND cleared_by='kept' AND json_extract(origin_key,'$[0]') LIKE 'history-%'",[prefix])?;
+        Ok(())
+    }).unwrap();
+    let after = store
+        .with_reader_for_test(|conn| credential_check_vm_steps(conn, &key))
+        .unwrap();
+    eprintln!(
+        "credential prefix whole check baseline_vm_steps={before} history10000_vm_steps={after}"
+    );
+    assert!(after<before+1000,"a credential's own cleared quota ids are permanent history too: before={before},after={after}");
+    store
+        .with_reader_for_test(|conn| {
+            let steps = plan(conn, &credential_quota_check_sql());
+            assert!(
+                steps.iter().any(|step| step.contains("SEARCH block")
+                    && step.contains("block_held_identity")
+                    && step.contains("origin_key>?")
+                    && step.contains("origin_key<?")),
+                "the credential prefix must keep both bounds on a held-row range seek: {steps:?}"
+            );
+            Ok(())
+        })
+        .unwrap();
+}

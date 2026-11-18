@@ -16,11 +16,12 @@ fn retirement_prune_keeps_young_and_nonretirement_tombstones() {
         Ok(())
     })).unwrap();
     let outside = rig.store.block_writes_outside_command();
+    // The count includes both the retired block and its retirement archive row.
     assert_eq!(
         rig.store
             .prune_retired_fence_origins(now - 30 * day, 10)
             .unwrap(),
-        1
+        2
     );
     assert_eq!(rig.store.block_writes_outside_command(), outside);
     assert_eq!(rig.published(), rig.fresh());
