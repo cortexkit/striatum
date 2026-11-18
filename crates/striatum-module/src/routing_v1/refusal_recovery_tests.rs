@@ -34,8 +34,9 @@ fn provider_reset(provider: i64) -> i64 {
 }
 
 /// Every account at its weekly limit, except those of `spared` (a provider
-/// number), which keep the fixture's readings. The fixture's billing fences
-/// stay on most accounts.
+/// number), which keep the fixture's readings. Most accounts also keep the
+/// `billing_exhausted` credential refusal that `build_fixture` records, so a
+/// refusal mixes quota limits with credential refusals.
 fn walled_fixture(
     catalog_facts: usize,
     listed_credentials: usize,
