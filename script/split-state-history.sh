@@ -196,7 +196,7 @@ def main(args):
         subprocess.run([args.verifier, str(original), str(state_stage), str(args.now_ms)], check=True)
 
         for path, namespace, expected_version, binding_table in (
-            (state_stage, 'route_state', 98, 'history_layout'),
+            (state_stage, 'route_state', 99, 'history_layout'),
             (history_stage, 'route_history', 1, 'history_binding'),
         ):
             identity(path)
