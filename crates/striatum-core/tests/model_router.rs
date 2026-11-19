@@ -4428,7 +4428,7 @@ fn subscription_scenario(
     margin: f64,
     agent: &str,
 ) -> SelectModelRouteInput<'static> {
-    use striatum_core::subscription::{MeasuredValue, SubscriptionPool};
+    use striatum_core::subscription::{MeasuredValue, PlanMeasurements, SubscriptionPool};
     let mut facts = vec![
         fact(FactBuilder {
             provider_id: "anthropic".into(),
@@ -4480,11 +4480,11 @@ fn subscription_scenario(
             ]
         };
         for plan in &mut plans {
-            plan.measured = Some(MeasuredValue {
+            plan.measured = Some(PlanMeasurements::from_latest(MeasuredValue {
                 multiplier: if claude { 38.1 } else { 18.7 },
                 interval_end_ms: 999_999,
                 row_date: "2026-10-09".into(),
-            });
+            }));
         }
         snapshot.by_capacity.insert(
             make_capacity_key(&f.provider_id, &f.model_id),
@@ -4768,8 +4768,8 @@ fn subscription_stale_or_absent_measurement_uses_operator_then_one() {
                 .unwrap();
             let pool = std::sync::Arc::make_mut(runtime.subscription_pool.as_mut().unwrap());
             if stale {
-                pool.plans[0].measured.as_mut().unwrap().interval_end_ms =
-                    pool.now_ms - ASTRO_MAX_AGE_MS;
+                let measured = pool.plans[0].measured.as_mut().unwrap();
+                measured.latest.as_mut().unwrap().interval_end_ms = pool.now_ms - ASTRO_MAX_AGE_MS;
             } else {
                 pool.plans[0].measured = None;
             }
@@ -4793,7 +4793,7 @@ fn subscription_stale_or_absent_measurement_uses_operator_then_one() {
 fn subscription_task_cost_examples_and_api_list_cost() {
     use striatum_core::billing::{BillingPlane, BillingRate};
     use striatum_core::routing_config::COST_REFERENCE_PER_MTOK;
-    use striatum_core::subscription::{MeasuredValue, SubscriptionPool};
+    use striatum_core::subscription::{MeasuredValue, PlanMeasurements, SubscriptionPool};
     for (provider, model, list, multiplier, expected) in [
         (
             "openai",
@@ -4843,11 +4843,11 @@ fn subscription_task_cost_examples_and_api_list_cost() {
                         provider: provider.into(),
                         plans: vec![{
                             let mut plan = subscription_plan("plan", 200.0, &[]);
-                            plan.measured = Some(MeasuredValue {
+                            plan.measured = Some(PlanMeasurements::from_latest(MeasuredValue {
                                 multiplier: multiplier.unwrap_or(99.0),
                                 interval_end_ms: 999_999,
                                 row_date: "2026-10-09".into(),
-                            });
+                            }));
                             plan
                         }],
                         now_ms: 1_000_000,
@@ -4922,7 +4922,7 @@ fn subscription_close_economic_prices_preserve_quality_tiebreak() {
         .unwrap();
     let pool = std::sync::Arc::make_mut(runtime.subscription_pool.as_mut().unwrap());
     let mut measured = pool.plans[0].measured.clone().unwrap();
-    measured.multiplier = 30.2;
+    measured.latest.as_mut().unwrap().multiplier = 30.2;
     pool.plans = vec![subscription_plan("pro_200", 200.0, &[3.0])];
     pool.plans[0].measured = Some(measured);
     let selected = select_model_route(input).unwrap();
