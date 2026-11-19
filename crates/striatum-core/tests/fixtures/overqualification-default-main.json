@@ -60,6 +60,7 @@
             "bankedResetsApplied": 0,
             "keepFreePercent": 0.0,
             "listCostUsd": 4.6,
+            "pacing": "max",
             "planPressure": 175.78124999999997,
             "planTier": "scenario",
             "planValues": [
@@ -73,13 +74,15 @@
             ],
             "priceUnit": "task",
             "valueMultiplier": 38.1,
-            "valueSource": "operator override"
+            "valueSource": "operator override",
+            "weeklyPressure": 175.78124999999997
           },
           "taskPricing": {
             "finalCostUsd": 21.222933070866137,
             "listCostUsd": 4.6,
             "normalizedCost": 424.45866141732273,
             "omittedDimensions": [],
+            "pacing": "max",
             "pressure": 175.78124999999997,
             "priceUnit": "task",
             "profile": {
@@ -105,7 +108,8 @@
             },
             "unpricedDimensions": [],
             "valueMultiplier": 38.1,
-            "valueSource": "operator override"
+            "valueSource": "operator override",
+            "weeklyPressure": 175.78124999999997
           }
         },
         "pricingMode": "basket",
@@ -172,6 +176,7 @@
             "bankedResetsApplied": 0,
             "keepFreePercent": 0.0,
             "listCostUsd": 4.6,
+            "pacing": "max",
             "planPressure": 175.78124999999997,
             "planTier": "scenario",
             "planValues": [
@@ -185,13 +190,15 @@
             ],
             "priceUnit": "task",
             "valueMultiplier": 38.1,
-            "valueSource": "operator override"
+            "valueSource": "operator override",
+            "weeklyPressure": 175.78124999999997
           },
           "taskPricing": {
             "finalCostUsd": 21.222933070866137,
             "listCostUsd": 4.6,
             "normalizedCost": 424.45866141732273,
             "omittedDimensions": [],
+            "pacing": "max",
             "pressure": 175.78124999999997,
             "priceUnit": "task",
             "profile": {
@@ -217,7 +224,8 @@
             },
             "unpricedDimensions": [],
             "valueMultiplier": 38.1,
-            "valueSource": "operator override"
+            "valueSource": "operator override",
+            "weeklyPressure": 175.78124999999997
           }
         },
         "pricingMode": "basket",
@@ -284,6 +292,7 @@
             "bankedResetsApplied": 0,
             "keepFreePercent": 0.0,
             "listCostUsd": 4.6,
+            "pacing": "max",
             "planPressure": 175.78124999999997,
             "planTier": "scenario",
             "planValues": [
@@ -297,13 +306,15 @@
             ],
             "priceUnit": "task",
             "valueMultiplier": 38.1,
-            "valueSource": "operator override"
+            "valueSource": "operator override",
+            "weeklyPressure": 175.78124999999997
           },
           "taskPricing": {
             "finalCostUsd": 21.222933070866137,
             "listCostUsd": 4.6,
             "normalizedCost": 424.45866141732273,
             "omittedDimensions": [],
+            "pacing": "max",
             "pressure": 175.78124999999997,
             "priceUnit": "task",
             "profile": {
@@ -329,7 +340,8 @@
             },
             "unpricedDimensions": [],
             "valueMultiplier": 38.1,
-            "valueSource": "operator override"
+            "valueSource": "operator override",
+            "weeklyPressure": 175.78124999999997
           }
         },
         "pricingMode": "basket",
@@ -396,6 +408,7 @@
             "bankedResetsApplied": 0,
             "keepFreePercent": 0.0,
             "listCostUsd": 4.6,
+            "pacing": "max",
             "planPressure": 175.78124999999997,
             "planTier": "scenario",
             "planValues": [
@@ -409,13 +422,15 @@
             ],
             "priceUnit": "task",
             "valueMultiplier": 38.1,
-            "valueSource": "operator override"
+            "valueSource": "operator override",
+            "weeklyPressure": 175.78124999999997
           },
           "taskPricing": {
             "finalCostUsd": 21.222933070866137,
             "listCostUsd": 4.6,
             "normalizedCost": 424.45866141732273,
             "omittedDimensions": [],
+            "pacing": "max",
             "pressure": 175.78124999999997,
             "priceUnit": "task",
             "profile": {
@@ -441,7 +456,8 @@
             },
             "unpricedDimensions": [],
             "valueMultiplier": 38.1,
-            "valueSource": "operator override"
+            "valueSource": "operator override",
+            "weeklyPressure": 175.78124999999997
           }
         },
         "pricingMode": "basket",
@@ -508,6 +524,7 @@
             "bankedResetsApplied": 0,
             "keepFreePercent": 0.0,
             "listCostUsd": 4.6,
+            "pacing": "max",
             "planPressure": 175.78124999999997,
             "planTier": "scenario",
             "planValues": [
@@ -521,13 +538,15 @@
             ],
             "priceUnit": "task",
             "valueMultiplier": 38.1,
-            "valueSource": "operator override"
+            "valueSource": "operator override",
+            "weeklyPressure": 175.78124999999997
           },
           "taskPricing": {
             "finalCostUsd": 21.222933070866137,
             "listCostUsd": 4.6,
             "normalizedCost": 424.45866141732273,
             "omittedDimensions": [],
+            "pacing": "max",
             "pressure": 175.78124999999997,
             "priceUnit": "task",
             "profile": {
@@ -553,7 +572,8 @@
             },
             "unpricedDimensions": [],
             "valueMultiplier": 38.1,
-            "valueSource": "operator override"
+            "valueSource": "operator override",
+            "weeklyPressure": 175.78124999999997
           }
         },
         "pricingMode": "basket",
@@ -619,6 +639,7 @@
             "bankedResetsApplied": 0,
             "keepFreePercent": 0.0,
             "listCostUsd": 4.6,
+            "pacing": "max",
             "planPressure": 175.78124999999997,
             "planTier": "scenario",
             "planValues": [
@@ -632,13 +653,15 @@
             ],
             "priceUnit": "task",
             "valueMultiplier": 38.1,
-            "valueSource": "operator override"
+            "valueSource": "operator override",
+            "weeklyPressure": 175.78124999999997
           },
           "taskPricing": {
             "finalCostUsd": 21.222933070866137,
             "listCostUsd": 4.6,
             "normalizedCost": 424.45866141732273,
             "omittedDimensions": [],
+            "pacing": "max",
             "pressure": 175.78124999999997,
             "priceUnit": "task",
             "profile": {
@@ -664,7 +687,8 @@
             },
             "unpricedDimensions": [],
             "valueMultiplier": 38.1,
-            "valueSource": "operator override"
+            "valueSource": "operator override",
+            "weeklyPressure": 175.78124999999997
           }
         },
         "pricingMode": "basket",
@@ -730,6 +754,7 @@
             "bankedResetsApplied": 0,
             "keepFreePercent": 0.0,
             "listCostUsd": 4.6,
+            "pacing": "max",
             "planPressure": 175.78124999999997,
             "planTier": "scenario",
             "planValues": [
@@ -743,13 +768,15 @@
             ],
             "priceUnit": "task",
             "valueMultiplier": 38.1,
-            "valueSource": "operator override"
+            "valueSource": "operator override",
+            "weeklyPressure": 175.78124999999997
           },
           "taskPricing": {
             "finalCostUsd": 21.222933070866137,
             "listCostUsd": 4.6,
             "normalizedCost": 424.45866141732273,
             "omittedDimensions": [],
+            "pacing": "max",
             "pressure": 175.78124999999997,
             "priceUnit": "task",
             "profile": {
@@ -775,7 +802,8 @@
             },
             "unpricedDimensions": [],
             "valueMultiplier": 38.1,
-            "valueSource": "operator override"
+            "valueSource": "operator override",
+            "weeklyPressure": 175.78124999999997
           }
         },
         "pricingMode": "basket",
@@ -840,6 +868,7 @@
             "bankedResetsApplied": 0,
             "keepFreePercent": 0.0,
             "listCostUsd": 4.6,
+            "pacing": "max",
             "planPressure": 175.78124999999997,
             "planTier": "scenario",
             "planValues": [
@@ -853,13 +882,15 @@
             ],
             "priceUnit": "task",
             "valueMultiplier": 38.1,
-            "valueSource": "operator override"
+            "valueSource": "operator override",
+            "weeklyPressure": 175.78124999999997
           },
           "taskPricing": {
             "finalCostUsd": 21.222933070866137,
             "listCostUsd": 4.6,
             "normalizedCost": 424.45866141732273,
             "omittedDimensions": [],
+            "pacing": "max",
             "pressure": 175.78124999999997,
             "priceUnit": "task",
             "profile": {
@@ -885,7 +916,8 @@
             },
             "unpricedDimensions": [],
             "valueMultiplier": 38.1,
-            "valueSource": "operator override"
+            "valueSource": "operator override",
+            "weeklyPressure": 175.78124999999997
           }
         },
         "pricingMode": "basket",
@@ -950,6 +982,7 @@
             "bankedResetsApplied": 0,
             "keepFreePercent": 0.0,
             "listCostUsd": 4.6,
+            "pacing": "max",
             "planPressure": 175.78124999999997,
             "planTier": "scenario",
             "planValues": [
@@ -963,13 +996,15 @@
             ],
             "priceUnit": "task",
             "valueMultiplier": 38.1,
-            "valueSource": "operator override"
+            "valueSource": "operator override",
+            "weeklyPressure": 175.78124999999997
           },
           "taskPricing": {
             "finalCostUsd": 21.222933070866137,
             "listCostUsd": 4.6,
             "normalizedCost": 424.45866141732273,
             "omittedDimensions": [],
+            "pacing": "max",
             "pressure": 175.78124999999997,
             "priceUnit": "task",
             "profile": {
@@ -995,7 +1030,8 @@
             },
             "unpricedDimensions": [],
             "valueMultiplier": 38.1,
-            "valueSource": "operator override"
+            "valueSource": "operator override",
+            "weeklyPressure": 175.78124999999997
           }
         },
         "pricingMode": "basket",
@@ -1060,6 +1096,7 @@
             "bankedResetsApplied": 0,
             "keepFreePercent": 0.0,
             "listCostUsd": 4.6,
+            "pacing": "max",
             "planPressure": 175.78124999999997,
             "planTier": "scenario",
             "planValues": [
@@ -1073,13 +1110,15 @@
             ],
             "priceUnit": "task",
             "valueMultiplier": 38.1,
-            "valueSource": "operator override"
+            "valueSource": "operator override",
+            "weeklyPressure": 175.78124999999997
           },
           "taskPricing": {
             "finalCostUsd": 21.222933070866137,
             "listCostUsd": 4.6,
             "normalizedCost": 424.45866141732273,
             "omittedDimensions": [],
+            "pacing": "max",
             "pressure": 175.78124999999997,
             "priceUnit": "task",
             "profile": {
@@ -1105,7 +1144,8 @@
             },
             "unpricedDimensions": [],
             "valueMultiplier": 38.1,
-            "valueSource": "operator override"
+            "valueSource": "operator override",
+            "weeklyPressure": 175.78124999999997
           }
         },
         "pricingMode": "basket",
@@ -1172,6 +1212,7 @@
             "bankedResetsApplied": 0,
             "keepFreePercent": 0.0,
             "listCostUsd": 0.24000000000000002,
+            "pacing": "max",
             "planPressure": 175.78124999999997,
             "planTier": "scenario",
             "planValues": [
@@ -1185,13 +1226,15 @@
             ],
             "priceUnit": "task",
             "valueMultiplier": 38.1,
-            "valueSource": "operator override"
+            "valueSource": "operator override",
+            "weeklyPressure": 175.78124999999997
           },
           "taskPricing": {
             "finalCostUsd": 1.107283464566929,
             "listCostUsd": 0.24000000000000002,
             "normalizedCost": 22.145669291338578,
             "omittedDimensions": [],
+            "pacing": "max",
             "pressure": 175.78124999999997,
             "priceUnit": "task",
             "profile": {
@@ -1217,7 +1260,8 @@
             },
             "unpricedDimensions": [],
             "valueMultiplier": 38.1,
-            "valueSource": "operator override"
+            "valueSource": "operator override",
+            "weeklyPressure": 175.78124999999997
           }
         },
         "pricingMode": "basket",
@@ -1284,6 +1328,7 @@
             "bankedResetsApplied": 0,
             "keepFreePercent": 0.0,
             "listCostUsd": 0.24000000000000002,
+            "pacing": "max",
             "planPressure": 175.78124999999997,
             "planTier": "scenario",
             "planValues": [
@@ -1297,13 +1342,15 @@
             ],
             "priceUnit": "task",
             "valueMultiplier": 38.1,
-            "valueSource": "operator override"
+            "valueSource": "operator override",
+            "weeklyPressure": 175.78124999999997
           },
           "taskPricing": {
             "finalCostUsd": 1.107283464566929,
             "listCostUsd": 0.24000000000000002,
             "normalizedCost": 22.145669291338578,
             "omittedDimensions": [],
+            "pacing": "max",
             "pressure": 175.78124999999997,
             "priceUnit": "task",
             "profile": {
@@ -1329,7 +1376,8 @@
             },
             "unpricedDimensions": [],
             "valueMultiplier": 38.1,
-            "valueSource": "operator override"
+            "valueSource": "operator override",
+            "weeklyPressure": 175.78124999999997
           }
         },
         "pricingMode": "basket",
@@ -1396,6 +1444,7 @@
             "bankedResetsApplied": 0,
             "keepFreePercent": 0.0,
             "listCostUsd": 0.24000000000000002,
+            "pacing": "max",
             "planPressure": 175.78124999999997,
             "planTier": "scenario",
             "planValues": [
@@ -1409,13 +1458,15 @@
             ],
             "priceUnit": "task",
             "valueMultiplier": 38.1,
-            "valueSource": "operator override"
+            "valueSource": "operator override",
+            "weeklyPressure": 175.78124999999997
           },
           "taskPricing": {
             "finalCostUsd": 1.107283464566929,
             "listCostUsd": 0.24000000000000002,
             "normalizedCost": 22.145669291338578,
             "omittedDimensions": [],
+            "pacing": "max",
             "pressure": 175.78124999999997,
             "priceUnit": "task",
             "profile": {
@@ -1441,7 +1492,8 @@
             },
             "unpricedDimensions": [],
             "valueMultiplier": 38.1,
-            "valueSource": "operator override"
+            "valueSource": "operator override",
+            "weeklyPressure": 175.78124999999997
           }
         },
         "pricingMode": "basket",
@@ -1508,6 +1560,7 @@
             "bankedResetsApplied": 0,
             "keepFreePercent": 0.0,
             "listCostUsd": 0.24000000000000002,
+            "pacing": "max",
             "planPressure": 175.78124999999997,
             "planTier": "scenario",
             "planValues": [
@@ -1521,13 +1574,15 @@
             ],
             "priceUnit": "task",
             "valueMultiplier": 38.1,
-            "valueSource": "operator override"
+            "valueSource": "operator override",
+            "weeklyPressure": 175.78124999999997
           },
           "taskPricing": {
             "finalCostUsd": 1.107283464566929,
             "listCostUsd": 0.24000000000000002,
             "normalizedCost": 22.145669291338578,
             "omittedDimensions": [],
+            "pacing": "max",
             "pressure": 175.78124999999997,
             "priceUnit": "task",
             "profile": {
@@ -1553,7 +1608,8 @@
             },
             "unpricedDimensions": [],
             "valueMultiplier": 38.1,
-            "valueSource": "operator override"
+            "valueSource": "operator override",
+            "weeklyPressure": 175.78124999999997
           }
         },
         "pricingMode": "basket",
@@ -1620,6 +1676,7 @@
             "bankedResetsApplied": 0,
             "keepFreePercent": 0.0,
             "listCostUsd": 0.24000000000000002,
+            "pacing": "max",
             "planPressure": 175.78124999999997,
             "planTier": "scenario",
             "planValues": [
@@ -1633,13 +1690,15 @@
             ],
             "priceUnit": "task",
             "valueMultiplier": 38.1,
-            "valueSource": "operator override"
+            "valueSource": "operator override",
+            "weeklyPressure": 175.78124999999997
           },
           "taskPricing": {
             "finalCostUsd": 1.107283464566929,
             "listCostUsd": 0.24000000000000002,
             "normalizedCost": 22.145669291338578,
             "omittedDimensions": [],
+            "pacing": "max",
             "pressure": 175.78124999999997,
             "priceUnit": "task",
             "profile": {
@@ -1665,7 +1724,8 @@
             },
             "unpricedDimensions": [],
             "valueMultiplier": 38.1,
-            "valueSource": "operator override"
+            "valueSource": "operator override",
+            "weeklyPressure": 175.78124999999997
           }
         },
         "pricingMode": "basket",
@@ -1731,6 +1791,7 @@
             "bankedResetsApplied": 0,
             "keepFreePercent": 0.0,
             "listCostUsd": 0.24000000000000002,
+            "pacing": "max",
             "planPressure": 175.78124999999997,
             "planTier": "scenario",
             "planValues": [
@@ -1744,13 +1805,15 @@
             ],
             "priceUnit": "task",
             "valueMultiplier": 38.1,
-            "valueSource": "operator override"
+            "valueSource": "operator override",
+            "weeklyPressure": 175.78124999999997
           },
           "taskPricing": {
             "finalCostUsd": 1.107283464566929,
             "listCostUsd": 0.24000000000000002,
             "normalizedCost": 22.145669291338578,
             "omittedDimensions": [],
+            "pacing": "max",
             "pressure": 175.78124999999997,
             "priceUnit": "task",
             "profile": {
@@ -1776,7 +1839,8 @@
             },
             "unpricedDimensions": [],
             "valueMultiplier": 38.1,
-            "valueSource": "operator override"
+            "valueSource": "operator override",
+            "weeklyPressure": 175.78124999999997
           }
         },
         "pricingMode": "basket",
@@ -1842,6 +1906,7 @@
             "bankedResetsApplied": 0,
             "keepFreePercent": 0.0,
             "listCostUsd": 0.24000000000000002,
+            "pacing": "max",
             "planPressure": 175.78124999999997,
             "planTier": "scenario",
             "planValues": [
@@ -1855,13 +1920,15 @@
             ],
             "priceUnit": "task",
             "valueMultiplier": 38.1,
-            "valueSource": "operator override"
+            "valueSource": "operator override",
+            "weeklyPressure": 175.78124999999997
           },
           "taskPricing": {
             "finalCostUsd": 1.107283464566929,
             "listCostUsd": 0.24000000000000002,
             "normalizedCost": 22.145669291338578,
             "omittedDimensions": [],
+            "pacing": "max",
             "pressure": 175.78124999999997,
             "priceUnit": "task",
             "profile": {
@@ -1887,7 +1954,8 @@
             },
             "unpricedDimensions": [],
             "valueMultiplier": 38.1,
-            "valueSource": "operator override"
+            "valueSource": "operator override",
+            "weeklyPressure": 175.78124999999997
           }
         },
         "pricingMode": "basket",
@@ -1952,6 +2020,7 @@
             "bankedResetsApplied": 0,
             "keepFreePercent": 0.0,
             "listCostUsd": 0.24000000000000002,
+            "pacing": "max",
             "planPressure": 175.78124999999997,
             "planTier": "scenario",
             "planValues": [
@@ -1965,13 +2034,15 @@
             ],
             "priceUnit": "task",
             "valueMultiplier": 38.1,
-            "valueSource": "operator override"
+            "valueSource": "operator override",
+            "weeklyPressure": 175.78124999999997
           },
           "taskPricing": {
             "finalCostUsd": 1.107283464566929,
             "listCostUsd": 0.24000000000000002,
             "normalizedCost": 22.145669291338578,
             "omittedDimensions": [],
+            "pacing": "max",
             "pressure": 175.78124999999997,
             "priceUnit": "task",
             "profile": {
@@ -1997,7 +2068,8 @@
             },
             "unpricedDimensions": [],
             "valueMultiplier": 38.1,
-            "valueSource": "operator override"
+            "valueSource": "operator override",
+            "weeklyPressure": 175.78124999999997
           }
         },
         "pricingMode": "basket",
@@ -2062,6 +2134,7 @@
             "bankedResetsApplied": 0,
             "keepFreePercent": 0.0,
             "listCostUsd": 0.24000000000000002,
+            "pacing": "max",
             "planPressure": 175.78124999999997,
             "planTier": "scenario",
             "planValues": [
@@ -2075,13 +2148,15 @@
             ],
             "priceUnit": "task",
             "valueMultiplier": 38.1,
-            "valueSource": "operator override"
+            "valueSource": "operator override",
+            "weeklyPressure": 175.78124999999997
           },
           "taskPricing": {
             "finalCostUsd": 1.107283464566929,
             "listCostUsd": 0.24000000000000002,
             "normalizedCost": 22.145669291338578,
             "omittedDimensions": [],
+            "pacing": "max",
             "pressure": 175.78124999999997,
             "priceUnit": "task",
             "profile": {
@@ -2107,7 +2182,8 @@
             },
             "unpricedDimensions": [],
             "valueMultiplier": 38.1,
-            "valueSource": "operator override"
+            "valueSource": "operator override",
+            "weeklyPressure": 175.78124999999997
           }
         },
         "pricingMode": "basket",
@@ -2172,6 +2248,7 @@
             "bankedResetsApplied": 0,
             "keepFreePercent": 0.0,
             "listCostUsd": 0.24000000000000002,
+            "pacing": "max",
             "planPressure": 175.78124999999997,
             "planTier": "scenario",
             "planValues": [
@@ -2185,13 +2262,15 @@
             ],
             "priceUnit": "task",
             "valueMultiplier": 38.1,
-            "valueSource": "operator override"
+            "valueSource": "operator override",
+            "weeklyPressure": 175.78124999999997
           },
           "taskPricing": {
             "finalCostUsd": 1.107283464566929,
             "listCostUsd": 0.24000000000000002,
             "normalizedCost": 22.145669291338578,
             "omittedDimensions": [],
+            "pacing": "max",
             "pressure": 175.78124999999997,
             "priceUnit": "task",
             "profile": {
@@ -2217,7 +2296,8 @@
             },
             "unpricedDimensions": [],
             "valueMultiplier": 38.1,
-            "valueSource": "operator override"
+            "valueSource": "operator override",
+            "weeklyPressure": 175.78124999999997
           }
         },
         "pricingMode": "basket",
