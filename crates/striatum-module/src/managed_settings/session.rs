@@ -7,13 +7,13 @@ use serde_json::Value;
 use subc_client_rs::config::{
     ConfigAppliedRequest, ConfigApplyResult, ConfigChanged, ConfigError, ConfigGetReply,
     ConfigGetRequest, ConfigReviewRequest, ConfigStatus, ConfigView, CONFIG_APPLIED_OP,
-    CONFIG_CHANGED_OP, CONFIG_DECLARE_OP, CONFIG_GATE_CAPABILITY, CONFIG_GET_OP, CONFIG_REVIEW_OP,
+    CONFIG_CHANGED_OP, CONFIG_DECLARE_OP, CONFIG_GET_OP, CONFIG_REVIEW_OP,
 };
 use tokio::sync::{mpsc, oneshot, Notify};
 use tokio::task::JoinHandle;
 
 use super::Settings;
-use crate::{control_flags, send, ErrorBody, Frame, FrameType, ModuleError, ModuleHelloAckBody};
+use crate::{control_flags, send, ErrorBody, Frame, FrameType, ModuleError};
 
 pub(crate) const WAITING: &str = "waiting for the daemon's settings view";
 const CALL_TIMEOUT: Duration = Duration::from_secs(10);
@@ -25,24 +25,12 @@ pub(crate) struct Session {
 }
 
 impl Session {
-    pub(crate) async fn start(
-        enabled: bool,
+    pub(crate) fn start(
         module_id: &str,
         path: &Path,
-        ack: &ModuleHelloAckBody,
+        negotiated_ver: u8,
         writer: &mpsc::Sender<Frame>,
-    ) -> Result<Option<Self>, ModuleError> {
-        if !enabled {
-            return Ok(None);
-        }
-        if !ack
-            .subc_capabilities
-            .iter()
-            .any(|capability| capability == CONFIG_GATE_CAPABILITY)
-        {
-            load_files(path).await?;
-            return Ok(None);
-        }
+    ) -> Result<Self, ModuleError> {
         let settings = Settings {
             module_id: module_id.into(),
             path: path.into(),
@@ -50,7 +38,7 @@ impl Session {
         let declaration = settings.config_declaration()?;
         let wire = Arc::new(Wire {
             settings: Arc::new(settings),
-            ver: ack.negotiated_ver,
+            ver: negotiated_ver,
             writer: writer.clone(),
             pending: Mutex::new(None),
             changed: Notify::new(),
@@ -65,26 +53,38 @@ impl Session {
         };
         crate::info_operator(format!("[striatum] {WAITING}"));
         let task = tokio::spawn(async move {
-            match driver.call(CONFIG_DECLARE_OP, &declaration).await {
-                Ok(_) => driver.refresh().await,
+            let declared = match driver.call(CONFIG_DECLARE_OP, &declaration).await {
+                Ok(_) => true,
                 Err(ConfigError::Refused(refusal)) => {
                     // Older deployments can advertise the gate before accepting routing's schema.
                     crate::warn_operator(format!(
                         "[striatum] config.declare refused ({}: {}); keeping the routing settings file reader",
                         refusal.code, refusal.message,
                     ));
+                    crate::info_operator(
+                        "[striatum] settings source: file (daemon refused config.declare)".into(),
+                    );
                     let result = load_files(&driver.wire.settings.path).await;
                     driver.finish_wait(result);
                     return;
                 }
-                Err(error) => log_error(CONFIG_DECLARE_OP, &error),
+                Err(error) => {
+                    log_error(CONFIG_DECLARE_OP, &error);
+                    false
+                }
+            };
+            crate::info_operator(
+                "[striatum] settings source: managed (daemon advertised config.gate)".into(),
+            );
+            if declared {
+                driver.refresh().await;
             }
             loop {
                 driver.wire.changed.notified().await;
                 driver.refresh().await;
             }
         });
-        Ok(Some(Self { wire, ready, task }))
+        Ok(Self { wire, ready, task })
     }
 
     /// Route only channel-0 settings messages to the driver. Review and apply

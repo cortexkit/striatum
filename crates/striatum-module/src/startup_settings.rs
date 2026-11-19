@@ -14,14 +14,10 @@ pub(super) fn check_config_at(path: &Path) -> Result<(), ModuleError> {
 pub(super) struct ModuleConfig {
     pub(super) connection_file_path: PathBuf,
     pub(super) module_id: String,
-    pub(super) managed_settings: bool,
 }
 
 impl ModuleConfig {
-    pub(super) fn from_env(
-        connection_file_path: PathBuf,
-        managed_settings: bool,
-    ) -> Result<Self, ModuleError> {
+    pub(super) fn from_env(connection_file_path: PathBuf) -> Result<Self, ModuleError> {
         let module_id = std::env::var(SUBC_MODULE_ID_ENV)
             .ok()
             .filter(|v| !v.trim().is_empty())
@@ -29,7 +25,6 @@ impl ModuleConfig {
         Ok(Self {
             connection_file_path,
             module_id,
-            managed_settings,
         })
     }
 }

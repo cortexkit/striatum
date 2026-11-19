@@ -34,7 +34,7 @@ pub(super) async fn async_main(
     // so a child spawned earlier would receive it. The result is cached for
     // the process; HELLO and the credential route read that cached answer.
     let _ = subc_os::launch_nonce();
-    let (connection_file_path, managed_settings) = match parse_startup_mode(args)? {
+    let connection_file_path = match parse_startup_mode(args)? {
         StartupMode::PrintManifest => return print_manifest(),
         StartupMode::CheckConfig => {
             let path = config_overrides::config_path();
@@ -56,10 +56,9 @@ pub(super) async fn async_main(
         } => return account_quota_dry_run(connection_file_path, capture_dir).await,
         StartupMode::Serve {
             connection_file_path,
-            managed_settings,
-        } => (connection_file_path, managed_settings),
+        } => connection_file_path,
     };
-    let config = ModuleConfig::from_env(connection_file_path, managed_settings)?;
+    let config = ModuleConfig::from_env(connection_file_path)?;
     let result = run(config, shutdown, store).await;
     shutdown.begin();
     result
@@ -78,7 +77,6 @@ pub(super) enum StartupMode {
     },
     Serve {
         connection_file_path: PathBuf,
-        managed_settings: bool,
     },
 }
 
@@ -138,6 +136,12 @@ pub(super) fn parse_startup_mode(
     args: impl IntoIterator<Item = OsString>,
 ) -> Result<StartupMode, ModuleError> {
     let args = args.into_iter().collect::<Vec<_>>();
+    if args.iter().any(|arg| arg == "--managed-settings") {
+        return Err(ModuleError::Message(
+            "--managed-settings has been removed; routing now follows the daemon's config.gate capability"
+                .into(),
+        ));
+    }
     if args.iter().any(|arg| arg == "--check-config") {
         return if args.as_slice() == [OsString::from("--check-config")] {
             Ok(StartupMode::CheckConfig)
@@ -178,10 +182,8 @@ pub(super) fn parse_startup_mode(
             capture_dir,
         });
     }
-    let managed_settings = args.iter().any(|arg| arg == "--managed-settings");
     parse_subc_arg(args).map(|connection_file_path| StartupMode::Serve {
         connection_file_path,
-        managed_settings,
     })
 }
 

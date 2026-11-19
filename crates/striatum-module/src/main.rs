@@ -155,6 +155,7 @@ use striatum_core::{
     RequestedModelRequirements, SelectModelRouteInput,
 };
 use striatum_store::{dev_descriptor, DecisionListFilter, SqliteRouteStateStore};
+use subc_client_rs::config::{CONFIG_GATE_CAPABILITY, CONFIG_REVIEW_OP};
 use subc_protocol::manifest::Concurrency;
 use subc_protocol::{
     manifest::{
@@ -283,9 +284,6 @@ async fn run(
     shutdown: &shutdown::Shutdown,
     store: &mut Option<SharedStore>,
 ) -> Result<(), ModuleError> {
-    if !config.managed_settings {
-        check_config_at(&config_overrides::config_path())?;
-    }
     project_settings::initialize(
         &config.connection_file_path,
         &std::env::current_dir().map_err(|error| ModuleError::Message(error.to_string()))?,
@@ -367,6 +365,17 @@ where
 {
     send_hello(&writer, config).await?;
     let ack = expect_hello_ack(&mut read_half).await?;
+    let daemon_has_config_gate = ack
+        .subc_capabilities
+        .iter()
+        .any(|capability| capability == CONFIG_GATE_CAPABILITY);
+    let config_path = config_overrides::config_path();
+    if !daemon_has_config_gate {
+        info_operator(
+            "[striatum] settings source: file (daemon did not advertise config.gate)".into(),
+        );
+        check_config_at(&config_path)?;
+    }
 
     // Open the route-state store from the daemon-delivered descriptor (or the dev
     // fallback). Opening acquires the single-writer lease and runs migrations (the
@@ -393,7 +402,6 @@ where
     // Variant overrides name efforts the catalog must publish. Config loaded
     // before the store opened got only shape checks; check it now, and every
     // later reload, against the stored catalog.
-    let config_path = config_overrides::config_path();
     config_overrides::attach_store_catalog(&config_path, store)
         .map_err(|error| ModuleError::Message(format!("{}: {error}", config_path.display())))?;
     // Seed the cache from the last persisted snapshot before anything can serve a
@@ -402,14 +410,16 @@ where
     if let Ok(mut guard) = quota_cache.lock() {
         *guard = restore_quota_cache(store.as_ref());
     }
-    let mut settings = managed_settings::Session::start(
-        config.managed_settings,
-        &config.module_id,
-        &config_path,
-        &ack,
-        &writer,
-    )
-    .await?;
+    let mut settings = if daemon_has_config_gate {
+        Some(managed_settings::Session::start(
+            &config.module_id,
+            &config_path,
+            ack.negotiated_ver,
+            &writer,
+        )?)
+    } else {
+        None
+    };
     let mut route_epochs = RouteEpochs::new();
     let mut read_half = Some(read_half);
     let pending_frame = if let Some(session) = &mut settings {
@@ -540,16 +550,19 @@ async fn send_hello(
     writer: &mpsc::Sender<Frame>,
     config: &ModuleConfig,
 ) -> Result<(), ModuleError> {
-    let mut control_ops = vec![MODULE_CONTROL_OP_HEALTH_CHECK.to_string()];
-    if config.managed_settings {
-        control_ops.push(subc_client_rs::config::CONFIG_REVIEW_OP.to_owned());
-    }
     let body = serde_json::to_vec(&ModuleHelloBody {
         manifest: manifest(&config.module_id),
         protocol_ver: PROTOCOL_VERSION,
         // Advertise health.check: the daemon's prober is capability-gated and only probes
         // modules that DECLARE the op: answering it (handle_control_request) is not enough.
-        control_ops: Some(control_ops),
+        // The daemon likewise requires config.review to be advertised before it can ask
+        // for a review. Mirror subc-client-rs 0.41.1: advertise config.review in HELLO
+        // (src/lib.rs:2829-2844, 3837-3845), then send config.declare only if HELLO_ACK
+        // lists config.gate (src/config.rs:187).
+        control_ops: Some(vec![
+            MODULE_CONTROL_OP_HEALTH_CHECK.to_owned(),
+            CONFIG_REVIEW_OP.to_owned(),
+        ]),
         launch_nonce: hello_launch_nonce()?,
     })
     .map_err(ModuleError::Json)?;

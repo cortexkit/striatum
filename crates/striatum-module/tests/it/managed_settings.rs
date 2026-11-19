@@ -9,7 +9,7 @@ use std::{
 
 use cortexkit_test_support::{fenced_command, stage_test_binary, ScratchDir};
 use serde_json::{json, Value};
-use subc_client_rs::config::{ConfigLayer, ConfigLayerSnapshot};
+use subc_client_rs::config::{ConfigLayer, ConfigLayerSnapshot, CONFIG_GATE_CAPABILITY};
 use subc_protocol::{Flags, Frame, FrameType, ModuleHelloAckBody, Priority};
 use subc_transport::{authenticate_server, read_frame, write_frame};
 use tokio::{
@@ -25,13 +25,14 @@ const EPOCH: u32 = 42;
 struct Rig {
     peer: TcpStream,
     child: Child,
+    hello_control_ops: Value,
     ver: u8,
     config: PathBuf,
     _scratch: ScratchDir,
 }
 
 impl Rig {
-    async fn start(opt_in: bool, cap: bool, file: &str) -> Self {
+    async fn start(cap: bool, file: &str) -> Self {
         let scratch = ScratchDir::new("routing-settings-wire");
         let root = scratch.path();
         let xdg = root.join("conf");
@@ -67,9 +68,6 @@ impl Rig {
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        if opt_in {
-            command.arg("--managed-settings");
-        }
         let mut child = command.spawn().unwrap();
         let (mut peer, _) = tokio::select! {
             accepted = timeout(DEADLINE, listener.accept()) => accepted.expect("routing did not connect").unwrap(),
@@ -80,22 +78,12 @@ impl Rig {
             .unwrap();
         let hello = recv(&mut peer).await;
         assert_eq!(hello.header.ty, FrameType::Hello);
-        let expected = if opt_in {
-            json!(["health.check", "config.review"])
-        } else {
-            json!(["health.check"])
-        };
-        assert_eq!(
-            body(&hello)["control_ops"],
-            expected,
-            "HELLO advertised the wrong control ops"
-        );
         let ver = hello.header.ver;
         let ack = ModuleHelloAckBody {
             negotiated_ver: ver,
             subc_ops: vec![],
             subc_capabilities: if cap {
-                vec!["config.gate".into()]
+                vec![CONFIG_GATE_CAPABILITY.into()]
             } else {
                 vec![]
             },
@@ -111,6 +99,7 @@ impl Rig {
         let mut rig = Self {
             peer,
             child,
+            hello_control_ops: body(&hello)["control_ops"].clone(),
             ver,
             config,
             _scratch: scratch,
@@ -165,6 +154,7 @@ impl Rig {
 
     async fn declare(&mut self) -> Frame {
         let declare = self.request("config.declare").await;
+        self.assert_review_advertised();
         let declaration = body(&declare);
         let schema: Value =
             serde_json::from_str(include_str!("../../routing-config.schema.json")).unwrap();
@@ -172,6 +162,14 @@ impl Rig {
         assert_eq!(declaration["schema"], schema);
         assert_eq!(declaration["project_dirs"], json!([]));
         declare
+    }
+
+    fn assert_review_advertised(&self) {
+        assert_eq!(
+            self.hello_control_ops,
+            json!(["health.check", "config.review"]),
+            "HELLO advertised the wrong control ops"
+        );
     }
 
     async fn bind(&mut self) {
@@ -227,6 +225,14 @@ fn body(frame: &Frame) -> Value {
     serde_json::from_slice(&frame.body).unwrap()
 }
 
+fn assert_settings_source(logs: &str, expected: &str) {
+    let sources: Vec<_> = logs
+        .lines()
+        .filter_map(|line| line.strip_prefix("[striatum] settings source: "))
+        .collect();
+    assert_eq!(sources, [expected], "{logs}");
+}
+
 macro_rules! vector {
     ($name:literal) => {
         serde_json::from_str::<Value>(include_str!(concat!(
@@ -239,23 +245,26 @@ macro_rules! vector {
 }
 
 #[tokio::test]
-async fn default_does_not_advertise_review_or_declare_even_to_a_capable_daemon() {
-    let mut rig = Rig::start(false, true, "{}").await;
+async fn capable_daemon_gets_a_declaration_without_a_startup_flag() {
+    let mut rig = Rig::start(true, "{}").await;
+    let declare = rig.declare().await;
+    rig.send(
+        FrameType::Response,
+        declare.header.corr,
+        vector!("config_declare_reply"),
+    )
+    .await;
+    rig.request("config.get").await;
     rig.ping().await;
-    assert!(!rig
-        .finish()
-        .await
-        .contains("waiting for the daemon's settings view"));
+    assert_settings_source(
+        &rig.finish().await,
+        "managed (daemon advertised config.gate)",
+    );
 }
 
 #[tokio::test]
 async fn old_daemon_uses_the_file_without_sending_a_declaration() {
-    let mut rig = Rig::start(
-        true,
-        false,
-        r#"{"retention":{"model_route_decisions_days":31}}"#,
-    )
-    .await;
+    let mut rig = Rig::start(false, r#"{"retention":{"model_route_decisions_days":31}}"#).await;
     rig.ping().await;
     rig.bind().await;
     let missing = rig.explain_missing().await;
@@ -264,17 +273,37 @@ async fn old_daemon_uses_the_file_without_sending_a_declaration() {
         .as_str()
         .unwrap()
         .contains("retention is 31 days"));
-    rig.finish().await;
+    std::fs::write(
+        &rig.config,
+        r#"{"retention":{"model_route_decisions_days":37}}"#,
+    )
+    .unwrap();
+    timeout(DEADLINE, async {
+        loop {
+            let missing = rig.explain_missing().await;
+            assert_eq!(missing["code"], "not_found");
+            if missing["message"]
+                .as_str()
+                .unwrap()
+                .contains("retention is 37 days")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("updated routing settings file was not reloaded");
+    rig.assert_review_advertised();
+    assert_settings_source(
+        &rig.finish().await,
+        "file (daemon did not advertise config.gate)",
+    );
 }
 
 #[tokio::test]
 async fn refused_declaration_loads_the_file_and_keeps_serving() {
-    let mut rig = Rig::start(
-        true,
-        true,
-        r#"{"retention":{"model_route_decisions_days":31}}"#,
-    )
-    .await;
+    let mut rig = Rig::start(true, r#"{"retention":{"model_route_decisions_days":31}}"#).await;
     let declare = rig.declare().await;
     rig.send(
         FrameType::Error,
@@ -308,6 +337,7 @@ async fn refused_declaration_loads_the_file_and_keeps_serving() {
         .unwrap()
         .contains("retention is 31 days"));
     let logs = rig.finish().await;
+    assert_settings_source(&logs, "file (daemon refused config.declare)");
     assert_eq!(logs.matches("config.declare refused").count(), 1, "{logs}");
     assert_eq!(
         logs.matches("waiting for the daemon's settings view")
@@ -324,7 +354,7 @@ async fn refused_declaration_loads_the_file_and_keeps_serving() {
 
 #[tokio::test]
 async fn module_delivery_vectors_drive_review_wait_ack_and_nack() {
-    let mut rig = Rig::start(true, true, "not a valid routing file").await;
+    let mut rig = Rig::start(true, "not a valid routing file").await;
     let declare = rig.declare().await;
     rig.send(
         FrameType::Response,

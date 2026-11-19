@@ -61,6 +61,18 @@ async fn account_quota_capture_preserves_bytes_and_io_errors() {
 }
 
 #[test]
+fn startup_refuses_removed_managed_settings_flag() {
+    let error =
+        parse_startup_mode(["--subc", "connection.json", "--managed-settings"].map(OsString::from))
+            .unwrap_err()
+            .to_string();
+    assert!(
+        error.contains("--managed-settings has been removed"),
+        "{error}"
+    );
+}
+
+#[test]
 fn config_check_uses_startup_loader_and_refuses_unknown_config() {
     assert_eq!(
         parse_startup_mode([OsString::from("--check-config")]).unwrap(),
