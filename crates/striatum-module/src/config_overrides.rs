@@ -540,19 +540,27 @@ fn parse_config_with_reporter(
             }
         }
     }
-    settings_shape::validate(&mut value)?;
     if let Some(consumers) = value
         .get("consumers")
         .and_then(serde_json::Value::as_object)
     {
         for (name, entry) in consumers {
             if entry.get("runner").is_some() && entry.get("runners").is_some() {
-                return Err(format!(
-                    "consumers.{name}: runner and runners are mutually exclusive"
-                ));
+                let conflict =
+                    format!("consumers.{name}: runner and runners are mutually exclusive");
+                for key in ["runner", "runners"] {
+                    if entry[key].is_null() {
+                        let path = settings_shape::pointer("/consumers", name);
+                        let error =
+                            settings_shape::null_error(&settings_shape::pointer(&path, key));
+                        return Err(format!("{error}; {conflict}"));
+                    }
+                }
+                return Err(conflict);
             }
         }
     }
+    settings_shape::validate(&mut value)?;
     let mut config: RoutingConfigFile =
         serde_json::from_str(&json).map_err(|error| format!("invalid routing config: {error}"))?;
     let section = &mut config.model_routing;

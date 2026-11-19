@@ -52,7 +52,7 @@ impl Site {
     }
 }
 
-fn pointer(path: &str, key: &str) -> String {
+pub(super) fn pointer(path: &str, key: &str) -> String {
     format!("{path}/{}", key.replace('~', "~0").replace('/', "~1"))
 }
 
@@ -76,7 +76,7 @@ pub(crate) fn convert(mut value: Value) -> Result<(Value, Vec<Edit>), String> {
     Ok((value, edits.unwrap()))
 }
 
-fn null_error(path: &str) -> String {
+pub(super) fn null_error(path: &str) -> String {
     if path.is_empty() {
         "invalid routing config: expected an object, not null".into()
     } else {
