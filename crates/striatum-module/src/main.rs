@@ -41,6 +41,7 @@ mod legacy_wire;
 #[cfg(test)]
 mod literal_census_tests;
 mod logging;
+mod managed_settings;
 pub(crate) use logging::{info_operator, warn_operator};
 #[cfg(test)]
 pub(crate) use logging::{
@@ -282,7 +283,9 @@ async fn run(
     shutdown: &shutdown::Shutdown,
     store: &mut Option<SharedStore>,
 ) -> Result<(), ModuleError> {
-    check_config_at(&config_overrides::config_path())?;
+    if !config.managed_settings {
+        check_config_at(&config_overrides::config_path())?;
+    }
     project_settings::initialize(
         &config.connection_file_path,
         &std::env::current_dir().map_err(|error| ModuleError::Message(error.to_string()))?,
@@ -351,7 +354,7 @@ async fn connect_to_subc(connection_file_path: &PathBuf) -> Result<TcpStream, Mo
 }
 
 async fn module_loop<R>(
-    read_half: &mut R,
+    mut read_half: R,
     writer: mpsc::Sender<Frame>,
     config: &ModuleConfig,
     quota_cache: SharedQuotaCache,
@@ -360,10 +363,10 @@ async fn module_loop<R>(
     store: &mut Option<SharedStore>,
 ) -> Result<(), ModuleError>
 where
-    R: AsyncRead + Unpin,
+    R: AsyncRead + Unpin + Send,
 {
     send_hello(&writer, config).await?;
-    let ack = expect_hello_ack(read_half).await?;
+    let ack = expect_hello_ack(&mut read_half).await?;
 
     // Open the route-state store from the daemon-delivered descriptor (or the dev
     // fallback). Opening acquires the single-writer lease and runs migrations (the
@@ -399,6 +402,33 @@ where
     if let Ok(mut guard) = quota_cache.lock() {
         *guard = restore_quota_cache(store.as_ref());
     }
+    let mut settings = managed_settings::Session::start(
+        config.managed_settings,
+        &config.module_id,
+        &config_path,
+        &ack,
+        &writer,
+    )
+    .await?;
+    let mut route_epochs = RouteEpochs::new();
+    let mut read_half = Some(read_half);
+    let pending_frame = if let Some(session) = &mut settings {
+        match managed_settings::wait_until_ready(
+            session,
+            read_half.take().unwrap(),
+            &writer,
+            &mut route_epochs,
+            &catalog_health,
+            &quota_cache,
+        )
+        .await?
+        {
+            Some(frame) => Some(frame),
+            None => return Ok(()),
+        }
+    } else {
+        None
+    };
     let background::BackgroundState {
         mut loops,
         broca_credentials,
@@ -410,14 +440,37 @@ where
         config_overrides::live_config(&override_path).min_band(),
     ));
 
-    let mut route_epochs = RouteEpochs::new();
     let mut profiles_started = false;
+    let mut first_frame = match pending_frame {
+        Some(frame) => Some(
+            background::frame_or_loop_stop(
+                async {
+                    let (reader, result) = frame.await;
+                    read_half = Some(reader);
+                    result
+                },
+                &mut loops,
+            )
+            .await,
+        ),
+        None => None,
+    };
     let result = loop {
-        let frame = match next_frame_or_loop_stop(read_half, &mut loops).await {
+        let next = match first_frame.take() {
+            Some(result) => result,
+            None => next_frame_or_loop_stop(read_half.as_mut().unwrap(), &mut loops).await,
+        };
+        let frame = match next {
             Ok(Some(frame)) => frame,
             Ok(None) => break Ok(()),
             Err(error) => break Err(error),
         };
+        if settings
+            .as_ref()
+            .is_some_and(|session| session.dispatch(&frame))
+        {
+            continue;
+        }
         match handle_frame(
             frame,
             &writer,
@@ -449,6 +502,7 @@ where
             profiles_started = true;
         }
     };
+    drop(settings);
     shutdown.begin();
     let flushed = quota_events::finish_clean_exit(loops, quota_cache, Arc::clone(store))
         .await
@@ -486,12 +540,16 @@ async fn send_hello(
     writer: &mpsc::Sender<Frame>,
     config: &ModuleConfig,
 ) -> Result<(), ModuleError> {
+    let mut control_ops = vec![MODULE_CONTROL_OP_HEALTH_CHECK.to_string()];
+    if config.managed_settings {
+        control_ops.push(subc_client_rs::config::CONFIG_REVIEW_OP.to_owned());
+    }
     let body = serde_json::to_vec(&ModuleHelloBody {
         manifest: manifest(&config.module_id),
         protocol_ver: PROTOCOL_VERSION,
         // Advertise health.check: the daemon's prober is capability-gated and only probes
         // modules that DECLARE the op: answering it (handle_control_request) is not enough.
-        control_ops: Some(vec![MODULE_CONTROL_OP_HEALTH_CHECK.to_string()]),
+        control_ops: Some(control_ops),
         launch_nonce: hello_launch_nonce()?,
     })
     .map_err(ModuleError::Json)?;

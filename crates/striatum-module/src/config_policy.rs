@@ -94,17 +94,24 @@ pub struct PanelPolicy {
 }
 
 impl PanelPolicy {
-    pub fn validate(&self) -> Result<(), String> {
-        if self.top_k == 0 || u16::from(self.top_k) + u16::from(self.extra) > 8 {
-            return Err("top_k must be >= 1 and top_k + extra must be <= 8".into());
+    fn invalid(&self) -> Option<(&'static [&'static str], &'static str)> {
+        let width_error = "top_k must be >= 1 and top_k + extra must be <= 8";
+        if self.top_k == 0 {
+            return Some((&["top_k"], width_error));
+        }
+        if u16::from(self.top_k) + u16::from(self.extra) > 8 {
+            return Some((&["top_k", "extra"], width_error));
         }
         if self.extra > 0 && self.extra_by.is_none() {
-            return Err("extra_by is required when extra > 0".into());
+            return Some((
+                &["extra_by", "extra"],
+                "extra_by is required when extra > 0",
+            ));
         }
         if self.floor.is_some_and(|floor| floor > 100) {
-            return Err("floor must be an integer from 0 to 100".into());
+            return Some((&["floor"], "floor must be an integer from 0 to 100"));
         }
-        Ok(())
+        None
     }
 }
 
@@ -163,7 +170,7 @@ pub struct PanelPolicies {
 }
 
 impl PanelPolicies {
-    pub fn validate(&self) -> Result<(), String> {
+    pub(crate) fn validate(&self, mut report_paths: impl FnMut(Vec<String>)) -> Result<(), String> {
         for (class, policy) in [
             ("audit", &self.audit),
             ("design_review", &self.design_review),
@@ -173,10 +180,14 @@ impl PanelPolicies {
             ("spec", &self.spec),
             ("lab", &self.lab),
         ] {
-            if let Some(policy) = policy {
-                policy
-                    .validate()
-                    .map_err(|error| format!("panels.{class}: {error}"))?;
+            if let Some((fields, reason)) = policy.as_ref().and_then(PanelPolicy::invalid) {
+                report_paths(
+                    fields
+                        .iter()
+                        .map(|field| format!("/panels/{class}/{field}"))
+                        .collect(),
+                );
+                return Err(format!("panels.{class}: {reason}"));
             }
         }
         Ok(())

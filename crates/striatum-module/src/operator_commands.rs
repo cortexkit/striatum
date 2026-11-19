@@ -34,7 +34,7 @@ pub(super) async fn async_main(
     // so a child spawned earlier would receive it. The result is cached for
     // the process; HELLO and the credential route read that cached answer.
     let _ = subc_os::launch_nonce();
-    let connection_file_path = match parse_startup_mode(std::env::args_os().skip(1))? {
+    let (connection_file_path, managed_settings) = match parse_startup_mode(args)? {
         StartupMode::PrintManifest => return print_manifest(),
         StartupMode::CheckConfig => {
             let path = config_overrides::config_path();
@@ -54,9 +54,12 @@ pub(super) async fn async_main(
             connection_file_path,
             capture_dir,
         } => return account_quota_dry_run(connection_file_path, capture_dir).await,
-        StartupMode::Serve(connection_file_path) => connection_file_path,
+        StartupMode::Serve {
+            connection_file_path,
+            managed_settings,
+        } => (connection_file_path, managed_settings),
     };
-    let config = ModuleConfig::from_env(connection_file_path)?;
+    let config = ModuleConfig::from_env(connection_file_path, managed_settings)?;
     let result = run(config, shutdown, store).await;
     shutdown.begin();
     result
@@ -73,7 +76,10 @@ pub(super) enum StartupMode {
         connection_file_path: PathBuf,
         capture_dir: Option<PathBuf>,
     },
-    Serve(PathBuf),
+    Serve {
+        connection_file_path: PathBuf,
+        managed_settings: bool,
+    },
 }
 
 /// `--account-quota-dry-run --subc <file> [--capture <dir>]`: fetch Insula's
@@ -172,7 +178,11 @@ pub(super) fn parse_startup_mode(
             capture_dir,
         });
     }
-    parse_subc_arg(args).map(StartupMode::Serve)
+    let managed_settings = args.iter().any(|arg| arg == "--managed-settings");
+    parse_subc_arg(args).map(|connection_file_path| StartupMode::Serve {
+        connection_file_path,
+        managed_settings,
+    })
 }
 
 fn parse_subc_arg(args: impl IntoIterator<Item = OsString>) -> Result<PathBuf, ModuleError> {

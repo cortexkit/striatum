@@ -186,6 +186,11 @@ pub(crate) struct PricingPatch {
 }
 
 impl LiveConfig {
+    #[cfg(test)]
+    pub(super) fn prepared_settings(&self) -> serde_json::Value {
+        serde_json::to_value(&self.config).unwrap()
+    }
+
     pub(crate) fn consumer_priorities(
         &self,
     ) -> BTreeMap<String, cortexkit_role_routing::declarations::ConsumerPriority> {
@@ -317,6 +322,7 @@ fn route_pricing(section: &ModelRoutingSection) -> RoutePricing {
 type FileStamp = Option<(SystemTime, u64, String)>;
 
 struct LiveConfigCache {
+    managed: bool,
     stamp: FileStamp,
     pending: Option<(FileStamp, Instant)>,
     active: Arc<LiveConfig>,
@@ -457,7 +463,15 @@ fn parse_config(document: &str) -> Result<RoutingConfigFile, String> {
 
 fn parse_config_with_reporter(
     document: &str,
+    report: impl FnMut(&str),
+) -> Result<RoutingConfigFile, String> {
+    parse_config_with_paths(document, report, |_| {})
+}
+
+fn parse_config_with_paths(
+    document: &str,
     mut report: impl FnMut(&str),
+    report_panel_paths: impl FnMut(Vec<String>),
 ) -> Result<RoutingConfigFile, String> {
     let mut json = jsonc_to_json(document)?;
     let mut value: serde_json::Value =
@@ -590,12 +604,54 @@ fn parse_config_with_reporter(
         }
     }
     config.prepare()?;
-    validate_live_config(&config)?;
+    validate_live_config(&config, report_panel_paths)?;
     Ok(config)
 }
 
 pub(crate) fn validate_document(document: &str) -> Result<(), String> {
     parse_config(document).map(|_| ())
+}
+
+pub(super) fn validate_review_document(document: &str) -> Result<(), (Vec<String>, String)> {
+    let mut paths = Vec::new();
+    parse_config_with_paths(document, |_| {}, |reported| paths = reported)
+        .map(|_| ())
+        .map_err(|error| (paths, error))
+}
+
+fn build_live_config(path: &Path, document: Option<String>) -> Result<LiveConfig, String> {
+    let config = match &document {
+        Some(document) => parse_config(document)
+            .map_err(|error| format!("invalid config in {}: {error}", path.display()))?,
+        None => RoutingConfigFile::default(),
+    };
+    Ok(LiveConfig::new(config, document))
+}
+
+fn publish_live_config(config: LiveConfig) -> Arc<LiveConfig> {
+    crate::routing_v1::runners::placements::settings_loaded(&config);
+    Arc::new(config)
+}
+
+pub(super) fn apply_managed(path: &Path, effective: &serde_json::Value) -> Result<(), String> {
+    let document = serde_json::to_string(effective).map_err(|error| error.to_string())?;
+    let next = build_live_config(path, Some(document))?;
+    let mut caches = live_configs().lock().unwrap();
+    if caches.get(path).is_some_and(|cache| {
+        cache.managed && cache.active.document.as_ref() == next.document.as_ref()
+    }) {
+        return Ok(());
+    }
+    caches.insert(
+        path.to_path_buf(),
+        LiveConfigCache {
+            managed: true,
+            stamp: None,
+            pending: None,
+            active: publish_live_config(next),
+        },
+    );
+    Ok(())
 }
 
 fn live_config_at(path: &Path, now: Instant) -> Result<Arc<LiveConfig>, String> {
@@ -613,6 +669,9 @@ fn live_config_at_with_reporter(
     mut report_rejection: impl FnMut(&str),
 ) -> Result<Arc<LiveConfig>, String> {
     let mut caches = live_configs().lock().unwrap();
+    if let Some(cache) = caches.get(path).filter(|cache| cache.managed) {
+        return Ok(Arc::clone(&cache.active));
+    }
     let stamp = match file_stamp(path) {
         Ok(stamp) => stamp,
         Err(error) => {
@@ -663,12 +722,7 @@ fn live_config_at_with_reporter(
             }
             Err(error) => return Err(error.to_string()),
         };
-        let config = match &document {
-            Some(document) => parse_config(document)
-                .map_err(|error| format!("invalid config in {}: {error}", path.display()))?,
-            None => RoutingConfigFile::default(),
-        };
-        Ok(LiveConfig::new(config, document))
+        build_live_config(path, document)
     })();
     let mut caches = live_configs().lock().unwrap();
     if let Some(cache) = caches.get(path) {
@@ -687,10 +741,7 @@ fn live_config_at_with_reporter(
         return Err("config changed while loading; retry".into());
     }
     let active = match next {
-        Ok(config) => {
-            crate::routing_v1::runners::placements::settings_loaded(&config);
-            Arc::new(config)
-        }
+        Ok(config) => publish_live_config(config),
         Err(error) => {
             let Some(cache) = caches.get(path) else {
                 return Err(error);
@@ -702,6 +753,7 @@ fn live_config_at_with_reporter(
     caches.insert(
         path.to_path_buf(),
         LiveConfigCache {
+            managed: false,
             stamp,
             pending: None,
             active: Arc::clone(&active),
@@ -710,7 +762,10 @@ fn live_config_at_with_reporter(
     Ok(active)
 }
 
-fn validate_live_config(config: &RoutingConfigFile) -> Result<(), String> {
+fn validate_live_config(
+    config: &RoutingConfigFile,
+    report_panel_paths: impl FnMut(Vec<String>),
+) -> Result<(), String> {
     config.concurrency.validate()?;
     if config.accounts.metered_fallback {
         return Err(
@@ -739,7 +794,7 @@ fn validate_live_config(config: &RoutingConfigFile) -> Result<(), String> {
     if config.catalog.poll_ms == Some(0) {
         return Err("catalog.poll_ms must be positive".into());
     }
-    section.panels.validate()?;
+    section.panels.validate(report_panel_paths)?;
     section.pins.validate()?;
     validate_v1_policy(section)?;
     for (provider, value) in &section.subscription_multipliers {
@@ -1912,10 +1967,24 @@ fn read_routing_config(path: &Path) -> Result<Option<RoutingConfigFile>, String>
         .map_err(|error| format!("invalid config in {}: {error}", path.display()))
 }
 
-/// The routing file as untyped JSON, for a reader that must not depend on
-/// every other block parsing (a typo elsewhere in the file leaves it working).
-/// A missing file is `Ok(None)`.
+/// Read the active managed document or, in file mode, parse untyped JSON.
+/// In file mode, the retention reader still works when other blocks in the
+/// file are invalid, and a missing file is `Ok(None)`.
 pub(crate) fn read_routing_config_value(path: &Path) -> Result<Option<serde_json::Value>, String> {
+    let managed = live_configs()
+        .lock()
+        .unwrap()
+        .get(path)
+        .filter(|cache| cache.managed)
+        .map(|cache| Arc::clone(&cache.active));
+    if let Some(active) = managed {
+        return active
+            .document
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(|error| error.to_string());
+    }
     let doc = match std::fs::read_to_string(path) {
         Ok(document) => document,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
