@@ -800,7 +800,7 @@ async fn panel_harness() -> (std::sync::Arc<Harness>, Route, Vec<String>) {
     super::conformance_tests::install_catalog(&harness, &catalog);
     super::conformance_tests::install_panel_families(&harness, &catalog);
     harness.edit_config(|c| {
-        c["panels"]["audit"] = json!({"topK":2,"by":"iq","extra":1,"extraBy":"random","floor":0});
+        c["panels"]["audit"] = json!({"top_k":2,"by":"iq","extra":1,"extra_by":"random","floor":0});
         c["consumers"][fixture::SUMMARY] = json!({"owner":"prefrontal-core"});
     });
     let owner = harness.bind(reserved("prefrontal-core"), None).await;

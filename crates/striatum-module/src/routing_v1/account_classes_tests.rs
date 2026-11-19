@@ -2427,7 +2427,7 @@ async fn runner_hold_caps_default_to_900_and_survive_selection_and_admission() {
     let input: Value = serde_json::from_str(&stored.requirements_json).unwrap();
     assert_eq!(input["hold_wait_max_s"], 3600);
     harness.edit_config(|config| {
-        config["providers"]["synthetic"]["accounts"]["max_hold"] = json!(1800)
+        config["providers"]["synthetic"]["accounts"]["max_hold"] = json!("1800s")
     });
     admission["admission_id"] = json!("current-provider-ceiling");
     admission["decision_id"] = json!(id);
@@ -2477,8 +2477,7 @@ async fn ladder_holds_a_blocked_entry_but_demand_and_no_wait_use_the_next_model(
     let moved = caller.call("route.select", &no_wait).await;
     assert_eq!(moved.0, FrameType::Response, "{}", moved.1);
     assert_eq!(moved.1["result"]["route"]["provider"], "secondary");
-    harness
-        .edit_config(|config| config["providers"]["synthetic"]["accounts"]["max_hold"] = json!(30));
+    harness.edit_config(|c| c["providers"]["synthetic"]["accounts"]["max_hold"] = json!("30s"));
     let moved = caller.call("route.select", &request).await;
     assert_eq!(moved.0, FrameType::Response, "{}", moved.1);
     assert_eq!(moved.1["result"]["route"]["provider"], "secondary");
@@ -4108,13 +4107,13 @@ async fn select_hold_threshold_is_independent_of_the_runner_wait_cap() {
     let body = json!({"consumer":"mason","pin":"synthetic/model","requirements":{"iq":30},
         "hold_ok":true,"hold_wait_max_s":120});
     harness.edit_config(|config| {
-        config["providers"]["synthetic"]["accounts"]["max_hold"] = json!(120);
-        config["providers"]["synthetic"]["accounts"]["hold_when_reset_within"] = json!(30);
+        config["providers"]["synthetic"]["accounts"]["max_hold"] = json!("120s");
+        config["providers"]["synthetic"]["accounts"]["hold_when_reset_within"] = json!("30s");
     });
     let refused = owner.call("route.select", &body).await;
     assert_eq!(refused.0, FrameType::Error, "{}", refused.1);
     harness.edit_config(|config| {
-        config["providers"]["synthetic"]["accounts"]["hold_when_reset_within"] = json!(120);
+        config["providers"]["synthetic"]["accounts"]["hold_when_reset_within"] = json!("120s");
     });
     let held = owner.call("route.select", &body).await;
     assert_eq!(held.0, FrameType::Response, "{}", held.1);

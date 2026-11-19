@@ -171,7 +171,7 @@ async fn capture_panel(all_full: bool) -> Sample {
     harness.edit_config(|config| {
         config["consumers"] = json!({"prefrontal-core.athena":{
             "owner":"prefrontal-core","pay_per_token":true}});
-        config["panels"]["audit"] = json!({"topK":3,"by":"iq","extra":0,"floor":0});
+        config["panels"]["audit"] = json!({"top_k":3,"by":"iq","extra":0,"floor":0});
         config["runners"] = json!([{"module":"broca","via_vault":true}]);
         config["concurrency"] = json!({"enforcement_enabled":true,"providers":{
             "synthetic-0":{"limit":1},"synthetic-1":{"limit":1},

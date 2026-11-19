@@ -39,7 +39,7 @@ async fn configured() -> (Arc<Harness>, Route, Value) {
     install_catalog(&h, &catalog);
     install_panel_families(&h, &catalog);
     h.edit_config(|c| {
-        c["panels"]["audit"] = json!({"topK":2,"by":"iq","extra":0,"floor":0});
+        c["panels"]["audit"] = json!({"top_k":2,"by":"iq","extra":0,"floor":0});
         c["consumers"][fixture::SUMMARY] = json!({"owner":"prefrontal-core"});
     });
     let route = h.bind(reserved("prefrontal-core"), None).await;
@@ -61,7 +61,7 @@ async fn panel(route: &Route, request: &Value) -> SelectPanelAnswer {
 async fn decommissioned_panel_candidate_is_not_seated_or_named_in_shortfall() {
     let (harness, route, mut request) = configured().await;
     harness.edit_config(|config| {
-        config["panels"]["audit"] = json!({"topK":5,"by":"iq","extra":0,"floor":0})
+        config["panels"]["audit"] = json!({"top_k":5,"by":"iq","extra":0,"floor":0})
     });
     request.as_object_mut().unwrap().remove("temperatures");
     assert_eq!(panel(&route, &request).await.seats.len(), 5);

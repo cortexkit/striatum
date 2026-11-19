@@ -1732,9 +1732,9 @@ impl RoutingSubject for KitSubject {
             return Err("invalid panel counts".into());
         }
         self.harness().edit_config(|config| {
-            let mut policy = json!({"topK":top,"extra":extra,"by":"iq","floor":0});
+            let mut policy = json!({"top_k":top,"extra":extra,"by":"iq","floor":0});
             if extra > 0 {
-                policy["extraBy"] = json!("random");
+                policy["extra_by"] = json!("random");
             }
             config["panels"][class] = policy;
         });
@@ -1785,9 +1785,10 @@ impl RoutingSubject for KitSubject {
         limits: HoldLimits,
     ) -> Result<(), String> {
         self.harness().edit_config(|config| {
-            config["providers"][provider]["accounts"]["max_hold"] = json!(limits.max_hold_s);
+            config["providers"][provider]["accounts"]["max_hold"] =
+                json!(format!("{}s", limits.max_hold_s));
             config["providers"][provider]["accounts"]["hold_when_reset_within"] =
-                json!(limits.hold_when_reset_within_s);
+                json!(format!("{}s", limits.hold_when_reset_within_s));
         });
         Ok(())
     }

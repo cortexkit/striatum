@@ -167,7 +167,7 @@ async fn panel_select_request_cpu() {
     }
     fixture.edit_config(|config| {
         config["panels"]["audit"] =
-            json!({"topK":3,"by":"iq","extra":3,"extraBy":"random","floor":0});
+            json!({"top_k":3,"by":"iq","extra":3,"extra_by":"random","floor":0});
     });
     let route = fixture
         .harness

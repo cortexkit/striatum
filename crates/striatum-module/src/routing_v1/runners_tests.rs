@@ -313,7 +313,7 @@ async fn requires_wire_api_filters_select_head_choices_panels_and_refreshes() {
     harness.install_facts(&facts);
     harness.edit_config(|config| {
         config["runners"] = json!([{"module":"fixture-runner", "via_vault":true}]);
-        config["panels"]["audit"] = json!({"topK":1,"by":"iq","extra":0,"floor":0});
+        config["panels"]["audit"] = json!({"top_k":1,"by":"iq","extra":0,"floor":0});
     });
     let consumer = harness.bind(reserved("example-consumer"), None).await;
     let operator = harness.bind(json!({"kind":"direct"}), None).await;

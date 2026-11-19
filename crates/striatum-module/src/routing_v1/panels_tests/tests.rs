@@ -118,7 +118,7 @@ async fn spec_extra_floor_shortfalls_keep_incident_package_sizes_and_rejected_ro
     let (h, route, mut request) = configured().await;
     request["class"] = json!("spec");
     h.edit_config(|c| {
-        c["panels"]["spec"] = json!({"topK":3,"by":"iq","extra":1,"extraBy":"random","floor":80});
+        c["panels"]["spec"] = json!({"top_k":3,"by":"iq","extra":1,"extra_by":"random","floor":80});
     });
     for mut fact in h
         .store()

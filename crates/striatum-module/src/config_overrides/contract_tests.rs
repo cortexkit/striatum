@@ -42,7 +42,7 @@ impl Drop for Rig {
     }
 }
 
-const GOOD: &str = r#"{"model_routing":{"exclude":{"all":["anthropic"]},"panels":{"audit":{"topK":1,"by":"iq"}},"pins":{"synthesizer":{"model":"openai/gpt-6","variant":"high"}}}}"#;
+const GOOD: &str = r#"{"model_routing":{"exclude":{"all":["anthropic"]},"panels":{"audit":{"top_k":1,"by":"iq"}},"pins":{"synthesizer":{"model":"openai/gpt-6","variant":"high"}}}}"#;
 
 fn first_load_refuses(document: &str, message: &str) {
     let mut rig = Rig::new();
@@ -126,7 +126,7 @@ macro_rules! refusal_case {
 
 refusal_case!(
     floor_null,
-    r#"{"model_routing":{"panels":{"audit":{"topK":1,"by":"iq","floor":null}}}}"#,
+    r#"{"model_routing":{"panels":{"audit":{"top_k":1,"by":"iq","floor":null}}}}"#,
     "invalid type"
 );
 refusal_case!(
@@ -244,87 +244,87 @@ refusal_case!(
 );
 refusal_case!(
     unknown_class,
-    r#"{"model_routing":{"panels":{"surprise":{"topK":1,"by":"iq"}}}}"#,
+    r#"{"model_routing":{"panels":{"surprise":{"top_k":1,"by":"iq"}}}}"#,
     "unknown field `surprise`"
 );
 refusal_case!(
     unknown_policy_key,
-    r#"{"model_routing":{"panels":{"audit":{"topK":1,"by":"iq","surprise":1}}}}"#,
+    r#"{"model_routing":{"panels":{"audit":{"top_k":1,"by":"iq","surprise":1}}}}"#,
     "unknown field `surprise`"
 );
 refusal_case!(
     top_k_required,
     r#"{"model_routing":{"panels":{"audit":{"by":"iq"}}}}"#,
-    "missing field `topK`"
+    "missing field `top_k`"
 );
 refusal_case!(
     top_k_zero,
-    r#"{"model_routing":{"panels":{"audit":{"topK":0,"by":"iq"}}}}"#,
-    "topK"
+    r#"{"model_routing":{"panels":{"audit":{"top_k":0,"by":"iq"}}}}"#,
+    "top_k"
 );
 refusal_case!(
     top_k_negative,
-    r#"{"model_routing":{"panels":{"audit":{"topK":-1,"by":"iq"}}}}"#,
+    r#"{"model_routing":{"panels":{"audit":{"top_k":-1,"by":"iq"}}}}"#,
     "invalid value"
 );
 refusal_case!(
     top_k_fraction,
-    r#"{"model_routing":{"panels":{"audit":{"topK":1.5,"by":"iq"}}}}"#,
+    r#"{"model_routing":{"panels":{"audit":{"top_k":1.5,"by":"iq"}}}}"#,
     "invalid type"
 );
 refusal_case!(
     by_required,
-    r#"{"model_routing":{"panels":{"audit":{"topK":1}}}}"#,
+    r#"{"model_routing":{"panels":{"audit":{"top_k":1}}}}"#,
     "missing field `by`"
 );
 refusal_case!(
     by_enum,
-    r#"{"model_routing":{"panels":{"audit":{"topK":1,"by":"random"}}}}"#,
+    r#"{"model_routing":{"panels":{"audit":{"top_k":1,"by":"random"}}}}"#,
     "unknown variant"
 );
 refusal_case!(
     extra_negative,
-    r#"{"model_routing":{"panels":{"audit":{"topK":1,"by":"iq","extra":-1}}}}"#,
+    r#"{"model_routing":{"panels":{"audit":{"top_k":1,"by":"iq","extra":-1}}}}"#,
     "invalid value"
 );
 refusal_case!(
     extra_fraction,
-    r#"{"model_routing":{"panels":{"audit":{"topK":1,"by":"iq","extra":0.5}}}}"#,
+    r#"{"model_routing":{"panels":{"audit":{"top_k":1,"by":"iq","extra":0.5}}}}"#,
     "invalid type"
 );
 refusal_case!(
     extra_by_required,
-    r#"{"model_routing":{"panels":{"audit":{"topK":1,"by":"iq","extra":1}}}}"#,
-    "extraBy is required"
+    r#"{"model_routing":{"panels":{"audit":{"top_k":1,"by":"iq","extra":1}}}}"#,
+    "extra_by is required"
 );
 refusal_case!(
     extra_by_null,
-    r#"{"model_routing":{"panels":{"audit":{"topK":1,"by":"iq","extra":1,"extraBy":null}}}}"#,
+    r#"{"model_routing":{"panels":{"audit":{"top_k":1,"by":"iq","extra":1,"extra_by":null}}}}"#,
     "invalid routing config"
 );
 refusal_case!(
     extra_by_enum,
-    r#"{"model_routing":{"panels":{"audit":{"topK":1,"by":"iq","extraBy":"shuffle"}}}}"#,
+    r#"{"model_routing":{"panels":{"audit":{"top_k":1,"by":"iq","extra_by":"shuffle"}}}}"#,
     "unknown variant"
 );
 refusal_case!(
     width_cap,
-    r#"{"model_routing":{"panels":{"audit":{"topK":7,"by":"iq","extra":2,"extraBy":"random"}}}}"#,
-    "topK + extra"
+    r#"{"model_routing":{"panels":{"audit":{"top_k":7,"by":"iq","extra":2,"extra_by":"random"}}}}"#,
+    "top_k + extra"
 );
 refusal_case!(
     floor_negative,
-    r#"{"model_routing":{"panels":{"audit":{"topK":1,"by":"iq","floor":-1}}}}"#,
+    r#"{"model_routing":{"panels":{"audit":{"top_k":1,"by":"iq","floor":-1}}}}"#,
     "invalid value"
 );
 refusal_case!(
     floor_over_100,
-    r#"{"model_routing":{"panels":{"audit":{"topK":1,"by":"iq","floor":101}}}}"#,
+    r#"{"model_routing":{"panels":{"audit":{"top_k":1,"by":"iq","floor":101}}}}"#,
     "floor must be"
 );
 refusal_case!(
     floor_fraction,
-    r#"{"model_routing":{"panels":{"audit":{"topK":1,"by":"iq","floor":80.5}}}}"#,
+    r#"{"model_routing":{"panels":{"audit":{"top_k":1,"by":"iq","floor":80.5}}}}"#,
     "invalid type"
 );
 refusal_case!(
@@ -606,11 +606,11 @@ fn converted_keys_load_and_camel_case_spellings_are_refused() {
         assert!(active.operator_policy().score_alias.is_empty());
         let model = &section.models["openai/gpt-6/high"];
         assert_eq!(
-            (model.elo, model.eq, model.speed),
+            (model.elo, model.eq, model.output_tokens_per_second),
             (Some(1900.0), Some(1750.0), Some(90.0))
         );
         assert_eq!(
-            (model.cost_per_mtok_out, model.context_window),
+            (model.cost_per_mtok_out, model.context_window_tokens),
             (Some(4.0), Some(100000.0))
         );
         assert_eq!(
@@ -713,13 +713,13 @@ fn valid_panel_boundaries_all_classes_and_strict_pins() {
     let mut rig = Rig::new();
     rig.write(
         r#"{"model_routing":{"panels":{
-        "audit":{"topK":1,"by":"iq"},
-        "design_review":{"topK":8,"by":"eq","extra":0},
-        "diagnose":{"topK":1,"by":"cost","extra":7,"extraBy":"random","floor":0},
-        "evaluate":{"topK":2,"by":"iq","extra":1,"extraBy":"eq","floor":100},
-        "explain":{"topK":1,"by":"cost","extraBy":"cost"},
-        "spec":{"topK":3,"by":"iq","extra":1,"extraBy":"iq"},
-        "lab":{"topK":4,"by":"iq"}},
+        "audit":{"top_k":1,"by":"iq"},
+        "design_review":{"top_k":8,"by":"eq","extra":0},
+        "diagnose":{"top_k":1,"by":"cost","extra":7,"extra_by":"random","floor":0},
+        "evaluate":{"top_k":2,"by":"iq","extra":1,"extra_by":"eq","floor":100},
+        "explain":{"top_k":1,"by":"cost","extra_by":"cost"},
+        "spec":{"top_k":3,"by":"iq","extra":1,"extra_by":"iq"},
+        "lab":{"top_k":4,"by":"iq"}},
         "pins":{"synthesizer":{"model":"p/m","variant":"high"},"lab_planner":{"model":"q/n"},
             "spec_designer":{"model":"r/o","variant":"xhigh"}}}}"#,
     );
@@ -840,11 +840,10 @@ fn generated_schema_is_current_and_closed() {
     let retired = super::validate_document(r#"{"accounts":{"enabled":false}}"#).unwrap_err();
     assert!(retired.contains("accounts.enabled"));
     assert!(retired.contains(crate::config_convert::COMMAND));
-    assert!(schema["$defs"]["AccountDuration"]["anyOf"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .all(|variant| variant["type"] != "object"));
+    assert_eq!(
+        schema["$defs"]["ProviderAccountsPolicy"]["properties"]["max_hold"]["type"],
+        "string"
+    );
     assert!(schema["$defs"]["RemovedAccountFlags"]
         .get("properties")
         .is_none());

@@ -278,7 +278,7 @@ async fn panel_ledger_replaces_full_seats_without_relaxing_floor_family_or_packa
     panel_models(&harness, false);
     harness.edit_config(|config| {
         config["concurrency"]["providers"]["synthetic"]["scope"] = json!("account_model");
-        config["panels"]["audit"] = json!({"topK":2,"by":"iq","extra":0,"floor":80});
+        config["panels"]["audit"] = json!({"top_k":2,"by":"iq","extra":0,"floor":80});
     });
     let runner = harness.bind(reserved("class-runner"), None).await;
     let consumer = harness.bind(reserved("class-owner"), None).await;
@@ -294,7 +294,8 @@ async fn panel_ledger_replaces_full_seats_without_relaxing_floor_family_or_packa
     assert!(answer.get("shortfall").is_none());
     assert_eq!(pressure().len(), 1);
     harness.edit_config(|config| {
-        config["panels"]["audit"] = json!({"topK":1,"by":"iq","extra":1,"extraBy":"eq","floor":80});
+        config["panels"]["audit"] =
+            json!({"top_k":1,"by":"iq","extra":1,"extra_by":"eq","floor":80});
     });
     let phased = panel_answer(&consumer, &request).await;
     assert_eq!(seated(&phased), ["spare", "standing"]);
@@ -302,7 +303,7 @@ async fn panel_ledger_replaces_full_seats_without_relaxing_floor_family_or_packa
     assert_eq!(phased["seats"][1]["phase"], "extra");
     assert_eq!(pressure().len(), 1);
     harness.edit_config(|config| {
-        config["panels"]["audit"] = json!({"topK":2,"by":"iq","extra":0,"floor":80});
+        config["panels"]["audit"] = json!({"top_k":2,"by":"iq","extra":0,"floor":80});
     });
 
     for account in [A, B] {

@@ -37,7 +37,7 @@ async fn fixture_with_repairs() -> (Arc<Harness>, Route) {
     super::super::conformance_tests::install_panel_families(&harness, &fixture::catalog());
     harness.edit_config(|config| {
         config["panels"]["audit"] =
-            json!({"topK":2,"by":"iq","extra":0,"extraBy":"random","floor":0})
+            json!({"top_k":2,"by":"iq","extra":0,"extra_by":"random","floor":0})
     });
     quota(true);
     let fence = Fence {

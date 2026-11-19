@@ -538,7 +538,7 @@ async fn broca_panel_lost_probe_binding_is_a_timed_seat_refusal() {
     let _clock = crate::InjectedClock::set(FENCE_NOW);
     let harness = broca_fence_harness();
     harness.edit_config(|config| {
-        config["panels"]["audit"] = json!({"topK":1,"by":"iq","extra":0,"floor":0});
+        config["panels"]["audit"] = json!({"top_k":1,"by":"iq","extra":0,"floor":0});
     });
     fence_inception(&harness, FENCE_NOW as i64 - 400 * 60_000);
     steal_selected_probe(&harness);

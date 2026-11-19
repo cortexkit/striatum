@@ -50,7 +50,7 @@ async fn configured(configured_consumer: &str) -> (Arc<Harness>, Route) {
         config["models"][OPUS]["pin_only_for"] = json!(["prefrontal-core.athena"]);
         config["models"][OPUS]["subscription"] = json!(true);
         config["models"][FABLE]["subscription"] = json!(true);
-        config["panels"]["audit"] = json!({"topK":1,"by":"iq","extra":0,"floor":0});
+        config["panels"]["audit"] = json!({"top_k":1,"by":"iq","extra":0,"floor":0});
     });
     let route = harness.bind(reserved("prefrontal-core"), None).await;
     (harness, route)

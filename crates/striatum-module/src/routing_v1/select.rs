@@ -4130,7 +4130,7 @@ mod tests {
         install_catalog(&harness, &catalog);
         install_panel_families(&harness, &catalog);
         harness.edit_config(|config| {
-            config["panels"]["audit"] = json!({"topK":2,"by":"iq","extra":0,"floor":0});
+            config["panels"]["audit"] = json!({"top_k":2,"by":"iq","extra":0,"floor":0});
             config["consumers"][fixture::SUMMARY] = json!({"owner":"prefrontal-core"});
         });
         let route = harness.bind(reserved("prefrontal-core"), None).await;
@@ -4284,7 +4284,7 @@ mod tests {
         install_catalog(&harness, &catalog);
         install_panel_families(&harness, &catalog);
         harness.edit_config(|config| {
-            config["panels"]["audit"] = json!({"topK":2,"by":"iq","extra":0,"floor":0});
+            config["panels"]["audit"] = json!({"top_k":2,"by":"iq","extra":0,"floor":0});
             config["consumers"][fixture::SUMMARY] = json!({"owner":"prefrontal-core"});
         });
         *crate::ACCOUNT_QUOTA.get().unwrap().lock().unwrap() = Default::default();
