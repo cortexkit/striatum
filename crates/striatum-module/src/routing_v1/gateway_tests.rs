@@ -301,7 +301,7 @@ async fn gateway_reach_is_runner_and_harness_local_on_select_choices_and_what_if
         let mut expected_models = choices["result"]["models"].clone();
         for model in expected_models.as_array_mut().unwrap() {
             model["effort_source"] = json!("none");
-            model["variant"] = Value::Null;
+            model["variant"] = json!(null);
             model["grade"] = json!({"elo":55.0,"eq":1700.0,
                 "elo_effort":"unrecorded","eq_effort":"unrecorded"});
         }
