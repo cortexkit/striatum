@@ -850,13 +850,20 @@ fn parse_admitted_request(
     parse_select_request_serving(&params, &capabilities)
 }
 
-async fn prepare_selection(
+struct AdmittedDemand {
+    request: SelectRequest,
+    workload: Option<effort_preview::Workload>,
+    ladder: Option<Vec<String>>,
+    placement: Option<cortexkit_role_routing::placement::Placement>,
+}
+
+fn admitted_demand(
     params: &Value,
     caller: &Caller,
-    deps: &Deps<'_>,
     shared: &RequestInputs,
-    evaluation: Option<&Evaluation<'_>>,
-) -> Result<SelectionInputs, Refusal> {
+    consumers: &super::consumers::Registry,
+    evaluation: bool,
+) -> Result<AdmittedDemand, Refusal> {
     super::refuse_unknown_members(params, MEMBERS)?;
     // An omitted task_ref is valid, but a present value must be a string.
     // Reject null rather than letting the optional-string parser treat it as omitted.
@@ -872,12 +879,9 @@ async fn prepare_selection(
             "task_ref must be 1-128 bytes of printable ASCII (0x21-0x7E)",
         ));
     }
-    let live_config = &shared.live_config;
     let operator_config = &shared.operator_config;
-    let consumers = super::consumers::effective(&operator_config);
-    let request = parse_admitted_request(params, caller, &consumers, evaluation.is_some())?;
-    let consumer = request.consumer.clone();
-    if evaluation.is_none() {
+    let consumer = parse_admitted_request(params, caller, consumers, evaluation)?.consumer;
+    if !evaluation {
         consumers.admit(&consumer, caller)?;
     }
     let declared = super::describe::capabilities()
@@ -891,15 +895,14 @@ async fn prepare_selection(
         refusal.message = format!("consumer kind {kind} must use route.select_engine");
         return Err(refusal);
     }
+    let effective_params = consumers.with_defaults(&consumer, params, operator_config);
+    let mut request = parse_admitted_request(&effective_params, caller, consumers, evaluation)?;
     let workload = shared.efforts.workload(
         &consumer,
         operator_config,
         request.requirements.workload.as_deref(),
         declared.workload.as_deref(),
     );
-    let effective_params = consumers.with_defaults(&consumer, params, &operator_config);
-    let mut request =
-        parse_admitted_request(&effective_params, caller, &consumers, evaluation.is_some())?;
     // Validate the marker for every caller, but only enrolled principals may
     // use it to spend the pinned model's subscription reserve.
     if !operator_config.honours_pin_origin(&caller.principal) {
@@ -908,6 +911,31 @@ async fn prepare_selection(
     if request.eligible_routes.as_ref().is_some_and(Vec::is_empty) {
         return Err(Refusal::no_route(NoRouteReason::NoAvailableModel, None));
     }
+    Ok(AdmittedDemand {
+        request,
+        workload,
+        ladder: declared.ladder,
+        placement: declared.placement,
+    })
+}
+
+async fn prepare_selection(
+    params: &Value,
+    caller: &Caller,
+    deps: &Deps<'_>,
+    shared: &RequestInputs,
+    evaluation: Option<&Evaluation<'_>>,
+) -> Result<SelectionInputs, Refusal> {
+    let live_config = &shared.live_config;
+    let operator_config = &shared.operator_config;
+    let consumers = super::consumers::effective(operator_config);
+    let AdmittedDemand {
+        mut request,
+        workload,
+        ladder,
+        placement: declared_placement,
+    } = admitted_demand(params, caller, shared, &consumers, evaluation.is_some())?;
+    let consumer = request.consumer.clone();
     if !crate::broca_credentials::wait_for_billing_catalog(deps.broca_credentials, BILLING_WAIT)
         .await
     {
@@ -923,10 +951,6 @@ async fn prepare_selection(
     // Keep the declared ladder separate from settings policy looked up by
     // consumer name: a settings child belonging to another owner must not
     // inherit it.
-    let ladder = super::describe::capabilities()
-        .contains(&"consumer_declarations")
-        .then(|| consumers.defaults_for(&consumer).ladder)
-        .flatten();
     let consumer_policy = operator_config.consumer_policy(
         &consumer,
         &crate::config_policy::ConsumerPolicy {
@@ -992,10 +1016,10 @@ async fn prepare_selection(
         .clone()
         .unwrap_or_default();
     let classifier = consumer == "classifier";
-    let placement = if declared.placement.is_some() {
+    let placement = if declared_placement.is_some() {
         let credentials = deps.broca_credentials.lock().map_err(store_refusal)?;
         super::consumers::declared::placement_module(
-            declared.placement.as_ref(),
+            declared_placement.as_ref(),
             caller,
             request.runners.as_deref(),
             |module| credentials.runner_declarations.contains_key(module),
@@ -1176,7 +1200,9 @@ async fn select_at_tier(
     let mut lost_until: Option<i64> = None;
     let mut lost = 0;
     loop {
-        match select_at_tier_attempt(
+        // A tier attempt carries the scoring and account snapshots across
+        // awaits. Keep that state off the stack of the callers that poll it.
+        match Box::pin(select_at_tier_attempt(
             params,
             caller,
             deps,
@@ -1189,7 +1215,7 @@ async fn select_at_tier(
             evaluation,
             shared,
             inputs,
-        )
+        ))
         .await
         {
             Ok(SelectionAttempt::Selected(answer)) => return Ok(answer),
