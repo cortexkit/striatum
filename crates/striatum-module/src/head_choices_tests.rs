@@ -213,11 +213,24 @@ fn broca_live_catalog_fixture() -> Arc<Harness> {
         harness.store().upsert_fact(&model, source).unwrap();
         facts.push(model);
     }
-    let catalog = json!({
+    let mut catalog = json!({
         "catalog_version": input["catalog_version"], "resolved_at_ms": 1794680117849_i64,
         "quality_scores": {"graded_by":"operator", "graded_at_ms":1794404263000_i64},
         "models": input["catalog_models"]
     });
+    // The captured November 14 catalog has no graded efforts. Supply the
+    // matching facts so the client picker test vectors still contain the
+    // defaults that previously came from routing's store.
+    for (route, effort) in [
+        ("anthropic/claude-opus-5-5", "high"),
+        ("google/antigravity-gemini-3.8-flash", "high"),
+        ("openai/gpt-6-astra", "xhigh"),
+        ("openai/gpt-6-luna", "xhigh"),
+        ("openai/gpt-6.1-sol", "xhigh"),
+        ("xai/grok-4.7", "xhigh"),
+    ] {
+        catalog["models"][route]["quality.graded_effort"] = json!(effort);
+    }
     let snapshot =
         fusiform_catalog::decode_catalog_get(&serde_json::to_vec(&catalog).unwrap()).unwrap();
     let (updates, cursor) = snapshot.parts();
