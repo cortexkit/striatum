@@ -184,17 +184,17 @@ pub(crate) fn lease_counts(
     now_ms: i64,
     excluded_lease: Option<&str>,
 ) -> rusqlite::Result<Vec<(String, i64)>> {
-    let mut statement = conn.prepare_cached(
-        "SELECT credential_id, COUNT(*) FROM pool_key_lease
-         WHERE provider = ?1 AND released_at IS NULL AND valid_until > ?2
-           AND lease_id IS NOT ?3
-         GROUP BY credential_id",
-    )?;
+    let mut statement = conn.prepare_cached(LEASE_COUNTS_SQL)?;
     let rows = statement.query_map(params![provider, now_ms, excluded_lease], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
     })?;
     rows.collect()
 }
+
+const LEASE_COUNTS_SQL: &str = "SELECT credential_id, COUNT(*) FROM pool_key_lease
+         WHERE provider = ?1 AND released_at IS NULL AND valid_until > ?2
+           AND lease_id IS NOT ?3
+         GROUP BY credential_id";
 
 fn touch(
     conn: &Connection,
@@ -581,6 +581,52 @@ impl crate::AccountTx<'_> {
 #[cfg(test)]
 mod wall_generation_tests {
     use super::*;
+
+    #[test]
+    fn pool_live_lease_count_uses_provider_and_expiry_range() {
+        let scratch = cortexkit_test_support::ScratchDir::new("pool-live-lease-count-plan");
+        let descriptor = crate::dev_descriptor(
+            "pool-live-lease-count-plan",
+            scratch.path().join("store.db").to_string_lossy(),
+        );
+        let old = SqliteRouteStateStore::open_at_version_for_test(&descriptor, 100).unwrap();
+        old.with_writer_for_test(|conn| {
+            conn.execute_batch("WITH RECURSIVE ids(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM ids WHERE n<100000)
+               INSERT INTO pool_key_lease (lease_id,provider,session_id,credential_id,workspace,acquired_at,valid_until,released_at)
+               SELECT 'old-'||n,'p','s','key','w',1,2,CASE WHEN n%2=0 THEN 2 END FROM ids;
+               INSERT INTO pool_key_lease (lease_id,provider,session_id,credential_id,workspace,acquired_at,valid_until,released_at)
+               VALUES ('active','p','s','key','w',100,200,NULL),
+                      ('released','p','s','key','w',100,200,100),
+                      ('excluded','p','s','key','w',100,200,NULL),
+                      ('other','q','s','key','w',100,200,NULL);")
+        }).unwrap();
+        drop(old);
+
+        let store = SqliteRouteStateStore::open(&descriptor).unwrap();
+        store
+            .with_reader_for_test(|conn| {
+                assert_eq!(
+                    lease_counts(conn, "p", 101, Some("excluded"))?,
+                    [("key".into(), 1)]
+                );
+                let total: usize =
+                    conn.query_row("SELECT count(*) FROM pool_key_lease", [], |row| row.get(0))?;
+                assert_eq!(total, 100_004, "the upgrade must preserve lease history");
+                let plan = conn
+                    .prepare(&format!("EXPLAIN QUERY PLAN {LEASE_COUNTS_SQL}"))?
+                    .query_map(params!["p", 101, "excluded"], |row| row.get::<_, String>(3))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                assert!(
+                    plan.iter().any(|line| line.contains(
+                        "USING INDEX pool_key_lease_live_by_expiry (provider=? AND valid_until>?)"
+                    )),
+                    "{plan:?}"
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+
     #[test]
     fn first_pool_refusal_survives_a_later_lease_touch() {
         let scratch = cortexkit_test_support::ScratchDir::new("first-pool-refusal");

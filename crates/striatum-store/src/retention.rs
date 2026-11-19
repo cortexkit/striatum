@@ -685,6 +685,52 @@ const USED_OFFER_SOURCES: &str = "
      AND l.admission_id=COALESCE(p.reservation_id,c.admission_id)
     WHERE c.decision_id IS NOT NULL AND c.used_at_ms IS NOT NULL";
 
+// A used offer names the run's original admission. For later moves, the
+// predecessor offer's reservation overrides that original admission as the
+// source of the move. Find both cases by the admission being checked rather
+// than materializing every used offer for its principal.
+fn has_used_offer_from(admission: &str, offer_filter: &str) -> String {
+    const PREDECESSOR: &str = "p.principal=u.principal AND p.admission_id=u.admission_id
+        AND p.run_id=u.run_id AND p.decision_id=u.previous_decision_id";
+    format!(
+        "EXISTS (
+        SELECT 1 FROM account_continue u INDEXED BY account_continue_by_admission
+        WHERE u.principal={admission}.principal AND u.admission_id={admission}.admission_id
+          AND u.decision_id IS NOT NULL AND u.used_at_ms IS NOT NULL
+          AND NOT EXISTS (SELECT 1 FROM account_continue p
+              WHERE {PREDECESSOR} AND p.reservation_id IS NOT NULL)
+          {offer_filter}
+        UNION ALL
+        SELECT 1 FROM account_continue p INDEXED BY account_continue_by_reservation
+        CROSS JOIN account_continue u INDEXED BY account_continue_previous
+        WHERE p.principal={admission}.principal AND p.reservation_id={admission}.admission_id
+          AND {PREDECESSOR}
+          AND u.decision_id IS NOT NULL AND u.used_at_ms IS NOT NULL
+          {offer_filter})"
+    )
+}
+
+fn has_succeeded_started_admission(keyed: bool) -> String {
+    if keyed {
+        let dependent_source = has_used_offer_from("s", "");
+        let dependent = format!("AND EXISTS (
+            SELECT 1 FROM account_admission s INDEXED BY account_admission_started_by_run
+            WHERE s.principal=a.principal AND s.run_id=u.run_id
+              AND s.provider=a.provider AND s.account_id=a.account_id AND s.state='started'
+              AND (s.admission_id=a.admission_id OR (s.request_mode!='renew' AND s.started_at<u.used_at_ms))
+              AND NOT {dependent_source})");
+        has_used_offer_from("a", &dependent)
+    } else {
+        "EXISTS (SELECT 1 FROM sources u
+             JOIN account_admission s ON s.principal=u.principal AND s.run_id=u.run_id
+              AND s.provider=u.provider AND s.account_id=u.account_id
+             WHERE u.principal=a.principal AND u.left_id=a.admission_id AND s.state='started'
+               AND (s.admission_id=u.left_id OR (s.request_mode!='renew' AND s.started_at<u.used_at_ms))
+               AND NOT EXISTS (SELECT 1 FROM sources x
+                 WHERE x.principal=s.principal AND x.left_id=s.admission_id))".into()
+    }
+}
+
 // The cutoff and the pass clock are separate: a short retention window must
 // not remove a still-open reservation or a recently observed started run.
 fn admission_due_by_values(a: &str) -> String {
@@ -711,12 +757,14 @@ fn admission_due_by_values(a: &str) -> String {
 fn admission_candidates(keyed: bool) -> String {
     let due = admission_due_by_values("a");
     let reservation_due = admission_due_by_values("r");
+    let protects_source = has_succeeded_started_admission(keyed);
     let source = if keyed {
         "WHERE a.rowid IN (SELECT value FROM json_each(?5)) AND"
     } else {
         "INDEXED BY account_admission_by_committed WHERE"
     };
-    format!("SELECT a.rowid FROM account_admission a {source} {due}
+    format!(
+        "SELECT a.rowid FROM account_admission a {source} {due}
         AND NOT EXISTS (SELECT 1 FROM account_pin p
             JOIN account_affinity f ON f.principal=p.principal
              AND f.conversation_hash=p.conversation_hash AND f.provider=p.provider
@@ -733,15 +781,28 @@ fn admission_candidates(keyed: bool) -> String {
             WHERE c.principal=a.principal AND c.admission_id=a.admission_id
               AND c.run_id=a.run_id AND r.state IN ('reserved','started')
               AND NOT ({reservation_due}))
-        AND NOT EXISTS (SELECT 1 FROM sources u
-            JOIN account_admission s ON s.principal=u.principal AND s.run_id=u.run_id
-             AND s.provider=u.provider AND s.account_id=u.account_id
-            WHERE u.principal=a.principal AND u.left_id=a.admission_id AND s.state='started'
-              AND (s.admission_id=u.left_id OR (s.request_mode!='renew' AND s.started_at<u.used_at_ms))
-              AND NOT EXISTS (SELECT 1 FROM sources x
-                WHERE x.principal=s.principal AND x.left_id=s.admission_id))
-        ORDER BY a.committed_at LIMIT ?2")
+         AND NOT {protects_source}
+         ORDER BY a.committed_at LIMIT ?2"
+    )
 }
+
+fn admission_delete_sql(keyed: bool) -> String {
+    let candidates = admission_candidates(keyed);
+    let sources = if keyed {
+        String::new()
+    } else {
+        format!("WITH sources AS MATERIALIZED ({USED_OFFER_SOURCES}) ")
+    };
+    format!(
+        "{sources}DELETE FROM account_admission WHERE rowid IN ({candidates})
+             RETURNING rowid, principal, admission_id, conversation_hash, provider,
+               account_id, pin_id, pin_generation, state, charged, committed_at,
+               started_at IS NOT NULL"
+    )
+}
+
+#[cfg(test)]
+mod regression_tests;
 
 #[cfg(test)]
 mod fork_retention_tests {
@@ -759,10 +820,12 @@ mod fork_retention_tests {
             .store
             .with_read(|conn| {
                 for keyed in [false, true] {
-                    let sql = format!(
-                        "EXPLAIN QUERY PLAN WITH sources AS MATERIALIZED ({USED_OFFER_SOURCES}) {}",
-                        admission_candidates(keyed)
-                    );
+                    let candidates = admission_candidates(keyed);
+                    let sql = if keyed {
+                        format!("EXPLAIN QUERY PLAN {candidates}")
+                    } else {
+                        format!("EXPLAIN QUERY PLAN WITH sources AS MATERIALIZED ({USED_OFFER_SOURCES}) {candidates}")
+                    };
                     let mut statement = conn.prepare(&sql)?;
                     let values = if keyed {
                         vec![
@@ -906,14 +969,7 @@ impl crate::AccountTx<'_> {
             // reservations must not keep each other forever. Source evidence
             // goes only after the other started rows it succeeds have gone,
             // even when a batch limit leaves those rows for the next pass.
-            let candidates = admission_candidates(keys.is_some());
-            let mut statement = conn.prepare(&format!(
-                "WITH sources AS MATERIALIZED ({USED_OFFER_SOURCES}) \
-                 DELETE FROM account_admission WHERE rowid IN ({candidates}) \
-                  RETURNING rowid, principal, admission_id, conversation_hash, provider, \
-                    account_id, pin_id, pin_generation, state, charged, committed_at, \
-                    started_at IS NOT NULL"
-            ))?;
+            let mut statement = conn.prepare(&admission_delete_sql(keys.is_some()))?;
             let mut values = vec![
                 rusqlite::types::Value::Integer(before),
                 rusqlite::types::Value::Integer(limit_param(limit)),
