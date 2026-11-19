@@ -438,13 +438,9 @@ async fn catch_up_snapshot<S: SampleSource>(
     source: &mut S,
     live: &LiveQuota,
     state: &mut SequenceState,
+    now: Instant,
 ) {
-    let now = Instant::now();
-    if !state.owe_snapshot
-        || state
-            .last_catch_up_attempt
-            .is_some_and(|at| now.duration_since(at) < CATCH_UP_SNAPSHOT_EVERY)
-    {
+    if !state.catch_up_deadline(now).is_some_and(|due| due <= now) {
         return;
     }
     state.last_catch_up_attempt = Some(now);
@@ -466,6 +462,13 @@ fn insula_error_code(bytes: &[u8]) -> Option<String> {
 }
 
 impl SequenceState {
+    fn catch_up_deadline(&self, now: Instant) -> Option<Instant> {
+        self.owe_snapshot.then(|| {
+            self.last_catch_up_attempt
+                .map_or(now, |at| at + CATCH_UP_SNAPSHOT_EVERY)
+        })
+    }
+
     fn stale(&self, sample: &SampleIdentity) -> bool {
         self.retired.contains(&sample.epoch)
             || (self.epoch.as_deref() == Some(&sample.epoch)
@@ -595,20 +598,20 @@ async fn consume_one<C: StreamCursor, S: SampleSource>(
         }
         if far_behind {
             state.owe_snapshot = true;
-            catch_up_snapshot(source, live, state).await;
+            catch_up_snapshot(source, live, state, Instant::now()).await;
             return cursor
                 .ack()
                 .await
                 .map_err(|e| ConsumeError::Bus(e.to_string()));
         }
-        catch_up_snapshot(source, live, state).await;
+        catch_up_snapshot(source, live, state, Instant::now()).await;
         let mut permanent = false;
         let result = async {
             let bytes = match source.fetch(&message.id).await {
                 Ok(bytes) => bytes,
                 Err(error) if error.contains("event_not_found") => {
                     state.owe_snapshot = true;
-                    catch_up_snapshot(source, live, state).await;
+                    catch_up_snapshot(source, live, state, Instant::now()).await;
                     return Ok(());
                 }
                 Err(error) => return Err(error),
@@ -618,7 +621,7 @@ async fn consume_one<C: StreamCursor, S: SampleSource>(
             if let Some(code) = insula_error_code(&bytes) {
                 if code == "event_not_found" {
                     state.owe_snapshot = true;
-                    catch_up_snapshot(source, live, state).await;
+                    catch_up_snapshot(source, live, state, Instant::now()).await;
                 } else {
                     eprintln!(
                         "[striatum] insula refused quota event {}: {code}",
@@ -638,6 +641,7 @@ async fn consume_one<C: StreamCursor, S: SampleSource>(
                     // A snapshot read after this event includes at least its observation;
                     // applying the earlier body afterwards could roll that snapshot back.
                     live.store_body(source.snapshot().await?, false).await?;
+                    state.owe_snapshot = false;
                     if live.covered_by_snapshot(&body)?.is_none() {
                         live.store_body(live.sample_body(body)?, true).await?;
                     }
@@ -693,15 +697,36 @@ async fn snapshot<S: SampleSource>(source: &mut S, live: &LiveQuota) -> bool {
     .await
 }
 
+#[cfg(test)]
 async fn poll_if_due<S: SampleSource>(
     source: &mut S,
     live: &LiveQuota,
     schedule: &mut SnapshotSchedule,
     now: Instant,
 ) {
+    maintain_inventory(source, live, schedule, &mut SequenceState::default(), now).await;
+}
+
+async fn maintain_inventory<S: SampleSource>(
+    source: &mut S,
+    live: &LiveQuota,
+    schedule: &mut SnapshotSchedule,
+    sequence: &mut SequenceState,
+    now: Instant,
+) {
     if schedule.due(now) {
+        // A successful full inventory also replaces the samples behind any quota
+        // notices acknowledged before their bodies could be read.
+        if sequence.owe_snapshot {
+            sequence.last_catch_up_attempt = Some(now);
+        }
         let success = snapshot(source, live).await;
+        if success {
+            sequence.owe_snapshot = false;
+        }
         schedule.completed(now, success);
+    } else {
+        catch_up_snapshot(source, live, sequence, now).await;
     }
 }
 
@@ -844,7 +869,7 @@ async fn delivery_loop(
             }
         }
         schedule.observe_binding(&live.cache, &mut reconnect, Instant::now());
-        poll_if_due(&mut source, &live, &mut schedule, Instant::now()).await;
+        maintain_inventory(&mut source, live, &mut schedule, &mut state, Instant::now()).await;
         let Some(attached) = bus.as_mut() else {
             let error = live
                 .cache
@@ -856,7 +881,11 @@ async fn delivery_loop(
             {
                 tracing::warn!(error, "event reader unbound for more than 60 seconds");
             }
-            tokio::time::sleep_until(reconnect.deadline().min(schedule.next).into()).await;
+            let wake = reconnect.deadline().min(schedule.next);
+            let wake = state
+                .catch_up_deadline(Instant::now())
+                .map_or(wake, |due| wake.min(due));
+            tokio::time::sleep_until(wake.into()).await;
             continue;
         };
         let mut down = None;

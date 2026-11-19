@@ -1,6 +1,6 @@
 //! One effective view of operator runner policy and verified runner facts.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use cortexkit_role_routing::declarations::{RunnerPair, StandingLimits};
 use cortexkit_role_routing::spellings::{AUTH_METHODS, WIRE_APIS};
@@ -26,7 +26,9 @@ mod placements_tests;
 #[cfg(test)]
 #[path = "runners/watch_tests.rs"]
 mod watch_tests;
-pub(crate) use admission::{fetch_describe, refresh_admission_tiers, tier_view_unknown};
+#[cfg(test)]
+pub(crate) use admission::fetch_describe;
+pub(crate) use admission::{refresh_admission_tiers, tier_view_unknown};
 pub(crate) use describe_cache::DescribeCache;
 pub(crate) use harness_facts::RunnerDeclaration;
 
@@ -1024,22 +1026,39 @@ pub(crate) async fn refresh_loop(
             let (updates, mut changes) = tokio::sync::watch::channel(CatalogWatchState::default());
             let watch = watch_catalog(&consumer, &updates);
             let refresh = async {
+                let mut discovery = Discovery {
+                    consumer: &consumer,
+                    connection_file: &connection_file,
+                    credentials: &credentials,
+                    config_path: &config_path,
+                    cache: &mut cache,
+                    classifiers: &mut classifiers,
+                    retries: BTreeMap::new(),
+                };
                 loop {
                     let revision = changes.borrow_and_update().revision;
-                    if !refresh_pass(
-                        &consumer,
-                        &connection_file,
-                        &credentials,
-                        &config_path,
-                        &mut cache,
-                        &mut classifiers,
-                    )
-                    .await
-                    {
+                    if !discovery.refresh_pass().await {
                         break;
                     }
-                    if !wait_for_catalog_refresh(&mut changes, revision, &wake).await {
-                        break;
+                    let mut deadline = tokio::time::Instant::now() + WATCH_BACKSTOP;
+                    loop {
+                        match wait_for_catalog_refresh(
+                            &mut changes,
+                            revision,
+                            &wake,
+                            &mut deadline,
+                            discovery.next_retry(),
+                        )
+                        .await
+                        {
+                            Refresh::Catalog => break,
+                            Refresh::Describe => {
+                                if !discovery.retry_describes().await {
+                                    return;
+                                }
+                            }
+                            Refresh::Reconnect => return,
+                        }
                     }
                 }
             };
@@ -1111,44 +1130,71 @@ async fn watch_catalog(
     }
 }
 
+enum Refresh {
+    Catalog,
+    Describe,
+    Reconnect,
+}
+
 async fn wait_for_catalog_refresh(
     changes: &mut tokio::sync::watch::Receiver<CatalogWatchState>,
     revision: u64,
     wake: &tokio::sync::Notify,
-) -> bool {
-    let mut deadline = tokio::time::Instant::now() + WATCH_BACKSTOP;
+    deadline: &mut tokio::time::Instant,
+    retry: Option<tokio::time::Instant>,
+) -> Refresh {
     loop {
         let state = *changes.borrow_and_update();
         if state.rebuild {
-            return false;
+            return Refresh::Reconnect;
         }
         // Only one latest revision is retained while a pass runs. Mark it seen
         // at the start of the next pass, never at the end of the current one.
         if state.revision != revision {
-            return true;
+            return Refresh::Catalog;
         }
         if !state.healthy {
-            deadline = deadline.min(tokio::time::Instant::now() + WATCH_FALLBACK);
+            *deadline = (*deadline).min(tokio::time::Instant::now() + WATCH_FALLBACK);
         }
         tokio::select! {
-            _ = tokio::time::sleep_until(deadline) => return true,
-            _ = wake.notified() => return true,
-            result = changes.changed() => if result.is_err() { return false; },
+            _ = tokio::time::sleep_until(*deadline) => return Refresh::Catalog,
+            _ = wake.notified() => return Refresh::Catalog,
+            _ = async { tokio::time::sleep_until(retry.unwrap()).await }, if retry.is_some() => return Refresh::Describe,
+            result = changes.changed() => if result.is_err() { return Refresh::Reconnect; },
         }
     }
 }
 
-async fn refresh_pass(
-    consumer: &subc_client_rs::SubcConsumer,
-    connection_file: &std::path::Path,
-    credentials: &crate::SharedBrocaCredentials,
-    config_path: &std::path::Path,
-    cache: &mut DescribeCache,
-    classifiers: &mut super::classifier::DescribeCache,
-) -> bool {
-    striatum_store::job_timing::run("runner_declarations", async {
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum DescribeTarget {
+    Classifier(String),
+    Tiers(String),
+}
+
+struct DescribeRetry {
+    due: tokio::time::Instant,
+    delay: std::time::Duration,
+}
+
+struct Discovery<'a> {
+    consumer: &'a subc_client_rs::SubcConsumer,
+    connection_file: &'a std::path::Path,
+    credentials: &'a crate::SharedBrocaCredentials,
+    config_path: &'a std::path::Path,
+    cache: &'a mut DescribeCache,
+    classifiers: &'a mut super::classifier::DescribeCache,
+    retries: BTreeMap<DescribeTarget, DescribeRetry>,
+}
+
+impl Discovery<'_> {
+    async fn refresh_pass(&mut self) -> bool {
+        striatum_store::job_timing::run("runner_declarations", self.read_catalog()).await
+    }
+
+    async fn read_catalog(&mut self) -> bool {
         let result = tokio::time::timeout(std::time::Duration::from_secs(15), async {
-            let catalog = consumer
+            let catalog = self
+                .consumer
                 .catalog_list()
                 .await
                 .map_err(|error| error.to_string())?;
@@ -1157,79 +1203,142 @@ async fn refresh_pass(
             Ok::<_, String>(modules)
         })
         .await;
-        if let Ok(Ok(modules)) = result {
-            let mut complete = true;
-            super::consumers::replace_catalog(&modules);
-            let policies = crate::config_overrides::live_config(&config_path).v1_runners();
-            let tier_modules = if let Ok(mut credentials) = credentials.lock() {
-                let tiers = cache.catalog(
-                    &modules,
-                    &policies,
-                    &mut credentials,
-                    crate::now_ms() as i64,
-                );
+        let Ok(Ok(modules)) = result else {
+            if let Ok(mut credentials) = self.credentials.lock() {
+                self.cache
+                    .missed_all(&mut credentials, crate::now_ms() as i64);
+                self.classifiers
+                    .expire(&mut credentials, crate::now_ms() as i64);
+            }
+            return false;
+        };
+        super::consumers::replace_catalog(&modules);
+        let policies = crate::config_overrides::live_config(self.config_path).v1_runners();
+        let targets: BTreeSet<_> = self
+            .credentials
+            .lock()
+            .map(|mut credentials| {
+                let now = crate::now_ms() as i64;
+                let tiers = self
+                    .cache
+                    .catalog(&modules, &policies, &mut credentials, now);
                 placements::declarations_changed(&credentials.runner_declarations);
-                tiers
-            } else {
-                BTreeSet::new()
-            };
-            let classifier_modules = credentials
-                .lock()
-                .map(|mut credentials| {
-                    classifiers.catalog(&modules, &mut credentials, crate::now_ms() as i64)
-                })
-                .unwrap_or_default();
-            for module in classifier_modules {
+                let classifiers = self.classifiers.catalog(&modules, &mut credentials, now);
+                classifiers
+                    .into_iter()
+                    .map(DescribeTarget::Classifier)
+                    .chain(tiers.into_iter().map(DescribeTarget::Tiers))
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.retries.retain(|target, _| targets.contains(target));
+        for target in targets {
+            if self
+                .retries
+                .get(&target)
+                .is_none_or(|retry| retry.due <= tokio::time::Instant::now())
+            {
+                if !self.describe(target, &policies).await {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    fn next_retry(&self) -> Option<tokio::time::Instant> {
+        self.retries.values().map(|retry| retry.due).min()
+    }
+
+    async fn retry_describes(&mut self) -> bool {
+        let now = tokio::time::Instant::now();
+        let targets: Vec<_> = self
+            .retries
+            .iter()
+            .filter(|(_, retry)| retry.due <= now)
+            .map(|(target, _)| target.clone())
+            .collect();
+        let policies = crate::config_overrides::live_config(self.config_path).v1_runners();
+        for target in targets {
+            if !self.describe(target, &policies).await {
+                return false;
+            }
+        }
+        true
+    }
+
+    async fn describe(&mut self, target: DescribeTarget, policies: &[RunnerPolicy]) -> bool {
+        let success = match &target {
+            DescribeTarget::Classifier(module) => {
                 let result = super::classifier::fetch_describe(
-                    &consumer,
-                    &connection_file,
-                    &module,
-                    &policies,
-                    &credentials,
+                    self.consumer,
+                    self.connection_file,
+                    module,
+                    policies,
+                    self.credentials,
                 )
                 .await;
-                complete &= result.is_ok();
-                if let Ok(mut credentials) = credentials.lock() {
+                if result
+                    .as_ref()
+                    .is_err_and(|error| error.needs_catalog_reconnect())
+                {
+                    return false;
+                }
+                if let Ok(mut credentials) = self.credentials.lock() {
                     if matches!(result, Ok(None)) {
-                        classifiers.revoke(&module, &mut credentials);
+                        self.classifiers.revoke(module, &mut credentials);
                     }
-                    classifiers.reply(
-                        &module,
+                    self.classifiers.reply(
+                        module,
                         result.as_ref().ok().and_then(Option::as_ref),
                         &mut credentials,
                         crate::now_ms() as i64,
                     );
                 }
+                result.is_ok()
             }
-            // The routing declaration names routes a runner can serve, not tier support.
-            // Only the runner's own role.describe can establish tier support.
-            for module in tier_modules {
-                let describe = fetch_describe(
-                    &consumer,
-                    &connection_file,
-                    &module,
-                    &policies,
-                    &credentials,
+            DescribeTarget::Tiers(module) => {
+                let describe = admission::fetch_describe_result(
+                    self.consumer,
+                    module,
+                    policies,
+                    self.credentials,
                 )
                 .await;
-                complete &= describe.is_some();
-                if let Ok(mut credentials) = credentials.lock() {
-                    cache.reply(
-                        &module,
-                        describe.as_ref(),
+                if matches!(
+                    describe,
+                    Err(enrollment::DescribeError::TargetChangedNeverSent)
+                ) {
+                    // The route opened to a different target than the catalog
+                    // advertised. Re-read the catalog before sending a describe.
+                    return false;
+                }
+                self.credentials.lock().is_ok_and(|mut credentials| {
+                    self.cache.reply(
+                        module,
+                        describe.as_ref().ok().and_then(Option::as_ref),
                         &mut credentials,
                         crate::now_ms() as i64,
-                    );
-                }
+                    )
+                })
             }
-            complete
-        } else if let Ok(mut credentials) = credentials.lock() {
-            cache.missed_all(&mut credentials, crate::now_ms() as i64);
-            classifiers.expire(&mut credentials, crate::now_ms() as i64);
-            false
+        };
+        if success {
+            self.retries.remove(&target);
         } else {
-            false
+            // Only a catalog exchange failure replaces the shared consumer. A
+            // describe miss retries just that endpoint without extending its TTL.
+            let delay = self.retries.get(&target).map_or(WATCH_RETRY_MIN, |retry| {
+                (retry.delay * 2).min(WATCH_RETRY_MAX)
+            });
+            self.retries.insert(
+                target,
+                DescribeRetry {
+                    due: tokio::time::Instant::now() + delay,
+                    delay,
+                },
+            );
         }
-    })
-    .await
+        true
+    }
 }
