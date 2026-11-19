@@ -26,7 +26,9 @@ mod placements_tests;
 #[cfg(test)]
 #[path = "runners/watch_tests.rs"]
 mod watch_tests;
-pub(crate) use admission::{fetch_describe, refresh_admission_tiers, tier_view_unknown};
+#[cfg(test)]
+pub(crate) use admission::fetch_describe;
+pub(crate) use admission::{refresh_admission_tiers, tier_view_unknown};
 pub(crate) use describe_cache::DescribeCache;
 pub(crate) use harness_facts::RunnerDeclaration;
 
