@@ -92,9 +92,24 @@ fn cache() -> &'static Mutex<Runtime> {
     CACHE.get_or_init(|| Mutex::new(Runtime::default()))
 }
 
-/// Join by account reference, not provider/tier spelling: Antigravity's quota
+fn price_matches_login(price: &Value, account_id: &str, credential_ref: Option<&str>) -> bool {
+    // An explicit account reference is authoritative even when the price also
+    // names the credential. Astrocyte omits it for key-only logins.
+    match &price["account_ref"] {
+        Value::Null => {
+            credential_ref.is_some_and(|credential| price["credential_ref"] == credential)
+        }
+        account_ref => account_ref == account_id,
+    }
+}
+
+/// Join by login reference, not provider/tier spelling: Antigravity's quota
 /// provider can differ from the prefix in its Astrocyte plan name.
-fn account_plan<'a>(report: &'a Value, account_id: &str) -> Result<Option<&'a Value>, ()> {
+fn account_plan<'a>(
+    report: &'a Value,
+    account_id: &str,
+    credential_ref: Option<&str>,
+) -> Result<Option<&'a Value>, ()> {
     let Some(rows) = report["latest"].as_array() else {
         return Ok(None);
     };
@@ -103,7 +118,7 @@ fn account_plan<'a>(report: &'a Value, account_id: &str) -> Result<Option<&'a Va
             && row["plan_prices"].as_array().is_some_and(|prices| {
                 prices
                     .iter()
-                    .any(|price| price["account_ref"] == account_id)
+                    .any(|price| price_matches_login(price, account_id, credential_ref))
             })
     });
     let matched = matches.next();
@@ -190,12 +205,11 @@ fn price_row<'a>(prices: &'a Value, provider: &str, tier: &str) -> Option<&'a Va
         .find(|row| row["provider_id"] == provider && row["tier"] == tier)
 }
 
-fn astro_fee(row: &Value, account_id: &str, now: i64) -> Option<f64> {
+fn astro_fee(row: &Value, account_id: &str, credential_ref: Option<&str>, now: i64) -> Option<f64> {
     let plan = row["plan"].as_str()?;
-    let plan = row["plan_prices"]
-        .as_array()?
-        .iter()
-        .find(|price| price["account_ref"] == account_id && price["plan"] == plan)?;
+    let plan = row["plan_prices"].as_array()?.iter().find(|price| {
+        price_matches_login(price, account_id, credential_ref) && price["plan"] == plan
+    })?;
     if plan["review_by_ms"]
         .as_i64()
         .is_some_and(|review| review < now)
@@ -405,7 +419,8 @@ fn build(state: &AccountQuotaState, report: &Value, prices: &Value, now: i64) ->
         let tier =
             tier.or_else(|| credential_identity.and_then(|identity| identity.plan_tier.as_deref()));
         let tier = tier.map(str::to_owned);
-        let joined = match account_plan(report, &reading.account_id) {
+        let credential_ref = credential_identity.and(entry.credential_ref.as_deref());
+        let joined = match account_plan(report, &reading.account_id, credential_ref) {
             Ok(row) => row,
             Err(()) => {
                 warn_ambiguous_account(&reading.account_id);
@@ -424,7 +439,9 @@ fn build(state: &AccountQuotaState, report: &Value, prices: &Value, now: i64) ->
                     .then(|| decimal(&r["price"], "minor_units"))
                     .flatten()
             })
-            .or_else(|| joined.and_then(|row| astro_fee(row, &reading.account_id, now)))
+            .or_else(|| {
+                joined.and_then(|row| astro_fee(row, &reading.account_id, credential_ref, now))
+            })
             .unwrap_or(DEFAULT_PLAN_FEE_USD);
         out.pools
             .entry(provider.into())
@@ -713,7 +730,17 @@ pub(crate) fn test_account_pools(
     prices: &Value,
     now: i64,
 ) -> HashMap<String, SubscriptionPool> {
-    build(state, &Value::Null, prices, now).pools
+    test_account_pools_with_report(state, &Value::Null, prices, now)
+}
+
+#[cfg(test)]
+pub(crate) fn test_account_pools_with_report(
+    state: &AccountQuotaState,
+    report: &Value,
+    prices: &Value,
+    now: i64,
+) -> HashMap<String, SubscriptionPool> {
+    build(state, report, prices, now).pools
 }
 
 #[cfg(test)]
@@ -1796,12 +1823,12 @@ mod tests {
 
     #[test]
     fn v1_reply_parses_but_supplies_no_plan_measurement() {
-        assert!(account_plan(&json!({"latest":[],"series":[]}), "a")
+        assert!(account_plan(&json!({"latest":[],"series":[]}), "a", None)
             .unwrap()
             .is_none());
         let captured = report();
         assert!(captured["latest"].is_array());
-        assert!(account_plan(&captured, "a").unwrap().is_none());
+        assert!(account_plan(&captured, "a", None).unwrap().is_none());
         assert!(captured["latest"]
             .as_array()
             .unwrap()
@@ -1872,8 +1899,8 @@ mod tests {
             "multiplier":99.0, "interval_end_ms":NOW, "observation_day":"2026-10-09"});
         let report = json!({"latest":[row]});
         assert!(measured(&report["latest"][0]).is_none());
-        assert!(account_plan(&report, "acct-10").unwrap().is_none());
-        assert!(astro_fee(&report["latest"][0], "acct-10", NOW).is_none());
+        assert!(account_plan(&report, "acct-10", None).unwrap().is_none());
+        assert!(astro_fee(&report["latest"][0], "acct-10", None, NOW).is_none());
     }
 
     fn v2_state(now: i64) -> AccountQuotaState {
@@ -2043,14 +2070,14 @@ mod tests {
     fn subscription_astro_fee_is_matched_by_plan_and_account() {
         let mut report = report_v2();
         let now = report["latest"][0]["interval_end_ms"].as_i64().unwrap();
-        let pro100 = account_plan(&report, "acct-9").unwrap().unwrap();
-        let pro200 = account_plan(&report, "acct-10").unwrap().unwrap();
-        assert_eq!(astro_fee(pro100, "acct-9", now), Some(100.0));
-        assert_eq!(astro_fee(pro200, "acct-10", now), Some(200.0));
-        assert_eq!(astro_fee(pro100, "acct-10", now), None);
+        let pro100 = account_plan(&report, "acct-9", None).unwrap().unwrap();
+        let pro200 = account_plan(&report, "acct-10", None).unwrap().unwrap();
+        assert_eq!(astro_fee(pro100, "acct-9", None, now), Some(100.0));
+        assert_eq!(astro_fee(pro200, "acct-10", None, now), Some(200.0));
+        assert_eq!(astro_fee(pro100, "acct-10", None, now), None);
         report["latest"].as_array_mut().unwrap().reverse();
-        let pro200 = account_plan(&report, "acct-10").unwrap().unwrap();
-        assert_eq!(astro_fee(pro200, "acct-10", now), Some(200.0));
+        let pro200 = account_plan(&report, "acct-10", None).unwrap().unwrap();
+        assert_eq!(astro_fee(pro200, "acct-10", None, now), Some(200.0));
         let built = build(&v2_state(now), &report, &Value::Null, now);
         assert_eq!(built.pools["openai"].plans[0].fee_usd, 100.0);
         assert_eq!(built.pools["openai"].plans[1].fee_usd, 200.0);
@@ -2063,7 +2090,7 @@ mod tests {
             .find(|r| r["plan"] == "openai/pro_200")
             .unwrap();
         row["plan_prices"][0]["review_by_ms"] = json!(now - 1);
-        assert_eq!(astro_fee(row, "acct-10", now), None);
+        assert_eq!(astro_fee(row, "acct-10", None, now), None);
     }
 
     #[test]
@@ -2079,9 +2106,9 @@ mod tests {
         pro100["plan_prices"].as_array_mut().unwrap().push(json!({
             "account_ref":"acct-10", "plan":"openai/pro_100", "monthly_nanos":100_000_000_000i64
         }));
-        assert!(account_plan(&report, "acct-10").is_err());
+        assert!(account_plan(&report, "acct-10", None).is_err());
         report["latest"].as_array_mut().unwrap().reverse();
-        assert!(account_plan(&report, "acct-10").is_err());
+        assert!(account_plan(&report, "acct-10", None).is_err());
         let mut state = v2_state(now);
         let mut unlisted = state.readings.readings[&("codex".into(), "acct-11".into())].clone();
         unlisted.account_id = "not-listed".into();
@@ -2099,7 +2126,7 @@ mod tests {
             .clone();
         identity.account_id = "not-listed".into();
         roster.identities.push(identity);
-        assert!(account_plan(&report, "not-listed").unwrap().is_none());
+        assert!(account_plan(&report, "not-listed", None).unwrap().is_none());
         let built = build(&state, &report, &Value::Null, now);
         let pool = &built.pools["openai"];
         let unknown = pool.plans.iter().find(|p| p.plan.is_none()).unwrap();

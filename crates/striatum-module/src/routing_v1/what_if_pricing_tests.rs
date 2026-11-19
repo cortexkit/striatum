@@ -144,6 +144,7 @@ const KIMI_PROVIDER: &str = "kimi-code-plan-global";
 const KIMI_ROUTE: &str = "kimi-code-plan-global/k3.1-pro";
 const KIMI_CREDENTIAL: &str = "apikey:kimi-for-coding";
 const KIMI_NOW: i64 = 1_795_100_907_000;
+const KIMI_PLAN: &str = "kimi-code-plan-global/allegro";
 
 fn kimi_fact() -> striatum_core::ModelFact {
     let mut fact = super::super::conformance_tests::catalog_fact(
@@ -326,6 +327,144 @@ fn route_pressure(answer: &Value, index: usize, route: &str) -> f64 {
     route_task_pricing(answer, index, route)["pressure"]
         .as_f64()
         .unwrap()
+}
+
+fn kimi_join_report() -> Value {
+    json!({"latest": [{
+        "quota_provider": "kimi-for-coding",
+        "plan": KIMI_PLAN,
+        "routing_eligible": false,
+        "multiplier": 3.60,
+        "last_eligible": {
+            "day": "2026-11-14",
+            "interval_end_ms": crate::account_quota::parse_rfc3339_ms("2026-11-15T00:00:00Z").unwrap(),
+            "multiplier": 4.40
+        },
+        "plan_prices": [{
+            "credential_ref": KIMI_CREDENTIAL,
+            "monthly_nanos": 99_000_000_000i64,
+            "plan": KIMI_PLAN
+        }]
+    }]})
+}
+
+fn kimi_join_pool(
+    state: &crate::account_quota::AccountQuotaState,
+    report: &Value,
+) -> SubscriptionPool {
+    crate::subscription_economics::test_account_pools_with_report(
+        state,
+        report,
+        &Value::Null,
+        KIMI_NOW,
+    )
+    .remove(KIMI_PROVIDER)
+    .unwrap()
+}
+
+#[tokio::test]
+async fn kimi_join_mason_what_if_uses_last_eligible_multiplier() {
+    let _clock = crate::InjectedClock::set(KIMI_NOW as u64);
+    let (harness, scenario, fixture) = setup(false);
+    let listing = install_key_only_kimi(&harness);
+    harness.edit_config(|config| {
+        config["providers"][KIMI_PROVIDER]["subscription_multiplier"] = json!(3.0);
+    });
+    let state = kimi_state(&listing, true);
+    let mut pools = scenario_pools(&fixture, false);
+    pools.insert(
+        KIMI_PROVIDER.into(),
+        kimi_join_pool(&state, &kimi_join_report()),
+    );
+    drop(scenario);
+    let _pools = crate::subscription_economics::test_pools(pools);
+    publish_kimi_state(state);
+    let operator = operator(&harness).await;
+    let answer = kimi_sweep(
+        &operator,
+        "prefrontal.mason",
+        &fixture,
+        (50..=70).map(f64::from).collect(),
+        None,
+    )
+    .await;
+    if std::env::var_os("STRIATUM_KIMI_SWEEP").is_some() {
+        let picks: Vec<_> = answer["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|result| &result["pick"]["route"])
+            .collect();
+        let price = route_task_pricing(&answer, 0, KIMI_ROUTE);
+        println!(
+            "KIMI_JOIN_SWEEP={}",
+            json!({"picks":picks,
+            "valueSource":price["valueSource"],"valueMultiplier":price["valueMultiplier"]})
+        );
+    }
+    for index in 0..=20 {
+        let price = route_task_pricing(&answer, index, KIMI_ROUTE);
+        assert_eq!(price["valueSource"], "astrocyte last eligible 2026-11-14");
+        assert_eq!(price["valueMultiplier"], 4.40);
+    }
+}
+
+#[test]
+fn kimi_join_fee_uses_matching_monthly_nanos() {
+    let harness = Harness::new("kimi-join-fee");
+    let state = kimi_state(&install_key_only_kimi(&harness), true);
+    let mut report = kimi_join_report();
+    report["latest"][0]["plan_prices"]
+        .as_array_mut()
+        .unwrap()
+        .insert(
+            0,
+            json!({
+                "account_ref": "different-account", "credential_ref": KIMI_CREDENTIAL,
+                "monthly_nanos": 123_000_000_000i64, "plan": KIMI_PLAN
+            }),
+        );
+    assert_eq!(kimi_join_pool(&state, &report).plans[0].fee_usd, 99.0);
+}
+
+#[test]
+fn kimi_join_account_ref_is_authoritative_and_mixed_matches_are_ambiguous() {
+    let harness = Harness::new("kimi-join-account");
+    let state = kimi_state(&install_key_only_kimi(&harness), true);
+    let mut report = kimi_join_report();
+    let mut competitor = report["latest"][0].clone();
+    competitor["plan"] = json!("different-plan");
+    competitor["plan_prices"][0]["plan"] = json!("different-plan");
+    competitor["plan_prices"][0]["account_ref"] = json!("different-account");
+    report["latest"][0]["plan_prices"][0] = json!({
+        "plan": KIMI_PLAN, "account_ref": KIMI_CREDENTIAL, "monthly_nanos": 99_000_000_000i64
+    });
+    report["latest"].as_array_mut().unwrap().push(competitor);
+    let pool = kimi_join_pool(&state, &report);
+    assert_eq!(pool.plans[0].plan.as_deref(), Some(KIMI_PLAN));
+    assert_eq!(pool.plans[0].fee_usd, 99.0);
+
+    report["latest"][1]["plan_prices"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("account_ref");
+    assert!(kimi_join_pool(&state, &report).plans[0].plan.is_none());
+}
+
+#[test]
+fn kimi_join_ignores_another_credential() {
+    let harness = Harness::new("kimi-join-credential");
+    let state = kimi_state(&install_key_only_kimi(&harness), true);
+    let mut report = kimi_join_report();
+    let matching_row = report["latest"][0].clone();
+    report["latest"][0]["plan_prices"][0]["credential_ref"] = json!("apikey:other");
+    assert!(kimi_join_pool(&state, &report).plans[0].plan.is_none());
+
+    report["latest"].as_array_mut().unwrap().push(matching_row);
+    assert_eq!(
+        kimi_join_pool(&state, &report).plans[0].plan.as_deref(),
+        Some(KIMI_PLAN)
+    );
 }
 
 #[tokio::test]
