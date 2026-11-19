@@ -1050,7 +1050,11 @@ pub(crate) async fn refresh_loop(
                         .await
                         {
                             Refresh::Catalog => break,
-                            Refresh::Describe => discovery.retry_describes().await,
+                            Refresh::Describe => {
+                                if !discovery.retry_describes().await {
+                                    return;
+                                }
+                            }
                             Refresh::Reconnect => return,
                         }
                     }
@@ -1232,7 +1236,9 @@ impl Discovery<'_> {
                 .get(&target)
                 .is_none_or(|retry| retry.due <= tokio::time::Instant::now())
             {
-                self.describe(target, &policies).await;
+                if !self.describe(target, &policies).await {
+                    return false;
+                }
             }
         }
         true
@@ -1242,7 +1248,7 @@ impl Discovery<'_> {
         self.retries.values().map(|retry| retry.due).min()
     }
 
-    async fn retry_describes(&mut self) {
+    async fn retry_describes(&mut self) -> bool {
         let now = tokio::time::Instant::now();
         let targets: Vec<_> = self
             .retries
@@ -1252,11 +1258,14 @@ impl Discovery<'_> {
             .collect();
         let policies = crate::config_overrides::live_config(self.config_path).v1_runners();
         for target in targets {
-            self.describe(target, &policies).await;
+            if !self.describe(target, &policies).await {
+                return false;
+            }
         }
+        true
     }
 
-    async fn describe(&mut self, target: DescribeTarget, policies: &[RunnerPolicy]) {
+    async fn describe(&mut self, target: DescribeTarget, policies: &[RunnerPolicy]) -> bool {
         let success = match &target {
             DescribeTarget::Classifier(module) => {
                 let result = super::classifier::fetch_describe(
@@ -1267,6 +1276,12 @@ impl Discovery<'_> {
                     self.credentials,
                 )
                 .await;
+                if result
+                    .as_ref()
+                    .is_err_and(|error| error.needs_catalog_reconnect())
+                {
+                    return false;
+                }
                 if let Ok(mut credentials) = self.credentials.lock() {
                     if matches!(result, Ok(None)) {
                         self.classifiers.revoke(module, &mut credentials);
@@ -1281,18 +1296,25 @@ impl Discovery<'_> {
                 result.is_ok()
             }
             DescribeTarget::Tiers(module) => {
-                let describe = fetch_describe(
+                let describe = admission::fetch_describe_result(
                     self.consumer,
-                    self.connection_file,
                     module,
                     policies,
                     self.credentials,
                 )
                 .await;
+                if matches!(
+                    describe,
+                    Err(enrollment::DescribeError::TargetChangedNeverSent)
+                ) {
+                    // The route opened to a different target than the catalog
+                    // advertised. Re-read the catalog before sending a describe.
+                    return false;
+                }
                 self.credentials.lock().is_ok_and(|mut credentials| {
                     self.cache.reply(
                         module,
-                        describe.as_ref(),
+                        describe.as_ref().ok().and_then(Option::as_ref),
                         &mut credentials,
                         crate::now_ms() as i64,
                     )
@@ -1315,5 +1337,6 @@ impl Discovery<'_> {
                 },
             );
         }
+        true
     }
 }
