@@ -25,6 +25,38 @@ const TABLES: [&str; 8] = [
     "account_eligibility",
 ];
 
+#[cfg(feature = "test-support")]
+static RECHECK_ROW_VISITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(feature = "test-support")]
+pub fn recheck_row_visits() -> u64 {
+    RECHECK_ROW_VISITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(feature = "test-support")]
+thread_local! {
+    static COUNT_RECHECK_ROWS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(feature = "test-support")]
+pub fn count_recheck_rows<T>(project: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            COUNT_RECHECK_ROWS.set(self.0);
+        }
+    }
+    let _restore = Restore(COUNT_RECHECK_ROWS.replace(true));
+    project()
+}
+
+fn count_recheck_row_visit() {
+    #[cfg(feature = "test-support")]
+    if COUNT_RECHECK_ROWS.get() {
+        RECHECK_ROW_VISITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PoolTelemetry {
     provider: String,
@@ -117,6 +149,17 @@ impl Record {
                     row.block.scope.admission_id.as_deref().unwrap_or(""),
                 ),
             ],
+            // A quota hold is linked by its fence ID, not by its provider
+            // column. Maintain that membership when a source is written or retired.
+            Self::Block(row) if row.source_present && row.block.kind == "account" => {
+                let mut scopes = vec![provider_scope(&row.block.scope.provider)];
+                if let Some(id) = row.fence_id() {
+                    if let Some(credential) = quota_hold_credential_key(&id) {
+                        scopes.push(credential_quota_scope(credential));
+                    }
+                }
+                scopes
+            }
             Self::Block(row) => vec![provider_scope(&row.block.scope.provider)],
             Self::Success(row) => vec![serde_json::json!(["fence", row.fence_id]).to_string()],
             Self::Pool(row) => vec![provider_scope(&row.provider)],
@@ -133,6 +176,20 @@ fn provider_scope(provider: &str) -> String {
 
 fn exclusion_scope(principal: &str, admission_id: &str) -> String {
     serde_json::json!(["exclusion", principal, admission_id]).to_string()
+}
+
+fn credential_quota_scope(origin_key: &str) -> String {
+    format!("credential-quota:{origin_key}")
+}
+
+fn quota_hold_credential_key(id: &str) -> Option<&str> {
+    let rest = id.strip_prefix("credential-quota:")?;
+    // Credential IDs can contain colons. Read the JSON key to find the suffix
+    // delimiter, then retain the original bytes used by the prefix comparison.
+    let mut json = serde_json::Deserializer::from_str(rest).into_iter::<[String; 2]>();
+    json.next()?.ok()?;
+    let (key, suffix) = rest.split_at(json.byte_offset());
+    suffix.starts_with(':').then_some(key)
 }
 
 impl Table {
@@ -292,6 +349,22 @@ impl BlockState {
         })
     }
 
+    fn block_rows_for_admission(&self, provider: &str) -> impl Iterator<Item = &StoredBlock> {
+        let table = &self.tables[0];
+        table
+            .scoped(&provider_scope(provider))
+            .chain(
+                (!provider.is_empty())
+                    .then(|| table.scoped(&provider_scope("")))
+                    .into_iter()
+                    .flatten(),
+            )
+            .filter_map(|(_, record)| match record {
+                Record::Block(row) => Some(row),
+                _ => None,
+            })
+    }
+
     pub(crate) fn block(&self, kind: &str, origin_key: &str) -> Option<&StoredBlock> {
         let table = self.tables.first()?;
         let key = serde_json::json!([kind, origin_key]).to_string();
@@ -345,67 +418,79 @@ impl BlockState {
         }
         let mut origin = row.origin();
         if origin.kind == "credential" {
-            let prefix = format!("credential-quota:{}:", origin.origin_key);
-            origin.quota = Some(self.block_rows().any(|hold| {
-                hold.source_present
-                    && hold.block.kind == "account"
-                    && hold.fence_id().is_some_and(|id| id.starts_with(&prefix))
-            }));
+            origin.quota = Some(
+                self.tables[0]
+                    .scopes
+                    .get(&credential_quota_scope(&origin.origin_key))
+                    .is_some(),
+            );
         }
         Some(origin)
     }
 
-    fn view_rows(&self) -> Vec<((u8, i64), ViewOrigin)> {
-        self.block_rows()
-            .filter_map(|row| {
-                let origin = self.view_origin(row)?;
-                if row.block.kind == "route"
-                    && self
-                        .block(
-                            "provider",
-                            &serde_json::json!([row.block.scope.provider]).to_string(),
-                        )
-                        .is_some_and(|provider| {
-                            provider.source_present
-                                && provider.cleared_at.is_none()
-                                && provider.scope_error == row.scope_error
-                                && provider.observed_at == row.observed_at
-                                && provider.cooldown_until.map(SqlReal::as_f64).unwrap_or(0.0)
-                                    >= row.cooldown_until.map(SqlReal::as_f64).unwrap_or(0.0)
-                                && provider
+    fn view_rows<'a>(
+        &'a self,
+        rows: impl Iterator<Item = &'a StoredBlock>,
+    ) -> Vec<((u8, i64), ViewOrigin)> {
+        rows.filter_map(|row| {
+            count_recheck_row_visit();
+            let origin = self.view_origin(row)?;
+            if row.block.kind == "route"
+                && self
+                    .block(
+                        "provider",
+                        &serde_json::json!([row.block.scope.provider]).to_string(),
+                    )
+                    .is_some_and(|provider| {
+                        provider.source_present
+                            && provider.cleared_at.is_none()
+                            && provider.scope_error == row.scope_error
+                            && provider.observed_at == row.observed_at
+                            && provider.cooldown_until.map(SqlReal::as_f64).unwrap_or(0.0)
+                                >= row.cooldown_until.map(SqlReal::as_f64).unwrap_or(0.0)
+                            && provider
+                                .quota_exhausted_until
+                                .map(SqlReal::as_f64)
+                                .unwrap_or(0.0)
+                                >= row
                                     .quota_exhausted_until
                                     .map(SqlReal::as_f64)
                                     .unwrap_or(0.0)
-                                    >= row
-                                        .quota_exhausted_until
-                                        .map(SqlReal::as_f64)
-                                        .unwrap_or(0.0)
-                        })
-                {
-                    return None;
-                }
-                Some((
-                    (super::view_branch(&row.block.kind), row.source_order),
-                    origin,
-                ))
-            })
-            .collect()
+                    })
+            {
+                return None;
+            }
+            Some((
+                (super::view_branch(&row.block.kind), row.source_order),
+                origin,
+            ))
+        })
+        .collect()
     }
 
     pub fn view_origins(&self) -> Vec<ViewOrigin> {
-        let mut rows: Vec<_> = self.view_rows().into_iter().map(|(_, row)| row).collect();
+        let mut rows: Vec<_> = self
+            .view_rows(self.block_rows())
+            .into_iter()
+            .map(|(_, row)| row)
+            .collect();
         rows.sort_by(|a, b| (&a.kind, &a.origin_key).cmp(&(&b.kind, &b.origin_key)));
         rows
     }
 
     pub fn view_origins_in_scan_order(&self) -> Vec<ViewOrigin> {
-        let mut rows = self.view_rows();
+        self.scan_order(self.block_rows())
+    }
+
+    fn scan_order<'a>(&'a self, rows: impl Iterator<Item = &'a StoredBlock>) -> Vec<ViewOrigin> {
+        let mut rows = self.view_rows(rows);
         rows.sort_by_key(|(position, _)| *position);
         rows.into_iter().map(|(_, row)| row).collect()
     }
 
     fn clocks(&self, rowid_order: bool) -> fence_rechecks::Clocks {
         self.block_rows()
+            .inspect(|_| count_recheck_row_visit())
             .filter(|row| row.managed && row.is_origin())
             .map(|row| {
                 let mut block = row.block.clone();
@@ -450,6 +535,51 @@ impl BlockState {
             self.pending_claim_history(block);
         }
         Ok(loaded.blocks.iter().map(FenceRecheck::from).collect())
+    }
+
+    /// Only the requested provider and provider-less origins can apply during admission.
+    pub fn admission_fence_rechecks(
+        &self,
+        provider: &str,
+        now: i64,
+    ) -> striatum_core::RouteStateResult<Vec<FenceRecheck>> {
+        if !self.enabled() {
+            return Ok(Vec::new());
+        }
+        let mut observations = Vec::new();
+        let rows = self.block_rows_for_admission(provider).inspect(|row| {
+            if row.managed
+                && row.is_origin()
+                && !row.source_present
+                && row.block.kind == "observation"
+                && row.cleared_at.is_none()
+            {
+                let mut recheck = FenceRecheck::from(&row.block);
+                recheck.cleared_models.clone_from(&row.cleared_models);
+                observations.push(recheck);
+            }
+        });
+        let mut rechecks = Vec::new();
+        for origin in self.scan_order(rows) {
+            let prior = self
+                .block(&origin.kind, &origin.origin_key)
+                .filter(|row| row.managed && row.is_origin());
+            if let Some(mut block) = fence_rechecks::derive_block(
+                origin,
+                prior.map(|row| (&row.block, row.cleared_at)),
+                now,
+            )
+            .map_err(crate::err)?
+            {
+                if let Some(row) = prior.filter(|row| row.block.evidence == block.evidence) {
+                    block.cleared_models.clone_from(&row.cleared_models);
+                }
+                self.pending_claim_history(&mut block);
+                rechecks.push(FenceRecheck::from(&block));
+            }
+        }
+        rechecks.extend(observations);
+        Ok(rechecks)
     }
 
     // A replacement source can be read before its keyed registration. Its

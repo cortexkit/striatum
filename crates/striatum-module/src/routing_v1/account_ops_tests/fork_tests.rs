@@ -1,5 +1,6 @@
 use super::*;
 use cortexkit_claustrum_client::{ListedCredential, ScopedCredentialListing};
+use striatum_core::route_state_store::CredentialRefusal;
 
 mod thalamus_reader_tests;
 
@@ -375,6 +376,208 @@ async fn fork_of_refuses_parent_block_and_needs_sign_in_without_fallback() {
             .is_none());
         crate::account_state::assert_published_equals_fresh_load(harness.store(), "fork refused");
     }
+}
+
+#[tokio::test]
+async fn fork_of_claims_one_due_credential_recovery_test() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, _) = fixture();
+    let runner = harness.bind(reserved("class-runner"), None).await;
+    parent(&runner).await;
+    let interval = crate::credential_fences::CREDENTIAL_REFUSED_REPROBE_MS;
+    place_entitlement_fence(&harness, NOW as i64 - interval);
+    let (before, owners) = parent_recheck(&harness);
+    assert!(!before.quota);
+    assert_eq!(before.next_recheck_at, NOW as i64);
+    assert!(owners.is_empty());
+
+    let first = runner
+        .call("route.account_for", &fork_request("first-probe", "parent"))
+        .await;
+    assert_eq!(response(&first)["account"]["credential_id"], PARENT);
+    let second = runner
+        .call("route.account_for", &fork_request("second-probe", "parent"))
+        .await;
+    assert_eq!(second.1["code"], "account_hold", "{}", second.1);
+    assert_eq!(
+        second.1["detail"]["reason"],
+        "fork_parent_account_unavailable"
+    );
+    let (after, owners) = parent_recheck(&harness);
+    assert_eq!(after.last_claimed_at, Some(NOW as i64));
+    assert_eq!(after.next_recheck_at, NOW as i64 + interval);
+    assert_eq!(second.1["detail"]["until_ms"], after.next_recheck_at);
+    assert_eq!(
+        owners,
+        vec![json!(["account_admission", "reserved:class-runner", "first-probe"]).to_string()]
+    );
+    assert!(harness
+        .store()
+        .v1_admission("reserved:class-runner", "second-probe")
+        .unwrap()
+        .is_none());
+}
+
+fn place_entitlement_fence(harness: &Harness, observed: i64) {
+    crate::account_writer::record_credential_entitlement_fence(
+        harness.store(),
+        &CredentialRefusal {
+            provider_id: "anthropic".into(),
+            credential_id: PARENT.into(),
+            code: "ENTITLEMENT_ERROR".into(),
+        },
+        None,
+        observed,
+    )
+    .unwrap();
+}
+
+fn parent_recheck(harness: &Harness) -> (striatum_store::FenceRecheck, Vec<String>) {
+    crate::account_writer::execute(
+        harness.store(),
+        striatum_store::AccountCommandKind::Repair,
+        |tx| {
+            let clock = tx
+                .fence_rechecks()?
+                .into_iter()
+                .find(|row| {
+                    row.kind == "credential" && row.credential_id.as_deref() == Some(PARENT)
+                })
+                .unwrap();
+            let owners = tx
+                .probe_authorizations_for_origins(std::slice::from_ref(&clock))?
+                .into_iter()
+                .map(|entry| entry.owner)
+                .collect();
+            Ok((clock, owners))
+        },
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn fork_of_refuses_an_active_parent_with_a_login_condition_until_cleared() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, mut credentials) = fixture();
+    let runner = harness.bind(reserved("class-runner"), None).await;
+    parent(&runner).await;
+    let original = credentials.listed_credentials().to_vec();
+    let mut marked = original.clone();
+    let login = marked.iter_mut().find(|row| row.id == PARENT).unwrap();
+    assert_eq!(login.state, "active");
+    login.condition = Some(cortexkit_claustrum_client::ListedCredentialCondition {
+        reason: "provider_verification_required".into(),
+        since_ms: 7,
+    });
+    credentials.apply_listing(
+        &ScopedCredentialListing {
+            view: "verification-required".into(),
+            credentials: marked,
+            ..Default::default()
+        },
+        NOW,
+    );
+    harness.set_credentials(credentials.clone());
+
+    let reply = runner
+        .call("route.account_for", &fork_request("marked-fork", "parent"))
+        .await;
+    assert_eq!(reply.1["code"], "account_hold", "{}", reply.1);
+    assert_eq!(
+        reply.1["detail"]["reason"],
+        "fork_parent_account_unavailable"
+    );
+    assert!(harness
+        .store()
+        .v1_admission("reserved:class-runner", "marked-fork")
+        .unwrap()
+        .is_none());
+
+    credentials.apply_listing(
+        &ScopedCredentialListing {
+            view: "verification-cleared".into(),
+            credentials: original,
+            ..Default::default()
+        },
+        NOW,
+    );
+    harness.set_credentials(credentials);
+    let reply = runner
+        .call("route.account_for", &fork_request("fresh-fork", "parent"))
+        .await;
+    assert_eq!(response(&reply)["account"]["credential_id"], PARENT);
+}
+
+#[tokio::test]
+async fn admission_recheck_projection_does_not_visit_unrelated_provider_rows() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let interval = crate::credential_fences::CREDENTIAL_REFUSED_REPROBE_MS;
+    let mut results = Vec::new();
+    for (providers, credentials) in [(1, 2), (20, 8)] {
+        let (harness, _) = fixture();
+        let runner = harness.bind(reserved("class-runner"), None).await;
+        place_entitlement_fence(&harness, NOW as i64 - interval);
+        let writer_harness = harness.clone();
+        // The vault listing never names these credentials. Insert their fences
+        // after roster preparation, which retires fences for missing logins.
+        crate::account_selection::admission::after_roster_prepared("ordinary-probe", move || {
+            crate::account_writer::execute(
+                writer_harness.store(),
+                striatum_store::AccountCommandKind::Repair,
+                move |tx| {
+                    for provider in 0..providers {
+                        for credential in 0..credentials {
+                            tx.record_credential_entitlement_fence(
+                                &CredentialRefusal {
+                                    provider_id: format!("unrelated-{provider}"),
+                                    credential_id: format!("oauth:unrelated-{credential}"),
+                                    code: "ENTITLEMENT_ERROR".into(),
+                                },
+                                None,
+                                NOW as i64,
+                            )?;
+                        }
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+        });
+        let mut body = fork_request("ordinary-probe", "unused");
+        body.as_object_mut().unwrap().remove("fork_of");
+        body["candidates"] = json!({"view_digest":"parent-only","accounts":[{"account_id":PARENT,"credential_id":PARENT}]});
+        let visits = striatum_store::recheck_row_visits();
+        let reply = runner.call("route.account_for", &body).await;
+        let visits = striatum_store::recheck_row_visits() - visits;
+        crate::account_writer::execute(
+            harness.store(),
+            striatum_store::AccountCommandKind::Repair,
+            move |tx| {
+                assert_eq!(
+                    tx.fence_rechecks()?
+                        .iter()
+                        .filter(|row| row.provider.starts_with("unrelated-"))
+                        .count(),
+                    providers * credentials
+                );
+                Ok(())
+            },
+        )
+        .unwrap();
+        eprintln!("recheck visits with {providers} unrelated providers and {credentials} credentials each: {visits}");
+        assert_eq!(response(&reply)["account"]["credential_id"], PARENT);
+        let (clock, owners) = parent_recheck(&harness);
+        assert_eq!(clock.last_claimed_at, Some(NOW as i64));
+        assert_eq!(clock.next_recheck_at, NOW as i64 + interval);
+        assert_eq!(owners.len(), 1);
+        assert!(visits > 0, "the relevant clock must have been visited");
+        results.push((visits, clock, owners));
+    }
+    assert_eq!(results[0].0, results[1].0, "recheck row visits");
+    assert_eq!(
+        (&results[0].1, &results[0].2),
+        (&results[1].1, &results[1].2)
+    );
 }
 
 #[tokio::test]

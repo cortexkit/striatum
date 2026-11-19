@@ -34,7 +34,7 @@ pub fn reading_log_rows_for_poll(
         return Vec::new();
     }
 
-    let account_key = render_account_key(provider_id, entry.account.as_deref());
+    let account_key = render_account_key(provider_id, entry.account_identity());
     let fetched_at = fetched_at_ms(entry).and_then(|value| i64::try_from(value).ok());
     let banked_credit_count = entry
         .saved_resets

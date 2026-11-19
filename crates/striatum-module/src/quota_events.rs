@@ -84,13 +84,22 @@ struct LiveQuota {
     cache: SharedQuotaCache,
     accounts: account_quota::SharedAccountQuota,
     store: SharedStore,
-    snapshot_baseline: Arc<Mutex<HashMap<AccountKey, crate::ProviderUsage>>>,
+    snapshot_baseline: Arc<Mutex<HashMap<ReadingKey, crate::ProviderUsage>>>,
 }
 
 struct CommittedQuota {
     cache: crate::QuotaCache,
     readings: account_quota::AccountReadings,
-    baseline: Option<Vec<(AccountKey, crate::ProviderUsage)>>,
+    baseline: Option<Vec<(ReadingKey, crate::ProviderUsage)>>,
+}
+
+type ReadingKey = (String, Option<String>);
+
+fn reading_key(entry: &crate::ProviderUsage) -> ReadingKey {
+    (
+        entry.provider.clone(),
+        entry.account_identity().map(str::to_owned),
+    )
 }
 
 /// Generations belong to one live cache, not the persisted snapshot format.
@@ -145,12 +154,7 @@ impl LiveQuota {
         let baseline = (!incremental).then(|| {
             windows
                 .iter()
-                .map(|entry| {
-                    (
-                        (entry.provider.clone(), entry.account.clone()),
-                        entry.clone(),
-                    )
-                })
+                .map(|entry| (reading_key(entry), entry.clone()))
                 .collect::<Vec<_>>()
         });
         crate::apply_quota_refresh(&mut cache, windows, at_ms);
@@ -219,7 +223,7 @@ impl LiveQuota {
     fn covered_by_snapshot(&self, body: &Value) -> Result<Option<bool>, String> {
         let entry: crate::ProviderUsage =
             serde_json::from_value(body.clone()).map_err(|e| e.to_string())?;
-        let key = (entry.provider.clone(), entry.account.clone());
+        let key = reading_key(&entry);
         let mut baseline = self
             .snapshot_baseline
             .lock()

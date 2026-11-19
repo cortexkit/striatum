@@ -1,6 +1,8 @@
 //! Forks reuse a granted parent's credential instead of scoring a new account.
 
 use super::*;
+use striatum_core::accounts::decision::ForkNote;
+use striatum_core::accounts::{policy::ForkParent, Decision, Hold, HoldBasis, Outcome};
 
 pub(super) fn hold_detail(params: &AccountForParams, mut detail: Value) -> Value {
     if params.fork_of.is_some() {
@@ -31,7 +33,8 @@ pub(super) fn prepare_and_admit(
                 .flat_map(|fact| {
                     classes.credentials.listed_credentials().iter().map(|row| {
                         let mut view = classes.view(row, fact);
-                        view.credentials[0].needs_reauth = row.state != "active";
+                        view.credentials[0].needs_reauth =
+                            row.state != "active" || row.condition.is_some();
                         view
                     })
                 })
@@ -86,7 +89,7 @@ pub(super) fn resolve(
     principal: &str,
     params: &AccountForParams,
     provider: &str,
-) -> RouteStateResult<Option<striatum_core::accounts::policy::ForkParent>> {
+) -> RouteStateResult<Option<ForkParent>> {
     let Some(fork) = &params.fork_of else {
         return Ok(None);
     };
@@ -96,9 +99,26 @@ pub(super) fn resolve(
     let Some(parent) = tx.fork_parent(principal, &fork.admission_id, provider)? else {
         return Ok(None);
     };
-    let blocked_until_ms = tx
-        .fence_rechecks()?
-        .into_iter()
+    Ok(Some(ForkParent {
+        admission_id: fork.admission_id.clone(),
+        account_id: parent.account_id,
+        credential_id: parent.credential_id,
+        pin_id: parent.pin_id,
+        pin_generation: parent.pin_generation,
+        blocked_until_ms: None,
+    }))
+}
+
+pub(super) fn apply_blocking_origins(
+    parent: &mut ForkParent,
+    origins: &[striatum_store::FenceRecheck],
+    provider: &str,
+    params: &AccountForParams,
+    now: i64,
+) -> Option<i64> {
+    let mut claimed = false;
+    parent.blocked_until_ms = origins
+        .iter()
         .filter(|origin| {
             origin.kind != "account"
                 && origin.kind != "principal"
@@ -108,16 +128,40 @@ pub(super) fn resolve(
                     &parent.credential_id,
                     &params.model,
                 )
-                && origin.due_at() > now_ms()
+                && origin.due_at() > now
         })
-        .map(|origin| origin.due_at())
+        .map(|origin| {
+            claimed |= origin.last_claimed_at.is_some();
+            origin.due_at()
+        })
         .max();
-    Ok(Some(striatum_core::accounts::policy::ForkParent {
-        admission_id: fork.admission_id.clone(),
-        account_id: parent.account_id,
-        credential_id: parent.credential_id,
-        pin_id: parent.pin_id,
+    // A fork blocked by an already-claimed origin needs its retry clock,
+    // not the generic short retry for an unavailable parent.
+    parent.blocked_until_ms.filter(|_| claimed)
+}
+
+pub(super) fn hold_after_lost_probe(
+    mut decision: Decision,
+    parent: &ForkParent,
+    until: i64,
+    now: i64,
+) -> Decision {
+    let seconds = (until.saturating_sub(now).max(0) as u64).div_ceil(1_000);
+    decision.outcome = Outcome::Hold(Hold {
+        account_id: parent.account_id.clone(),
+        credential_id: parent.credential_id.clone(),
+        pin_id: parent.pin_id.clone(),
         pin_generation: parent.pin_generation,
-        blocked_until_ms,
-    }))
+        reset_at_ms: until,
+        base_retry_after_s: seconds,
+        retry_after_s: seconds,
+        basis: HoldBasis::ForkParentUnavailable,
+    });
+    if !matches!(decision.explanation.fork_of, Some(ForkNote::Refused { .. })) {
+        decision.explanation.fork_of = Some(ForkNote::Refused {
+            admission_id: parent.admission_id.clone(),
+            reason: "refusal_backed_block".into(),
+        });
+    }
+    decision
 }

@@ -62,6 +62,8 @@ mod operator_quality;
 mod prune_facts;
 pub use operator_quality::{OperatorQuality, UnscoredAdmissibleModel};
 mod block_state;
+#[cfg(feature = "test-support")]
+pub use block_state::{count_recheck_rows, recheck_row_visits};
 mod block_storage;
 mod catalog_efforts;
 mod engine_measurements;
