@@ -37,7 +37,9 @@ pub(super) async fn async_main(
     let connection_file_path = match parse_startup_mode(args)? {
         StartupMode::PrintManifest => return print_manifest(),
         StartupMode::CheckConfig => {
-            let path = config_overrides::config_path();
+            let path =
+                config_overrides::config_path(&crate::startup_settings::module_id_from_env())
+                    .map_err(ModuleError::Message)?;
             let report = config_overrides::check_config_offline(
                 &path,
                 config_overrides::default_store_path().as_deref(),

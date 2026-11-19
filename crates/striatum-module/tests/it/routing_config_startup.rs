@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use subc_protocol::{Flags, Frame, FrameType, Priority};
+use subc_client_rs::config::CONFIG_GATE_CAPABILITY;
+use subc_protocol::{Flags, Frame, FrameType, Priority, SUBC_MODULE_ID_ENV};
 use subc_transport::{read_frame, write_frame};
 use tokio::{process::Child, time::timeout};
 
@@ -54,8 +55,8 @@ impl Home {
         wait_for_output(child).await
     }
 
-    async fn assert_file_settings_serve(&self, xdg: bool) {
-        let (child, mut peer, hello) = launch_with_ack(&self.0, self.command(xdg), vec![]).await;
+    async fn assert_file_settings_serve(&self, command: Command) {
+        let (child, mut peer, hello) = launch_with_ack(&self.0, command, vec![]).await;
         let control_frame = |ty, corr| {
             Frame::build_with_version(
                 hello.header.ver,
@@ -100,7 +101,12 @@ impl Home {
         let binary =
             cortexkit_test_support::stage_test_binary(Path::new(env!("CARGO_BIN_EXE_ck-striatum")));
         let mut command = cortexkit_test_support::fenced_command(&binary, &self.0);
-        command.env("HOME", &self.0).env_remove("XDG_CONFIG_HOME");
+        command
+            .env("HOME", &self.0)
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("APPDATA")
+            .env_remove("USERPROFILE")
+            .env_remove(SUBC_MODULE_ID_ENV);
         if xdg {
             command.env("XDG_CONFIG_HOME", self.0.join("xdg"));
         }
@@ -152,7 +158,7 @@ async fn old_explicit_only_providers_refuses_startup_with_converter() {
 async fn absent_routing_file_with_xdg_does_not_read_home_file() {
     let home = Home::new();
     std::fs::write(home.config_dir(false).join("striatum.jsonc"), "not json").unwrap();
-    home.assert_file_settings_serve(true).await;
+    home.assert_file_settings_serve(home.command(true)).await;
 }
 
 #[tokio::test]
@@ -165,7 +171,7 @@ async fn striatum_startup_and_check_config_name_the_settings_file() {
             if primary_exists {
                 std::fs::write(&primary, "{}").unwrap();
             }
-            home.assert_file_settings_serve(xdg).await;
+            home.assert_file_settings_serve(home.command(xdg)).await;
             let output = home.run_with_args(xdg, &["--check-config"]);
             let report = String::from_utf8(output.stderr).unwrap();
             assert!(output.status.success(), "{report}");
@@ -175,6 +181,71 @@ async fn striatum_startup_and_check_config_name_the_settings_file() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn non_default_module_id_reads_and_declares_its_own_settings_file() {
+    let home = Home::new();
+    let path = home.config_dir(true).join("striatum-secondary.jsonc");
+    std::fs::write(&path, "{}").unwrap();
+    std::fs::write(home.config_dir(true).join("striatum.jsonc"), "not json").unwrap();
+    let command = || {
+        let mut command = home.command(true);
+        command.env(SUBC_MODULE_ID_ENV, "striatum-secondary");
+        command
+    };
+
+    home.assert_file_settings_serve(command()).await;
+    let output = command().arg("--check-config").output().unwrap();
+    let report = String::from_utf8(output.stderr).unwrap();
+    assert!(output.status.success(), "{report}");
+    assert!(
+        report.contains(&format!("config check passed: {}", path.display())),
+        "{report}"
+    );
+
+    let (child, mut peer, hello) =
+        launch_with_ack(&home.0, command(), vec![CONFIG_GATE_CAPABILITY.into()]).await;
+    let declare = timeout(DEADLINE, read_frame(&mut peer))
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(declare.header.ty, FrameType::Request);
+    let declaration: serde_json::Value = serde_json::from_slice(&declare.body).unwrap();
+    assert_eq!(declaration["op"], "config.declare");
+    assert_eq!(declaration["user_file"], path.to_str().unwrap());
+    let goodbye = Frame::build_with_version(
+        hello.header.ver,
+        FrameType::Goodbye,
+        Flags::new(false, Priority::Passive, false),
+        0,
+        0,
+        0,
+        vec![],
+    )
+    .unwrap();
+    write_frame(&mut peer, &goodbye).await.unwrap();
+    let output = wait_for_output(child).await;
+    assert!(output.status.success(), "{output:?}");
+}
+
+#[test]
+fn empty_xdg_config_home_falls_back_to_home() {
+    let home = Home::new();
+    let expected = home.config_dir(false).join("striatum.jsonc");
+    let output = home
+        .command(false)
+        .env("XDG_CONFIG_HOME", "")
+        .arg("--check-config")
+        .output()
+        .unwrap();
+    let report = String::from_utf8(output.stderr).unwrap();
+    assert!(output.status.success(), "{report}");
+    assert!(
+        report.contains(&format!("config check passed: {}", expected.display())),
+        "{report}"
+    );
 }
 
 #[tokio::test]
@@ -220,6 +291,53 @@ async fn striatum_invalid_settings_file_refuses_startup_and_check_config() {
         );
         assert!(!message.contains("missing-connection-file"), "{message}");
     }
+}
+
+#[test]
+fn missing_config_home_refuses_relative_fallback_at_startup() {
+    let home = Home::new();
+    let missing_connection = home.0.join("missing-connection-file");
+    let mut command = home.command(false);
+    let message = stderr(
+        command
+            .current_dir(&home.0)
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("APPDATA")
+            .env_remove("USERPROFILE")
+            .env_remove("HOME")
+            .args([
+                std::ffi::OsStr::new("--subc"),
+                missing_connection.as_os_str(),
+            ])
+            .output()
+            .unwrap(),
+    );
+    assert!(
+        message.contains("routing config home is relative"),
+        "{message}"
+    );
+    assert!(message.contains(".config"), "{message}");
+    assert!(message.contains("XDG_CONFIG_HOME"), "{message}");
+    assert!(message.contains("HOME"), "{message}");
+}
+
+#[test]
+fn relative_xdg_config_home_is_refused_instead_of_falling_back_to_absolute_home() {
+    let home = Home::new();
+    let message = stderr(
+        home.command(false)
+            .current_dir(&home.0)
+            .env("XDG_CONFIG_HOME", "relative-config")
+            .arg("--check-config")
+            .output()
+            .unwrap(),
+    );
+    assert!(
+        message.contains("routing config home is relative"),
+        "{message}"
+    );
+    assert!(message.contains("relative-config"), "{message}");
+    assert!(message.contains("XDG_CONFIG_HOME"), "{message}");
 }
 
 #[test]

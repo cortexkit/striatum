@@ -2228,7 +2228,7 @@ pub async fn catalog_refresh_loop(
     connection_file_path: PathBuf,
     store: Arc<SqliteRouteStateStore>,
     health: SharedCatalogHealth,
-    _poll_ms: u64,
+    config_path: PathBuf,
     ladder_sources: LadderSources,
     credentials: crate::broca_credentials::SharedBrocaCredentials,
 ) {
@@ -2237,7 +2237,6 @@ pub async fn catalog_refresh_loop(
     let _ = std::fs::create_dir_all(&project_root);
     let mut bootstrapped = false;
     let mut last_logged_error: Option<String> = None;
-    let config_path = crate::config_overrides::config_path();
     let (wake, rebind_wake) = {
         let mut guard = credentials.lock().unwrap();
         guard.connection_file_path = Some(connection_file_path.clone());

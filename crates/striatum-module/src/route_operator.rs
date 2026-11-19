@@ -169,6 +169,7 @@ pub(super) async fn handle_route_explain(
     frame: Frame,
     writer: &mpsc::Sender<Frame>,
     store: &SharedStore,
+    config_path: &Path,
 ) -> Result<(), ModuleError> {
     let (ver, channel, epoch, corr) = (
         frame.header.ver,
@@ -217,8 +218,8 @@ pub(super) async fn handle_route_explain(
     let decision = match lookup {
         Ok(Some(decision)) => decision,
         Ok(None) => {
-            let retention_days = retention::retention_windows(&config_overrides::config_path())
-                .model_route_decisions_days;
+            let retention_days =
+                retention::retention_windows(config_path).model_route_decisions_days;
             return send_route_error(
                 writer,
                 ver,

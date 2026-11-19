@@ -969,7 +969,7 @@ async fn handle_select_request_attempt(
         return handle_cooldown_status(frame, writer, store).await;
     }
     if envelope.method == ROUTE_EXPLAIN_OP {
-        return handle_route_explain(frame, writer, store).await;
+        return handle_route_explain(frame, writer, store, operator_config_path).await;
     }
     if envelope.method == ROUTE_DECISIONS_LIST_OP {
         return handle_route_decisions_list(frame, writer, store).await;

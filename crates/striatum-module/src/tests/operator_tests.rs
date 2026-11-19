@@ -320,7 +320,7 @@ async fn route_explain_unknown_id_names_key_and_retention() {
     let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
     let message = body["message"].as_str().unwrap();
     let retention_days =
-        retention::retention_windows(&config_overrides::config_path()).model_route_decisions_days;
+        retention::retention_windows(&test_operator_config()).model_route_decisions_days;
     assert_eq!(body["code"], "not_found");
     assert!(message.contains("decisionID 'dec-pruned'"));
     assert!(message.contains(&format!(

@@ -167,7 +167,7 @@ use subc_protocol::{
         HealthStatus, ModuleControlRequest, ModuleControlResponse, MODULE_CONTROL_OP_HEALTH_CHECK,
     },
     ErrorBody, Flags, Frame, FrameType, ModuleHelloAckBody, ModuleHelloBody, Priority,
-    PROTOCOL_VERSION, SUBC_MODULE_ID_ENV,
+    PROTOCOL_VERSION,
 };
 use subc_transport::{authenticate_client, connection_file, read_frame, write_frame};
 use tokio::{
@@ -369,12 +369,12 @@ where
         .subc_capabilities
         .iter()
         .any(|capability| capability == CONFIG_GATE_CAPABILITY);
-    let config_path = config_overrides::config_path();
+    let config_path = &config.config_path;
     if !daemon_has_config_gate {
         info_operator(
             "[striatum] settings source: file (daemon did not advertise config.gate)".into(),
         );
-        check_config_at(&config_path)?;
+        check_config_at(config_path)?;
     }
 
     // Open the route-state store from the daemon-delivered descriptor (or the dev
@@ -402,7 +402,7 @@ where
     // Variant overrides name efforts the catalog must publish. Config loaded
     // before the store opened got only shape checks; check it now, and every
     // later reload, against the stored catalog.
-    config_overrides::attach_store_catalog(&config_path, store)
+    config_overrides::attach_store_catalog(config_path, store)
         .map_err(|error| ModuleError::Message(format!("{}: {error}", config_path.display())))?;
     // Seed the cache from the last persisted snapshot before anything can serve a
     // selection, so a restart does not select with no quota reading until the
@@ -413,7 +413,7 @@ where
     let mut settings = if daemon_has_config_gate {
         Some(managed_settings::Session::start(
             &config.module_id,
-            &config_path,
+            config_path,
             ack.negotiated_ver,
             &writer,
         )?)
@@ -878,18 +878,9 @@ struct PrintedManifest {
 }
 
 fn print_manifest() -> Result<(), ModuleError> {
-    let output = printed_manifest_json(&printed_manifest_module_id())?;
+    let output = printed_manifest_json(&startup_settings::module_id_from_env())?;
     println!("{output}");
     Ok(())
-}
-
-/// The module id serving would declare: the same resolution as
-/// `ModuleConfig::from_env`, so the printed manifest matches the HELLO one.
-fn printed_manifest_module_id() -> String {
-    std::env::var(SUBC_MODULE_ID_ENV)
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .unwrap_or_else(|| DEFAULT_MODULE_ID.to_string())
 }
 
 fn printed_manifest_json(module_id: &str) -> Result<String, ModuleError> {

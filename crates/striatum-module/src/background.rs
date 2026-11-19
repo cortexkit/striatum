@@ -163,7 +163,7 @@ pub(super) async fn start(
     loops.spawn("history mover", history_mover_loop(Arc::clone(store)));
     loops.spawn(
         "retention",
-        retention::retention_loop(Arc::clone(&store), config_overrides::config_path()),
+        retention::retention_loop(Arc::clone(&store), config.config_path.clone()),
     );
     // The quota event consumer starts from the restored per-account views.
     loops.spawn(
@@ -177,7 +177,7 @@ pub(super) async fn start(
                 quota_cache: Arc::clone(quota_cache),
                 store: Arc::clone(store),
                 credentials: Arc::clone(&broca_credentials),
-                config_path: config_overrides::config_path(),
+                config_path: config.config_path.clone(),
             },
         ),
     );
@@ -186,21 +186,22 @@ pub(super) async fn start(
         routing_v1::runners::refresh_loop(
             config.connection_file_path.clone(),
             Arc::clone(&broca_credentials),
-            config_overrides::config_path(),
+            config.config_path.clone(),
         ),
     );
     // Derive serving methods from the restored listing before the first catalog poll.
-    let (join_state, join_store, join_credentials) = (
+    let (join_state, join_store, join_credentials, join_config_path) = (
         Arc::clone(&account_state),
         Arc::clone(store),
         Arc::clone(&broca_credentials),
+        config.config_path.clone(),
     );
     tokio::task::spawn_blocking(move || {
         account_quota::refresh_serving_methods(
             &join_state,
             &join_store,
             &join_credentials,
-            &config_overrides::config_path(),
+            &join_config_path,
         )
     })
     .await
@@ -220,7 +221,7 @@ pub(super) async fn start(
                 Arc::clone(&store),
                 roster_resolver,
                 Arc::clone(&broca_credentials),
-                config_overrides::config_path(),
+                config.config_path.clone(),
                 Arc::clone(quota_cache),
             ),
         );
@@ -228,15 +229,13 @@ pub(super) async fn start(
     // Every placement and config reload compares the winner ladder over the same
     // config a selection reads (the operator policy lives in the routing file)
     // and the availability live selections report.
-    let ladder_sources = winner_ladder::LadderSources::live(
-        &config_overrides::config_path(),
-        &config_overrides::config_path(),
-    );
+    let ladder_sources =
+        winner_ladder::LadderSources::live(&config.config_path, &config.config_path);
 
     // Load a validated config snapshot before serving. The watcher publishes
     // replacements; model overrides remain request overlays so withdrawing one
     // exposes the stored fact without rewriting operator score placements.
-    let override_path = config_overrides::config_path();
+    let override_path = config.config_path.clone();
     // Selection policy and model-fact overrides share the routing-owned file.
     let operator_config_path = override_path.clone();
     config_overrides::live_config(&override_path);
@@ -260,7 +259,7 @@ pub(super) async fn start(
             config.connection_file_path.clone(),
             Arc::clone(&store),
             Arc::clone(&catalog_health),
-            catalog_poll_ms,
+            config.config_path.clone(),
             ladder_sources.clone(),
             Arc::clone(&broca_credentials),
         ),
@@ -639,6 +638,7 @@ mod tests {
     fn the_account_roster_loop_waiting_on_a_busy_account_writer_leaves_the_runtime_serving() {
         let scratch = cortexkit_test_support::ScratchDir::new("roster-loop-runtime-stall-files");
         let connection_file = scratch.join("subc.json");
+        let config_path = scratch.join("striatum.jsonc");
         assert_runtime_serves_while_writer_is_busy(
             "roster-loop-runtime-stall",
             striatum_store::AccountCommandKind::Repair,
@@ -668,7 +668,7 @@ mod tests {
                     store,
                     Arc::new(SlowEmptyResolver),
                     credentials,
-                    crate::config_overrides::config_path(),
+                    config_path,
                     Arc::new(Mutex::new(crate::QuotaCache::default())),
                 ))
             },

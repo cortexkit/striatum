@@ -1941,7 +1941,7 @@ fn refresh_account_views(
     // store transaction is open.
     let snapshot = state.lock().ok().map(|guard| guard.clone());
     if let Some(snapshot) = snapshot {
-        let config = crate::config_overrides::live_config(&crate::config_overrides::config_path());
+        let config = crate::config_overrides::live_config(routing_config_path);
         let quota_view = Arc::new(Mutex::new(snapshot.clone()));
         if let Err(error) = crate::account_selection::ClassContext::load(
             store,

@@ -28,7 +28,6 @@ use striatum_core::{
 };
 use striatum_store::ReasoningCatalog;
 use subc_jsonc::jsonc_to_json;
-const CONFIG_RELATIVE_PATH: &str = "cortexkit/striatum.jsonc";
 // Fusiform's catalog-changed events reach routing through its durable NATS
 // consumer (`m_striatum`) and trigger an immediate refresh, so this poll is
 // only a backstop for an event lost while the reader was down.
@@ -1807,23 +1806,33 @@ struct ModelFactOverride {
     rules: crate::config_policy::EntityPolicy,
 }
 
-/// Resolve a path under the user's config home. Honors XDG_CONFIG_HOME, else
-/// `$HOME/.config`, matching the daemon's own resolution.
-fn config_home_path(relative: &str) -> PathBuf {
-    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
-        return PathBuf::from(xdg).join(relative);
+/// The absolute global file path the daemon accepts for this module identity.
+pub(super) fn config_path(module_id: &str) -> Result<PathBuf, String> {
+    let home = PathBuf::from(cortexkit_store_types::resolve_config_home());
+    if !home.is_absolute() {
+        let variables = if cfg!(windows) {
+            "XDG_CONFIG_HOME, APPDATA, USERPROFILE, or HOME"
+        } else {
+            "XDG_CONFIG_HOME or HOME"
+        };
+        return Err(format!(
+            "routing config home is relative ({home:?}); set {variables} to an absolute path"
+        ));
     }
-    if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
-        return PathBuf::from(home).join(".config").join(relative);
+    let filename = format!("{module_id}.jsonc");
+    if module_id.is_empty()
+        || matches!(module_id, "." | "..")
+        || module_id.contains(['/', '\\'])
+        || !matches!(
+            Path::new(&filename).components().next(),
+            Some(std::path::Component::Normal(_))
+        )
+    {
+        return Err(format!(
+            "routing module id {module_id:?} cannot form a settings filename"
+        ));
     }
-    PathBuf::from(".config").join(relative)
-}
-
-/// The config-home path for this module's own config file.
-pub fn config_path() -> PathBuf {
-    static PATH: OnceLock<PathBuf> = OnceLock::new();
-    PATH.get_or_init(|| config_home_path(CONFIG_RELATIVE_PATH))
-        .clone()
+    Ok(home.join("cortexkit").join(filename))
 }
 
 /// The routing settings document within a global or tier settings directory.
