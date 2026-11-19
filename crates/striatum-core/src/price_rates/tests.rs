@@ -1,7 +1,9 @@
 use super::*;
 use crate::{
     model_facts_seed,
-    subscription::{MeasuredValue, QuotaAccount, SubscriptionPlan, SubscriptionPool},
+    subscription::{
+        MeasuredValue, PlanMeasurements, QuotaAccount, SubscriptionPlan, SubscriptionPool,
+    },
     BillingRate,
 };
 
@@ -42,11 +44,11 @@ fn plan(multiplier: f64, used: f64) -> SubscriptionPlan {
     SubscriptionPlan {
         tier: None,
         plan: None,
-        measured: Some(MeasuredValue {
+        measured: Some(PlanMeasurements::from_latest(MeasuredValue {
             multiplier,
             interval_end_ms: 999,
             row_date: "fresh".into(),
-        }),
+        })),
         fee_usd: 200.0,
         accounts: vec![QuotaAccount {
             weekly_used: used,

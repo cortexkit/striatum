@@ -5,7 +5,7 @@ use std::{
 };
 
 use cortexkit_bus_client::{BucketItem, BusClient};
-use serde_json::{json, Value};
+use serde_json::{json, value::RawValue, Map, Value};
 
 const FALLBACK: Duration = Duration::from_secs(60);
 const BACKSTOP: Duration = Duration::from_secs(15 * 60);
@@ -64,8 +64,30 @@ pub(super) struct State {
     pub(super) generation: u64,
 }
 
+fn parse_row(value: &[u8]) -> Option<Value> {
+    serde_json::from_slice(value).ok().or_else(|| {
+        // serde_json rejects overflowing numbers in a Value. Isolate the
+        // optional history so an unrepresentable field doesn't lose the plan.
+        let mut fields: BTreeMap<String, &RawValue> = serde_json::from_slice(value).ok()?;
+        let history = fields.remove("last_eligible")?;
+        let mut row = fields
+            .into_iter()
+            .map(|(key, value)| serde_json::from_str(value.get()).map(|value| (key, value)))
+            .collect::<Result<Map<String, Value>, _>>()
+            .ok()?;
+        if let Ok(fields) = serde_json::from_str::<BTreeMap<String, &RawValue>>(history.get()) {
+            let history = fields
+                .into_iter()
+                .filter_map(|(key, value)| serde_json::from_str(value.get()).ok().map(|v| (key, v)))
+                .collect();
+            row.insert("last_eligible".into(), Value::Object(history));
+        }
+        Some(Value::Object(row))
+    })
+}
+
 fn decode(value: &[u8]) -> Option<Value> {
-    let row: Value = serde_json::from_slice(value).ok()?;
+    let row = parse_row(value)?;
     row["quota_provider"].as_str()?;
     if !matches!(row.get("plan"), Some(Value::Null | Value::String(_))) {
         return None;
@@ -94,10 +116,12 @@ fn decode(value: &[u8]) -> Option<Value> {
             return None;
         }
     }
-    // Ineligible rows and older provider-wide rows with plan: null still belong
-    // in the snapshot, although pricing ignores their measurements. A row that
-    // claims a usable plan measurement must pass the report's existing decoder.
-    if row["routing_eligible"] == true && row["plan"].is_string() && super::measured(&row).is_none()
+    // Keep ineligible and provider-wide rows for their plan metadata. If the
+    // latest plan observation claims eligibility, validate it independently
+    // of the optional last eligible observation.
+    if row["routing_eligible"] == true
+        && row["plan"].is_string()
+        && super::latest_measurement(&row).is_none()
     {
         return None;
     }

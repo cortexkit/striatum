@@ -1,9 +1,13 @@
 //! Subscription costs use plan value multipliers and pooled quota pressure.
 //! This module consumes snapshots only; selection never calls a quota service.
 
+use std::borrow::Cow;
+
 use serde::Serialize;
 
 pub const ASTRO_MAX_AGE_MS: i64 = 48 * 60 * 60 * 1000;
+// Bridge gaps in eligible observations without letting old plan economics win indefinitely.
+pub const LAST_ELIGIBLE_MAX_AGE_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 pub const DEFAULT_PLAN_FEE_USD: f64 = 200.0;
 /// Below this remaining share, a short window can constrain spending before
 /// the weekly reset; above it, weekly pacing also accounts for expiring quota.
@@ -23,6 +27,21 @@ pub struct MeasuredValue {
     pub multiplier: f64,
     pub interval_end_ms: i64,
     pub row_date: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlanMeasurements {
+    pub latest: Option<MeasuredValue>,
+    pub last_eligible: Option<MeasuredValue>,
+}
+
+impl PlanMeasurements {
+    pub fn from_latest(latest: MeasuredValue) -> Self {
+        Self {
+            latest: Some(latest),
+            last_eligible: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -46,7 +65,7 @@ pub struct SubscriptionPlan {
     pub tier: Option<String>,
     /// Exact plan name joined from Astrocyte's per-account plan prices.
     pub plan: Option<String>,
-    pub measured: Option<MeasuredValue>,
+    pub measured: Option<PlanMeasurements>,
     pub fee_usd: f64,
     pub accounts: Vec<QuotaAccount>,
 }
@@ -123,33 +142,90 @@ pub struct SubscriptionPlanValue {
     pub plan_tier: Option<String>,
     pub plan: Option<String>,
     pub value_multiplier: f64,
-    /// One of measured, operator, or default.
-    pub source: &'static str,
+    /// `measured` for a fresh observation, `astrocyte last eligible <day>` for a
+    /// historical observation, `operator` for a configured override, or `default` for 1.0.
+    pub source: Cow<'static, str>,
     pub weight: f64,
 }
 
 impl MeasuredValue {
-    fn usable(&self, now_ms: i64) -> bool {
-        self.multiplier.is_finite()
-            && self.multiplier > 0.0
-            && now_ms >= self.interval_end_ms
-            && now_ms - self.interval_end_ms < ASTRO_MAX_AGE_MS
+    fn usable_age(&self, now_ms: i64) -> Option<i64> {
+        if !self.multiplier.is_finite() || self.multiplier <= 0.0 {
+            return None;
+        }
+        now_ms
+            .checked_sub(self.interval_end_ms)
+            .filter(|age| *age >= 0)
     }
+}
+
+enum ResolvedValue<'a> {
+    Latest(&'a MeasuredValue),
+    LastEligible(&'a MeasuredValue),
+    Operator(f64),
+    Unmeasured,
+}
+
+impl ResolvedValue<'_> {
+    fn multiplier(&self) -> f64 {
+        match self {
+            Self::Latest(row) | Self::LastEligible(row) => row.multiplier,
+            Self::Operator(value) => *value,
+            Self::Unmeasured => 1.0,
+        }
+    }
+
+    fn source(&self) -> String {
+        match self {
+            Self::Latest(row) => format!("astrocyte {}", row.row_date),
+            Self::LastEligible(row) => format!("astrocyte last eligible {}", row.row_date),
+            Self::Operator(_) => "operator override".into(),
+            Self::Unmeasured => "unmeasured".into(),
+        }
+    }
+
+    fn plan_source(&self) -> Cow<'static, str> {
+        match self {
+            Self::Latest(_) => "measured".into(),
+            Self::LastEligible(_) => self.source().into(),
+            Self::Operator(_) => "operator".into(),
+            Self::Unmeasured => "default".into(),
+        }
+    }
+}
+
+fn resolve_measurement(
+    operator_multiplier: Option<f64>,
+    measured: Option<&PlanMeasurements>,
+    now_ms: i64,
+) -> ResolvedValue<'_> {
+    if let Some(rows) = measured {
+        if let Some(row) = rows.latest.as_ref().filter(|row| {
+            row.usable_age(now_ms)
+                .is_some_and(|age| age < ASTRO_MAX_AGE_MS)
+        }) {
+            return ResolvedValue::Latest(row);
+        }
+        if let Some(row) = rows.last_eligible.as_ref().filter(|row| {
+            row.usable_age(now_ms)
+                .is_some_and(|age| age <= LAST_ELIGIBLE_MAX_AGE_MS)
+        }) {
+            return ResolvedValue::LastEligible(row);
+        }
+    }
+    if let Some(multiplier) = operator_multiplier.filter(|v| v.is_finite() && *v > 0.0) {
+        return ResolvedValue::Operator(multiplier);
+    }
+    ResolvedValue::Unmeasured
 }
 
 pub fn resolve_value(
     operator_multiplier: Option<f64>,
-    measured: Option<&MeasuredValue>,
+    measured: Option<&PlanMeasurements>,
     now_ms: i64,
 ) -> (f64, String) {
-    let valid = |v: &f64| v.is_finite() && *v > 0.0;
-    if let Some(row) = measured.filter(|row| row.usable(now_ms)) {
-        return (row.multiplier, format!("astrocyte {}", row.row_date));
-    }
-    if let Some(multiplier) = operator_multiplier.filter(valid) {
-        return (multiplier, "operator override".into());
-    }
-    (1.0, "unmeasured".into())
+    let value = resolve_measurement(operator_multiplier, measured, now_ms);
+    (value.multiplier(), value.source())
 }
 
 /// Remaining time / squared remaining share. For fixed time this is monotone
@@ -423,22 +499,12 @@ impl SubscriptionPool {
             .iter()
             .zip(&budgets)
             .map(|(plan, budget)| {
-                let (value, _) = resolve_value(operator, plan.measured.as_ref(), value_now);
+                let value = resolve_measurement(operator, plan.measured.as_ref(), value_now);
                 SubscriptionPlanValue {
                     plan_tier: plan.tier.clone(),
                     plan: plan.plan.clone(),
-                    value_multiplier: value,
-                    source: if plan
-                        .measured
-                        .as_ref()
-                        .is_some_and(|row| row.usable(value_now))
-                    {
-                        "measured"
-                    } else if operator.is_some_and(|v| v.is_finite() && v > 0.0) {
-                        "operator"
-                    } else {
-                        "default"
-                    },
+                    value_multiplier: value.multiplier(),
+                    source: value.plan_source(),
                     weight: if total_points > 0.0 {
                         budget.0.unwrap_or(0.0) / total_points
                     } else if self.plans.len() == 1 && budget.0.is_none() {
@@ -518,11 +584,11 @@ mod tests {
 
     #[test]
     fn fresh_measurement_beats_operator_and_stale_falls_back() {
-        let row = MeasuredValue {
+        let row = PlanMeasurements::from_latest(MeasuredValue {
             multiplier: 18.7,
             interval_end_ms: 1_000,
             row_date: "2026-10-09".into(),
-        };
+        });
         assert_eq!(
             resolve_value(Some(6.0), Some(&row), 1_001),
             (18.7, "astrocyte 2026-10-09".into())
@@ -549,11 +615,11 @@ mod tests {
     #[test]
     fn invalid_multipliers_never_supply_value() {
         for invalid in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
-            let row = MeasuredValue {
+            let row = PlanMeasurements::from_latest(MeasuredValue {
                 multiplier: invalid,
                 interval_end_ms: 1_000,
                 row_date: "2026-10-09".into(),
-            };
+            });
             assert_eq!(resolve_value(Some(6.0), Some(&row), 1_001).0, 6.0);
             assert_eq!(resolve_value(Some(invalid), Some(&row), 1_001).0, 1.0);
             assert_eq!(resolve_value(Some(invalid), None, 1_001).0, 1.0);
@@ -607,11 +673,11 @@ mod tests {
     #[test]
     fn subscription_plan_values_use_spendable_points_weighted_harmonic_mean() {
         let mut measured = plan(10.0);
-        measured.measured = Some(MeasuredValue {
+        measured.measured = Some(PlanMeasurements::from_latest(MeasuredValue {
             multiplier: 4.0,
             interval_end_ms: 999,
             row_date: "fresh".into(),
-        });
+        }));
         let mut fallback = plan(70.0);
         fallback.tier = Some("pro_100".into());
         fallback.plan = Some("openai/pro_100".into());
@@ -631,7 +697,7 @@ mod tests {
             price
                 .plan_values
                 .iter()
-                .map(|p| (p.source, p.weight))
+                .map(|p| (p.source.as_ref(), p.weight))
                 .collect::<Vec<_>>(),
             vec![("measured", 0.8), ("operator", 0.2), ("operator", 0.0)]
         );

@@ -3384,7 +3384,7 @@ mod task_profile_pricing_tests {
     #[test]
     fn profile_uses_pool_measurement_and_pressure_for_workers_and_heads() {
         use crate::subscription::{
-            MeasuredValue, QuotaAccount, SubscriptionPlan, SubscriptionPool,
+            MeasuredValue, PlanMeasurements, QuotaAccount, SubscriptionPlan, SubscriptionPool,
         };
         let mut fact = model("codex", "sol");
         fact.subscription_multiplier = Some(2.0);
@@ -3397,11 +3397,11 @@ mod task_profile_pricing_tests {
                 plans: vec![SubscriptionPlan {
                     tier: Some("pro".into()),
                     plan: Some("openai/pro_200".into()),
-                    measured: Some(MeasuredValue {
+                    measured: Some(PlanMeasurements::from_latest(MeasuredValue {
                         multiplier: 18.7,
                         interval_end_ms: 999,
                         row_date: "fresh".into(),
-                    }),
+                    })),
                     fee_usd: 200.0,
                     accounts: vec![QuotaAccount {
                         weekly_used: 50.0,

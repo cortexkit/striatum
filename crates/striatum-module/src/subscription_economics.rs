@@ -19,8 +19,8 @@ use striatum_core::{
     model_facts::{make_capacity_key, RoutePricing},
     model_router::ModelRouteStateSnapshot,
     subscription::{
-        MeasuredValue, PacingRule, QuotaAccount, SubscriptionPlan, SubscriptionPool,
-        DEFAULT_PLAN_FEE_USD,
+        MeasuredValue, PacingRule, PlanMeasurements, QuotaAccount, SubscriptionPlan,
+        SubscriptionPool, DEFAULT_PLAN_FEE_USD,
     },
     ModelFact,
 };
@@ -127,25 +127,37 @@ fn warn_ambiguous_account(account_id: &str) {
     }
 }
 
-/// Read the joined plan's explicitly usable observation:
+/// Read the joined plan's latest eligible observation.
 /// `multiplier` is API list value divided by the subscription cost of quota used.
 /// `fee_multiplier` instead compares value with fees paid and is not quota value.
-/// Missing plan or eligibility fields in older reports supply no measurement.
-/// Age uses interval_end_ms,
-/// not snapshot_at_ms: recomputing an old day cannot freshen its evidence.
-fn measured(row: &Value) -> Option<MeasuredValue> {
+fn latest_measurement(row: &Value) -> Option<MeasuredValue> {
     row["plan"].as_str()?;
     if row["routing_eligible"].as_bool() != Some(true) {
         return None;
     }
+    decode_measurement(row, "observation_day")
+}
+
+fn decode_measurement(row: &Value, day_key: &str) -> Option<MeasuredValue> {
     let multiplier = row["multiplier"].as_f64()?;
     if multiplier <= 0.0 || !multiplier.is_finite() {
         return None;
     }
     Some(MeasuredValue {
         multiplier,
+        // Recomputing an old day cannot freshen its evidence.
         interval_end_ms: row["interval_end_ms"].as_i64()?,
-        row_date: row["observation_day"].as_str()?.to_string(),
+        row_date: row[day_key].as_str()?.to_string(),
+    })
+}
+
+fn measured(row: &Value) -> Option<PlanMeasurements> {
+    row["plan"].as_str()?;
+    let latest = latest_measurement(row);
+    let last_eligible = decode_measurement(&row["last_eligible"], "day");
+    (latest.is_some() || last_eligible.is_some()).then_some(PlanMeasurements {
+        latest,
+        last_eligible,
     })
 }
 
@@ -874,6 +886,182 @@ mod tests {
         runtime
     }
 
+    const DAY_MS: i64 = 86_400_000;
+    const KIMI_NOW: i64 = 1_795_046_400_000;
+    const KIMI_PROVIDER: &str = "kimi-for-coding";
+    const KIMI_PLAN: &str = "kimi-code-plan-global/allegro";
+    const KIMI_CREDENTIAL: &str = "apikey:fixture-kimi-for-coding";
+    const KIMI_LAST_ELIGIBLE: &str = "astrocyte last eligible 2026-11-14";
+
+    fn kimi_multiplier_report() -> Value {
+        json!({"latest": [{
+            "quota_provider": KIMI_PROVIDER,
+            "plan": KIMI_PLAN,
+            "routing_eligible": false,
+            "eligibility_reasons": ["insufficient_points"],
+            "observation_day": "2026-11-19",
+            "interval_end_ms": KIMI_NOW - 1,
+            "multiplier": 8.0,
+            "last_eligible": {
+                "day": "2026-11-14",
+                "interval_end_ms": KIMI_NOW - 5 * DAY_MS,
+                "multiplier": 4.4,
+                "fee_multiplier": 9.0
+            },
+            "plan_prices": [{"plan": KIMI_PLAN, "credential_ref": KIMI_CREDENTIAL}]
+        }]})
+    }
+
+    fn kimi_credentials() -> BTreeMap<String, BTreeSet<String>> {
+        [(KIMI_PROVIDER.into(), [KIMI_CREDENTIAL.into()].into())].into()
+    }
+
+    fn kimi_report_price(
+        report: &Value,
+        now: i64,
+        operator: Option<f64>,
+    ) -> striatum_core::subscription::SubscriptionPricing {
+        let pools = build_with_credentials(
+            &AccountQuotaState::default(),
+            report,
+            &Value::Null,
+            now,
+            &kimi_credentials(),
+        )
+        .pools;
+        credential_route_price(pools, now, KIMI_PROVIDER, operator)
+    }
+
+    fn assert_kimi_last_eligible(price: &striatum_core::subscription::SubscriptionPricing) {
+        assert_eq!(price.value_multiplier, 4.4, "expected last eligible value");
+        assert_eq!(price.value_source, KIMI_LAST_ELIGIBLE);
+        let wire = serde_json::to_value(price).unwrap();
+        assert_eq!(wire["planValues"][0]["plan"], KIMI_PLAN);
+        assert_eq!(wire["planValues"][0]["source"], KIMI_LAST_ELIGIBLE);
+    }
+
+    #[test]
+    fn multiplier_last_eligible_recent_beats_operator() {
+        assert_kimi_last_eligible(&kimi_report_price(
+            &kimi_multiplier_report(),
+            KIMI_NOW,
+            Some(3.0),
+        ));
+    }
+
+    #[test]
+    fn multiplier_last_eligible_expires_after_thirty_days() {
+        let report = kimi_multiplier_report();
+        for now in [KIMI_NOW + 25 * DAY_MS + 1, KIMI_NOW + 26 * DAY_MS] {
+            let price = kimi_report_price(&report, now, Some(3.0));
+            assert_eq!(price.value_multiplier, 3.0);
+            assert_eq!(price.value_source, "operator override");
+        }
+        assert_kimi_last_eligible(&kimi_report_price(
+            &report,
+            KIMI_NOW + 25 * DAY_MS,
+            Some(3.0),
+        ));
+    }
+
+    #[test]
+    fn multiplier_last_eligible_does_not_displace_fresh_measurement() {
+        let mut report = kimi_multiplier_report();
+        let row = &mut report["latest"][0];
+        row["routing_eligible"] = json!(true);
+        row["observation_day"] = json!("2026-11-14");
+        row["interval_end_ms"] = row["last_eligible"]["interval_end_ms"].clone();
+        row["multiplier"] = row["last_eligible"]["multiplier"].clone();
+        let end = row["interval_end_ms"].as_i64().unwrap();
+        let price = kimi_report_price(&report, end + 2 * DAY_MS - 1, Some(3.0));
+        assert_eq!(price.value_multiplier, 4.4);
+        assert_eq!(price.value_source, "astrocyte 2026-11-14");
+        assert_eq!(price.plan_values[0].source, "measured");
+        assert_kimi_last_eligible(&kimi_report_price(&report, end + 2 * DAY_MS, Some(3.0)));
+    }
+
+    #[test]
+    fn multiplier_last_eligible_absence_preserves_operator_and_default() {
+        let report = kimi_multiplier_report();
+        let mut absent = report.clone();
+        absent["latest"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("last_eligible");
+        for (operator, multiplier, source, plan_source) in [
+            (Some(3.0), 3.0, "operator override", "operator"),
+            (None, 1.0, "unmeasured", "default"),
+        ] {
+            let price = kimi_report_price(&absent, KIMI_NOW, operator);
+            assert_eq!(price.value_multiplier, multiplier);
+            assert_eq!(price.value_source, source);
+            assert_eq!(price.plan_values[0].source, plan_source);
+        }
+        assert_kimi_last_eligible(&kimi_report_price(&report, KIMI_NOW, Some(3.0)));
+    }
+
+    #[test]
+    fn multiplier_last_eligible_malformed_keeps_the_kv_plan() {
+        let mut report = kimi_multiplier_report();
+        for (key, value) in [
+            ("multiplier", json!(0.0)),
+            ("multiplier", json!(-1.0)),
+            ("multiplier", json!("4.4")),
+            ("day", json!(14)),
+            ("interval_end_ms", json!("yesterday")),
+        ] {
+            let mut malformed = report.clone();
+            malformed["latest"][0]["last_eligible"][key] = value;
+            let bucket = multiplier_runtime(
+                &malformed,
+                AccountQuotaState::default(),
+                kimi_credentials(),
+                KIMI_NOW,
+            );
+            assert_eq!(bucket.multipliers.health()["planCount"], 1);
+            let price =
+                credential_route_price(bucket.economics.pools, KIMI_NOW, KIMI_PROVIDER, Some(3.0));
+            assert_eq!(price.plan_values[0].plan.as_deref(), Some(KIMI_PLAN));
+            assert_eq!(price.value_multiplier, 3.0, "malformed {key}");
+            assert_eq!(price, kimi_report_price(&malformed, KIMI_NOW, Some(3.0)));
+        }
+        assert_kimi_last_eligible(&kimi_report_price(&report, KIMI_NOW, Some(3.0)));
+
+        report["latest"][0]["last_eligible"]["multiplier"] = json!(0.0);
+        let row = report["latest"][0]
+            .to_string()
+            .replace("\"multiplier\":0.0", "\"multiplier\":1e400");
+        assert!(row.contains("1e400"));
+        let mut state = multiplier::State::default();
+        state.apply(cortexkit_bus_client::BucketItem::Put {
+            key: "opaque".into(),
+            revision: 1,
+            value: row.into_bytes().into(),
+        });
+        assert_eq!(state.health()["planCount"], 1);
+        assert_eq!(
+            kimi_report_price(&state.report(), KIMI_NOW, Some(3.0)).value_multiplier,
+            3.0
+        );
+    }
+
+    #[test]
+    fn multiplier_last_eligible_kv_matches_report() {
+        let mut report = kimi_multiplier_report();
+        report["latest"][0]["last_eligible"]["fee_multiplier"] = Value::Null;
+        let bucket = multiplier_runtime(
+            &report,
+            AccountQuotaState::default(),
+            kimi_credentials(),
+            KIMI_NOW,
+        );
+        assert_eq!(bucket.multipliers.health()["planCount"], 1);
+        let price =
+            credential_route_price(bucket.economics.pools, KIMI_NOW, KIMI_PROVIDER, Some(3.0));
+        assert_eq!(price, kimi_report_price(&report, KIMI_NOW, Some(3.0)));
+        assert_kimi_last_eligible(&price);
+    }
+
     #[test]
     fn multiplier_kv_and_poll_fixtures_have_identical_multipliers_and_selection_prices() {
         let (mut credential_report, credentials, _) = credential_fixture();
@@ -944,6 +1132,9 @@ mod tests {
                 .measured
                 .as_ref()
                 .unwrap()
+                .latest
+                .as_ref()
+                .unwrap()
                 .multiplier,
             21.452711840768313
         );
@@ -977,6 +1168,9 @@ mod tests {
         assert_eq!(
             runtime.economics.pools["openai"].plans[1]
                 .measured
+                .as_ref()
+                .unwrap()
+                .latest
                 .as_ref()
                 .unwrap()
                 .multiplier,
@@ -1045,6 +1239,9 @@ mod tests {
                 .measured
                 .as_ref()
                 .unwrap()
+                .latest
+                .as_ref()
+                .unwrap()
                 .multiplier,
             11.0
         );
@@ -1068,6 +1265,9 @@ mod tests {
                 .plans
                 .iter()
                 .find_map(|plan| plan.measured.as_ref())
+                .unwrap()
+                .latest
+                .as_ref()
                 .unwrap()
                 .multiplier,
             21.452711840768313
@@ -1626,7 +1826,7 @@ mod tests {
     #[test]
     fn plan_observation_uses_quota_multiplier_and_interval_end() {
         let report = json!({"latest":[{"quota_provider":"claude","plan":"anthropic/max_20x","routing_eligible":true,"observation_day":"2026-10-09","snapshot_at_ms":NOW,"interval_end_ms":NOW-1,"api_nanos":284000000000i64,"delta_percent":10.0,"subscription_nanos":4666666667i64,"multiplier":60.8,"fee_multiplier":123.0}],"series":[]});
-        let row = measured(&report["latest"][0]).unwrap();
+        let row = measured(&report["latest"][0]).unwrap().latest.unwrap();
         assert_eq!(row.multiplier, 60.8);
         assert_eq!(row.interval_end_ms, NOW - 1);
         assert_eq!(row.row_date, "2026-10-09");
@@ -1648,7 +1848,14 @@ mod tests {
             "plan":"anthropic/max_20x", "routing_eligible":true,
             "interval_end_ms":NOW-1, "multiplier":60.8
         }]});
-        assert_eq!(measured(&report["latest"][0]).unwrap().multiplier, 60.8);
+        assert_eq!(
+            measured(&report["latest"][0])
+                .unwrap()
+                .latest
+                .unwrap()
+                .multiplier,
+            60.8
+        );
     }
 
     #[test]
@@ -1752,6 +1959,9 @@ mod tests {
         assert_eq!(
             original["openai"].plans[1]
                 .measured
+                .as_ref()
+                .unwrap()
+                .latest
                 .as_ref()
                 .unwrap()
                 .multiplier,
