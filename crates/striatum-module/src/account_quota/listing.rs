@@ -8,15 +8,21 @@ use serde_json::{json, Value};
 pub(super) fn encode(listing: &ScopedCredentialListing) -> Value {
     json!({
         "view": listing.view,
-        "credentials": listing.credentials.iter().map(|row| json!({
-            "id": row.id, "categories": row.categories, "type": row.credential_type,
-            "serves": row.serves, "provider_ids": row.provider_ids,
-            "auth_method": row.auth_method, "refresh_adapter": row.refresh_adapter,
-            "state": row.state, "record_version": row.record_version,
-            "operations": row.operations, "account_id": row.account_id,
-            "email": row.email, "org_name": row.org_name, "plan_tier": row.plan_tier,
-            "plan_tier_source": row.plan_tier_source,
-        })).collect::<Vec<_>>(),
+        "credentials": listing.credentials.iter().map(|row| {
+            let mut value = json!({
+                "id": row.id, "categories": row.categories, "type": row.credential_type,
+                "serves": row.serves, "provider_ids": row.provider_ids,
+                "auth_method": row.auth_method, "refresh_adapter": row.refresh_adapter,
+                "state": row.state, "record_version": row.record_version,
+                "operations": row.operations, "account_id": row.account_id,
+                "email": row.email, "org_name": row.org_name, "plan_tier": row.plan_tier,
+                "plan_tier_source": row.plan_tier_source,
+            });
+            if let Some(condition) = &row.condition {
+                value["condition"] = condition_json(condition);
+            }
+            value
+        }).collect::<Vec<_>>(),
         "grant_tuples": listing.grant_tuples.iter().map(|grant| json!({
             "selector_kind": grant.selector_kind, "selector": grant.selector,
             "operation": grant.operation,
@@ -24,6 +30,20 @@ pub(super) fn encode(listing: &ScopedCredentialListing) -> Value {
         "undecodable_credentials": listing.undecodable_credentials,
         "undecodable_grants": listing.undecodable_grants,
     })
+}
+
+pub(crate) fn condition_json(
+    condition: &cortexkit_claustrum_client::ListedCredentialCondition,
+) -> Value {
+    json!({"reason": condition.reason, "since_ms": condition.since_ms})
+}
+
+pub(super) fn persisted_view(row: striatum_store::PersistedVaultRoster) -> Option<String> {
+    let roster: Value = serde_json::from_str(&row.roster_json).ok()?;
+    // An older router may have saved this digest without its conditions. Let
+    // the first live read replace that snapshot, even when its digest matches.
+    (roster["listing_includes_conditions"] == true && roster["listing"].is_object())
+        .then_some(row.view)
 }
 
 pub(crate) fn restore_credential_listing(
@@ -81,6 +101,50 @@ pub(crate) fn restore_credential_listing(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn login_condition_producer_replies_decode_and_preserve_the_condition() {
+        // Claustrum's list_scoped replies, not its connector or peer rows.
+        let vectors: Value = serde_json::from_str(include_str!(
+            "../../fixtures/claustrum-list-scoped-conditions.json"
+        ))
+        .unwrap();
+        for (case, tier) in [
+            ("listing_condition", None),
+            ("listing_condition_with_plan_tier", Some("pro")),
+            ("listing_unconditioned", None),
+        ] {
+            let decoded = decode_list_scoped_reply(vectors[case].clone()).unwrap();
+            assert!(decoded.undecodable_credentials.is_empty(), "{case}");
+            assert_eq!(decoded.credentials.len(), 1, "{case}");
+            let row = &decoded.credentials[0];
+            assert_eq!(row.id, "oauth:antigravity:condition-fixture");
+            assert_eq!(row.plan_tier.as_deref(), tier, "{case}");
+            assert_eq!(
+                encode(&decoded)["credentials"][0].get("condition"),
+                vectors[case]["result"]["credentials"][0].get("condition"),
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn login_condition_first_live_listing_replaces_an_old_snapshot_with_the_same_view() {
+        let listing = ScopedCredentialListing {
+            view: "same-digest".into(),
+            ..Default::default()
+        };
+        let row = super::super::apply_roster_listing(&mut Default::default(), &listing, 1).unwrap();
+        let mut old_row = row.clone();
+        let mut old_wire: Value = serde_json::from_str(&row.roster_json).unwrap();
+        old_wire
+            .as_object_mut()
+            .unwrap()
+            .remove("listing_includes_conditions");
+        old_row.roster_json = old_wire.to_string();
+        assert_eq!(persisted_view(row).as_deref(), Some("same-digest"));
+        assert_eq!(persisted_view(old_row), None);
+    }
 
     #[test]
     fn client_upgrade_preserves_listing_wire_bytes() {

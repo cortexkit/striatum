@@ -3,6 +3,25 @@
 
 use super::*;
 
+#[derive(Default)]
+pub(crate) struct LoginConditions {
+    reasons: BTreeSet<String>,
+    credential_ids: BTreeSet<String>,
+}
+
+impl LoginConditions {
+    pub(crate) fn extend(&mut self, other: Self) {
+        self.reasons.extend(other.reasons);
+        self.credential_ids.extend(other.credential_ids);
+    }
+
+    pub(crate) fn detail(&self) -> Value {
+        json!({
+            "cause": "login_condition", "reasons": self.reasons, "credential_ids": self.credential_ids,
+        })
+    }
+}
+
 // Tests count eligibility calls rather than inferring avoided work from timing.
 #[cfg(test)]
 pub(crate) static SELECT_ELIGIBILITY_PROBES: std::sync::atomic::AtomicUsize =
@@ -1755,6 +1774,14 @@ impl ClassContext {
         row: &cortexkit_claustrum_client::ListedCredential,
         fact: &striatum_core::ModelFact,
     ) -> bool {
+        row.condition.is_none() && self.eligible_without_login_condition(row, fact)
+    }
+
+    fn eligible_without_login_condition(
+        &self,
+        row: &cortexkit_claustrum_client::ListedCredential,
+        fact: &striatum_core::ModelFact,
+    ) -> bool {
         // Keep account quota in the allocator's roster, not its entitlement
         // filter. A scheduled probe temporarily bypasses that quota restriction;
         // admission must still claim the attempt before sending.
@@ -2299,12 +2326,41 @@ impl ClassContext {
         model: &str,
         priced_per_token: bool,
     ) -> (RosterBuild, BTreeMap<String, i64>) {
+        self.build_route_roster(provider, model, priced_per_token, false)
+    }
+
+    /// Admission applies the condition gate after the decision's tier, size,
+    /// and offered-account restrictions, so it can explain what made it empty.
+    pub(super) fn roster_before_login_conditions(
+        &self,
+        provider: &str,
+        model: &str,
+        priced_per_token: bool,
+    ) -> (RosterBuild, BTreeMap<String, i64>) {
+        self.build_route_roster(provider, model, priced_per_token, true)
+    }
+
+    fn build_route_roster(
+        &self,
+        provider: &str,
+        model: &str,
+        priced_per_token: bool,
+        include_conditioned: bool,
+    ) -> (RosterBuild, BTreeMap<String, i64>) {
         let fact = self.fact_for(provider, model);
         let fenced = self.route_fenced_accounts(provider, model);
         let mut skipped = BTreeMap::new();
         let mut accounts: BTreeMap<String, AccountView> = BTreeMap::new();
         if let Some(fact) = fact {
-            for row in self.eligible_rows(self.class(fact, priced_per_token).rows, fact) {
+            for row in self
+                .class(fact, priced_per_token)
+                .rows
+                .into_iter()
+                .filter(|row| {
+                    (include_conditioned || row.condition.is_none())
+                        && self.eligible_without_login_condition(row, fact)
+                })
+            {
                 let view = self.view(row, fact);
                 if let Some(until) = fenced.get(&view.account_id) {
                     skipped.insert(view.account_id, *until);
@@ -2330,6 +2386,65 @@ impl ClassContext {
             },
             skipped,
         )
+    }
+
+    pub(super) fn filter_login_conditions(
+        &self,
+        build: &mut RosterBuild,
+        offered: impl Fn(&str, &str) -> bool,
+    ) -> Option<LoginConditions> {
+        let marked: BTreeMap<_, _> = self
+            .credentials
+            .listed_credentials()
+            .iter()
+            .filter_map(|row| Some((row.id.as_str(), row.condition.as_ref()?)))
+            .collect();
+        if marked.is_empty() {
+            return None;
+        }
+        let mut conditions = LoginConditions::default();
+        let mut has_unmarked = false;
+        let roster = build.roster.as_mut()?;
+        for account in &mut roster.accounts {
+            account.credentials.retain(|credential| {
+                let id = &credential.credential_id;
+                let condition = marked.get(id.as_str());
+                if offered(&account.account_id, id) {
+                    if let Some(condition) = condition {
+                        conditions.credential_ids.insert(id.clone());
+                        conditions.reasons.insert(condition.reason.clone());
+                    } else {
+                        has_unmarked = true;
+                    }
+                }
+                condition.is_none()
+            });
+        }
+        roster
+            .accounts
+            .retain(|account| !account.credentials.is_empty());
+        (!has_unmarked && !conditions.credential_ids.is_empty()).then_some(conditions)
+    }
+
+    pub(crate) fn login_condition_detail(
+        &self,
+        provider: &str,
+        model: &str,
+        priced: bool,
+    ) -> Option<LoginConditions> {
+        if !self
+            .credentials
+            .listed_credentials()
+            .iter()
+            .any(|row| row.condition.is_some())
+        {
+            return None;
+        }
+        let (mut roster, fenced) = self.roster_before_login_conditions(provider, model, priced);
+        if !fenced.is_empty() {
+            return None;
+        }
+        self.filter_login_conditions(&mut roster, |_, _| true)
     }
 
     /// Accounts closed by a shared quota route fence or an account-wide backoff
@@ -2638,6 +2753,13 @@ impl ClassContext {
         let class = self.class(fact, priced);
         if class.rows.iter().any(|row| self.eligible(row, fact)) {
             return None;
+        }
+        if let Some(detail) = self.login_condition_detail(&fact.provider_id, &fact.model_id, priced)
+        {
+            return Some(striatum_core::CredentialRefusalMark {
+                reason: "login_condition",
+                credential_ids: detail.credential_ids.into_iter().collect(),
+            });
         }
         let refused: Vec<_> = class.rows.iter().map(|row| row.id.clone()).collect();
         let reason = if !refused.is_empty()

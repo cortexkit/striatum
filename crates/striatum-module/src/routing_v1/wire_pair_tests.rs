@@ -246,6 +246,93 @@ async fn athena_can_select_api_and_antigravity_rows() {
     }
 }
 
+fn mark_antigravity(harness: &Harness) {
+    let shared = harness.credentials();
+    let mut credentials = shared.lock().unwrap();
+    let mut rows = credentials.listed_credentials().to_vec();
+    let row = rows
+        .iter_mut()
+        .find(|row| row.id == "antigravity:google")
+        .unwrap();
+    row.condition = Some(cortexkit_claustrum_client::ListedCredentialCondition {
+        reason: "provider_verification_required".into(),
+        since_ms: 7,
+    });
+    credentials.apply_listing(
+        &ScopedCredentialListing {
+            view: "antigravity-verified-by-user-needed".into(),
+            credentials: rows,
+            ..Default::default()
+        },
+        NOW,
+    );
+}
+
+#[tokio::test]
+async fn login_condition_excludes_antigravity_from_automatic_picks() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, _, _) = setup();
+    let caller = harness.bind(reserved(OWNER), None).await;
+    let alias = format!("google/{ALIAS}");
+    let api = format!("google/{API}");
+    let mut request = json!({
+        "consumer":"athena", "requirements":{"iq":0,"eq":0}, "available_routes":[alias],
+    });
+    let before = caller.call("route.select", &request).await;
+    assert_eq!(before.0, subc_protocol::FrameType::Response, "{}", before.1);
+    assert_eq!(before.1["result"]["route"]["model"], ALIAS, "{}", before.1);
+
+    mark_antigravity(&harness);
+    let only_marked = caller.call("route.select", &request).await;
+    assert_eq!(
+        only_marked.0,
+        subc_protocol::FrameType::Error,
+        "{}",
+        only_marked.1
+    );
+    assert_eq!(only_marked.1["code"], "auth_required", "{}", only_marked.1);
+    assert_eq!(
+        only_marked.1["detail"],
+        json!({
+            "cause":"login_condition", "reasons":["provider_verification_required"],
+            "credential_ids":["antigravity:google"],
+        })
+    );
+    request["available_routes"] = json!([alias, api]);
+    let fallback = caller.call("route.select", &request).await;
+    assert_eq!(
+        fallback.0,
+        subc_protocol::FrameType::Response,
+        "{}",
+        fallback.1
+    );
+    assert_eq!(
+        fallback.1["result"]["route"]["model"], API,
+        "{}",
+        fallback.1
+    );
+}
+
+#[tokio::test]
+async fn login_condition_refuses_a_pin_with_no_unmarked_login() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, _, _) = setup();
+    mark_antigravity(&harness);
+    let caller = harness.bind(reserved(OWNER), None).await;
+    let reply = caller.call("route.select", &json!({
+        "consumer":"athena", "requirements":{"iq":0,"eq":0}, "pin":format!("google/{ALIAS}"),
+    })).await;
+    assert_eq!(reply.0, subc_protocol::FrameType::Error, "{}", reply.1);
+    assert_eq!(reply.1["code"], "auth_required", "{}", reply.1);
+    assert_eq!(
+        reply.1["detail"],
+        json!({
+            "cause":"login_condition", "reasons":["provider_verification_required"],
+            "credential_ids":["antigravity:google"],
+        })
+    );
+}
+
 #[test]
 fn single_method_and_discovery_gaps_keep_existing_reachability() {
     let _clock = crate::InjectedClock::set(NOW);

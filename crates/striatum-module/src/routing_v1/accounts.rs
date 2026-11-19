@@ -939,6 +939,18 @@ fn account_refusal(code: &str, message: String, detail: Option<&Value>) -> Refus
             Refusal::new(RefusalCode::AccountSelectionDisabled, message.clone())
         }
         "account_selection_unsupported" => Refusal::new(RefusalCode::AuthRequired, message.clone()),
+        "auth_required" if detail.is_some_and(|detail| detail["cause"] == "login_condition") => {
+            let detail = detail.unwrap();
+            Refusal::with(
+                RefusalCode::AuthRequired,
+                message.clone(),
+                &json!({
+                    "cause": "login_condition",
+                    "reasons": detail["reasons"],
+                    "credential_ids": detail["credential_ids"],
+                }),
+            )
+        }
         "account_selection_unavailable" => {
             let mut refusal = account_unavailable(message.clone());
             if let Some(detail) = detail.and_then(Value::as_object) {
