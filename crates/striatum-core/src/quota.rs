@@ -225,6 +225,10 @@ pub struct ProviderUsage {
     pub api_provider: Option<String>,
     #[serde(default)]
     pub account: Option<String>,
+    /// Vault credential which produced this reading. For account-less rows the
+    /// consumer resolves this through its listed credential roster.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_ref: Option<String>,
     /// Which retrieval path produced this (e.g. "oauth"): observability only.
     #[serde(default)]
     pub source: Option<String>,

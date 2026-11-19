@@ -3,7 +3,8 @@
 //! Routing will choose which subscription account serves new work from these
 //! views. This module only builds them: it polls Insula's complete feed with
 //! `usage.get {}`, keeps every account's whole entry with its
-//! producer date, joins accounts to vault identities by vault account id, and
+//! producer date, joins accounts to vault identities by vault account id or
+//! listed credential id, and
 //! says for each account whether its reading is fit to place new (cold) work
 //! on, and why not when it is not: degraded, too old, missing windows, or no
 //! vault identity. Nothing selects an account from these views yet, and model
@@ -136,6 +137,12 @@ pub struct AccountEntry {
     #[serde(default)]
     pub account: Option<String>,
     #[serde(default)]
+    pub credential_ref: Option<String>,
+    /// Resolved through the in-memory vault listing for entries whose producer
+    /// account is null. This is routing's storage key, not a producer field.
+    #[serde(skip)]
+    resolved_account: Option<String>,
+    #[serde(default)]
     pub account_info: Option<AccountInfo>,
     #[serde(default)]
     pub source: Option<String>,
@@ -162,6 +169,16 @@ impl AccountEntry {
             .as_deref()
             .filter(|account| !account.is_empty())
     }
+
+    fn credential_ref(&self) -> Option<&str> {
+        self.credential_ref
+            .as_deref()
+            .filter(|credential| !credential.is_empty())
+    }
+
+    fn reading_account_id(&self) -> Option<&str> {
+        self.account_id().or(self.resolved_account.as_deref())
+    }
 }
 
 /// One decoded `usage.get` reply: every entry routing could decode (kept with
@@ -171,7 +188,8 @@ impl AccountEntry {
 pub struct DecodedEnvelope {
     pub entries: Vec<(AccountEntry, Value)>,
     pub complete_providers: Vec<String>,
-    /// Entries without an account id; they cannot be keyed to an account.
+    /// Entries without an account id or credential ref; they cannot be keyed to
+    /// a routing login.
     pub unkeyed_entries: usize,
     /// Decode errors for entries routing could not read. The rest of the reply
     /// is still used.
@@ -206,7 +224,9 @@ pub fn decode_usage_envelope(bytes: &[u8]) -> Result<DecodedEnvelope, String> {
     };
     for raw in result {
         match serde_json::from_value::<AccountEntry>(raw.clone()) {
-            Ok(entry) if entry.account_id().is_none() => decoded.unkeyed_entries += 1,
+            Ok(entry) if entry.account_id().is_none() && entry.credential_ref().is_none() => {
+                decoded.unkeyed_entries += 1;
+            }
             Ok(entry) => decoded.entries.push((entry, raw.clone())),
             Err(error) => decoded.undecodable_entries.push(error.to_string()),
         }
@@ -509,7 +529,7 @@ pub fn merge_provider_poll(
         if entry.provider != provider {
             continue;
         }
-        let Some(account) = entry.account_id() else {
+        let Some(account) = entry.reading_account_id() else {
             continue;
         };
         match chosen.get(account) {
@@ -1469,6 +1489,9 @@ mod watch;
 pub struct AccountQuotaState {
     pub readings: AccountReadings,
     pub roster: Option<VaultRoster>,
+    /// Resolved identities for every listed credential, including API keys
+    /// which have no vault account id.
+    pub credential_identities: BTreeMap<String, CredentialIdentity>,
     pub roster_poll: RosterPoll,
     pub last_insula_error: Option<String>,
     /// Readings restored from the store at boot.
@@ -1481,6 +1504,7 @@ impl Default for AccountQuotaState {
         Self {
             readings: AccountReadings::default(),
             roster: None,
+            credential_identities: BTreeMap::new(),
             roster_poll: RosterPoll::NotPolled,
             last_insula_error: None,
             restored_readings: 0,
@@ -1490,6 +1514,45 @@ impl Default for AccountQuotaState {
 }
 
 pub type SharedAccountQuota = Arc<Mutex<AccountQuotaState>>;
+
+/// The account identity routing assigns to one listed vault credential. A
+/// credential without a vault account id is itself the login's account id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CredentialIdentity {
+    pub account_id: String,
+    pub active: bool,
+    pub plan_tier: Option<String>,
+}
+
+fn credential_identities(
+    listing: &ScopedCredentialListing,
+) -> BTreeMap<String, CredentialIdentity> {
+    let mut identities: BTreeMap<String, CredentialIdentity> = BTreeMap::new();
+    let mut ambiguous = BTreeSet::new();
+    for credential in &listing.credentials {
+        if ambiguous.contains(&credential.id) {
+            continue;
+        }
+        let identity = CredentialIdentity {
+            account_id: credential
+                .account_id
+                .clone()
+                .unwrap_or_else(|| credential.id.clone()),
+            active: credential.state == "active",
+            plan_tier: credential.plan_tier.clone(),
+        };
+        if let Some(previous) = identities.get(&credential.id) {
+            if previous == &identity {
+                continue;
+            }
+            identities.remove(&credential.id);
+            ambiguous.insert(credential.id.clone());
+            continue;
+        }
+        identities.insert(credential.id.clone(), identity);
+    }
+    identities
+}
 
 fn persisted_reading(reading: &StoredReading) -> PersistedAccountReading {
     PersistedAccountReading {
@@ -1582,10 +1645,13 @@ pub fn restore_account_state(store: &SqliteRouteStateStore) -> AccountQuotaState
         Err(error) => tracing::warn!(error = %error, "account quota completeness unreadable"),
     }
     match store.account_vault_roster() {
-        Ok(Some(row)) => match serde_json::from_str::<VaultRoster>(&row.roster_json) {
-            Ok(roster) => state.roster = Some(roster),
-            Err(error) => tracing::warn!(error = %error, "persisted vault roster undecodable"),
-        },
+        Ok(Some(row)) => {
+            state.credential_identities = listing::restore_credential_identities(&row);
+            match serde_json::from_str::<VaultRoster>(&row.roster_json) {
+                Ok(roster) => state.roster = Some(roster),
+                Err(error) => tracing::warn!(error = %error, "persisted vault roster undecodable"),
+            }
+        }
         Ok(None) => {}
         Err(error) => tracing::warn!(error = %error, "persisted vault roster unreadable"),
     }
@@ -1617,6 +1683,7 @@ pub fn apply_roster_listing(
     at_ms: i64,
 ) -> Option<PersistedVaultRoster> {
     let roster = build_roster(listing, state.roster.as_ref(), at_ms);
+    state.credential_identities = credential_identities(listing);
     let row = serde_json::to_value(&roster).ok().map(|mut value| {
         // Quota identities omit API keys without account ids. Persist the
         // full non-secret view too, for admission immediately after restart.
@@ -1631,6 +1698,42 @@ pub fn apply_roster_listing(
     state.roster = Some(roster);
     state.roster_poll = RosterPoll::Listed { at_ms };
     row
+}
+
+fn claim_unknown_credential_warning(credential_ref: &str) -> bool {
+    static WARNED: std::sync::OnceLock<Mutex<BTreeSet<String>>> = std::sync::OnceLock::new();
+    WARNED
+        .get_or_init(Default::default)
+        .lock()
+        .map_or(false, |mut warned| {
+            warned.insert(credential_ref.to_string())
+        })
+}
+
+/// Resolve only entries whose producer account is absent. A credential ref is
+/// not an account identity on the wire; it names one listed vault credential,
+/// whose routing account may be a vault account id or the credential id itself.
+fn resolve_credential_refs(
+    envelope: &mut DecodedEnvelope,
+    identities: &BTreeMap<String, CredentialIdentity>,
+) {
+    for (entry, _) in &mut envelope.entries {
+        if entry.account_id().is_some() {
+            continue;
+        }
+        let Some(credential_ref) = entry.credential_ref() else {
+            continue;
+        };
+        if let Some(identity) = identities.get(credential_ref) {
+            entry.resolved_account = Some(identity.account_id.clone());
+        } else if claim_unknown_credential_warning(credential_ref) {
+            tracing::warn!(
+                provider = %entry.provider,
+                credential_ref,
+                "account quota: Insula credentialRef is not one unambiguous listed credential; reading not attached"
+            );
+        }
+    }
 }
 
 /// Decode one provider's reply and merge it. Returns the rows to persist, or
@@ -1648,7 +1751,8 @@ pub fn apply_provider_reply(
     ),
     String,
 > {
-    let envelope = decode_usage_envelope(body)?;
+    let mut envelope = decode_usage_envelope(body)?;
+    resolve_credential_refs(&mut envelope, &state.credential_identities);
     if !envelope.undecodable_entries.is_empty() {
         tracing::warn!(
             provider,
@@ -1677,7 +1781,8 @@ pub fn apply_usage_reply(
     ),
     String,
 > {
-    let envelope = decode_usage_envelope(body)?;
+    let mut envelope = decode_usage_envelope(body)?;
+    resolve_credential_refs(&mut envelope, &state.credential_identities);
     let providers: BTreeSet<_> = envelope
         .entries
         .iter()

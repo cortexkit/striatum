@@ -3,6 +3,27 @@
 use cortexkit_claustrum_client::{decode_list_scoped_reply, ScopedCredentialListing};
 use serde_json::{json, Value};
 
+pub(super) fn restore_credential_identities(
+    row: &striatum_store::PersistedVaultRoster,
+) -> std::collections::BTreeMap<String, super::CredentialIdentity> {
+    let Ok(roster) = serde_json::from_str::<Value>(&row.roster_json) else {
+        return Default::default();
+    };
+    let Some(listing) = roster.get("listing") else {
+        return Default::default();
+    };
+    match decode_list_scoped_reply(json!({"result": listing})) {
+        Ok(listing)
+            if listing.view == row.view
+                && listing.undecodable_credentials.is_empty()
+                && listing.undecodable_grants.is_empty() =>
+        {
+            super::credential_identities(&listing)
+        }
+        _ => Default::default(),
+    }
+}
+
 // The client listing types do not implement serde. Keep the published wire shape
 // so restoration uses the client's row validation rather than a second decoder.
 pub(super) fn encode(listing: &ScopedCredentialListing) -> Value {

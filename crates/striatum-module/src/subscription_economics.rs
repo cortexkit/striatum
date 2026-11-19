@@ -364,16 +364,33 @@ fn build(state: &AccountQuotaState, report: &Value, prices: &Value, now: i64) ->
         {
             continue;
         }
+        let credential_identity = if entry.account.is_none() {
+            let Some(identity) = entry
+                .credential_ref
+                .as_deref()
+                .and_then(|credential| state.credential_identities.get(credential))
+                .filter(|identity| identity.account_id == reading.account_id)
+            else {
+                continue;
+            };
+            Some(identity)
+        } else {
+            None
+        };
         let roster = state
             .roster
             .as_ref()
             .and_then(|r| crate::account_quota::identity_for_reading(r, reading));
-        if roster.is_some_and(|r| r.active_credential_ids.is_empty()) {
+        if roster.is_some_and(|r| r.active_credential_ids.is_empty())
+            || credential_identity.is_some_and(|identity| !identity.active)
+        {
             continue;
         }
         let Some((provider, tier)) = plan_price_key(reading, roster) else {
             continue;
         };
+        let tier =
+            tier.or_else(|| credential_identity.and_then(|identity| identity.plan_tier.as_deref()));
         let tier = tier.map(str::to_owned);
         let joined = match account_plan(report, &reading.account_id) {
             Ok(row) => row,

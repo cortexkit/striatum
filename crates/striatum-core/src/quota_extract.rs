@@ -663,6 +663,7 @@ mod tests {
             api_provider: None,
             provider: "codex".into(),
             account: None,
+            credential_ref: None,
             source: None,
             usage: Some(Usage {
                 primary: Some(win(40.0, "2026-01-01T00:00:00Z", Some(300))),
@@ -694,6 +695,7 @@ mod tests {
             api_provider: None,
             provider: "ollama".into(),
             account: None,
+            credential_ref: None,
             source: None,
             usage: Some(Usage {
                 primary: Some(RateWindow {
@@ -735,6 +737,7 @@ mod tests {
             api_provider: None,
             provider: "ollama".into(),
             account: None,
+            credential_ref: None,
             source: None,
             usage: Some(Usage {
                 primary: Some(RateWindow {
@@ -770,6 +773,7 @@ mod tests {
             api_provider: None,
             provider: "ollama".into(),
             account: None,
+            credential_ref: None,
             source: None,
             usage: Some(Usage {
                 primary: Some(win(40.0, "not-a-timestamp", Some(300))),
@@ -819,6 +823,7 @@ mod tests {
             api_provider: None,
             provider: "antigravity".into(),
             account: None,
+            credential_ref: None,
             source: None,
             usage: Some(Usage {
                 // Misleading aggregate: must be IGNORED.
@@ -896,6 +901,7 @@ mod tests {
             api_provider: None,
             provider: "antigravity".into(),
             account: None,
+            credential_ref: None,
             source: None,
             usage: Some(Usage {
                 primary: None,
@@ -961,6 +967,7 @@ mod tests {
             api_provider: Some("google".into()),
             provider: "gemini".into(),
             account: None,
+            credential_ref: None,
             source: None,
             usage: Some(Usage {
                 primary: None,
@@ -1016,6 +1023,7 @@ mod tests {
             api_provider: None,
             provider: "antigravity".into(),
             account: None,
+            credential_ref: None,
             source: None,
             usage: Some(Usage {
                 primary: None,
@@ -1220,6 +1228,7 @@ mod tests {
             api_provider: None,
             provider: "antigravity".into(),
             account: None,
+            credential_ref: None,
             source: None,
             usage: Some(usage.clone()),
             spend: Vec::new(),
@@ -1348,6 +1357,7 @@ mod tests {
             api_provider: None,
             provider: "antigravity".into(),
             account: None,
+            credential_ref: None,
             source: None,
             usage: Some(usage),
             spend: Vec::new(),
@@ -1378,6 +1388,7 @@ mod tests {
             api_provider: None,
             provider: "antigravity".into(),
             account: None,
+            credential_ref: None,
             source: None,
             usage: Some(Usage {
                 primary: Some(win(100.0, "2026-01-01T00:00:00Z", Some(300))),
@@ -1412,6 +1423,7 @@ mod tests {
             api_provider: None,
             provider: provider.into(),
             account: None,
+            credential_ref: None,
             source: None,
             usage: Some(Usage {
                 // An aggregate beside pools is not read.

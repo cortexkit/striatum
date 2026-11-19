@@ -120,16 +120,18 @@ impl LiveQuota {
             .lock()
             .map_err(|_| "quota cache poisoned")?
             .clone();
-        let readings = self
-            .accounts
-            .lock()
-            .map_err(|_| "account cache poisoned")?
-            .readings
-            .clone();
+        let (readings, credential_identities) = {
+            let accounts = self.accounts.lock().map_err(|_| "account cache poisoned")?;
+            (
+                accounts.readings.clone(),
+                accounts.credential_identities.clone(),
+            )
+        };
         // Usage merges only readings; the independently refreshed vault roster
         // need not be copied or restored by an Insula event.
         let mut accounts = account_quota::AccountQuotaState {
             readings,
+            credential_identities,
             ..Default::default()
         };
         let at_ms = crate::now_ms();
