@@ -333,6 +333,133 @@ fn fixture() -> (ScratchDir, LiveQuota) {
     (scratch, live)
 }
 
+const KIMI_CREDENTIAL: &str = "apikey:kimi-for-coding";
+
+fn kimi_entry() -> Value {
+    serde_json::from_str(
+        r#"{"provider":"kimi-for-coding","apiProvider":"kimi-code-plan-global","account":null,"credentialRef":"apikey:kimi-for-coding","source":"vault","usage":{"primary":{"usedPercent":6.21,"resetsAt":"2026-11-19T18:08:27Z","windowMinutes":10080},"secondary":{"usedPercent":0.0,"resetsAt":"2026-11-19T17:08:27Z","windowMinutes":300}}}"#,
+    )
+    .unwrap()
+}
+
+fn install_credential_roster(live: &LiveQuota) {
+    let listing = cortexkit_claustrum_client::ScopedCredentialListing {
+        view: "key-only-kimi".into(),
+        credentials: vec![cortexkit_claustrum_client::ListedCredential {
+            id: KIMI_CREDENTIAL.into(),
+            state: "active".into(),
+            categories: vec!["llm-provider".into()],
+            provider_ids: vec!["kimi-code-plan-global".into()],
+            credential_type: "apikey".into(),
+            auth_method: Some("apikey".into()),
+            plan_tier: Some("pro_500".into()),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    account_quota::apply_roster_listing(
+        &mut live.accounts.lock().unwrap(),
+        &listing,
+        crate::now_ms() as i64,
+    )
+    .unwrap();
+}
+
+fn store_snapshot(live: &LiveQuota, entries: Vec<Value>) {
+    live.store(
+        &serde_json::to_vec(&json!({"result": entries})).unwrap(),
+        false,
+    )
+    .unwrap();
+}
+
+fn stored_rows(live: &LiveQuota) -> Vec<striatum_store::PersistedAccountReading> {
+    live.store.account_quota_readings().unwrap()
+}
+
+#[test]
+fn exact_accountless_kimi_snapshot_stores_the_listed_credential_login() {
+    let (_scratch, live) = fixture();
+    install_credential_roster(&live);
+    store_snapshot(&live, vec![kimi_entry()]);
+
+    let rows = stored_rows(&live);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].provider, "kimi-for-coding");
+    assert_eq!(rows[0].account_id, KIMI_CREDENTIAL);
+    assert_eq!(
+        serde_json::from_str::<Value>(&rows[0].entry_json).unwrap(),
+        kimi_entry()
+    );
+    let cached = serde_json::to_value(&live.cache.lock().unwrap().windows).unwrap();
+    assert_eq!(cached[0]["credentialRef"], KIMI_CREDENTIAL);
+}
+
+#[test]
+fn unknown_credential_ref_does_not_attach_or_replace_the_known_login() {
+    let (_scratch, live) = fixture();
+    install_credential_roster(&live);
+    store_snapshot(&live, vec![kimi_entry()]);
+    let mut unknown = kimi_entry();
+    unknown["credentialRef"] = json!("apikey:not-in-the-vault");
+    unknown["usage"]["primary"]["usedPercent"] = json!(100.0);
+    live.store(
+        &serde_json::to_vec(&json!({"result":[unknown]})).unwrap(),
+        true,
+    )
+    .unwrap();
+
+    let rows = stored_rows(&live);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].account_id, KIMI_CREDENTIAL);
+    assert_eq!(
+        serde_json::from_str::<Value>(&rows[0].entry_json).unwrap()["usage"]["primary"]
+            ["usedPercent"],
+        6.21
+    );
+}
+
+#[test]
+fn producer_account_wins_over_credential_ref_when_both_are_present() {
+    let (_scratch, live) = fixture();
+    install_credential_roster(&live);
+    let mut both = kimi_entry();
+    both["account"] = json!("vault-account");
+    store_snapshot(&live, vec![both, kimi_entry()]);
+
+    let rows = stored_rows(&live);
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    let account_row = rows
+        .iter()
+        .find(|row| row.account_id == "vault-account")
+        .expect("the producer account remains the storage key");
+    assert_eq!(
+        serde_json::from_str::<Value>(&account_row.entry_json).unwrap()["credentialRef"],
+        KIMI_CREDENTIAL
+    );
+    assert!(rows.iter().any(|row| row.account_id == KIMI_CREDENTIAL));
+}
+
+#[test]
+fn accountless_bus_notice_stores_the_same_credential_login_as_a_snapshot() {
+    let (_scratch, snapshot) = fixture();
+    install_credential_roster(&snapshot);
+    store_snapshot(&snapshot, vec![kimi_entry()]);
+    let (_scratch, notice) = fixture();
+    install_credential_roster(&notice);
+    notice.store_sample(kimi_entry()).unwrap();
+
+    let notice_rows = stored_rows(&notice);
+    assert_eq!(notice_rows.len(), 1, "{notice_rows:?}");
+    assert_eq!(notice_rows[0].account_id, KIMI_CREDENTIAL);
+    let identity = |rows: Vec<striatum_store::PersistedAccountReading>| {
+        rows.into_iter()
+            .map(|row| (row.provider, row.account_id, row.entry_json))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(identity(notice_rows), identity(stored_rows(&snapshot)));
+}
+
 fn bus() -> InMemoryBus {
     InMemoryBus::new(
         InMemoryConfig::default()

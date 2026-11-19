@@ -85,6 +85,7 @@ pub(crate) fn decode_usage_result(
                     provider,
                     api_provider: field("apiProvider").map(str::to_string),
                     account,
+                    credential_ref: field("credentialRef").map(str::to_string),
                     source: None,
                     usage: None,
                     spend: Vec::new(),
