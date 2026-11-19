@@ -467,6 +467,7 @@ async fn fact_capability_absent_until_all_filters_exist() {
             "ck.box_test.event.thalamus-harness.route_fact.v1",
             "ck.box_test.event.colliculus.route_fact.v1",
             "ck.box_test.event.prefrontal-core.route_fact.v1",
+            "ck.box_test.event.prefrontal.route_fact.v1",
             "ck.box_test.event.plexus.route_fact.v1",
         ]
     );
