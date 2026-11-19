@@ -400,6 +400,25 @@ async fn n_pick_wire_matches_policy_fixture_and_decision_explanation() {
         .unwrap()
         .replace("$decisionID", decision_id);
     let mut expected: serde_json::Value = serde_json::from_str(&expected).unwrap();
+    // The archived Sol Pro row has no catalog effort facts; the old seed's
+    // xhigh prompt default must no longer appear in the legacy panel reply.
+    let removed_effort_delta = [(
+        "/result/members/0/promptParams",
+        "openai/gpt-5.6-sol-pro",
+        "xhigh",
+    )];
+    for (path, route, old_variant) in removed_effort_delta {
+        assert_eq!(expected["result"]["members"][0]["routeKey"], route);
+        assert_eq!(
+            expected
+                .pointer_mut(path)
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .remove("variant"),
+            Some(json!(old_variant))
+        );
+    }
     for member in expected["result"]["members"].as_array_mut().unwrap() {
         member["harness"] = json!("broca");
     }
