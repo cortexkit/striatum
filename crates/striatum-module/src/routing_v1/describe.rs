@@ -1,6 +1,7 @@
 //! `role.describe`: the role, its ops, the configured consumers and the
 //! requirement members this provider reads.
 
+use cortexkit_role_routing::capabilities::SELECT_WORKLOAD;
 use cortexkit_role_routing::describe::{ConsumerEntry, RoleDescribe};
 use cortexkit_role_routing::errors::Refusal;
 use serde_json::Value;
@@ -16,6 +17,7 @@ const ACCOUNT_CONTINUE_RESUME: &str = "account_continue_resume";
 pub(super) const CAPABILITIES: &[&str] = &[
     cortexkit_role_routing::capabilities::CONSUMER_DECLARATIONS,
     cortexkit_role_routing::capabilities::CONSUMER_PRIORITY,
+    SELECT_WORKLOAD,
     cortexkit_role_routing::capabilities::SELECT_KIND,
     cortexkit_role_routing::capabilities::SELECT_MEDIA,
     cortexkit_role_routing::capabilities::SELECT_SEARCH,
@@ -185,7 +187,9 @@ pub(super) fn describe(deps: &Deps<'_>) -> Result<Value, Refusal> {
         fields.extend(
             cortexkit_role_routing::select::OPTIONAL_REQUIREMENT_FIELDS
                 .iter()
-                .map(|field| Value::String((*field).into())),
+                .copied()
+                .filter(|field| *field != "workload" || capabilities.contains(&SELECT_WORKLOAD))
+                .map(|field| Value::String(field.into())),
         );
         if capabilities.contains(&"select_media") {
             fields.extend(

@@ -1,6 +1,7 @@
 //! Resolve reasoning effort and its matching grade from the catalog snapshot.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Mutex;
 
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -52,33 +53,54 @@ pub(crate) struct Efforts {
 }
 
 impl Efforts {
-    pub fn workload<'a>(&'a self, consumer: &str, settings: &'a LiveConfig) -> Option<&'a str> {
-        self.workloads
+    pub fn workload(
+        &self,
+        consumer: &str,
+        settings: &LiveConfig,
+        request: Option<&str>,
+        declared: Option<&str>,
+    ) -> Option<Workload> {
+        // The preview can replace settings for its sweep without changing
+        // operator configuration or the precedence used by live selections.
+        let (name, source) = self
+            .workloads
             .iter()
             .filter(|(name, _)| crate::config_policy::consumer_matches(name, consumer))
             .max_by_key(|(name, _)| crate::config_policy::consumer_specificity(name))
             .map(|(_, workload)| workload.as_str())
             .or_else(|| settings.consumer_workload(consumer))
-            .or_else(|| declared_workload(consumer))
-            .filter(|workload| WORKLOADS.contains(workload))
+            .map(|name| (name, WorkloadSource::Settings))
+            .or(request.map(|name| (name, WorkloadSource::Request)))
+            .or(declared.map(|name| (name, WorkloadSource::Declaration)))?;
+        // Check the winning name, not each layer: an unknown override still
+        // suppresses the workload policy from lower-priority layers.
+        match WORKLOADS.iter().copied().find(|known| *known == name) {
+            Some(name) => Some(Workload { name, source }),
+            None => {
+                warn_unknown_workload(consumer, name);
+                None
+            }
+        }
     }
 
     pub fn resolve(
         &self,
         fact: &ModelFact,
         targets: &BTreeMap<String, String>,
-        workload: Option<&str>,
+        workload: Option<Workload>,
         pinned: bool,
         explicit: Option<&str>,
     ) -> Result<Choice, Rejection> {
-        resolve(
+        let mut choice = resolve(
             self.model(fact, targets),
-            workload,
+            workload.map(|w| w.name),
             pinned,
             explicit,
             fact.scores.elo,
             fact.scores.eq,
-        )
+        )?;
+        choice.workload_source = workload.map(|w| w.source);
+        Ok(choice)
     }
 
     fn model(
@@ -122,10 +144,31 @@ impl Efforts {
     }
 }
 
-// Module declarations will supply the default once the routing contract has
-// a workload member. Keep that lookup separate from operator overrides.
-fn declared_workload(_consumer: &str) -> Option<&'static str> {
-    None
+fn warn_unknown_workload(consumer: &str, name: &str) {
+    static WARNED: Mutex<BTreeSet<(String, String)>> = Mutex::new(BTreeSet::new());
+    let first = WARNED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert((consumer.to_owned(), name.to_owned()));
+    if first {
+        crate::warn_operator(format!(
+            "[striatum] ignoring unknown workload {name:?} for consumer {consumer:?}"
+        ));
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct Workload {
+    name: &'static str,
+    source: WorkloadSource,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum WorkloadSource {
+    Settings,
+    Request,
+    Declaration,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -143,6 +186,8 @@ enum Source {
 pub(crate) struct Choice {
     pub variant: Option<String>,
     effort_source: Source,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workload_source: Option<WorkloadSource>,
     pub grade: Grade,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub minimum_unverified: Option<String>,
@@ -311,6 +356,7 @@ fn resolve(
     Ok(Choice {
         variant: variant.map(str::to_owned),
         effort_source,
+        workload_source: None,
         grade: Grade {
             elo,
             eq,

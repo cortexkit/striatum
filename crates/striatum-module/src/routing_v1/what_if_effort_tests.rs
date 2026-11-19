@@ -3,6 +3,9 @@ use super::*;
 #[path = "what_if_live_effort_tests.rs"]
 mod live_tests;
 
+#[path = "declared_workload_tests.rs"]
+mod declared_workload_tests;
+
 const A: &str = "example-provider/model-a";
 const B: &str = "example-provider/model-b";
 const C: &str = "example-subscription/model-c";
