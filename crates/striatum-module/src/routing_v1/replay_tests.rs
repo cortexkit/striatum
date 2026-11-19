@@ -273,6 +273,8 @@ pub(super) fn assert_or_record_with_fingerprint(
                 &mut expected,
                 fingerprint.expect("frozen state replay needs its catalog fingerprint"),
             );
+            project_additive_pricing_members(&mut observed);
+            project_additive_pricing_members(&mut expected);
         }
         if file == "availability" {
             for state in ["after_select", "state"] {
@@ -430,6 +432,7 @@ fn project_additive_shape_members(value: &mut Value) {
     match value {
         Value::Array(values) => values.iter_mut().for_each(project_additive_shape_members),
         Value::Object(object) => {
+            remove_additive_pricing_members(object);
             // Retry clocks and scoped success proofs are internal persistence,
             // checked by per-kind migration and admission tests. Do not rewrite
             // historical recordings merely to add their table/column census.
@@ -655,6 +658,58 @@ fn project_additive_shape_members(value: &mut Value) {
             object.values_mut().for_each(project_additive_shape_members);
         }
         _ => {}
+    }
+}
+
+fn project_additive_pricing_members(value: &mut Value) {
+    match value {
+        Value::Array(values) => values.iter_mut().for_each(project_additive_pricing_members),
+        Value::Object(object) => {
+            remove_additive_pricing_members(object);
+            object
+                .values_mut()
+                .for_each(project_additive_pricing_members);
+        }
+        _ => {}
+    }
+}
+
+fn remove_additive_pricing_members(object: &mut serde_json::Map<String, Value>) {
+    // Frozen decisions predate the pacing breakdown. Dedicated selection
+    // previews and decision tests check those exact values; leave every other
+    // member in this whole-recording comparison.
+    for field in ["taskPricing", "subscriptionPricing"] {
+        if let Some(pricing) = object.get_mut(field).and_then(Value::as_object_mut) {
+            for added in ["pacing", "weeklyPressure", "shortWindowPressure"] {
+                pricing.remove(added);
+            }
+        }
+    }
+}
+
+#[test]
+fn additive_pricing_projection_accepts_only_the_three_pacing_members() {
+    let observed = json!({"objective":{
+        "taskPricing":{"pressure":1.0,"pacing":"max","weeklyPressure":1.0,
+            "shortWindowPressure":0.4,"finalCostUsd":4.0},
+        "subscriptionPricing":{"planPressure":1.0,"pacing":"max","weeklyPressure":1.0,
+            "shortWindowPressure":0.4,"keepFreePercent":0.0}
+    }});
+    let expected = json!({"objective":{
+        "taskPricing":{"pressure":1.0,"finalCostUsd":4.0},
+        "subscriptionPricing":{"planPressure":1.0,"keepFreePercent":0.0}
+    }});
+    let mut projected = observed;
+    let mut expected = expected;
+    project_additive_pricing_members(&mut projected);
+    project_additive_pricing_members(&mut expected);
+    assert_eq!(projected, expected);
+
+    for field in ["taskPricing", "subscriptionPricing"] {
+        let mut unknown = projected.clone();
+        unknown["objective"][field]["unlistedPricingMember"] = json!(true);
+        project_additive_pricing_members(&mut unknown);
+        assert_ne!(unknown, expected, "{field} accepted an unknown member");
     }
 }
 
