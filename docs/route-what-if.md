@@ -109,8 +109,12 @@ only narrow the runner's admitted pairs.
   for this call, or supplies one if the module has none. It does not register an
   unavailable runner or change operator settings, accounts or credentials.
 * `head_choices`: optional object with required `runner_module` and optional
-  `harness`, as in `route.head_choices`. Requests the same picker response under
-  the call's policy and runner declaration overrides, alongside the IQ sweep.
+  `harness`, as in `route.head_choices`. Runs the picker under the call's policy
+  and runner declaration overrides, alongside the IQ sweep.
+* `workloads`: optional map from dotted consumer names to workload names. The
+  most specific matching entry replaces the consumer's configured workload for
+  this call only. An unknown workload is treated as none. Head picks do not use
+  a workload.
 * `pricing_patch`: optional object with only `overqualification` and
   `banked_resets`. `overqualification` is the mode string `"additive"` or
   `"cost_scaled"`; `banked_resets` maps provider ids to `"emergency"` or
@@ -143,9 +147,10 @@ by the operator route's bound scope still applies, just as it does to `route.sel
 ## Result
 
 The management response's `result` contains `consumer`, `results`, `anchor_version`, `snapshot_ms`,
-`elapsed_ms` and `concurrency`, plus `head_choices` when requested (the unchanged
-`route.head_choices` response shape) and `panels` when `panel` is supplied. Each
-`results` row contains:
+`elapsed_ms` and `concurrency`, plus `head_choices` when requested and `panels`
+when `panel` is supplied. The public picker shape is unchanged; in what-if,
+each head model adds the diagnostic fields `effort_source`, `variant` and
+`grade` to that shape. Each `results` row contains:
 
 ```json
 {
