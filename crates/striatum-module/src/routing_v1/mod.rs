@@ -47,6 +47,7 @@ mod panels;
 mod panels_estimate_tests;
 #[cfg(test)]
 mod panels_tests;
+pub(crate) mod quota_override;
 mod reads;
 pub(crate) mod report;
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]

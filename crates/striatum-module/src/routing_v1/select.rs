@@ -715,6 +715,7 @@ impl RequestInputs {
                 .and_then(|blocks| blocks.route_state_snapshot(now)),
         }
         .map_err(store_refusal)?;
+        let quota = sweep.and_then(|sweep| sweep.quota_override.as_ref());
         let (
             windows,
             available,
@@ -722,16 +723,27 @@ impl RequestInputs {
             retained_degraded_count,
             last_error,
             restored_from_ms,
-        ) = match deps.quota_cache.lock() {
-            Ok(cache) => (
-                cache.windows.clone(),
-                cache.available,
-                cache.refreshed_at_ms,
-                cache.retained_degraded_since_ms.len(),
-                cache.last_error.clone(),
-                cache.restored_from_ms,
-            ),
-            Err(_) => (Vec::new(), false, 0, 0, Some("cache poisoned".into()), None),
+        ) = if let Some(quota) = quota {
+            (
+                quota.windows.clone(),
+                true,
+                quota.wall_clock as u64,
+                0,
+                None,
+                None,
+            )
+        } else {
+            match deps.quota_cache.lock() {
+                Ok(cache) => (
+                    cache.windows.clone(),
+                    cache.available,
+                    cache.refreshed_at_ms,
+                    cache.retained_degraded_since_ms.len(),
+                    cache.last_error.clone(),
+                    cache.restored_from_ms,
+                ),
+                Err(_) => (Vec::new(), false, 0, 0, Some("cache poisoned".into()), None),
+            }
         };
         let stale_age_ms = (!windows.is_empty())
             .then(|| crate::stale_quota_age_ms(refreshed_at_ms, now as u64))
@@ -744,13 +756,24 @@ impl RequestInputs {
                 self.live_config.quota_model_pools_ref(),
             );
         }
-        crate::subscription_economics::overlay(
-            &mut snapshot,
-            &self.facts,
-            now as i64,
-            self.live_config.pricing(),
-            self.pacing,
-        );
+        if let Some(quota) = quota {
+            crate::subscription_economics::overlay_pools(
+                quota.pools.clone(),
+                &mut snapshot,
+                &self.facts,
+                quota.at,
+                self.live_config.pricing(),
+                self.pacing,
+            );
+        } else {
+            crate::subscription_economics::overlay(
+                &mut snapshot,
+                &self.facts,
+                now as i64,
+                self.live_config.pricing(),
+                self.pacing,
+            );
+        }
         let quota_signal_json = crate::select::quota_signal_json(
             &snapshot,
             &crate::select::QuotaSignalView {
@@ -2266,12 +2289,15 @@ async fn select_at_tier_attempt(
     )
     .ok_or_else(|| Refusal::no_route(NoRouteReason::NoAvailableModel, None))?;
 
-    if evaluation.is_some() {
+    if let Some(evaluation) = evaluation {
         let mut preview = json!({
             "route": selected.route_key,
             "variant": selected.prompt_params.variant,
             "cost_usd": selected.score.objective.task_pricing.as_ref().filter(|price| price.price_unit == "task").and_then(|price| price.final_cost_usd),
         });
+        if evaluation.accounts.quota_override.is_some() {
+            super::quota_override::describe_plan(&selected, &mut preview);
+        }
         catalog_choice.append_to(&mut preview);
         if selected
             .explanation

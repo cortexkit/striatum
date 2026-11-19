@@ -35,6 +35,9 @@ pub struct SubscriptionPool {
     /// Count saved windows in pricing only; account admission still uses live quota.
     pub banked_as_capacity: bool,
     pub now_ms: i64,
+    /// Historical quota previews check the age of Astrocyte subscription-value
+    /// measurements against the real clock, not the historical quota clock.
+    pub value_now_ms: Option<i64>,
     pub pacing: PacingRule,
 }
 
@@ -388,6 +391,7 @@ impl SubscriptionPool {
         keep_free: f64,
         head: bool,
     ) -> Option<SubscriptionPricing> {
+        let value_now = self.value_now_ms.unwrap_or(self.now_ms);
         let budgets: Vec<_> = self
             .plans
             .iter()
@@ -419,7 +423,7 @@ impl SubscriptionPool {
             .iter()
             .zip(&budgets)
             .map(|(plan, budget)| {
-                let (value, _) = resolve_value(operator, plan.measured.as_ref(), self.now_ms);
+                let (value, _) = resolve_value(operator, plan.measured.as_ref(), value_now);
                 SubscriptionPlanValue {
                     plan_tier: plan.tier.clone(),
                     plan: plan.plan.clone(),
@@ -427,7 +431,7 @@ impl SubscriptionPool {
                     source: if plan
                         .measured
                         .as_ref()
-                        .is_some_and(|row| row.usable(self.now_ms))
+                        .is_some_and(|row| row.usable(value_now))
                     {
                         "measured"
                     } else if operator.is_some_and(|v| v.is_finite() && v > 0.0) {
@@ -449,7 +453,7 @@ impl SubscriptionPool {
         let weighted: Vec<_> = plan_values.iter().filter(|p| p.weight > 0.0).collect();
         let (value, source) = if weighted.len() == 1 {
             let index = plan_values.iter().position(|p| p.weight > 0.0).unwrap();
-            resolve_value(operator, self.plans[index].measured.as_ref(), self.now_ms)
+            resolve_value(operator, self.plans[index].measured.as_ref(), value_now)
         } else if !weighted.is_empty() {
             // Capacity-proportional usage pays list/M for each plan, so costs
             // combine arithmetically and the list-to-quota multiplier harmonically.
@@ -461,7 +465,7 @@ impl SubscriptionPool {
                 "spendable-points weighted harmonic mean".into(),
             )
         } else {
-            resolve_value(operator, None, self.now_ms)
+            resolve_value(operator, None, value_now)
         };
         let pricing = |points, pressure: PlanPressure, banked, tier| SubscriptionPricing {
             value_multiplier: value,
@@ -792,6 +796,7 @@ mod tests {
             allow_banked: true,
             banked_as_capacity: false,
             now_ms: 1,
+            value_now_ms: None,
             pacing: PacingRule::Max,
         };
         assert!(!pool(false).available(5.0, false));

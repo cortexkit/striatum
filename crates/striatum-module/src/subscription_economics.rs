@@ -671,6 +671,30 @@ pub(crate) fn overlay(
     overlay_pools(pools, snapshot, facts, now, pricing, pacing);
 }
 
+pub(crate) fn preview_pools(
+    state: &AccountQuotaState,
+    quota_now: i64,
+    value_now: i64,
+) -> HashMap<String, SubscriptionPool> {
+    let (report, prices, credentials) = cache()
+        .lock()
+        .map(|cache| {
+            let (prices, credentials) = cache.inputs.as_ref().map_or_else(
+                || (Value::Null, BTreeMap::new()),
+                |inputs| (inputs.prices.clone(), inputs.credentials.clone()),
+            );
+            (cache.report.clone(), prices, credentials)
+        })
+        .unwrap_or_default();
+    // Rebuild quota budgets from the override, not from the live economics
+    // cache. Current plan mappings and value evidence are not quota readings.
+    let mut pools = build_with_credentials(state, &report, &prices, quota_now, &credentials).pools;
+    for pool in pools.values_mut() {
+        pool.value_now_ms = Some(value_now);
+    }
+    pools
+}
+
 #[cfg(test)]
 pub(crate) fn test_account_pools(
     state: &AccountQuotaState,
@@ -699,7 +723,7 @@ pub(crate) fn test_pools(pools: HashMap<String, SubscriptionPool>) -> impl Drop 
 /// pool whose provider has no fact here: `set_banked_allowance` compares pools
 /// with each other, so one pool on a reserve read at an earlier refresh would
 /// change whether the others may spend banked resets.
-fn overlay_pools(
+pub(crate) fn overlay_pools(
     mut pools: HashMap<String, SubscriptionPool>,
     snapshot: &mut ModelRouteStateSnapshot,
     facts: &[ModelFact],

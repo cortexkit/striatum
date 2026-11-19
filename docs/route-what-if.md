@@ -121,6 +121,20 @@ only narrow the runner's admitted pairs.
   pressure, remains the live rule and the default for this operation. Omission
   also retains the existing `task_pricing` response shape; the flag adds the
   pricing inputs described below so the preview can be replayed.
+  With `quota_override`, `"max"` is also accepted explicitly so both rules
+  can be requested with the same historical readings.
+* `quota_override`: optional list of Insula `usage.get` entries (each entry
+  names an `account` or `credentialRef` and may carry `usage`, `fetchedAt`,
+  `stale`, `spend` and `savedResets`). It replaces the quota readings used by
+  the IQ sweep and panel evaluations; an empty list supplies no readings.
+  Current account identities, live operational fences, catalog, task profiles
+  and subscription value evidence still apply. The concurrency report is the
+  current concurrency snapshot, not a historical one.
+* `quota_override_at_ms`: optional nonnegative Unix millisecond quota time no
+  later than now, accepted only with `quota_override`. Defaults to the call's
+  current time. Quota reading age, reset countdowns and banked credit expiry
+  are relative to this time; the age of Astrocyte's subscription-value
+  measurements is still checked against current time.
 * `pricing_patch`: optional object with only `overqualification` and
   `banked_resets`. `overqualification` is the mode string `"additive"` or
   `"cost_scaled"`; `banked_resets` maps provider ids to `"emergency"` or
@@ -198,11 +212,14 @@ is available. It is
 those units must not be presented as a task estimate. `normalized_cost` remains
 the scorer's actual comparison cost, before quota and overqualification terms.
 Each adequate candidate's `task_pricing` contains the arithmetic behind that
-estimate. With `pacing: "expiry"`, subscription entries also contain `pacing`,
+estimate. With `pacing: "expiry"` or `quota_override`, subscription entries also contain `pacing`,
 `weeklyPressure`, and `shortWindowPressure` when a short-window pool
 participates. `pressure` is the weekly value or the greater of the weekly and
 participating short-window values. Stored live decisions carry the same inputs,
 with `pacing: "max"` identifying the current rule.
+In a quota override sweep, a pick with subscription pricing also has
+`subscription_plan: {provider, plan, tier}`. `plan` is the exact name when the
+priced tier identifies one unambiguously; either plan field can be null.
 
 A refused row has `pick: null` and `refusal: {code, detail}`; the other fields
 remain present. If selection stops before model admission (for example no

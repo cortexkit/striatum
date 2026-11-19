@@ -484,7 +484,10 @@ pub(super) fn price_selection_inputs_for_sweep(
                 store,
                 broca_credentials,
                 Arc::clone(sources.operator_config),
-                ACCOUNT_QUOTA.get(),
+                sweep
+                    .and_then(|sweep| sweep.quota_override.as_ref())
+                    .map(|quota| &quota.accounts)
+                    .or_else(|| ACCOUNT_QUOTA.get()),
                 facts.clone(),
                 catalog_snapshot,
                 now_ms() as i64,
