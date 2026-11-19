@@ -1,9 +1,16 @@
-//! Exercise startup before a daemon connection: bad operator policy must stop
-//! the real process rather than silently permit models the operator excluded.
+//! Exercise startup and offline checks for the routing file. When the daemon
+//! does not manage settings, bad operator policy must stop the module before it
+//! can serve routes.
 
 use std::path::{Path, PathBuf};
-use std::process::Output;
+use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+use subc_protocol::{Flags, Frame, FrameType, Priority};
+use subc_transport::{read_frame, write_frame};
+use tokio::{process::Child, time::timeout};
+
+use super::managed_settings::{launch_with_ack, DEADLINE};
 
 struct Home(PathBuf);
 
@@ -39,6 +46,57 @@ impl Home {
     }
 
     fn run_with_args(&self, xdg: bool, args: &[&str]) -> Output {
+        self.command(xdg).args(args).output().unwrap()
+    }
+
+    async fn run_with_file_settings(&self) -> Output {
+        let (child, _peer, _) = launch_with_ack(&self.0, self.command(true), vec![]).await;
+        wait_for_output(child).await
+    }
+
+    async fn assert_file_settings_serve(&self, xdg: bool) {
+        let (child, mut peer, hello) = launch_with_ack(&self.0, self.command(xdg), vec![]).await;
+        let control_frame = |ty, corr| {
+            Frame::build_with_version(
+                hello.header.ver,
+                ty,
+                Flags::new(false, Priority::Passive, false),
+                0,
+                0,
+                corr,
+                vec![],
+            )
+            .unwrap()
+        };
+        let reply = timeout(DEADLINE, async {
+            write_frame(&mut peer, &control_frame(FrameType::Ping, 800)).await?;
+            read_frame(&mut peer).await
+        })
+        .await
+        .expect("routing did not answer PING");
+        let pong = match reply {
+            Ok(Some(frame)) => frame,
+            other => {
+                let output = wait_for_output(child).await;
+                panic!(
+                    "expected PONG, got {other:?}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        };
+        assert_eq!((pong.header.ty, pong.header.corr), (FrameType::Pong, 800));
+        write_frame(&mut peer, &control_frame(FrameType::Goodbye, 0))
+            .await
+            .unwrap();
+        let output = wait_for_output(child).await;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn command(&self, xdg: bool) -> Command {
         let binary =
             cortexkit_test_support::stage_test_binary(Path::new(env!("CARGO_BIN_EXE_ck-striatum")));
         let mut command = cortexkit_test_support::fenced_command(&binary, &self.0);
@@ -46,7 +104,7 @@ impl Home {
         if xdg {
             command.env("XDG_CONFIG_HOME", self.0.join("xdg"));
         }
-        command.args(args).output().unwrap()
+        command
     }
 }
 
@@ -56,15 +114,22 @@ impl Drop for Home {
     }
 }
 
+async fn wait_for_output(child: Child) -> Output {
+    timeout(DEADLINE, child.wait_with_output())
+        .await
+        .expect("routing did not exit")
+        .unwrap()
+}
+
 fn stderr(output: Output) -> String {
     assert!(!output.status.success());
     String::from_utf8(output.stderr).unwrap()
 }
 
-fn invalid_startup(document: &str, token: &str) {
+async fn invalid_startup(document: &str, token: &str) {
     let home = Home::new();
     std::fs::write(home.config_dir(true).join("striatum.jsonc"), document).unwrap();
-    let message = stderr(home.run(true));
+    let message = stderr(home.run_with_file_settings().await);
     assert!(message.contains(token), "{message}");
     assert!(message.contains("striatum.jsonc"), "{message}");
     assert!(!message.contains("missing-connection-file"), "{message}");
@@ -72,29 +137,26 @@ fn invalid_startup(document: &str, token: &str) {
 
 // The in-process `refusal_case!` contract tests and old-shape tests in
 // `config_overrides` check every refusal message, including the converter
-// remedy, on first load and on reload. One binary spawn here is
-// enough to prove that a refusal stops startup before the daemon connection.
-#[test]
-fn old_explicit_only_providers_refuses_startup_with_converter() {
+// remedy, on first load and on reload. This spawn verifies that file mode
+// refuses to serve after an invalid startup document.
+#[tokio::test]
+async fn old_explicit_only_providers_refuses_startup_with_converter() {
     invalid_startup(
         r#"{"model_routing":{"explicit_only_providers":["anthropic-platform"]}}"#,
         "ck-striatum config-convert",
-    );
+    )
+    .await;
 }
 
-#[test]
-fn absent_routing_file_with_xdg_does_not_read_home_file() {
+#[tokio::test]
+async fn absent_routing_file_with_xdg_does_not_read_home_file() {
     let home = Home::new();
     std::fs::write(home.config_dir(false).join("striatum.jsonc"), "not json").unwrap();
-    let message = stderr(home.run(true));
-    assert!(
-        message.contains(Path::new("missing-connection-file").to_str().unwrap()),
-        "valid empty policy must reach daemon connection: {message}"
-    );
+    home.assert_file_settings_serve(true).await;
 }
 
-#[test]
-fn striatum_startup_and_check_config_name_the_settings_file() {
+#[tokio::test]
+async fn striatum_startup_and_check_config_name_the_settings_file() {
     for xdg in [false, true] {
         for primary_exists in [false, true] {
             let home = Home::new();
@@ -103,8 +165,7 @@ fn striatum_startup_and_check_config_name_the_settings_file() {
             if primary_exists {
                 std::fs::write(&primary, "{}").unwrap();
             }
-            let startup = stderr(home.run(xdg));
-            assert!(startup.contains("missing-connection-file"), "{startup}");
+            home.assert_file_settings_serve(xdg).await;
             let output = home.run_with_args(xdg, &["--check-config"]);
             let report = String::from_utf8(output.stderr).unwrap();
             assert!(output.status.success(), "{report}");
@@ -116,8 +177,8 @@ fn striatum_startup_and_check_config_name_the_settings_file() {
     }
 }
 
-#[test]
-fn removed_model_naming_refuses_startup_and_check_config() {
+#[tokio::test]
+async fn removed_model_naming_refuses_startup_and_check_config() {
     for document in [
         r#"{"model_naming":{}}"#,
         r#"{"model_naming":null}"#,
@@ -128,7 +189,7 @@ fn removed_model_naming_refuses_startup_and_check_config() {
         let primary = home.config_dir(true).join("striatum.jsonc");
         std::fs::write(&primary, document).unwrap();
         for output in [
-            home.run(true),
+            home.run_with_file_settings().await,
             home.run_with_args(true, &["--check-config"]),
         ] {
             let message = stderr(output);
@@ -143,13 +204,13 @@ fn removed_model_naming_refuses_startup_and_check_config() {
     }
 }
 
-#[test]
-fn striatum_invalid_settings_file_refuses_startup_and_check_config() {
+#[tokio::test]
+async fn striatum_invalid_settings_file_refuses_startup_and_check_config() {
     let home = Home::new();
     let primary = home.config_dir(true).join("striatum.jsonc");
     std::fs::write(&primary, "not json").unwrap();
     for output in [
-        home.run(true),
+        home.run_with_file_settings().await,
         home.run_with_args(true, &["--check-config"]),
     ] {
         let message = stderr(output);
@@ -159,6 +220,16 @@ fn striatum_invalid_settings_file_refuses_startup_and_check_config() {
         );
         assert!(!message.contains("missing-connection-file"), "{message}");
     }
+}
+
+#[test]
+fn connection_failure_takes_precedence_over_invalid_settings_file() {
+    let home = Home::new();
+    std::fs::write(home.config_dir(true).join("striatum.jsonc"), "not json").unwrap();
+    let message = stderr(home.run(true));
+    assert!(message.contains("reading connection file"), "{message}");
+    assert!(message.contains("missing-connection-file"), "{message}");
+    assert!(!message.contains("invalid config"), "{message}");
 }
 
 #[test]

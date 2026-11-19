@@ -18,7 +18,7 @@ use tokio::{
     time::timeout,
 };
 
-const DEADLINE: Duration = Duration::from_secs(10);
+pub(super) const DEADLINE: Duration = Duration::from_secs(10);
 const CHANNEL: u16 = 317;
 const EPOCH: u32 = 42;
 
@@ -39,78 +39,25 @@ impl Rig {
         let config = xdg.join("cortexkit/striatum.jsonc");
         std::fs::create_dir_all(config.parent().unwrap()).unwrap();
         std::fs::write(&config, file).unwrap();
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let key = [7_u8; 32];
-        let daemon = [0_u8; 16];
-        let connection = root.join("connection.json");
-        std::fs::write(
-            &connection,
-            json!({
-                "schema": 1,
-                "endpoints": [{"host": "127.0.0.1", "port": listener.local_addr().unwrap().port()}],
-                "key": key,
-                "daemon_id": daemon,
-                "pid": std::process::id(),
-                "daemon_ver": "0.50.17"
-            })
-            .to_string(),
-        )
-        .unwrap();
-        std::fs::set_permissions(&connection, std::fs::Permissions::from_mode(0o600)).unwrap();
         let binary = stage_test_binary(Path::new(env!("CARGO_BIN_EXE_ck-striatum")));
-        let mut command = Command::from(fenced_command(&binary, root));
+        let mut command = fenced_command(&binary, root);
         command
-            .current_dir(root)
-            .arg("--subc")
-            .arg(&connection)
             .env("XDG_CONFIG_HOME", &xdg)
-            .env_remove("SUBC_MODULE_ID")
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        let mut child = command.spawn().unwrap();
-        let (mut peer, _) = tokio::select! {
-            accepted = timeout(DEADLINE, listener.accept()) => accepted.expect("routing did not connect").unwrap(),
-            stopped = child.wait() => panic!("routing stopped before connecting: {stopped:?}"),
+            .env_remove("SUBC_MODULE_ID");
+        let capabilities = if cap {
+            vec![CONFIG_GATE_CAPABILITY.into()]
+        } else {
+            vec![]
         };
-        authenticate_server(&mut peer, &key, &daemon, "0.50.17", Duration::from_secs(2))
-            .await
-            .unwrap();
-        let hello = recv(&mut peer).await;
-        assert_eq!(hello.header.ty, FrameType::Hello);
-        let ver = hello.header.ver;
-        let ack = ModuleHelloAckBody {
-            negotiated_ver: ver,
-            subc_ops: vec![],
-            subc_capabilities: if cap {
-                vec![CONFIG_GATE_CAPABILITY.into()]
-            } else {
-                vec![]
-            },
-            storage: Some(
-                serde_json::to_value(striatum_store::dev_descriptor(
-                    "striatum",
-                    root.join("store.db").to_str().unwrap(),
-                ))
-                .unwrap(),
-            ),
-            machine_id: None,
-        };
-        let mut rig = Self {
+        let (child, peer, hello) = launch_with_ack(root, command, capabilities).await;
+        Self {
             peer,
             child,
             hello_control_ops: body(&hello)["control_ops"].clone(),
-            ver,
+            ver: hello.header.ver,
             config,
             _scratch: scratch,
-        };
-        rig.send(
-            FrameType::HelloAck,
-            hello.header.corr,
-            serde_json::to_value(ack).unwrap(),
-        )
-        .await;
-        rig
+        }
     }
 
     async fn send(&mut self, kind: FrameType, corr: u64, body: Value) {
@@ -211,6 +158,75 @@ impl Rig {
         assert!(output.status.success(), "{stderr}");
         stderr
     }
+}
+
+pub(super) async fn launch_with_ack(
+    root: &Path,
+    command: std::process::Command,
+    capabilities: Vec<String>,
+) -> (Child, TcpStream, Frame) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let key = [7_u8; 32];
+    let daemon = [0_u8; 16];
+    let connection = root.join("connection.json");
+    std::fs::write(
+        &connection,
+        json!({
+            "schema": 1,
+            "endpoints": [{"host": "127.0.0.1", "port": listener.local_addr().unwrap().port()}],
+            "key": key,
+            "daemon_id": daemon,
+            "pid": std::process::id(),
+            "daemon_ver": "0.50.17"
+        })
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::set_permissions(&connection, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let mut child = Command::from(command)
+        .current_dir(root)
+        .arg("--subc")
+        .arg(&connection)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let (mut peer, _) = tokio::select! {
+        accepted = timeout(DEADLINE, listener.accept()) => accepted.expect("routing did not connect").unwrap(),
+        stopped = child.wait() => panic!("routing stopped before connecting: {stopped:?}"),
+    };
+    authenticate_server(&mut peer, &key, &daemon, "0.50.17", Duration::from_secs(2))
+        .await
+        .unwrap();
+    let hello = recv(&mut peer).await;
+    assert_eq!(hello.header.ty, FrameType::Hello);
+    let ver = hello.header.ver;
+    let ack = ModuleHelloAckBody {
+        negotiated_ver: ver,
+        subc_ops: vec![],
+        subc_capabilities: capabilities,
+        storage: Some(
+            serde_json::to_value(striatum_store::dev_descriptor(
+                "striatum",
+                root.join("store.db").to_str().unwrap(),
+            ))
+            .unwrap(),
+        ),
+        machine_id: None,
+    };
+    let ack = Frame::build_with_version(
+        ver,
+        FrameType::HelloAck,
+        Flags::new(false, Priority::Passive, false),
+        0,
+        0,
+        hello.header.corr,
+        serde_json::to_vec(&ack).unwrap(),
+    )
+    .unwrap();
+    write_frame(&mut peer, &ack).await.unwrap();
+    (child, peer, hello)
 }
 
 async fn recv(peer: &mut TcpStream) -> Frame {
