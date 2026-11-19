@@ -258,6 +258,53 @@ async fn approved_reason_panels_use_astra_and_kimi_at_max() {
 }
 
 #[tokio::test]
+async fn replacement_excludes_the_served_effort_of_a_base_catalog_row() {
+    let (harness, route) = approved().await;
+    harness.edit_config(|c| {
+        c["panels"]["audit"] = json!({"top_k":1,"by":"iq","extra":0,"extra_by":"random"});
+    });
+    let body = json!({"class":"audit","consumer":format!("{ATHENA}.audit"),
+        "available_routes":[ASTRA, CARBON]});
+    let original = live(&route, "route.select_panel", body.clone()).await;
+    let seated = &original["seats"][0]["answer"]["route"];
+    assert_eq!(seated["model"], "gpt-6.2-astra");
+    assert_eq!(seated["variant"], "max");
+    let replace = json!({"replace":{"panel_id":original["panel_id"],"slot":0}});
+    let first = live(&route, "route.select_panel", replace.clone()).await;
+    assert_eq!(
+        first["seat"]["answer"]["route"]["model"], "gemini-4-carbon",
+        "{first}"
+    );
+    let second = live(&route, "route.select_panel", replace).await;
+    assert!(second["seat"].is_null(), "{second}");
+
+    harness.edit_config(|c| {
+        c["consumers"][format!("{ATHENA}.audit")]["workload"] = json!("code");
+    });
+    let different = live(
+        &route,
+        "route.select_panel",
+        json!({"replace":{
+            "panel_id":original["panel_id"],"slot":0
+        }}),
+    )
+    .await;
+    assert_eq!(
+        different["seat"]["answer"]["route"]["model"], "gpt-6.2-astra",
+        "{different}"
+    );
+    assert_eq!(different["seat"]["answer"]["route"]["variant"], "xhigh");
+
+    let mut excluded = body;
+    excluded["exclude"] = json!([ASTRA]);
+    let answer = live(&route, "route.select_panel", excluded).await;
+    assert_eq!(
+        answer["seats"][0]["answer"]["route"]["model"],
+        "gemini-4-carbon"
+    );
+}
+
+#[tokio::test]
 async fn approved_masons_chair_and_summary_keep_their_efforts() {
     let (_harness, route) = approved().await;
     for (model, variant) in [

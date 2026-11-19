@@ -78,10 +78,15 @@ pub struct QuotaAccount {
     /// True if any non-weekly live window prevents sending on the account.
     pub short_walled: bool,
     pub short_windows: Vec<QuotaConstraint>,
+    /// A named model scope has its own constraint. `None` means the last known
+    /// reading is past its reset and cannot establish fresh headroom.
+    pub scoped_windows: Vec<(&'static str, Option<QuotaConstraint>)>,
     pub banked_resets: u32,
     pub banked_expires_at_ms: Option<i64>,
     /// Individual expiries, when the producer supplies the saved-credit list.
     pub banked_credit_expiries_ms: Vec<i64>,
+    /// Groups of saved resets sharing their kind's reported earliest expiry.
+    pub banked_kind_expiries_ms: Vec<(i64, u32)>,
     /// The account holds a spendable prepaid-credits balance, which the
     /// provider draws once the plan's limit is reached. Such an account keeps
     /// serving with no weekly headroom, so it never leaves the pool walled.
@@ -111,7 +116,7 @@ pub struct SubscriptionPricing {
     pub short_window_pressure: Option<f64>,
     pub keep_free_percent: f64,
     pub available_points: Option<f64>,
-    pub banked_resets_applied: u32,
+    pub banked_resets_applied: u64,
     pub plan_tier: Option<String>,
 }
 
@@ -243,7 +248,7 @@ impl SubscriptionPlan {
         head: bool,
         allow_banked: bool,
         now_ms: i64,
-    ) -> (Option<f64>, f64, u32) {
+    ) -> (Option<f64>, f64, u64) {
         let (points, pressure, banked) =
             self.budget_with_pacing(keep_free, head, allow_banked, now_ms, PacingRule::Max);
         (points, pressure.plan, banked)
@@ -256,7 +261,7 @@ impl SubscriptionPlan {
         allow_banked: bool,
         now_ms: i64,
         pacing: PacingRule,
-    ) -> (Option<f64>, PlanPressure, u32) {
+    ) -> (Option<f64>, PlanPressure, u64) {
         if self.accounts.is_empty() {
             return (None, PlanPressure::neutral(), 0);
         }
@@ -330,7 +335,7 @@ impl SubscriptionPlan {
     }
 
     #[cfg(test)]
-    fn capacity_pressure(&self, keep_free: f64, head: bool, now_ms: i64) -> (f64, u32) {
+    fn capacity_pressure(&self, keep_free: f64, head: bool, now_ms: i64) -> (f64, u64) {
         let (pressure, banked) =
             self.capacity_pressure_with_pacing(keep_free, head, now_ms, PacingRule::Max);
         (pressure.plan, banked)
@@ -342,35 +347,36 @@ impl SubscriptionPlan {
         head: bool,
         now_ms: i64,
         pacing: PacingRule,
-    ) -> (PlanPressure, u32) {
+    ) -> (PlanPressure, u64) {
         let margin = if head { 0.0 } else { keep_free };
         let mut points = 0.0;
-        let mut banked = 0;
+        let mut banked = 0_u64;
         let mut time: f64 = 0.0;
         for account in &self.accounts {
             time = time.max(account.weekly_remaining_fraction);
             if !account.short_walled && account.weekly_used < 100.0 {
                 points += (100.0 - account.weekly_used - margin).max(0.0);
             }
-            let listed = account
-                .banked_credit_expiries_ms
-                .len()
-                .min(account.banked_resets as usize);
-            let unlisted = account.banked_resets - listed as u32;
-            let count = account
+            let mut unlisted = account.banked_resets;
+            let mut count = 0_u64;
+            for (expiry, size) in account
                 .banked_credit_expiries_ms
                 .iter()
-                .take(listed)
-                .filter(|expiry| **expiry > now_ms)
-                .count() as u32
-                + if account
-                    .banked_expires_at_ms
-                    .is_none_or(|expiry| expiry > now_ms)
-                {
-                    unlisted
-                } else {
-                    0
-                };
+                .map(|expiry| (*expiry, 1))
+                .chain(account.banked_kind_expiries_ms.iter().copied())
+            {
+                let size = size.min(unlisted);
+                unlisted -= size;
+                if expiry > now_ms {
+                    count += u64::from(size);
+                }
+            }
+            if account
+                .banked_expires_at_ms
+                .is_none_or(|expiry| expiry > now_ms)
+            {
+                count += u64::from(unlisted);
+            }
             banked += count;
             points += count as f64 * (100.0 - margin).max(0.0);
         }
@@ -758,9 +764,11 @@ mod tests {
                 hours_to_reset: 84.0,
                 short_walled: false,
                 short_windows: Vec::new(),
+                scoped_windows: Vec::new(),
                 banked_resets: 3,
                 banked_expires_at_ms: Some(10_000),
                 banked_credit_expiries_ms: Vec::new(),
+                banked_kind_expiries_ms: Vec::new(),
                 prepaid_credits: false,
             }],
         }
@@ -843,6 +851,16 @@ mod tests {
             p.capacity_pressure(20.0, true, 1),
             p.capacity_pressure(0.0, false, 1)
         );
+    }
+
+    #[test]
+    fn banked_capacity_counter_keeps_totals_above_u32() {
+        let mut p = plan(95.0);
+        p.accounts[0].banked_resets = 1 << 31;
+        p.accounts[0].banked_expires_at_ms = None;
+        p.accounts.push(p.accounts[0].clone());
+        let (_, banked) = p.capacity_pressure(0.0, false, 1);
+        assert_eq!(banked as u64, 1_u64 << 32);
     }
 
     /// Live on 2026-10-30 after 14:20Z: every Codex account sat at its weekly
