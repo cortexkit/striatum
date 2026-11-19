@@ -808,6 +808,7 @@ fn count_input_build(config: &std::sync::Arc<config_overrides::LiveConfig>, stag
 /// Every tier attempt clones it before applying tier or sticky-account filters.
 struct SelectionInputs {
     request: SelectRequest,
+    workload: Option<effort_preview::Workload>,
     consumer_pinned: bool,
     now: f64,
     facts: Vec<ModelFact>,
@@ -832,7 +833,7 @@ fn parse_admitted_request(
         .any(|cap| *cap == "consumer_declarations")
     {
         if let Some(consumer) = params.get("consumer").and_then(Value::as_str) {
-            let defaults = consumers.defaults_for(consumer);
+            let mut defaults = consumers.defaults_for(consumer);
             if defaults.iq.is_some() {
                 // A declaration relaxes required IQ only for its admitted callers.
                 // Requests without a declared IQ default keep using
@@ -840,6 +841,8 @@ fn parse_admitted_request(
                 if !evaluation {
                     consumers.admit(consumer, caller)?;
                 }
+                // Keep explicit workload distinguishable from a declaration.
+                defaults.workload = None;
                 return parse_select_request_with_defaults(&params, &capabilities, &defaults);
             }
         }
@@ -888,6 +891,12 @@ async fn prepare_selection(
         refusal.message = format!("consumer kind {kind} must use route.select_engine");
         return Err(refusal);
     }
+    let workload = shared.efforts.workload(
+        &consumer,
+        operator_config,
+        request.requirements.workload.as_deref(),
+        declared.workload.as_deref(),
+    );
     let effective_params = consumers.with_defaults(&consumer, params, &operator_config);
     let mut request =
         parse_admitted_request(&effective_params, caller, &consumers, evaluation.is_some())?;
@@ -1123,6 +1132,7 @@ async fn prepare_selection(
     count_input_build(&shared.operator_config, 1);
     Ok(SelectionInputs {
         request,
+        workload,
         consumer_pinned,
         now,
         facts,
@@ -1693,6 +1703,7 @@ async fn select_at_tier_attempt(
     let live_effort_diagnostics = std::sync::Mutex::new(effort_preview::Diagnostics::default());
     let selection = Selection {
         efforts: &shared.efforts,
+        workload: inputs.workload,
         effort_diagnostics: evaluation
             .map_or(&live_effort_diagnostics, |view| &view.effort_diagnostics),
         panel_seat,
@@ -2598,6 +2609,7 @@ fn concurrency_rejected_routes(refusal: &Refusal) -> Vec<String> {
 /// Everything one select's automatic and pinned attempts share.
 struct Selection<'a> {
     efforts: &'a effort_preview::Efforts,
+    workload: Option<effort_preview::Workload>,
     effort_diagnostics: &'a std::sync::Mutex<effort_preview::Diagnostics>,
     panel_seat: bool,
     policy_memo: &'a config_overrides::SelectionPolicyMemo,
@@ -3075,8 +3087,7 @@ impl<'a> Selection<'a> {
         self.efforts.resolve(
             fact,
             self.sources.catalog_targets,
-            self.efforts
-                .workload(self.consumer, self.sources.operator_config),
+            self.workload,
             pinned,
             explicit,
         )

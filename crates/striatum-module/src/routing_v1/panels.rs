@@ -990,7 +990,13 @@ async fn candidates(
     let outcome = live.apply(&mut facts);
     let catalog = {
         let preview = &shared.efforts;
-        let workload = preview.workload(&request.consumer, config);
+        let declared = consumers.defaults_for(&request.consumer);
+        let workload = preview.workload(
+            &request.consumer,
+            config,
+            None,
+            declared.workload.as_deref(),
+        );
         let mut catalog = CatalogSeats::default();
         facts.retain_mut(|fact| {
             if fact.decommissioned {

@@ -331,11 +331,9 @@ impl Catalog {
                 .or_default()
                 .insert(striatum_core::module_identity::canonical(&owner).into_owned());
         }
-        // An ownerless settings child cannot open admission beneath a declared
-        // namespace whose declaration uses the 0.7.18 members (a default iq,
-        // a ladder of pins, a runner placement, caller selectors or a kind),
-        // including values it would inherit. Without those members it remains
-        // settings-only, admitting any currently bound caller as before.
+        // A settings child that inherits extended declaration policy also
+        // inherits the declaration's admission restriction. Otherwise an
+        // ownerless child remains open to any currently bound caller.
         let inherited_owners: Vec<_> = registry
             .owners
             .iter()
@@ -444,7 +442,8 @@ impl Registry {
                 tools,
                 tool_capabilities,
                 modalities,
-                structured_output
+                structured_output,
+                workload,
             );
         }
         // Operator overrides are resolved after inheritance: an ancestor
@@ -471,8 +470,17 @@ impl Registry {
         let mut demand = serde_json::to_value(self.defaults_for(consumer)).unwrap();
         let mut requirements = demand.as_object_mut().unwrap().clone();
         // parse_select_request_with_defaults resolves IQ after admission. The
-        // remaining declaration members describe policy or authority, not requirements.
-        for member in ["priority", "iq", "ladder", "placement", "selectors", "kind"] {
+        // remaining declaration policy and authority members aren't requirements.
+        // Workload stays separate so selection can record which layer supplied it.
+        for member in [
+            "priority",
+            "iq",
+            "ladder",
+            "placement",
+            "selectors",
+            "kind",
+            "workload",
+        ] {
             requirements.remove(member);
         }
         if let Some(request) = params.get("requirements").and_then(Value::as_object) {

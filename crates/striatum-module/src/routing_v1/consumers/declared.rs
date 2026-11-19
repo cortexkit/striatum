@@ -69,6 +69,7 @@ pub(super) fn extended(defaults: &DemandDefaults) -> bool {
         || defaults.placement.is_some()
         || defaults.selectors.is_some()
         || defaults.kind.is_some()
+        || defaults.workload.is_some()
 }
 
 #[cfg(test)]

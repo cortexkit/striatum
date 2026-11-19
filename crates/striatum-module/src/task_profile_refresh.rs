@@ -766,8 +766,9 @@ mod tests {
             models: rig.store.get_selection_catalog().unwrap().efforts.clone(),
             workloads: Default::default(),
         };
+        let workload = efforts.workload("mason", &Default::default(), Some("code"), None);
         let choice = efforts
-            .resolve(&sol, &Default::default(), Some("code"), false, None)
+            .resolve(&sol, &Default::default(), workload, false, None)
             .unwrap();
         assert_eq!(choice.variant.as_deref(), Some("low"));
         let cache = ProfileCache::default();

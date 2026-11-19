@@ -152,6 +152,7 @@ pub(super) fn explain(params: &Value, caller: &Caller, deps: &Deps<'_>) -> Resul
             serde_json::from_str(&decision.requirements_json).map_err(store_refusal)?;
         for key in [
             "effort_source",
+            "workload_source",
             "grade",
             "minimum_unverified",
             "workload_exclusions",

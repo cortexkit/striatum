@@ -1554,7 +1554,7 @@ async fn handle_select_panel(
         models: prepared.catalog_snapshot.efforts.clone(),
         workloads: Default::default(),
     };
-    let workload = efforts.workload(panel_consumer.id(), &operator_config);
+    let workload = efforts.workload(panel_consumer.id(), &operator_config, None, None);
     let mut choices = HashMap::new();
     let mut workload_exclusions = Vec::new();
     prepared.facts.retain_mut(|fact| {
