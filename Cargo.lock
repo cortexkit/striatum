@@ -219,21 +219,21 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
 name = "cortexkit-bus-client"
-version = "0.1.4"
+version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5f49f294985b669e4440c01ba3b31e0897adc107f0dd3b50454808f8ab833c0e"
+checksum = "2138258ff809265a7478914e99cc32988978b0b5fd4247e87bdeb2cbbeae5d1b"
 dependencies = [
  "async-nats",
  "async-trait",
  "base64",
  "bytes",
- "cortexkit-bus-naming 0.4.4",
+ "cortexkit-bus-naming 0.5.0",
  "cortexkit-bus-nats",
  "cortexkit-bus-trait",
  "futures-util",
  "serde",
  "serde_json",
- "subc-client-rs 0.40.0",
+ "subc-client-rs",
  "subc-protocol 0.37.4",
  "thiserror",
  "tokio",
@@ -260,23 +260,24 @@ checksum = "059309f7503eba557d5c1bcf1dfcf59f8fa978516ed0827cf79ecb62ff7fc07a"
 
 [[package]]
 name = "cortexkit-bus-naming"
-version = "0.4.4"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "80ef546ce7b3c9796810c1ffe36a7daf23d82a4af8772f7336704c248beddcfe"
+checksum = "a853393c74b013e737d9b8a0a56ed05e70ffc911c174ed09232f4edcd61427ec"
 
 [[package]]
 name = "cortexkit-bus-nats"
-version = "0.5.0"
+version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d321fc4091746e63c719f722f7658a26c40fdc20b41f0bf9cde0e78b6cea2234"
+checksum = "55a7bd392e37c754ff51d56d1ded432f9db4c453d9c7a924abbbdc619ad601a5"
 dependencies = [
  "async-nats",
  "async-trait",
  "bytes",
- "cortexkit-bus-naming 0.4.4",
+ "cortexkit-bus-naming 0.5.0",
  "cortexkit-bus-trait",
  "futures-util",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -299,7 +300,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "subc-client-rs 0.41.1",
+ "subc-client-rs",
  "subc-os",
  "subc-protocol 0.37.4",
  "subc-transport",
@@ -1699,7 +1700,7 @@ dependencies = [
  "base64",
  "cortexkit-bus-client",
  "cortexkit-bus-inmemory",
- "cortexkit-bus-naming 0.4.4",
+ "cortexkit-bus-naming 0.5.0",
  "cortexkit-bus-nats",
  "cortexkit-bus-trait",
  "cortexkit-claustrum-client",
@@ -1718,7 +1719,7 @@ dependencies = [
  "sha2",
  "striatum-core",
  "striatum-store",
- "subc-client-rs 0.40.0",
+ "subc-client-rs",
  "subc-jsonc",
  "subc-os",
  "subc-protocol 0.37.4",
@@ -1745,26 +1746,6 @@ dependencies = [
 
 [[package]]
 name = "subc-client-rs"
-version = "0.40.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f7827e0a56613b4c1fb82dc009c541a8eaa94ab4f028e92f3d3cb85fae14fff8"
-dependencies = [
- "async-trait",
- "serde",
- "serde_json",
- "sha2",
- "subc-config",
- "subc-control 0.40.0",
- "subc-os",
- "subc-protocol 0.37.4",
- "subc-transport",
- "tokio",
- "tokio-util",
- "tracing",
-]
-
-[[package]]
-name = "subc-client-rs"
 version = "0.41.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9d5e18a56ef70e37f6b99f645e6114b908e0ae8d148e7e77a62de536219ed1c5"
@@ -1774,7 +1755,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "subc-config",
- "subc-control 0.41.0",
+ "subc-control",
  "subc-os",
  "subc-protocol 0.37.4",
  "subc-transport",
@@ -1794,18 +1775,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
-]
-
-[[package]]
-name = "subc-control"
-version = "0.40.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7b2cf8d47a1e3534b914791bb07c63c3478af7928033a70962c8aa89b00244f3"
-dependencies = [
- "serde",
- "serde_json",
- "subc-config",
- "subc-protocol 0.37.4",
 ]
 
 [[package]]
