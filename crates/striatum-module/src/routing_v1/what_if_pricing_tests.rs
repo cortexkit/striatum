@@ -468,6 +468,26 @@ async fn expiry_pacing_preview_is_call_local_and_preserves_default_pricing_shape
         stored, *live_price,
         "the decision must retain its pacing inputs"
     );
+    let connection = rusqlite::Connection::open(harness.store_path()).unwrap();
+    let explanation: String = connection
+        .query_row(
+            "SELECT explanation_json FROM model_route_decisions WHERE id = ?1",
+            [live["decision_id"].as_str().unwrap()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let explanation: Value = serde_json::from_str(&explanation).unwrap();
+    let pricing_line = explanation
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .find(|line| line.contains("task pricing"))
+        .unwrap();
+    assert!(pricing_line.contains("\"pressure\""));
+    assert!(!pricing_line.contains("\"pacing\""));
+    assert!(!pricing_line.contains("\"weeklyPressure\""));
+    assert!(!pricing_line.contains("\"shortWindowPressure\""));
 }
 
 #[tokio::test]

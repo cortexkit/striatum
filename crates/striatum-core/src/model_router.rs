@@ -269,6 +269,21 @@ pub struct TaskRoutePricing {
     pub unpriced_dimensions: Vec<String>,
 }
 
+impl TaskRoutePricing {
+    fn explanation_json(&self) -> String {
+        // Keep the established explanation-line JSON shape stable by leaving
+        // the pacing breakdown to the decision's structured pricing objects.
+        if self.pacing.is_none() {
+            return serde_json::to_string(self).expect("task pricing contains finite numbers");
+        }
+        let mut legacy = self.clone();
+        legacy.pacing = None;
+        legacy.weekly_pressure = None;
+        legacy.short_window_pressure = None;
+        serde_json::to_string(&legacy).expect("task pricing contains finite numbers")
+    }
+}
+
 /// Where the token profile a route was basket-priced on came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -2606,7 +2621,7 @@ pub fn evaluate_model_route_with_concurrency(
             explanation.push(format!(
                 "route {}: task pricing (level={level}, tasks={tasks}): {}",
                 admissible[candidate.idx].route.route_key,
-                serde_json::to_string(pricing).expect("task pricing contains finite numbers"),
+                pricing.explanation_json(),
             ));
         }
         if candidate.idx != winner.idx && candidate.objective.price_unknown {
