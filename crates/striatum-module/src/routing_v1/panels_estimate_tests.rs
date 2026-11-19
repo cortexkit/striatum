@@ -43,7 +43,7 @@ async fn configured() -> (Arc<Harness>, Route) {
     install_panel_families(&harness, &catalog);
     harness.edit_config(|config| {
         config["panels"]["audit"] =
-            json!({"topK":2,"by":"iq","extra":1,"extraBy":"random","floor":0});
+            json!({"top_k":2,"by":"iq","extra":1,"extra_by":"random","floor":0});
         config["consumers"][fixture::SUMMARY] = json!({"owner":"prefrontal-core"});
     });
     let route = harness.bind(reserved("prefrontal-core"), None).await;
@@ -273,7 +273,7 @@ async fn panel_estimate_due_model_recovery_test_stays_unclaimed() {
     let _clock = crate::InjectedClock::set(NOW);
     let harness = super::metered_tests::quota_probe_harness();
     harness.edit_config(|config| {
-        config["panels"]["audit"] = json!({"topK":1,"by":"iq","extra":0,"floor":0});
+        config["panels"]["audit"] = json!({"top_k":1,"by":"iq","extra":0,"floor":0});
     });
     let route = harness.bind(reserved("example-consumer"), None).await;
     let before = rows(&harness);

@@ -15,7 +15,10 @@ pub fn convert_archived(document: &str) -> serde_json::Value {
     {
         policy.remove("variants");
     }
-    super::config_convert::convert_value(value).unwrap()
+    let entity_settings = super::config_convert::convert_value(value).unwrap();
+    super::config_overrides::settings_shape::convert(entity_settings)
+        .unwrap()
+        .0
 }
 
 pub fn document(document: &str) -> String {

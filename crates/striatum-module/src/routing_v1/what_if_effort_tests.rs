@@ -214,7 +214,7 @@ async fn catalog_effort_uses_adjusted_elo_and_eq_for_bar_and_panel_ranking() {
         row["quality.eq.effort.low"] = json!(eq);
     });
     harness.edit_config(|config| {
-        config["panels"]["audit"] = json!({"topK":2,"by":"eq","extra":0,"extraBy":"random"});
+        config["panels"]["audit"] = json!({"top_k":2,"by":"eq","extra":0,"extra_by":"random"});
         config["models"][A]["elo"] = json!(2250);
         config["models"][A]["eq"] = json!(2200);
         config["models"][B]["elo"] = json!(1850);

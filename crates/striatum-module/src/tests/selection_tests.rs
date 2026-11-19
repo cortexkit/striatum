@@ -809,7 +809,7 @@ async fn panel_replaces_an_exhausted_claude_pool_and_records_blocked_keys() {
     let config = rig.dir.join("striatum.jsonc");
     crate::test_config::write(&config, json!({"model_routing": {
             "exclude": {"all": ["anthropic/claude-opus-5-5", "anthropic-platform/claude-sonnet-fallback"]},
-            "panels": {"audit": {"topK": 2, "extra": 0, "by": "iq"}}
+            "panels": {"audit": {"top_k": 2, "extra": 0, "by": "iq"}}
         }}).to_string()).unwrap();
     let credentials = platform_listing(&[
         ("apikey:anthropic:empty", &["anthropic-platform"]),

@@ -21,11 +21,22 @@ pub(crate) enum NoCap {
     None,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(untagged)]
 pub(crate) enum CapLimit {
-    Number(#[schemars(range(min = 1))] u64),
+    Number(u64),
     Unlimited(NoCap),
+}
+
+impl JsonSchema for CapLimit {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "CapLimit".into()
+    }
+
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        // The minimum applies only to numbers; the pattern applies only to strings.
+        schemars::json_schema!({"type": ["integer", "string"], "minimum": 1, "pattern": "^none$"})
+    }
 }
 
 impl CapLimit {
@@ -40,7 +51,9 @@ impl CapLimit {
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CapOverride {
+    /// Maximum simultaneous requests, as a whole number of at least 1, or `none` to remove the cap.
     pub(crate) limit: CapLimit,
+    /// Count requests per account, or separately for each model on the account. Omit to inherit the less specific setting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) scope: Option<CapScope>,
 }
@@ -48,17 +61,22 @@ pub(crate) struct CapOverride {
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ModelCapOverride {
+    /// Maximum simultaneous requests on this model, as a whole number of at least 1, or `none` to remove the cap.
     pub(crate) limit: CapLimit,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct CapSettings {
-    /// Defaults off so operators can inspect counts before enabling enforcement.
+    /// Enforce the limits. When disabled, counts are visible but requests are not blocked by these limits.
     pub(crate) enforcement_enabled: bool,
+    /// Limits by provider ID.
     pub(crate) providers: BTreeMap<String, CapOverride>,
+    /// Limits by provider/plan.
     pub(crate) plans: BTreeMap<String, CapOverride>,
+    /// Limits by provider/model.
     pub(crate) models: BTreeMap<String, ModelCapOverride>,
+    /// Limits by provider/account.
     pub(crate) accounts: BTreeMap<String, CapOverride>,
 }
 

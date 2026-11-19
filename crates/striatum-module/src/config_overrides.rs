@@ -40,7 +40,11 @@ pub const CONFIG_POLL_INTERVAL: Duration = Duration::from_secs(2);
 #[cfg(test)]
 mod contract_tests;
 mod dormant_models;
+#[cfg(test)]
+mod managed_settings_tests;
 mod new_shape;
+mod settings_schema;
+pub(crate) mod settings_shape;
 pub(crate) use new_shape::SelectionPolicyMemo;
 #[cfg(test)]
 mod new_shape_tests;
@@ -496,6 +500,13 @@ fn parse_config_with_reporter(
             crate::config_convert::COMMAND
         ));
     }
+    if value
+        .get("accounts")
+        .and_then(|accounts| accounts.get("shadow"))
+        .is_some()
+    {
+        return Err("invalid routing config: unknown field `shadow` under accounts; delete the retired setting".into());
+    }
     crate::config_convert::reject_removed_variants(&value)?;
     for key in ["model_routing", "account_selection", "pins", "score_alias"] {
         if value.get(key).is_some() {
@@ -503,18 +514,6 @@ fn parse_config_with_reporter(
                 "old routing config key {key}; run {} <input> <output>",
                 crate::config_convert::COMMAND
             ));
-        }
-    }
-    if let Some(consumers) = value
-        .get("consumers")
-        .and_then(serde_json::Value::as_object)
-    {
-        for (name, entry) in consumers {
-            if entry.get("runner").is_some() && entry.get("runners").is_some() {
-                return Err(format!(
-                    "consumers.{name}: runner and runners are mutually exclusive"
-                ));
-            }
         }
     }
     if let Some(root) = value.as_object_mut() {
@@ -541,6 +540,27 @@ fn parse_config_with_reporter(
             }
         }
     }
+    if let Some(consumers) = value
+        .get("consumers")
+        .and_then(serde_json::Value::as_object)
+    {
+        for (name, entry) in consumers {
+            if entry.get("runner").is_some() && entry.get("runners").is_some() {
+                let conflict =
+                    format!("consumers.{name}: runner and runners are mutually exclusive");
+                for key in ["runner", "runners"] {
+                    if entry[key].is_null() {
+                        let path = settings_shape::pointer("/consumers", name);
+                        let error =
+                            settings_shape::null_error(&settings_shape::pointer(&path, key));
+                        return Err(format!("{error}; {conflict}"));
+                    }
+                }
+                return Err(conflict);
+            }
+        }
+    }
+    settings_shape::validate(&mut value)?;
     let mut config: RoutingConfigFile =
         serde_json::from_str(&json).map_err(|error| format!("invalid routing config: {error}"))?;
     let section = &mut config.model_routing;
@@ -740,7 +760,7 @@ fn validate_live_config(config: &RoutingConfigFile) -> Result<(), String> {
             model.elo,
             model.eq,
             model.subscription_multiplier,
-            model.context_window,
+            model.context_window_tokens,
         ]
         .into_iter()
         .flatten()
@@ -750,7 +770,7 @@ fn validate_live_config(config: &RoutingConfigFile) -> Result<(), String> {
             }
         }
         if model
-            .speed
+            .output_tokens_per_second
             .is_some_and(|value| !value.is_finite() || value < 0.0)
         {
             return Err(format!("invalid speed override for {key}"));
@@ -1064,7 +1084,7 @@ impl LiveConfig {
                         striatum_core::billing::BillingRate::Priced { rate: cost },
                     );
                 }
-                if let Some(speed) = model.speed {
+                if let Some(speed) = model.output_tokens_per_second {
                     fact.scores.speed = speed * model.speed_multiplier.unwrap_or(1.0);
                 } else {
                     fact.scores.speed = observed_speed;
@@ -1239,37 +1259,39 @@ fn prompt_cache_providers_cache() -> &'static Mutex<HashMap<PathBuf, PromptCache
 #[derive(Debug, Deserialize, Serialize, Clone, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct RoutingConfigFile {
-    /// Whole dotted consumer names; the longest matching override wins.
+    /// Scheduling priority by consumer name. The most specific dotted name wins.
     #[serde(default)]
     consumer_priorities: BTreeMap<String, crate::config_policy::PriorityClass>,
+    /// Limits on the number of requests running at once.
     #[serde(default)]
     concurrency: crate::concurrency_caps::CapSettings,
     #[serde(flatten)]
     model_routing: ModelRoutingSection,
+    /// Routing and account settings by provider ID.
     #[serde(default)]
     providers: BTreeMap<String, ProviderPolicy>,
+    /// Routing preferences by consumer name.
     #[serde(default)]
     consumers: BTreeMap<String, ConsumerPolicy>,
+    /// Modules that can run models, in order of preference.
     #[serde(default)]
     runners: Vec<RunnerPolicy>,
-    /// Full caller principals allowed to mark user pins with `pin_origin`.
-    /// Defaults to reserved:prefrontal-core and reserved:prefrontal during the
-    /// module rename window; an explicit empty list enrolls nobody.
+    /// Full caller identities allowed to mark a model choice as made by the user. An empty list allows nobody.
     #[serde(default = "default_pin_origin_callers")]
     pin_origin_callers: Vec<String>,
-    /// Target agents that are heads: operator-facing sessions that may spend
-    /// a subscription's kept-free reserve. Matched case-insensitively.
+    /// Names of operator-facing agents allowed to use reserved subscription quota. Case is ignored.
     #[serde(default)]
     head_agents: Vec<String>,
-    /// Quota pools that meter only some models: a routed model whose id
-    /// starts with `model_prefix` draws on `pool` beside its family pool.
+    /// Additional quota pools that apply only to models with a matching name prefix.
     #[serde(default)]
     quota_model_pools: Vec<QuotaModelPoolConfig>,
+    /// Settings for refreshing the model catalog.
     #[serde(default)]
     catalog: CatalogSection,
-    /// How long the routing store keeps each history table.
+    /// How long to keep routing and account history, and how much scoring detail to keep.
     #[serde(default)]
     retention: RetentionSection,
+    /// Default account selection and spending rules, unless a provider overrides them.
     #[serde(default)]
     accounts: crate::config_policy::ProviderAccountsPolicy,
 }
@@ -1300,9 +1322,9 @@ impl Default for RoutingConfigFile {
     }
 }
 
-/// Regenerate with `cargo run -p striatum-module --bin ck-striatum -- --print-config-schema`.
+/// Regenerate with `cargo run --locked -p striatum-module --bin ck-striatum -- --print-config-schema`.
 pub fn routing_config_schema() -> String {
-    serde_json::to_string_pretty(&schemars::schema_for!(RoutingConfigFile)).unwrap() + "\n"
+    settings_schema::render()
 }
 
 fn allocator_policy_from(
@@ -1379,9 +1401,9 @@ fn allocator_policy_from(
                 .and_then(|seconds| seconds.checked_mul(1000))
                 .ok_or("unknown_reset_retry too large")?;
         }
-        if let Some(limit) = source.spend_budget {
+        if let Some(limit) = source.spend_budget_usd {
             if !limit.is_finite() || limit <= 0.0 {
-                return Err("spend_budget must be positive".into());
+                return Err("spend_budget_usd must be positive".into());
             }
             policy.spend_budget = Some(limit);
         }
@@ -1472,7 +1494,7 @@ mod account_policy_config_tests {
             "accounts":{"max_hold":"90s"},
             "providers":{"synthetic":{"accounts":{"strategy":"hybrid","max_hold":"30s",
                 "soft_quota_remaining_percent":10,"floors":[{"pool":"pool-a","window_minutes":300,"remaining_percent":5}],
-                "spend_budget":20,"spend_budget_reset_at_ms":1800000600000,"paid_credits":true,"unknown_reset_retry":"2h"}}}
+                "spend_budget_usd":20,"spend_budget_reset_at_ms":1800000600000,"paid_credits":true,"unknown_reset_retry":"2h"}}}
         }"#).unwrap();
         let policy = allocator_policy_from(
             &config.accounts,
@@ -1520,6 +1542,7 @@ pub struct AccountSelectionFlags {
 #[derive(Debug, Deserialize, Serialize, Default, Clone, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct CatalogSection {
+    /// Time between model catalog refreshes, in milliseconds. Must be at least 1.
     #[serde(default)]
     #[schemars(range(min = 1))]
     poll_ms: Option<u64>,
@@ -1532,30 +1555,27 @@ struct CatalogSection {
 /// a bad value here never rejects the rest of the file.
 #[derive(Debug, Deserialize, Serialize, Default, Clone, JsonSchema)]
 struct RetentionSection {
-    /// Served account-selection history, after each row's last activity.
-    /// Default 30, minimum 7.
+    /// Days to keep account selections after their last activity. Minimum 7 days.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(with = "Option<u64>", range(min = 7))]
     account_selection_days: Option<serde_json::Value>,
-    /// Runner observation log. Default 7, minimum 1.
+    /// Days to keep reports from model runners. Minimum 1 day.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(with = "Option<u64>", range(min = 1))]
     account_observation_days: Option<serde_json::Value>,
-    /// Route decision ledger, as the compact record. Default 30, minimum 1.
+    /// Days to keep the summary of each routing decision. Minimum 1 day.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(with = "Option<u64>", range(min = 1))]
     model_route_decisions_days: Option<serde_json::Value>,
-    /// Full per-candidate scoring and quota signals of a decision, before
-    /// they are compacted. Default 2, minimum 1.
+    /// Days to keep full scores and quota details for each routing decision. Minimum 1 day.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(with = "Option<u64>", range(min = 1))]
     model_route_decisions_full_detail_days: Option<serde_json::Value>,
-    /// One decision in this many, chosen by a hash of its id, keeps full
-    /// detail for the whole decision window. Default 20; 0 keeps none.
+    /// Keep full scoring details for one decision in this many until its summary expires. Set to 0 to keep no long-term samples.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(with = "Option<u64>")]
     model_route_decisions_full_detail_sample_one_in: Option<serde_json::Value>,
-    /// Per-message usage. Default 30, minimum 7.
+    /// Days to keep usage records for individual requests. Minimum 7 days.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(with = "Option<u64>", range(min = 7))]
     model_route_usage_days: Option<serde_json::Value>,
@@ -1564,7 +1584,9 @@ struct RetentionSection {
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct QuotaModelPoolConfig {
+    /// Beginning of the model name that this quota rule matches.
     model_prefix: String,
+    /// Name of the additional quota pool used by matching models.
     pool: String,
 }
 
@@ -1578,6 +1600,7 @@ struct ModelRoutingSection {
     /// admitted when the route is otherwise servable.
     #[serde(skip)]
     exclude: ExcludeGroups,
+    /// How many models to choose and how to rank them for each panel type.
     #[serde(default)]
     panels: PanelPolicies,
     #[serde(skip)]
@@ -1585,22 +1608,20 @@ struct ModelRoutingSection {
     /// Providers and models priced as subscription-backed in addition to auth facts.
     #[serde(skip)]
     subscription: Vec<String>,
-    /// Keyed by "provider/model" or "provider/model/variant".
+    /// Override catalog values or routing rules by provider/model or provider/model/variant.
     #[serde(default)]
     models: HashMap<String, ModelFactOverride>,
-    /// Power-curve exponent mapping caller IQ demand to the request frontier.
+    /// Set how quickly the reasoning quality target rises as a request asks for more. Use a number greater than 0.
     #[serde(default)]
     #[schemars(transform = positive_number)]
     demand_exponent: Option<f64>,
-    /// Over-qualification term added to selection cost for routes far above the
-    /// request's iq demand. Absent fields take the routing-core defaults.
+    /// How much to discourage using a stronger model than a request needs.
     #[serde(default)]
     overqualification: OverqualificationSection,
-    /// Minimum adequacy for best-effort selection (sanity band). Default 0.6.
-    /// Clamped to [0, 1]; NaN is rejected loudly at parse time.
+    /// Minimum fit for choosing a fallback model when none meets the quality target. Use a score from 0 to 1.
     #[serde(default)]
     min_best_effort_adequacy: Option<f64>,
-    /// Terminal send failures required before the route-local safety backoff starts.
+    /// Number of failed sends in a row before temporarily avoiding a route. Must be at least 1.
     #[serde(default)]
     #[schemars(range(min = 1))]
     consecutive_terminal_failure_threshold: Option<u32>,
@@ -1608,8 +1629,7 @@ struct ModelRoutingSection {
     /// avoid these providers when a cache-capable adequate route exists.
     #[serde(skip)]
     providers_without_prompt_cache: Vec<String>,
-    /// Provider-wide subscription multipliers. Legacy route keys are accepted
-    /// only to warn and discard them; model-level values never override these.
+    /// Divide estimated subscription costs by these provider-specific numbers. Use numbers greater than 0; a provider's own setting takes precedence.
     #[serde(default, skip_serializing)]
     subscription_multipliers: HashMap<String, f64>,
     /// Percent of each weekly account window reserved from delegated workers;
@@ -1654,12 +1674,16 @@ impl Default for ModelRoutingSection {
 #[derive(Debug, Deserialize, Serialize, Default, Clone, Copy, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct OverqualificationSection {
+    /// Add a fixed-scale penalty (`additive`) or multiply the estimated cost (`cost_scaled`).
     #[serde(default)]
     mode: OverqualificationMode,
+    /// How far the model's reasoning score may exceed the target before adding a penalty. In additive mode only; use 0 or more. If omitted in additive mode, uses 40.
     #[schemars(range(min = 0))]
     threshold: Option<f64>,
+    /// Extra reasoning score needed to double the penalty. In additive mode only; use a number greater than 0. If omitted in additive mode, uses 10.
     #[schemars(transform = positive_number)]
     doubling: Option<f64>,
+    /// Starting penalty before it grows with excess reasoning quality. In additive mode only; use 0 or more. If omitted in additive mode, uses 0.05.
     #[schemars(range(min = 0))]
     base: Option<f64>,
 }
@@ -1702,21 +1726,27 @@ impl OverqualificationSection {
 #[derive(Debug, Deserialize, Serialize, Default, Clone, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ModelFactOverride {
+    /// Override the model's reasoning score. Use a number greater than 0, or omit to use the catalog score.
     #[schemars(transform = positive_number)]
     elo: Option<f64>,
+    /// Override the model's collaboration score. Use a number greater than 0, or omit to use the catalog score.
     #[schemars(transform = positive_number)]
     eq: Option<f64>,
+    /// Override generation speed in output tokens per second, from 0 upward. Omit to use measured or catalog speed.
     #[schemars(range(min = 0))]
-    speed: Option<f64>,
+    output_tokens_per_second: Option<f64>,
+    /// Override cost in US dollars per million output tokens, from 0 upward.
     #[schemars(range(min = 0))]
     cost_per_mtok_out: Option<f64>,
+    /// Override the context window in tokens. Use a number greater than 0, or omit to use the catalog size.
     #[schemars(transform = positive_number)]
-    context_window: Option<f64>,
+    context_window_tokens: Option<f64>,
+    /// Override whether the model can read images. Omit to use catalog support.
     vision: Option<bool>,
+    /// Multiply the speed used to compare this model with others. Use a number greater than 0 and up to 2.
     #[schemars(range(max = 2), transform = positive_number)]
     speed_multiplier: Option<f64>,
-    /// Retained for old operator files. Ignored with a warning at load because
-    /// subscription value belongs to the provider, not an individual model.
+    /// This setting is ignored. Set the subscription cost multiplier on the provider instead.
     subscription_multiplier: Option<f64>,
     #[serde(flatten)]
     rules: crate::config_policy::EntityPolicy,
@@ -1770,13 +1800,13 @@ fn merge_override(base: &ModelFact, ov: &ModelFactOverride) -> ModelFact {
     fact.scores = ModelScores {
         elo: ov.elo.unwrap_or(base.scores.elo),
         eq: ov.eq.unwrap_or(base.scores.eq),
-        speed: ov.speed.unwrap_or(base.scores.speed),
+        speed: ov.output_tokens_per_second.unwrap_or(base.scores.speed),
     };
     if ov.cost_per_mtok_out.is_some() {
         fact.cost_per_m_tok_out = ov.cost_per_mtok_out;
     }
-    if ov.context_window.is_some() {
-        fact.context_window = ov.context_window;
+    if ov.context_window_tokens.is_some() {
+        fact.context_window = ov.context_window_tokens;
     }
     if ov.vision.is_some() {
         fact.supports_vision = ov.vision;
@@ -1798,7 +1828,7 @@ const CONFIG_CATALOG_FACT_FIELDS: [CatalogFactField; 3] = [
 #[cfg(test)]
 fn named_catalog_fields(ov: &ModelFactOverride) -> Vec<CatalogFactField> {
     let mut fields = Vec::new();
-    if ov.context_window.is_some() {
+    if ov.context_window_tokens.is_some() {
         fields.push(CatalogFactField::ContextWindow);
     }
     if ov.cost_per_mtok_out.is_some() {
@@ -2691,7 +2721,7 @@ mod tests {
             &config_path,
             serde_json::json!({
                 "model_routing": {
-                    "models": { route_key.clone(): { "speed": 1200.0 } }
+                    "models": { route_key.clone(): { "output_tokens_per_second": 1200.0 } }
                 }
             })
             .to_string(),
@@ -2730,7 +2760,7 @@ mod tests {
             &config_path,
             serde_json::json!({
                 "model_routing": {
-                    "models": { route_key.clone(): { "speed": 1200.0 } }
+                    "models": { route_key.clone(): { "output_tokens_per_second": 1200.0 } }
                 }
             })
             .to_string(),

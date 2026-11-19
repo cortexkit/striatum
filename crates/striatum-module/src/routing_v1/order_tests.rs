@@ -147,7 +147,7 @@ async fn non_chat_catalog_rows_cannot_be_selected_or_pinned() {
 async fn check_chat_classification(classification: Value, reason: &str) {
     let harness = harness(&[(CHEAP, true, true, 200_000), (DEAR, true, true, 200_000)]);
     harness.edit_config(|config| {
-        config["panels"]["audit"] = json!({"topK": 1, "by": "iq", "extra": 0, "floor": 0});
+        config["panels"]["audit"] = json!({"top_k": 1, "by": "iq", "extra": 0, "floor": 0});
     });
     let mut payload = json!({"catalog_version": 2, "resolved_at_ms": 2, "models": {
         CHEAP: {"existence": "present",

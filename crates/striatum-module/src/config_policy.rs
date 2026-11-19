@@ -1,7 +1,7 @@
 //! Closed operator policy shapes. Consumer admission and panel selection read
 //! these values from the same immutable snapshot as the model overrides.
 
-use schemars::{JsonSchema, Schema};
+use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeMap;
 
@@ -66,29 +66,29 @@ pub enum ExtraRanking {
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-#[schemars(transform = panel_constraints)]
 pub struct PanelPolicy {
-    #[serde(rename = "topK")]
+    /// Number of leading models to select, from 1 to 8.
     #[schemars(range(min = 1, max = 8))]
     pub top_k: u8,
+    /// Rank the leading models by reasoning quality, collaboration quality, or cost.
     pub by: Ranking,
+    /// Number of additional models to select, from 0 to 8 minus the leading count.
     #[serde(default)]
     #[schemars(range(min = 0, max = 7))]
     pub extra: u8,
+    /// How to choose the additional models. Required when the additional count is above 0.
     #[serde(
-        rename = "extraBy",
         default,
         deserialize_with = "present_value",
         skip_serializing_if = "Option::is_none"
     )]
-    #[schemars(with = "ExtraRanking", !default)]
     pub extra_by: Option<ExtraRanking>,
+    /// Minimum quality score for a panel seat, from 0 to 100. Omit to use the request's quality rules.
     #[serde(
         default,
         deserialize_with = "present_value",
         skip_serializing_if = "Option::is_none"
     )]
-    #[schemars(with = "u8", !default)]
     #[schemars(range(min = 0, max = 100))]
     pub floor: Option<u8>,
 }
@@ -96,10 +96,10 @@ pub struct PanelPolicy {
 impl PanelPolicy {
     pub fn validate(&self) -> Result<(), String> {
         if self.top_k == 0 || u16::from(self.top_k) + u16::from(self.extra) > 8 {
-            return Err("topK must be >= 1 and topK + extra must be <= 8".into());
+            return Err("top_k must be >= 1 and top_k + extra must be <= 8".into());
         }
         if self.extra > 0 && self.extra_by.is_none() {
-            return Err("extraBy is required when extra > 0".into());
+            return Err("extra_by is required when extra > 0".into());
         }
         if self.floor.is_some_and(|floor| floor > 100) {
             return Err("floor must be an integer from 0 to 100".into());
@@ -108,73 +108,57 @@ impl PanelPolicy {
     }
 }
 
-// JSON Schema cannot add two properties, so enumerate the eight possible
-// topK values to express the same width cap used by runtime validation.
-fn panel_constraints(schema: &mut Schema) {
-    let mut constraints = vec![serde_json::json!({
-        "if": {"required": ["extra"], "properties": {"extra": {"minimum": 1}}},
-        "then": {"required": ["extraBy"], "properties": {"extraBy": {"type": "string"}}}
-    })];
-    for top_k in 1..=8 {
-        constraints.push(serde_json::json!({
-            "if": {"properties": {"topK": {"const": top_k}}},
-            "then": {"properties": {"extra": {"maximum": 8 - top_k}}}
-        }));
-    }
-    schema.insert("allOf".into(), constraints.into());
-}
-
 #[derive(Debug, Default, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct PanelPolicies {
+    /// Model selection for audit panels. Omit to use the built-in audit policy.
     #[serde(
         default,
         deserialize_with = "present_value",
         skip_serializing_if = "Option::is_none"
     )]
-    #[schemars(with = "PanelPolicy", !default)]
     pub audit: Option<PanelPolicy>,
+    /// Model selection for design review panels. Omit to use the built-in design review policy.
     #[serde(
         default,
         deserialize_with = "present_value",
         skip_serializing_if = "Option::is_none"
     )]
-    #[schemars(with = "PanelPolicy", !default)]
     pub design_review: Option<PanelPolicy>,
+    /// Model selection for diagnosis panels. Omit to use the built-in diagnosis policy.
     #[serde(
         default,
         deserialize_with = "present_value",
         skip_serializing_if = "Option::is_none"
     )]
-    #[schemars(with = "PanelPolicy", !default)]
     pub diagnose: Option<PanelPolicy>,
+    /// Model selection for evaluation panels. Omit to use the built-in evaluation policy.
     #[serde(
         default,
         deserialize_with = "present_value",
         skip_serializing_if = "Option::is_none"
     )]
-    #[schemars(with = "PanelPolicy", !default)]
     pub evaluate: Option<PanelPolicy>,
+    /// Model selection for explanation panels. Omit to use the built-in explanation policy.
     #[serde(
         default,
         deserialize_with = "present_value",
         skip_serializing_if = "Option::is_none"
     )]
-    #[schemars(with = "PanelPolicy", !default)]
     pub explain: Option<PanelPolicy>,
+    /// Model selection for specification panels. Omit to use the built-in specification policy.
     #[serde(
         default,
         deserialize_with = "present_value",
         skip_serializing_if = "Option::is_none"
     )]
-    #[schemars(with = "PanelPolicy", !default)]
     pub spec: Option<PanelPolicy>,
+    /// Model selection for lab panels. Omit to use the built-in lab policy.
     #[serde(
         default,
         deserialize_with = "present_value",
         skip_serializing_if = "Option::is_none"
     )]
-    #[schemars(with = "PanelPolicy", !default)]
     pub lab: Option<PanelPolicy>,
 }
 
@@ -192,7 +176,7 @@ impl PanelPolicies {
             if let Some(policy) = policy {
                 policy
                     .validate()
-                    .map_err(|error| format!("model_routing.panels.{class}: {error}"))?;
+                    .map_err(|error| format!("panels.{class}: {error}"))?;
             }
         }
         Ok(())
@@ -202,14 +186,16 @@ impl PanelPolicies {
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SynthesizerPin {
+    /// Route to pin, written as provider/model.
     #[schemars(regex(pattern = r"^[^/\s]+/[^\s]+$"))]
     pub model: String,
+    /// Optional named model variant. Omit to use the model's usual variant.
     #[serde(
         default,
         deserialize_with = "present_value",
         skip_serializing_if = "Option::is_none"
     )]
-    #[schemars(with = "String", !default, regex(pattern = r"\S"))]
+    #[schemars(regex(pattern = r"\S"))]
     pub variant: Option<String>,
 }
 
@@ -316,24 +302,19 @@ impl ExcludeGroups {
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RunnerPolicy {
-    /// The runner's module id. Only a route principal the daemon verified as
-    /// this module may call the runner operations.
+    /// Name of the module that runs the selected model.
     #[schemars(regex(pattern = r"^\S+$"))]
     pub module: String,
-    /// Restrict this placement to one of the runner's declared harnesses.
+    /// Restrict this entry to one of the runner's named execution environments.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harness: Option<String>,
-    /// The routes it runs, in the exclusion grammar (`provider`,
-    /// `provider/model`, `provider/model/variant`). Absent: every route it
-    /// serves. With `via_vault`, reach also requires a serving vault credential.
+    /// Routes this runner may use, as provider, provider/model, or provider/model/variant. Omit to allow every route the runner supports.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routes: Option<Vec<String>>,
-    /// Tool capability tags (such as `code.read/v1`) the runner can reach a
-    /// tool provider for. A select that lists tool capabilities is answered
-    /// only on a runner reaching every one of them.
+    /// Tools this runner can provide, named by capability tags such as `code.read/v1`.
     #[serde(default)]
     pub tool_capabilities: Vec<String>,
-    /// When true, reaching this runner also requires a serving vault credential.
+    /// Require an available account credential before choosing this runner.
     #[serde(default)]
     pub via_vault: bool,
 }
@@ -366,18 +347,17 @@ pub fn consumer_matches(prefix: &str, consumer: &str) -> bool {
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct EntityPolicy {
+    /// Service speed to request for this provider or model. Omit to follow the broader routing policy.
     pub service_tier: Option<crate::tier_settings::Tier>,
+    /// Allow only these consumers and their dotted subgroups. Omit to inherit the broader allow list.
     pub only_for: Option<Vec<String>>,
+    /// Block these consumers and their dotted subgroups. Omit to inherit the broader block list.
     pub not_for: Option<Vec<String>>,
-    /// Require a pin for this entity. Metered billing planes default to true;
-    /// false opts into automatic selection, with model values overriding providers.
+    /// Require an explicitly named model instead of choosing it automatically. Omit to follow the provider or billing policy.
     pub pin_only: Option<bool>,
-    /// Like `pin_only`, but only for these consumers and their dotted
-    /// descendants: other admitted consumers still route here automatically.
-    /// Lets a scarce model serve one consumer by choice and others by pin.
+    /// Require an explicitly named model only for these consumers and their dotted subgroups.
     pub pin_only_for: Option<Vec<String>>,
-    /// Mark a flat-rate subscription, including API-key plans. True also exempts
-    /// this entity from built-in metered pin-only defaults, not explicit pin-only rules.
+    /// Treat this provider or model as a flat-rate subscription. Omit to use the account's billing information.
     pub subscription: Option<bool>,
 }
 
@@ -386,13 +366,17 @@ pub struct EntityPolicy {
 pub struct ProviderPolicy {
     #[serde(flatten)]
     pub rules: EntityPolicy,
+    /// Allow this provider to use cached prompts when available.
     pub prompt_cache: Option<bool>,
+    /// Divide the estimated cost of using a subscription by this number. Use a number greater than 0.
     pub subscription_multiplier: Option<f64>,
+    /// Reserve this percentage of weekly quota for operator-facing sessions, from 0 to 100.
     pub keep_free_percent: Option<f64>,
-    /// Saved-reset pricing: emergency credits one near the wall; capacity counts
-    /// every unexpired reset as a full quota window. Neither applies a reset.
+    /// Count saved quota resets only near exhaustion (`emergency`) or count all unexpired resets (`capacity`).
     pub banked_resets: BankedResets,
+    /// Models this provider may serve. Omit to allow every model offered by the provider.
     pub models: Option<Vec<String>>,
+    /// Account selection and spending rules that override the global account settings for this provider.
     pub accounts: ProviderAccountsPolicy,
 }
 
@@ -408,57 +392,66 @@ pub enum BankedResets {
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProviderAccountsPolicy {
+    /// Allow this provider to use a pay-per-token account when its subscription accounts are unavailable.
     pub metered_fallback: bool,
+    /// How to choose among available accounts: `sticky`, `round_robin`, `hybrid`, or `ordered`.
     pub strategy: Option<String>,
+    /// Preferred account order, listed by account ID.
     pub order: Option<Vec<String>>,
+    /// For ordered selection, try main accounts first (`main-first`) or fallback accounts first (`fallback-first`).
     pub ordered: Option<String>,
+    /// Prefer accounts with at least this percentage of quota remaining, from 0 to 100.
     pub soft_quota_remaining_percent: Option<f64>,
+    /// Minimum remaining quota for individual quota pools.
     pub floors: Option<Vec<AccountPoolFloor>>,
+    /// Longest time a request may wait for an account. Use seconds (`s`), minutes (`m`), or hours (`h`).
     pub max_hold: Option<AccountDuration>,
+    /// Wait for an account only if its quota resets within this time. Use seconds (`s`), minutes (`m`), or hours (`h`). Omit to use the request's wait limit.
     pub hold_when_reset_within: Option<AccountDuration>,
+    /// Wait this long before retrying an account whose reset time is unknown. Use seconds (`s`), minutes (`m`), or hours (`h`).
     pub unknown_reset_retry: Option<AccountDuration>,
-    pub spend_budget: Option<f64>,
+    /// Maximum account spending in US dollars. Use a positive amount or omit for no spending limit.
+    pub spend_budget_usd: Option<f64>,
+    /// Scheduled spending-limit reset as milliseconds since the Unix epoch. Omit for no scheduled reset.
     pub spend_budget_reset_at_ms: Option<i64>,
+    /// Allow calls to draw on the account's paid credits.
     pub paid_credits: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
-#[serde(untagged)]
-pub enum AccountDuration {
-    Seconds(u64),
-    Text(String),
-}
+#[serde(transparent)]
+pub struct AccountDuration(String);
 
 impl AccountDuration {
     pub fn seconds(&self) -> Result<u64, String> {
-        match self {
-            Self::Seconds(seconds) => Ok(*seconds),
-            Self::Text(text) => {
-                let (number, factor) = if let Some(number) = text.strip_suffix('s') {
-                    (number, 1)
-                } else if let Some(number) = text.strip_suffix('m') {
-                    (number, 60)
-                } else if let Some(number) = text.strip_suffix('h') {
-                    (number, 3600)
-                } else {
-                    return Err("duration must use s, m or h".into());
-                };
-                number
-                    .parse::<u64>()
-                    .ok()
-                    .and_then(|number| number.checked_mul(factor))
-                    .ok_or_else(|| "duration must be a non-negative whole number of seconds".into())
-            }
-        }
+        let text = &self.0;
+        let (number, factor) = if let Some(number) = text.strip_suffix('s') {
+            (number, 1)
+        } else if let Some(number) = text.strip_suffix('m') {
+            (number, 60)
+        } else if let Some(number) = text.strip_suffix('h') {
+            (number, 3600)
+        } else {
+            return Err("duration must use s, m or h".into());
+        };
+        number
+            .parse::<u64>()
+            .ok()
+            .and_then(|number| number.checked_mul(factor))
+            .ok_or_else(|| "duration must be a non-negative whole number of seconds".into())
     }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AccountPoolFloor {
+    /// Name of the quota pool. Provide a pool name, a window length, or both.
     pub pool: Option<String>,
+    /// Length of the quota window in minutes. Provide a window length, a pool name, or both.
     pub window_minutes: Option<u32>,
+    /// Model this floor applies to. Omit to apply it to every model using the pool.
     pub model: Option<String>,
+    /// Minimum quota that must remain in the pool, from 0 to 100 percent.
     pub remaining_percent: f64,
 }
 
@@ -480,43 +473,57 @@ pub enum BelowBarPolicy {
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProjectPolicy {
+    /// Prefer this model in the project, as provider/model or provider/model:variant. Leave empty for ordinary selection.
     pub pin: String,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct ConsumerPolicy {
+    /// Name of the workload this consumer serves. Omit when it does not declare a workload.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workload: Option<String>,
+    /// Service speed to request for this consumer. Omit to follow the broader routing policy.
     pub service_tier: Option<crate::tier_settings::Tier>,
+    /// Service speed to request for particular model or provider IDs.
     pub service_tiers: Option<BTreeMap<String, crate::tier_settings::Tier>>,
+    /// Choose a model for each request (`demand`) or follow an ordered list of models (`ladder`).
     pub mode: Option<ConsumerMode>,
-    /// Automatic selection when no route clears the adequacy floor. Defaults to
-    /// refuse for mason and its dotted descendants, best_effort for others;
-    /// explicit model pins are admitted without quality ranking.
+    /// When no model meets the quality target, decline the request (`refuse`) or try the best available model (`best_effort`).
     pub below_bar: Option<BelowBarPolicy>,
+    /// Ordered model preferences, written as provider/model or provider/model:variant.
     pub ladder: Option<Vec<String>>,
     /// Internal provenance: only an operator-written ladder admits pin-only routes.
     #[serde(skip)]
     #[schemars(skip)]
     pub(crate) ladder_source: Option<ConsumerLadderSource>,
+    /// Name of the preferred module that runs this consumer's models.
     pub runner: Option<String>,
-    /// Replaces the global runner list for this consumer and its dotted children, including when empty.
+    /// Replace the global runner list for this consumer and its dotted subgroups. An empty list disables all runners.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runners: Option<Vec<RunnerPolicy>>,
+    /// Module responsible for this consumer. Omit to use the consumer's declared owner.
     pub owner: Option<String>,
+    /// Limit this consumer to routes priced per token.
     pub pay_per_token: Option<bool>,
+    /// Prefer a specific model and optional variant for this consumer.
     #[serde(
         default,
         deserialize_with = "present_value",
         skip_serializing_if = "Option::is_none"
     )]
     pub pin: Option<SynthesizerPin>,
+    /// Project-specific model preferences for this consumer.
     pub projects: BTreeMap<String, ProjectPolicy>,
+    /// Minimum reasoning quality requested, from 0 to 100.
     pub iq: Option<f64>,
+    /// Minimum collaboration quality requested, from 0 to 100.
     pub eq: Option<f64>,
+    /// Minimum context capacity in tokens.
     pub context_tokens: Option<u64>,
+    /// Minimum output capacity in tokens.
     pub max_output_tokens: Option<u64>,
+    /// Tools the selected runner must provide, named by capability tags.
     pub tool_capabilities: Option<Vec<String>>,
 }
 

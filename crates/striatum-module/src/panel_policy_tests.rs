@@ -196,7 +196,7 @@ mod class_panel_policy {
     #[tokio::test]
     async fn explicit_seed_and_lab_round_seeds_drive_golden_draws() {
         let rig = PanelRig::new(json!({"model_routing": {"panels": {"lab": {
-            "topK": 2, "by": "iq", "extra": 1, "extraBy": "random", "floor": 80
+            "top_k": 2, "by": "iq", "extra": 1, "extra_by": "random", "floor": 80
         }}}}));
         for (class, seed, extra) in [
             ("AUDIT", "explicit-seed", "anthropic/b"),
@@ -371,7 +371,7 @@ mod class_panel_policy {
     #[tokio::test]
     async fn live_policy_and_synthesizer_pin_edits_change_the_next_selection_after_debounce() {
         let rig = PanelRig::new(json!({"model_routing": {
-            "panels": {"audit": {"topK": 1, "by": "iq"}}
+            "panels": {"audit": {"top_k": 1, "by": "iq"}}
         }, "consumers":{"prefrontal-core.athena.synthesizer":{"pin":{"model":"synth/old","variant":"high"}}}}));
         let params = rig.params("AUDIT");
         let before = rig.select(params.clone()).await;
@@ -383,7 +383,7 @@ mod class_panel_policy {
         assert_eq!(before["result"]["policy"]["floor"], serde_json::Value::Null);
         rig.edit(
             json!({"model_routing": {
-                "panels": {"audit": {"topK": 2, "by": "eq"}}
+                "panels": {"audit": {"top_k": 2, "by": "eq"}}
             }, "consumers":{"prefrontal-core.athena.synthesizer":{"pin":{"model":"synth/new"}}}}),
             2_000_000_001,
         );
@@ -412,7 +412,7 @@ mod class_panel_policy {
             serde_json::from_str(recorded.explanation_json.as_ref().unwrap()).unwrap();
         assert_eq!(stored["policy"], before["result"]["policy"]);
         rig.edit(
-            json!({"model_routing": {"panels": {"audit": {"topK": 0, "by": "iq"}}}}),
+            json!({"model_routing": {"panels": {"audit": {"top_k": 0, "by": "iq"}}}}),
             2_000_000_002,
         );
         crate::config_overrides::settle_live_config(&rig.path);

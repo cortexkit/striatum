@@ -1181,18 +1181,20 @@ impl RoutingSubject for KitSubject {
             config["consumers"] = consumers
                 .iter()
                 .map(|consumer| {
-                    (
-                        consumer.id.clone(),
-                        json!({
-                            "owner": (consumer.id == fixture::SUMMARY).then_some(fixture::CONSUMER),
-                            "pay_per_token": consumer.priced_only,
-                            "iq": consumer.requirements.iq,
-                            "eq": consumer.requirements.defaults.eq,
-                            "context_tokens": consumer.requirements.defaults.context_window,
-                            "max_output_tokens": consumer.requirements.defaults.max_output_tokens,
-                            "tool_capabilities": consumer.requirements.defaults.tool_capabilities,
-                        }),
-                    )
+                    let mut policy = json!({
+                        "owner": (consumer.id == fixture::SUMMARY).then_some(fixture::CONSUMER),
+                        "pay_per_token": consumer.priced_only,
+                        "iq": consumer.requirements.iq,
+                        "eq": consumer.requirements.defaults.eq,
+                        "context_tokens": consumer.requirements.defaults.context_window,
+                        "max_output_tokens": consumer.requirements.defaults.max_output_tokens,
+                        "tool_capabilities": consumer.requirements.defaults.tool_capabilities,
+                    });
+                    policy
+                        .as_object_mut()
+                        .unwrap()
+                        .retain(|_, value| !value.is_null());
+                    (consumer.id.clone(), policy)
                 })
                 .collect::<serde_json::Map<String, Value>>()
                 .into();
@@ -1732,9 +1734,9 @@ impl RoutingSubject for KitSubject {
             return Err("invalid panel counts".into());
         }
         self.harness().edit_config(|config| {
-            let mut policy = json!({"topK":top,"extra":extra,"by":"iq","floor":0});
+            let mut policy = json!({"top_k":top,"extra":extra,"by":"iq","floor":0});
             if extra > 0 {
-                policy["extraBy"] = json!("random");
+                policy["extra_by"] = json!("random");
             }
             config["panels"][class] = policy;
         });
@@ -1785,9 +1787,10 @@ impl RoutingSubject for KitSubject {
         limits: HoldLimits,
     ) -> Result<(), String> {
         self.harness().edit_config(|config| {
-            config["providers"][provider]["accounts"]["max_hold"] = json!(limits.max_hold_s);
+            config["providers"][provider]["accounts"]["max_hold"] =
+                json!(format!("{}s", limits.max_hold_s));
             config["providers"][provider]["accounts"]["hold_when_reset_within"] =
-                json!(limits.hold_when_reset_within_s);
+                json!(format!("{}s", limits.hold_when_reset_within_s));
         });
         Ok(())
     }
@@ -1986,7 +1989,10 @@ impl RoutingSubject for KitSubject {
             // Make example_summary accessible to that fixture caller before
             // reserve setup; ordinary fixture routes retain ownership checks.
             self.harness().edit_config(|config| {
-                config["consumers"][fixture::SUMMARY]["owner"] = Value::Null;
+                config["consumers"][fixture::SUMMARY]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("owner");
             });
         }
         if let Some(scope) = &stamp.scope {

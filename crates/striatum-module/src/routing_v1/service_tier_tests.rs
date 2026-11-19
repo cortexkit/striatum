@@ -1139,7 +1139,7 @@ async fn service_tier_refused_pin_records_its_real_reason_once() {
 async fn service_tier_project_settings_reach_legacy_panel_members() {
     let _clock = crate::InjectedClock::set(NOW);
     let (harness, _) = setup(&["pro_500"], true, true);
-    harness.edit_config(|config| config["panels"]["audit"] = json!({"topK":1,"by":"iq"}));
+    harness.edit_config(|config| config["panels"]["audit"] = json!({"top_k":1,"by":"iq"}));
     let project = harness
         .store_path()
         .parent()
@@ -1598,7 +1598,7 @@ async fn panel_settings_only_fast_passes_contract_checker_and_requested_tier_cap
     };
     let _clock = crate::InjectedClock::set(NOW);
     let (harness, _) = setup(&["pro_500"], true, true);
-    harness.edit_config(|config| config["panels"]["audit"] = json!({"topK":1,"by":"iq"}));
+    harness.edit_config(|config| config["panels"]["audit"] = json!({"top_k":1,"by":"iq"}));
     let project = root();
     write(
         &project,

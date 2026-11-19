@@ -118,7 +118,7 @@ async fn claimed_non_quota_test_gives_panel_seats_a_short_check_time() {
     let _due = crate::InjectedClock::set(NOW + 5_001);
     claim(&owner, &runner, false).await;
     harness.edit_config(|config| {
-        config["panels"]["audit"] = json!({"topK":1,"by":"iq","extra":0,"floor":0});
+        config["panels"]["audit"] = json!({"top_k":1,"by":"iq","extra":0,"floor":0});
     });
     let pinned = owner
         .call(

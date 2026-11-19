@@ -195,7 +195,7 @@ async fn approved_reason_panels_use_astra_and_kimi_at_max() {
                 "design_review" | "evaluate" => 3,
                 _ => 2,
             };
-            c["panels"][class] = json!({"topK":top,"by":"iq","extra":0,"extraBy":"random"});
+            c["panels"][class] = json!({"top_k":top,"by":"iq","extra":0,"extra_by":"random"});
         }
     });
     for class in [

@@ -1239,7 +1239,7 @@ async fn golden_login_policy_narrows_picks_panels_picker_and_account_admission()
         config["runners"] = json!([{"module":"broca","via_vault":true}]);
         config["consumers"]["athena"] = json!({"owner":"prefrontal-core"});
         config["consumers"]["head"] = json!({"owner":"prefrontal-core"});
-        config["panels"]["audit"] = json!({"topK":3,"by":"iq","extra":0,"floor":0});
+        config["panels"]["audit"] = json!({"top_k":3,"by":"iq","extra":0,"floor":0});
     });
     let now = crate::now_ms();
     let mut credentials = BrocaCredentials::default();
