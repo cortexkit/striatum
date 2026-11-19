@@ -12,6 +12,7 @@ use subc_protocol::FrameType;
 const NOW: u64 = 1_800_000_000_000;
 const OWNER: DurableOwner<'_> = DurableOwner::Module("striatum");
 
+mod digest_tests;
 mod health_tests;
 mod order_tests;
 #[path = "route_fact_tests/transport_cpu_tests.rs"]
@@ -24,15 +25,19 @@ fn result(reply: (FrameType, Value)) -> Value {
 }
 
 async fn fixture() -> (Arc<Harness>, Route, Handler) {
+    fixture_for_admission("broca", "admission").await
+}
+
+async fn fixture_for_admission(module: &str, admission: &str) -> (Arc<Harness>, Route, Handler) {
     let (harness, _) = super::account_classes_tests::setup("synthetic", false);
-    harness.edit_config(|config| config["runners"] = json!([{"module":"broca","via_vault":true}]));
-    let runner = harness.bind(reserved("broca"), None).await;
+    harness.edit_config(|config| config["runners"] = json!([{"module":module,"via_vault":true}]));
+    let runner = harness.bind(reserved(module), None).await;
     result(
         runner
             .call(
                 "route.account_for",
                 &json!({"provider":"synthetic", "model":"model",
-        "conversation_key":"conversation", "admission_id":"admission"}),
+        "conversation_key":"conversation", "admission_id":admission}),
             )
             .await,
     );
@@ -137,17 +142,22 @@ async fn bus(handler: &Handler) -> (InMemoryBus, Cursor) {
 
 async fn publish(bus: &InMemoryBus, module: &str, id: &str, body: &Value) -> Vec<u8> {
     let bytes = serde_json::to_vec(body).unwrap();
+    let digest = ContentDigest::of_bytes(&bytes);
     let receipt = bus
         .publish(
             &format!("ck.box_test.event.{module}.route_fact.v1"),
             id,
-            ContentDigest::of_bytes(&bytes),
-            Headers::new(),
+            digest,
+            digest_headers(digest),
         )
         .await
         .unwrap();
     assert!(!receipt.duplicate());
     bytes
+}
+
+fn digest_headers(digest: ContentDigest) -> Headers {
+    Headers::from([("Ck-Content-Digest".into(), digest.to_string())])
 }
 
 async fn consume(handler: &Handler, cursor: &mut Cursor, bytes: &[u8]) {
@@ -525,7 +535,7 @@ async fn fact_subject_reader_token_preserves_publisher_identity() {
             "ck.box_test.event.broca.route_fact.v1.striatum",
             "finish",
             ContentDigest::of_bytes(&body),
-            Headers::new(),
+            digest_headers(ContentDigest::of_bytes(&body)),
         )
         .await
         .unwrap();

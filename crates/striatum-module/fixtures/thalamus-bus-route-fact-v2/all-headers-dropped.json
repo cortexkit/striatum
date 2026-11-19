@@ -1,0 +1,1 @@
+{"op":"route.account_observe","params":{"admission_id":"admission-synthetic-all-headers-dropped","attempt_outcome":{"status":"served"},"credential_id":"credential-synthetic-001","event_id":"admission-synthetic-all-headers-dropped:7:attempt","headers":{},"kind":"attempt","run_id":"run-synthetic-001","served_account_id":"account-synthetic-001","upstream_origin":"upstream"}}

@@ -109,3 +109,30 @@ port: `catalog.get — operator transcription grade` renames `quality.grade` to
 digest is `1ad59d65a4d7306f9462fc5f849c97bdc54cb58d902450f988787d56aa2bf4d1`.
 `catalog_fixture_port_changes_only_the_media_grade_key` reverses that rename and
 checks the original capture's digest, proving that no other fields changed.
+
+## Broca route-fact observations
+
+`broca-route-fact-1119/` contains byte-for-byte copies of the publications from
+Broca's own publisher for `admission_started_body` and `run_finished_body` on
+account `box_test`. They were supplied in
+`.cortexkit/internal-docs/research/broca-route-fact-1119/`. Before import, its
+`SHA256SUMS` was checked against the supplied prefix `fe0c7bee24ea1441`, then the
+original files were verified against the manifest.
+
+| Imported path | SHA-256 |
+| --- | --- |
+| `broca-route-fact-1119/admission-started.json` | `822af034833b1a778faba2874f88fe9a3b06e2ef3e9f7b703cc1627bd1cbba3b` |
+| `broca-route-fact-1119/run-finished.json` | `6a610abf8ceea85ad3c953a7ea9f41fb844248a1f9cd7184f301867bbeeb9a87` |
+
+## Thalamus route-fact observations
+
+`thalamus-bus-route-fact-v1/` and `thalamus-bus-route-fact-v2/` copy the supplied
+Thalamus bus observation bodies byte for byte from the matching directories
+under `.cortexkit/internal-docs/research/`. Each body was verified against its
+source `SHA256SUMS`; the tests use those body digests as the transport headers.
+
+| Imported path | SHA-256 |
+| --- | --- |
+| `thalamus-bus-route-fact-v1/typed-success.json` | `bdb59cf0af248f2f669554ae1741e06bfd8f9b25db5c6d4ee8830161cc46b63e` |
+| `thalamus-bus-route-fact-v2/mixed-headers.json` | `389e3b7dde17afc7995b98729ca2ac01d2a833b21f245faca63cd76bea0c4009` |
+| `thalamus-bus-route-fact-v2/all-headers-dropped.json` | `880027a45706c78c2c9fafdab55c19c90e9672b93b304f0d5f96aa9a8a995ecb` |

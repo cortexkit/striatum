@@ -12,6 +12,7 @@ use crate::route_facts::{Delivery, Handler};
 use crate::subscription_economics::multiplier;
 
 const DURABLE: &str = "m_striatum";
+pub(super) const CONTENT_DIGEST_HEADER: &str = "Ck-Content-Digest";
 
 pub(crate) mod metadata;
 pub(crate) mod reconnect;
@@ -305,7 +306,7 @@ pub(super) fn payload(names: &AccountNames, event: &EventDelivery) -> Result<Del
         event.msg_id.clone(),
         &event.body,
         event.headers().clone(),
-        event.header("Ck-Content-Digest"),
+        event.header(CONTENT_DIGEST_HEADER),
         None,
         event.delivered_count.max(1) as u64,
     )
@@ -340,6 +341,10 @@ pub(super) fn message(
         published_at_ms,
         delivery_count,
     })
+}
+
+pub(super) fn content_digest_matches(body: &[u8], digest: ContentDigest) -> bool {
+    ContentDigest::of_bytes(body) == digest
 }
 
 /// A fetched SDK delivery is settled through the same cursor contract as tests.

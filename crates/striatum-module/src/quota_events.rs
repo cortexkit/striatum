@@ -496,7 +496,7 @@ fn verify(message: &Message, bytes: &[u8]) -> Result<(SampleIdentity, Value), St
     if result.event_key != message.id
         || result.event_name != "quota_sampled"
         || result.digest != message.digest.to_string()
-        || ContentDigest::of_bytes(result.body.get().as_bytes()) != message.digest
+        || !quota_bus::content_digest_matches(result.body.get().as_bytes(), message.digest)
     {
         return Err("quota sample digest or event identity mismatch".into());
     }

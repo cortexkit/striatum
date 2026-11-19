@@ -2,10 +2,11 @@
 use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 
 use cortexkit_bus_naming::AccountNames;
-use cortexkit_bus_trait::{Message, StreamCursor};
+use cortexkit_bus_trait::{ContentDigest, Message, StreamCursor};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::quota_bus::{content_digest_matches, CONTENT_DIGEST_HEADER};
 use crate::{broca_credentials::SharedBrocaCredentials, routing_v1, SharedQuotaCache, SharedStore};
 
 pub(crate) fn fact_subjects(names: &AccountNames) -> Vec<String> {
@@ -213,6 +214,28 @@ impl Handler {
         };
         if subject.version != 1 {
             return Ok(false);
+        }
+        if subject.event == "route_fact" {
+            // The adapter's Message.digest is computed locally, not supplied by the publisher.
+            let reason = match message.headers.get(CONTENT_DIGEST_HEADER) {
+                None => Some("content_digest_missing"),
+                Some(header) => match header.parse::<ContentDigest>() {
+                    Ok(digest) if content_digest_matches(body, digest) => None,
+                    _ => Some("content_digest_mismatch"),
+                },
+            };
+            if let Some(reason) = reason {
+                tracing::warn!(
+                    publisher = subject.module,
+                    subject = message.subject,
+                    message_id = message.id,
+                    reason,
+                    "route fact terminated"
+                );
+                cursor.term(Some(reason)).await.map_err(|e| e.to_string())?;
+                self.refused_publisher(&subject.module, &subject.event, subject.version);
+                return Ok(true);
+            }
         }
         if body.len() > 4096 {
             tracing::warn!(

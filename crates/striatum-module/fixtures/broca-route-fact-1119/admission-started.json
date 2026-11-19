@@ -1,0 +1,8 @@
+{
+  "body": "{\"op\":\"route.account_observe\",\"params\":{\"admission_id\":\"adm1\",\"caller\":{\"runner\":\"broca\"},\"event_id\":\"adm1:admission_started\",\"kind\":\"admission_started\",\"run_id\":\"run-1\"}}",
+  "headers": {
+    "Ck-Content-Digest": "5675a39b5a553a27bcd1bf82fca7ee55e3324cb64b2cb0e158086ad3d17d7470"
+  },
+  "nats_msg_id": "adm1:admission_started",
+  "subject": "ck.box_test.event.broca.route_fact.v1"
+}

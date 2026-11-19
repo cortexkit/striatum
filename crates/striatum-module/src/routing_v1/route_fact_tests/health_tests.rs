@@ -15,7 +15,7 @@ async fn fact_duplicate_keeps_last_apply_and_counts_publisher_not_reader_in_both
                 "ck.box_test.event.broca.route_fact.v1.striatum",
                 "finish-copy",
                 ContentDigest::of_bytes(&bytes),
-                Headers::new(),
+                digest_headers(ContentDigest::of_bytes(&bytes)),
             )
             .await
             .unwrap();

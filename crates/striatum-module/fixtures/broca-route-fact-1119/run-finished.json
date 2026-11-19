@@ -1,0 +1,8 @@
+{
+  "body": "{\"op\":\"route.account_observe\",\"params\":{\"admission_id\":\"adm1\",\"caller\":{\"runner\":\"broca\"},\"event_id\":\"adm1:run_finished\",\"headers\":{\"x-ratelimit-remaining-requests\":\"41\"},\"kind\":\"run_finished\",\"run_id\":\"run-1\",\"terminal_reason\":\"completed\",\"upstream_origin\":\"upstream\"}}",
+  "headers": {
+    "Ck-Content-Digest": "f82c2357f673ef81eb544040441c8611e2b8c1e6f2309227cf4de8c7bfe5ccb2"
+  },
+  "nats_msg_id": "adm1:run_finished",
+  "subject": "ck.box_test.event.broca.route_fact.v1"
+}

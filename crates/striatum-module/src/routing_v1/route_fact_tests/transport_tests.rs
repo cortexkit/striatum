@@ -134,7 +134,7 @@ async fn fact_invalid_unknown_publisher_and_oversized_bodies_terminated() {
                 &format!("ck.box_test.event.{module}.route_fact.v1"),
                 "invalid",
                 ContentDigest::of_bytes(&body),
-                Headers::new(),
+                digest_headers(ContentDigest::of_bytes(&body)),
             )
             .await
             .unwrap();
