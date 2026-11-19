@@ -100,7 +100,6 @@ impl AccountState {
         })
     }
 }
-
 /// Keyed SQL reads a pruning command makes to recompute a derived index whose
 /// source row it deleted. Counted apart from request-path reads, which the
 /// admission state must not need.
@@ -1476,7 +1475,8 @@ impl AccountCommand<'_> {
         }
         self.sql.sync_fence_rechecks()
     }
-    #[cfg(test)]
+    // Kept in production because generated block-state replay tests require it; only tests call it.
+    #[allow(dead_code)]
     pub(crate) fn prune_account_admissions(
         &mut self,
         before: i64,

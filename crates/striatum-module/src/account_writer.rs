@@ -112,7 +112,6 @@ pub(crate) fn clear_route_cooldowns(
         striatum_store::writer_entry_trace::enter("module_adapter::clear_route_cooldowns");
     store.clear_route_cooldowns(requested)
 }
-
 pub(crate) fn apply_fusiform_catalog_snapshot_for_providers(
     store: &SqliteRouteStateStore,
     facts: &[FusiformFactUpdate],
@@ -370,7 +369,8 @@ pub(crate) fn v1_record_selection(
         striatum_store::writer_entry_trace::enter("module_adapter::v1_record_selection");
     store.v1_record_selection(decision, selection_json)
 }
-#[cfg(test)]
+// Kept in production because generated block-state replay tests require it; only tests call it.
+#[allow(dead_code)]
 pub(crate) fn bind_fence_probe_owner(
     store: &SqliteRouteStateStore,
     from: &str,
