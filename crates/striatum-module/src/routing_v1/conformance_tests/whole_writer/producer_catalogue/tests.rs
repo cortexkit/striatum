@@ -12,6 +12,34 @@ const CALLBACK_BOUNDARIES: [(&str, &str); 3] = [
     ("account_repair", "module_adapter::repair"),
 ];
 
+// Selection grants directly to a decision. The focused handoff test checks the
+// branch of `AccountTx::bind_decision_probe` that moves an existing authorization
+// between owners. Routing does not persist a probe claim before the decision ID
+// exists, so only the focused test creates such a claim.
+const NATIVE_TRANSFER: &str = "account_tx::fence_rechecks::transfer_probe_authorization";
+
+pub(super) fn require_focused_transfer(
+    expected: &mut BTreeSet<String>,
+    observed: &BTreeSet<String>,
+) {
+    assert!(
+        expected.remove(NATIVE_TRANSFER),
+        "missing focused writer declaration: {NATIVE_TRANSFER}"
+    );
+    assert!(
+        !observed.contains(NATIVE_TRANSFER),
+        "routing replay exercised the focused handoff: {NATIVE_TRANSFER}"
+    );
+}
+
+pub(super) fn assert_focused_transfer_wrote(step: &[striatum_store::writer_entry_trace::Entry]) {
+    assert!(
+        step.iter().any(|entry| entry.name == NATIVE_TRANSFER
+            && entry.account_rows_written.is_some_and(|rows| rows > 0)),
+        "focused handoff did not write through {NATIVE_TRANSFER}: {step:?}"
+    );
+}
+
 pub(super) fn assert_reconciled(trace: &striatum_store::writer_entry_trace::Trace) {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../scripts/account-writer-entry-points.txt");

@@ -19,7 +19,6 @@ clear_credential_entitlement_fence
 clear_credential_entitlement_fences_for_credential
 clear_credential_entitlement_fences
 adopt_credential_entitlement_fingerprint
-bind_fence_probe_owner
 pool_acquire
 pool_acquire_for_route
 pool_renew

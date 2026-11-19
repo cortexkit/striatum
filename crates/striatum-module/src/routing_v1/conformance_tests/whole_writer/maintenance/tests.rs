@@ -1,13 +1,17 @@
 use super::*;
 use crate::account_writer as writer;
+use crate::retention::{RetentionWindows, ADMISSION_DELETE_BATCH_ROWS};
+
+const DAY_MS: i64 = 86_400_000;
 
 impl World {
     pub(super) fn maintenance_group(&mut self) {
-        self.delete_historical_pins();
-        let before = i64::try_from(self.now).unwrap() - 30 * 86_400_000;
         let now = i64::try_from(self.now).unwrap();
+        let before = now
+            - i64::try_from(RetentionWindows::default().account_selection_days).unwrap() * DAY_MS;
+        self.delete_historical_pins(before, now);
         self.adapter("retention/admissions", |store| {
-            writer::prune_account_admissions(store, before, 10, now)
+            writer::prune_account_admissions(store, before, ADMISSION_DELETE_BATCH_ROWS, now)
         });
         self.adapter("retention/pins", |store| {
             writer::prune_account_pins(store, before, 10)
@@ -47,16 +51,13 @@ impl World {
         self.command("retention/non-returning forms", move |tx| {
             striatum_store::AccountTx::tick(tx, now)?;
             striatum_store::AccountTx::release_expired_admission_probes(tx, now)?;
-            striatum_store::AccountTx::prune_account_admissions(tx, before, 10, now)?;
             striatum_store::AccountTx::prune_account_continuations(tx, before, 10)?;
             Ok(())
         });
     }
 
-    fn delete_historical_pins(&mut self) {
-        let now = i64::try_from(self.now).unwrap();
-        let at = now - 4 * 86_400_000;
-        let before = now - 2 * 86_400_000;
+    fn delete_historical_pins(&mut self, before: i64, now: i64) {
+        let at = before - 2 * DAY_MS;
         let first = self
             .catalog
             .accounts
@@ -64,7 +65,7 @@ impl World {
             .find(|row| row.provider == fixture::SUBSCRIPTION_PROVIDER)
             .unwrap();
         let (account, credential) = (first.account_id.clone(), first.credential_id.clone());
-        self.delete_unkeyed_admission(&account, &credential, at, before, now);
+        self.delete_one_admission(&account, &credential, at, before, now);
         let sequence = self.sequence;
         for index in 0..2 {
             let (pin, row) = crate::account_state::pinned_admission_for_route(
@@ -85,7 +86,7 @@ impl World {
         }
         assert_eq!(
             self.adapter("retention/delete two closed admissions", |store| {
-                writer::prune_account_admissions(store, before, 10, now)
+                writer::prune_account_admissions(store, before, ADMISSION_DELETE_BATCH_ROWS, now)
             }),
             2
         );
@@ -116,7 +117,7 @@ impl World {
         self.witness("retention_delete");
     }
 
-    fn delete_unkeyed_admission(
+    fn delete_one_admission(
         &mut self,
         account: &str,
         credential: &str,
@@ -126,7 +127,7 @@ impl World {
     ) {
         let (pin, row) = crate::account_state::pinned_admission_for_route(
             &format!("reserved:{}", fixture::RUNNER_ONE),
-            &format!("unkeyed-prune-{}", self.sequence),
+            &format!("retained-admission-{}", self.sequence),
             fixture::SUBSCRIPTION_PROVIDER,
             "model-c",
             account,
@@ -135,36 +136,36 @@ impl World {
         );
         let principal = row.principal.clone();
         let admission = row.admission_id.clone();
-        self.command("retention/unkeyed finished admission input", move |tx| {
+        self.command("retention/old finished admission input", move |tx| {
             tx.insert_pin(&pin)?;
             tx.insert_admission(&row)?;
             assert!(tx.mark_admission_finished(&row.principal, &row.admission_id, at + 1)?);
             Ok(())
         });
-        // The adapter deletes preselected row identities. This facade selects
-        // eligible rows itself, so give it a real deletion rather than a no-op.
+        let first_entry = self.trace.entries().len();
         assert_eq!(
-            self.command("retention/unkeyed admission facade", move |tx| {
-                tx.prune_account_admissions(before, 1, now)
+            self.adapter("retention/delete one reader-planned admission", |store| {
+                writer::prune_account_admissions(store, before, 1, now)
             }),
             1
         );
-        self.command("retention/unkeyed target is gone", move |tx| {
+        self.assert_writes_since(
+            first_entry,
+            &[
+                "module_adapter::prune_account_admissions",
+                "account_command::delete_account_admissions",
+                "account_tx::retention::delete_account_admissions_returning",
+            ],
+        );
+        self.command("retention/planned admission is gone", move |tx| {
             assert!(tx.admission(&principal, &admission)?.is_none());
             Ok(())
         });
         assert_eq!(
-            self.adapter("retention/remove the unkeyed witness pin", |store| {
+            self.adapter("retention/remove the witness pin", |store| {
                 writer::prune_account_pins(store, before, 1)
             }),
             1
-        );
-        assert!(
-            self.trace.entries().iter().any(|entry| {
-                entry.name == "account_command::prune_account_admissions"
-                    && entry.account_rows_written.is_some_and(|rows| rows > 0)
-            }),
-            "the actual unkeyed facade must delete durable rows"
         );
     }
 }

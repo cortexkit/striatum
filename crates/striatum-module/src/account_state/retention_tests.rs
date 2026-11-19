@@ -91,6 +91,14 @@ fn retention_checks_open_windows_independently_of_the_cutoff() {
     let cutoff = T + 4 * MINUTE;
     assert_eq!(
         run(&store, T + 30_000, move |tx| {
+            striatum_store::AccountTx::prune_account_admissions(tx, cutoff, 100, T + 30_000)
+        })
+        .unwrap(),
+        0,
+        "the native count-only form must also respect an open window"
+    );
+    assert_eq!(
+        run(&store, T + 30_000, move |tx| {
             tx.prune_account_admissions(cutoff, 100, T + 30_000)
         })
         .unwrap(),

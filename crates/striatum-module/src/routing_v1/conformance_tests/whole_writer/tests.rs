@@ -320,6 +320,18 @@ impl World {
         result
     }
 
+    fn assert_writes_since(&self, first_entry: usize, producers: &[&str]) {
+        let entries = self.trace.entries();
+        let step = &entries[first_entry..];
+        for producer in producers {
+            assert!(
+                step.iter().any(|entry| entry.name == *producer
+                    && entry.account_rows_written.is_some_and(|rows| rows > 0)),
+                "step did not write through {producer}: {step:?}"
+            );
+        }
+    }
+
     async fn request_group(&mut self, draw: u8, nonce: u64) {
         let key = format!("generated-{nonce}-{}", self.sequence);
         let subscription = format!("{}/model-c", fixture::SUBSCRIPTION_PROVIDER);
@@ -605,6 +617,7 @@ fn assert_all_producers_driven(trace: &striatum_store::writer_entry_trace::Trace
         .into_iter()
         .map(|entry| entry.name.to_owned())
         .collect();
+    producer_catalogue::require_focused_transfer(&mut expected, &observed);
     let missing = expected.difference(&observed).collect::<Vec<_>>();
     assert!(
         missing.is_empty(),
@@ -686,7 +699,7 @@ async fn generated_request_groups_compare_all_state_after_every_real_step() {
             stringify!(generated_request_groups_compare_all_state_after_every_real_step),
             |_| {},
         );
-        assert_eq!((seeds, groups, states), (6, 264, 6_619));
+        assert_eq!((seeds, groups, states), (6, 264, 6_547));
         println!("compared {states} whole states across {seeds} seeds and {groups} generated request groups");
         return;
     };

@@ -1018,6 +1018,7 @@ impl SqliteRouteStateStore {
             .map_err(err)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn bind_fence_probe_owner(&self, from: &str, to: &str) -> RouteStateResult<()> {
         let from = from.to_owned();
         let to = to.to_owned();
@@ -4082,10 +4083,8 @@ mod tests {
 }
 
 impl crate::AccountTx<'_> {
+    #[cfg(any(test, feature = "test-support"))]
     pub fn bind_fence_probe_owner(&self, from: &str, to: &str) -> RouteStateResult<()> {
-        #[cfg(any(test, feature = "test-support"))]
-        let _writer_entry =
-            crate::writer_entry_trace::enter("account_tx::fence_rechecks::bind_fence_probe_owner");
         self.command_scope(|tx| {
             tx.transfer_probe_authorization(from, to)?;
             tx.conn
