@@ -645,6 +645,7 @@ pub(super) struct RequestInputs {
     pub(super) operator_config: std::sync::Arc<config_overrides::LiveConfig>,
     pub(super) catalog_snapshot: std::sync::Arc<striatum_store::CatalogFactsSnapshot>,
     pub(super) efforts: effort_preview::Efforts,
+    pub(super) pacing: striatum_core::subscription::PacingRule,
     facts: Vec<ModelFact>,
     pub(super) catalog_targets: std::collections::BTreeMap<String, String>,
     policy_memo: std::sync::Arc<config_overrides::SelectionPolicyMemo>,
@@ -692,6 +693,7 @@ impl RequestInputs {
                 models: catalog_snapshot.efforts.clone(),
                 workloads: Default::default(),
             },
+            pacing: Default::default(),
             catalog_snapshot,
             facts,
             catalog_targets,
@@ -747,6 +749,7 @@ impl RequestInputs {
             &self.facts,
             now as i64,
             self.live_config.pricing(),
+            self.pacing,
         );
         let quota_signal_json = crate::select::quota_signal_json(
             &snapshot,

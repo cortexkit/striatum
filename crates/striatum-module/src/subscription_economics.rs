@@ -19,7 +19,8 @@ use striatum_core::{
     model_facts::{make_capacity_key, RoutePricing},
     model_router::ModelRouteStateSnapshot,
     subscription::{
-        MeasuredValue, QuotaAccount, SubscriptionPlan, SubscriptionPool, DEFAULT_PLAN_FEE_USD,
+        MeasuredValue, PacingRule, QuotaAccount, SubscriptionPlan, SubscriptionPool,
+        DEFAULT_PLAN_FEE_USD,
     },
     ModelFact,
 };
@@ -661,12 +662,13 @@ pub(crate) fn overlay(
     facts: &[ModelFact],
     now: i64,
     pricing: &RoutePricing,
+    pacing: PacingRule,
 ) {
     let pools = cache()
         .lock()
         .map(|c| c.economics.pools.clone())
         .unwrap_or_default();
-    overlay_pools(pools, snapshot, facts, now, pricing);
+    overlay_pools(pools, snapshot, facts, now, pricing, pacing);
 }
 
 #[cfg(test)]
@@ -703,6 +705,7 @@ fn overlay_pools(
     facts: &[ModelFact],
     now: i64,
     pricing: &RoutePricing,
+    pacing: PacingRule,
 ) {
     for fact in facts {
         let pool = pools
@@ -718,6 +721,7 @@ fn overlay_pools(
     for (provider, pool) in pools.iter_mut() {
         pool.keep_free_percent = pricing.keep_free_percent(provider);
         pool.banked_as_capacity = pricing.banked_resets_capacity.contains(provider);
+        pool.pacing = pacing;
         let elapsed = (now - pool.now_ms).max(0) as f64 / 3_600_000.0;
         for plan in &mut pool.plans {
             if elapsed > 0.25 {
@@ -1173,7 +1177,14 @@ mod tests {
         }))
         .unwrap();
         fact.subscription_multiplier = operator;
-        overlay_pools(pools, &mut snapshot, &[fact.clone()], now, &pricing);
+        overlay_pools(
+            pools,
+            &mut snapshot,
+            &[fact.clone()],
+            now,
+            &pricing,
+            PacingRule::Max,
+        );
         select_model_route(SelectModelRouteInput {
             target_agent: "alfonso".into(),
             target_is_head: true,
@@ -1744,6 +1755,7 @@ mod tests {
                     &[fact.clone()],
                     now,
                     &pricing,
+                    PacingRule::Max,
                 );
                 let selected = select_model_route(SelectModelRouteInput {
                     target_agent: "mason".into(),
@@ -2041,7 +2053,7 @@ mod tests {
         .unwrap()];
         let mut snapshot = ModelRouteStateSnapshot::default();
 
-        overlay_pools(pools, &mut snapshot, &facts, NOW, &pricing);
+        overlay_pools(pools, &mut snapshot, &facts, NOW, &pricing, PacingRule::Max);
 
         // Under the selection's reserve anthropic has no free headroom, so the
         // nearly spent openai plan may fall back on its banked resets. Judged on

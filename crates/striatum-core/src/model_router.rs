@@ -255,6 +255,14 @@ pub struct TaskRoutePricing {
     pub value_multiplier: f64,
     pub value_source: String,
     pub pressure: f64,
+    /// Subscription pacing inputs needed to recompute this price. Metered
+    /// routes leave all three absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pacing: Option<crate::subscription::PacingRule>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub weekly_pressure: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub short_window_pressure: Option<f64>,
     pub final_cost_usd: Option<f64>,
     pub normalized_cost: f64,
     pub omitted_dimensions: Vec<String>,
@@ -1479,6 +1487,15 @@ fn compute_profile_objective(
         value_multiplier,
         value_source,
         pressure,
+        pacing: objective.subscription_pricing.as_ref().map(|p| p.pacing),
+        weekly_pressure: objective
+            .subscription_pricing
+            .as_ref()
+            .map(|p| p.weekly_pressure),
+        short_window_pressure: objective
+            .subscription_pricing
+            .as_ref()
+            .and_then(|p| p.short_window_pressure),
         final_cost_usd,
         normalized_cost: cost,
         omitted_dimensions,
@@ -1549,6 +1566,15 @@ fn record_cold_start_pricing(
             "cold-start effective rate".to_string()
         },
         pressure,
+        pacing: objective.subscription_pricing.as_ref().map(|p| p.pacing),
+        weekly_pressure: objective
+            .subscription_pricing
+            .as_ref()
+            .map(|p| p.weekly_pressure),
+        short_window_pressure: objective
+            .subscription_pricing
+            .as_ref()
+            .and_then(|p| p.short_window_pressure),
         final_cost_usd: (!objective.price_unknown).then_some(objective.cost * reference),
         normalized_cost: objective.cost,
         omitted_dimensions: Vec::new(),

@@ -759,6 +759,7 @@ async fn what_if_rejects_invalid_params_before_snapshotting() {
         json!({"pricing_patch":{"overqualification":{"mode":"cost_scaled"}}}),
         json!({"pricing_patch":{"banked_resets":{"openai":"other"}}}),
         json!({"pricing_patch":{"banked_resets":{"bad/provider":"capacity"}}}),
+        json!({"pacing":"max"}),
     ] {
         let mut params = json!({"consumer":fixture::SUMMARY,"iqs":[50]});
         params

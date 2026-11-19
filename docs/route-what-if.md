@@ -115,6 +115,12 @@ only narrow the runner's admitted pairs.
   most specific matching entry replaces the consumer's configured workload for
   this call only. An unknown workload is treated as none. Head picks do not use
   a workload.
+* `pacing`: optional `"expiry"`. This previews weekly plan pressure, raised by
+  a short-window pool only when its pooled remaining share is below 25%. The
+  current rule, which always takes the higher of weekly and short-window
+  pressure, remains the live rule and the default for this operation. Omission
+  also retains the existing `task_pricing` response shape; the flag adds the
+  pricing inputs described below so the preview can be replayed.
 * `pricing_patch`: optional object with only `overqualification` and
   `banked_resets`. `overqualification` is the mode string `"additive"` or
   `"cost_scaled"`; `banked_resets` maps provider ids to `"emergency"` or
@@ -136,7 +142,7 @@ only narrow the runner's admitted pairs.
   the top-level `runner` is given. Unknown members are rejected.
 
 Consumer policy, global exclusions, configured service tiers, grades, pricing
-(except the explicit request-local `pricing_patch`),
+(except the explicit request-local `pricing_patch` and `pacing`),
 runner availability and account eligibility all remain in force. As with
 `route.select`, an operator-configured consumer IQ/EQ overrides request demand;
 the returned `bar` is the effective demand bar, not an independently calculated
@@ -191,6 +197,12 @@ is available. It is
 `null` for unknown prices or cold-start message/million-output-token pricing:
 those units must not be presented as a task estimate. `normalized_cost` remains
 the scorer's actual comparison cost, before quota and overqualification terms.
+Each adequate candidate's `task_pricing` contains the arithmetic behind that
+estimate. With `pacing: "expiry"`, subscription entries also contain `pacing`,
+`weeklyPressure`, and `shortWindowPressure` when a short-window pool
+participates. `pressure` is the weekly value or the greater of the weekly and
+participating short-window values. Stored live decisions carry the same inputs,
+with `pacing: "max"` identifying the current rule.
 
 A refused row has `pick: null` and `refusal: {code, detail}`; the other fields
 remain present. If selection stops before model admission (for example no

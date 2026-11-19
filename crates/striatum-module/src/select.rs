@@ -338,7 +338,13 @@ pub(super) fn prepare_selection_inputs_for_sweep(
     if let Some(windows) = quota_windows.as_ref().filter(|_| stale_age_ms.is_none()) {
         merge_quota_overlay(&mut snapshot, windows, &facts, model_pools);
     }
-    subscription_economics::overlay(&mut snapshot, &facts, now as i64, pricing);
+    subscription_economics::overlay(
+        &mut snapshot,
+        &facts,
+        now as i64,
+        pricing,
+        striatum_core::subscription::PacingRule::Max,
+    );
     let quota_signal_json = quota_signal_json(
         &snapshot,
         &QuotaSignalView {

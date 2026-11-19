@@ -31,6 +31,13 @@ struct Params {
     head_choices: Option<Value>,
     panel: Option<PanelParams>,
     workloads: Option<BTreeMap<String, String>>,
+    pacing: Option<Pacing>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Pacing {
+    Expiry,
 }
 
 /// A dry-run panel. Member values are passed to `route.select_panel`'s own
@@ -186,6 +193,10 @@ pub(super) async fn what_if_with_profile_lookup(
     let accounts = crate::account_selection::Sweep::capture(deps.store).map_err(store_refusal)?;
     let mut inputs =
         select::RequestInputs::read_with_config(&deps, live.clone(), operator.clone())?;
+    let pacing_preview = params.pacing.is_some();
+    inputs.pacing = params.pacing.map_or(Default::default(), |_| {
+        striatum_core::subscription::PacingRule::Expiry
+    });
     inputs.efforts.workloads = params.workloads.unwrap_or_default();
     let concurrency = concurrency::Snapshot::from_snapshot(
         &deps,
@@ -219,7 +230,18 @@ pub(super) async fn what_if_with_profile_lookup(
             effort_diagnostics: Mutex::new(Default::default()),
         };
         let result = select::evaluate(&request, caller, &deps, &view, profile_lookup).await;
-        let evidence = view.evidence.into_inner().unwrap();
+        let mut evidence = view.evidence.into_inner().unwrap();
+        if !pacing_preview {
+            // The unflagged preview keeps its established response shape. Live
+            // decision records retain the pacing inputs under both rules.
+            for candidate in &mut evidence.adequate {
+                if let Some(pricing) = &mut candidate.task_pricing {
+                    pricing.pacing = None;
+                    pricing.weekly_pressure = None;
+                    pricing.short_window_pressure = None;
+                }
+            }
+        }
         let effort_diagnostics = view.effort_diagnostics.into_inner().unwrap();
         let minimum_unverified_count = {
             // The count describes candidates that reached the quality check,
