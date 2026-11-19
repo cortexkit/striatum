@@ -297,8 +297,9 @@ async fn session(client: &BusClient) -> Result<(), String> {
             biased;
             changed = changes.changed() => {
                 changed.map_err(|_| "bus credential maintenance stopped".to_owned())?;
-                // A fresh watch starts at LastPerSubject, not the SDK's resumable
-                // revision, so a new binding replaces the entire in-memory map.
+                // A fresh watch starts from the latest value of every key, not
+                // from the SDK's resumable revision, so a new binding replaces
+                // the entire in-memory map.
                 return Ok(());
             }
             _ = health.tick() => {

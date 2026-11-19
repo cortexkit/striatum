@@ -4,8 +4,8 @@ CREATE INDEX pool_key_lease_live_by_expiry
   WHERE released_at IS NULL;
 
 -- When a run used an offer to switch accounts, retention checks the
--- predecessor reservation and started admissions of that run without
--- scanning the principal's entire history.
+-- predecessor reservation and the run's admissions still in progress
+-- (state 'started') without scanning the principal's entire history.
 CREATE INDEX account_continue_by_reservation
   ON account_continue (principal, reservation_id)
   WHERE reservation_id IS NOT NULL;
