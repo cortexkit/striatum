@@ -13,6 +13,7 @@ use serde_json::{json, Value};
 use super::conformance_tests::{install_catalog, reserved, Harness, Route};
 use super::dispatch_tests::configured;
 
+#[path = "replay_tests/effort_delta_tests.rs"]
 mod effort_delta;
 pub(super) use effort_delta::cleared_catalog_fingerprint;
 
