@@ -13,8 +13,9 @@ pub(in crate::routing_v1) fn cleared_catalog_fingerprint(harness: &Harness) -> S
 }
 
 /// Apply named deltas to the independent historical state, never to the live
-/// observation. The path lists identify exact decision rows; newly captured
-/// rows cannot opt themselves into an exception.
+/// observation. Only the decision rows listed in the delta file receive these
+/// changes; a row the replay captures that isn't on the list is compared
+/// unchanged.
 pub(super) fn apply(file: &str, expected: &mut Value, fingerprint: &str) {
     let (paths, old_fingerprint, elo, eq) = match file {
         "availability" => (

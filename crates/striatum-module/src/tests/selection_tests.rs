@@ -400,8 +400,9 @@ async fn n_pick_wire_matches_policy_fixture_and_decision_explanation() {
         .unwrap()
         .replace("$decisionID", decision_id);
     let mut expected: serde_json::Value = serde_json::from_str(&expected).unwrap();
-    // The archived Sol Pro row has no catalog effort facts; the old seed's
-    // xhigh prompt default must no longer appear in the legacy panel reply.
+    // The archived Sol Pro row has no catalog effort facts, so the xhigh
+    // default routing once stored with the model must no longer appear in the
+    // legacy panel reply.
     let removed_effort_delta = [(
         "/result/members/0/promptParams",
         "openai/gpt-5.6-sol-pro",
@@ -665,7 +666,8 @@ async fn select_panel_serves_full_contract_shape() {
         "wire keys stay camelCase"
     );
     assert_eq!(result["members"][0]["temperature"], 0.2);
-    // The seed-only panel fixture has no catalog effort default for its seat.
+    // This panel fixture has no catalog effort facts for its seat, so the seat
+    // runs with no named effort.
     let removed_effort_delta = ["/members/0/promptParams/variant"];
     for path in removed_effort_delta {
         assert!(result.pointer(path).is_none(), "{path}: {result}");
