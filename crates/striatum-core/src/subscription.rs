@@ -78,8 +78,8 @@ pub struct QuotaAccount {
     /// True if any non-weekly live window prevents sending on the account.
     pub short_walled: bool,
     pub short_windows: Vec<QuotaConstraint>,
-    /// A named model scope has its own constraint. `None` means a retained
-    /// reading for that scope has already reached its reset.
+    /// A named model scope has its own constraint. `None` means the last known
+    /// reading is past its reset and cannot establish fresh headroom.
     pub scoped_windows: Vec<(&'static str, Option<QuotaConstraint>)>,
     pub banked_resets: u32,
     pub banked_expires_at_ms: Option<i64>,
