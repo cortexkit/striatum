@@ -219,7 +219,7 @@ participating short-window values. Stored live decisions carry the same inputs,
 with `pacing: "max"` identifying the current rule.
 In a quota override sweep, a pick with subscription pricing also has
 `subscription_plan: {provider, plan, tier}`. `plan` is the exact name when the
-priced tier identifies one unambiguously; either plan field can be null.
+priced tier identifies one unambiguously; `plan` and `tier` can each be null.
 
 A refused row has `pick: null` and `refusal: {code, detail}`; the other fields
 remain present. If selection stops before model admission (for example no

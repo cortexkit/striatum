@@ -22,8 +22,8 @@ impl QuotaOverride {
             .get()
             .and_then(|quota| quota.lock().ok().map(|quota| quota.clone()))
             .unwrap_or_default();
-        // Keep today's roster and identity joins, but never keep a live quota
-        // reading for an account omitted from the override.
+        // Keep today's accounts and their account-to-credential mappings, but
+        // never keep a live quota reading for an account the override omits.
         state.readings = Default::default();
         for (index, raw) in entries.iter().enumerate() {
             let entry: AccountEntry = serde_json::from_value(raw.clone())
