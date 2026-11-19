@@ -82,8 +82,9 @@ credentials. The script does not overwrite artifacts.
   and coverage before treating the sweep as representative.
 - Plan moves use the exact returned subscription plan name when the priced
   tier identifies one, and provider/tier otherwise. The wall proxy groups by
-  provider/tier (the account checkpoints do not retain the exact historical
-  Astrocyte plan join) and weekly reset timestamp. It fits the median and
+  provider/tier (the account checkpoints do not retain the exact plan names
+  that subscription pricing joins from the value report) and weekly reset
+  timestamp. It fits the median and
   shows the min/max of observed weekly percentage-point rises per served
   admission on each account-day. It deduplicates admission IDs, uses only
   within-reset intervals, and skips account-days where several weekly meters
@@ -92,9 +93,9 @@ credentials. The script does not overwrite artifacts.
   headroom, not by a simulated account allocator. Reported first walls mean
   the first sampled slot whose proxy headroom reached zero; they do not
   estimate within-slot timing or simulate the routing response to an early
-  wall. Missing rates and unmatched cohorts stay unknown. Today’s runner
-  availability, consumer policy, pins, fences and profile refreshes can all
-  differ from those of the recorded decisions.
+  wall. Missing rates and unmatched cohorts stay unknown. Today's runner
+  availability, consumer policy, fixed-route preferences, account restrictions
+  and task profiles can all differ from those of the recorded decisions.
 
 For a synthetic fixture with banked sensitivity, normalized consumers and a
 known pressure mismatch, run:

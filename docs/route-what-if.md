@@ -127,9 +127,9 @@ only narrow the runner's admitted pairs.
   names an `account` or `credentialRef` and may carry `usage`, `fetchedAt`,
   `stale`, `spend` and `savedResets`). It replaces the quota readings used by
   the IQ sweep and panel evaluations; an empty list supplies no readings.
-  Current account identities, live operational fences, catalog, task profiles
-  and subscription value evidence still apply. The concurrency report is the
-  current concurrency snapshot, not a historical one.
+  Current account identities, restrictions from provider refusals or cooldowns,
+  catalog, task profiles and subscription value evidence still apply. The
+  concurrency report is the current concurrency snapshot, not a historical one.
 * `quota_override_at_ms`: optional nonnegative Unix millisecond quota time no
   later than now, accepted only with `quota_override`. Defaults to the call's
   current time. Quota reading age, reset countdowns and banked credit expiry
