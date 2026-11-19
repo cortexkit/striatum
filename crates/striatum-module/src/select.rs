@@ -1186,7 +1186,8 @@ pub(crate) fn runner_for_route(
         message: refusal.message,
     })?;
     if let Some(owner) = owner {
-        crate::account_writer::bind_fence_probe_owner(store, &grant.lease_id, owner)
+        store
+            .bind_fence_probe_owner(&grant.lease_id, owner)
             .map_err(LaunchRefusal::store)?;
     }
     Ok((grant.runner.clone(), Some(grant)))

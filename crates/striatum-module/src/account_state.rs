@@ -1475,17 +1475,13 @@ impl AccountCommand<'_> {
         }
         self.sql.sync_fence_rechecks()
     }
-    // Kept in production because generated block-state replay tests require it; only tests call it.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn prune_account_admissions(
         &mut self,
         before: i64,
         limit: usize,
         now_ms: i64,
     ) -> RouteStateResult<usize> {
-        #[cfg(test)]
-        let _writer_entry =
-            striatum_store::writer_entry_trace::enter("account_command::prune_account_admissions");
         let deleted = self
             .sql
             .prune_account_admissions_returning(before, limit, now_ms)?;

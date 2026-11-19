@@ -8,6 +8,7 @@ pub(crate) fn rebind_claim_owner_sql() -> String {
     )
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn bind_claim_owner_sql() -> String {
     format!(
         "UPDATE block SET claim_owner=?2 WHERE {} AND is_origin=1 AND managed=1 AND claim_owner=?1",

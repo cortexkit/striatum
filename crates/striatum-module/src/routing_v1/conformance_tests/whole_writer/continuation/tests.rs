@@ -34,11 +34,51 @@ impl World {
         let original = format!("continued-original-{nonce}-{}", self.sequence);
         let reservation = format!("continued-reservation-{nonce}-{}", self.sequence);
         let run = format!("run-{original}");
-        self.ok(Caller::Runner,"route.account_for",json!({"provider":provider,"model":"model-c","conversation_key":original,"admission_id":original,"requested_account":{"account_id":accounts[0]}})).await;
+        let first_entry = self.trace.entries().len();
+        let admitted = self.ok(Caller::Runner,"route.account_for",json!({"provider":provider,"model":"model-c","conversation_key":original,"admission_id":original,"decision_id":previous,"service_tier":"standard","requested_account":{"account_id":accounts[0]}})).await;
+        // The trace counts changes to allocator state, not updates to the
+        // recorded decisions. Check the calls and read back their values.
+        let entries = self.trace.entries();
+        let step = &entries[first_entry..];
+        for producer in [
+            "account_tx::account_selection::bind_model_account",
+            "account_tx::account_selection::record_account_service_tier",
+        ] {
+            assert!(
+                step.iter()
+                    .any(|entry| entry.name == producer && entry.account_rows_written.is_some()),
+                "decision-linked admission did not reach {producer}: {step:?}"
+            );
+        }
+        let store = self.harness.store();
+        let identity = store
+            .decision_provider_identity(&previous)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            identity.account_ref,
+            admitted["account"]["account_id"].as_str().unwrap()
+        );
+        assert_eq!(
+            identity.credential_id.as_deref(),
+            admitted["account"]["credential_id"].as_str()
+        );
         let now = i64::try_from(self.now).unwrap();
         let (p, a, r) = (principal.clone(), original.clone(), run.clone());
-        assert!(self.command("continuation/start original run", move |tx| tx
-            .mark_admission_started(&p, &a, Some(&r), now, false)));
+        let account_decision = self.command("continuation/start original run", move |tx| {
+            let admission = tx
+                .admission(&p, &a)?
+                .expect("the original admission was issued");
+            assert!(tx.mark_admission_started(&p, &a, Some(&r), now, false)?);
+            Ok(admission.decision_id)
+        });
+        assert_eq!(
+            self.harness
+                .store()
+                .account_decision_service_tier(&account_decision)
+                .unwrap(),
+            Some((Some("standard".into()), "standard".into()))
+        );
         self.ok(Caller::Runner,"route.account_for",json!({"provider":provider,"model":"model-c","conversation_key":reservation,"admission_id":reservation,"requested_account":{"account_id":accounts[1]}})).await;
         let (p, a) = (principal.clone(), reservation.clone());
         let reserved = self

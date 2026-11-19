@@ -369,18 +369,7 @@ pub(crate) fn v1_record_selection(
         striatum_store::writer_entry_trace::enter("module_adapter::v1_record_selection");
     store.v1_record_selection(decision, selection_json)
 }
-// Kept in production because generated block-state replay tests require it; only tests call it.
-#[allow(dead_code)]
-pub(crate) fn bind_fence_probe_owner(
-    store: &SqliteRouteStateStore,
-    from: &str,
-    to: &str,
-) -> RouteStateResult<()> {
-    #[cfg(test)]
-    let _writer_entry =
-        striatum_store::writer_entry_trace::enter("module_adapter::bind_fence_probe_owner");
-    store.bind_fence_probe_owner(from, to)
-}
+
 pub(crate) fn prune_account_admissions(
     store: &SqliteRouteStateStore,
     before: i64,

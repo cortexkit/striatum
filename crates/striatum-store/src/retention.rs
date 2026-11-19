@@ -857,31 +857,26 @@ impl crate::AccountTx<'_> {
         })
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn prune_account_admissions(
         &self,
         before: i64,
         limit: usize,
         now_ms: i64,
     ) -> RouteStateResult<usize> {
-        #[cfg(any(test, feature = "test-support"))]
-        let _writer_entry =
-            crate::writer_entry_trace::enter("account_tx::retention::prune_account_admissions");
         self.prune_account_admissions_returning(before, limit, now_ms)
             .map(|deleted| deleted.len())
     }
 
-    /// The same retention delete, returning each deleted row's identity so the
-    /// module's in-memory admission indexes can drop exactly those rows.
+    /// Compare unkeyed eligibility against the keyed retention path, including
+    /// the identities of rows the module's in-memory indexes must forget.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn prune_account_admissions_returning(
         &self,
         before: i64,
         limit: usize,
         now_ms: i64,
     ) -> RouteStateResult<Vec<crate::PrunedAdmission>> {
-        #[cfg(any(test, feature = "test-support"))]
-        let _writer_entry = crate::writer_entry_trace::enter(
-            "account_tx::retention::prune_account_admissions_returning",
-        );
         self.prune_admission_rows(before, limit, now_ms, None)
     }
 
