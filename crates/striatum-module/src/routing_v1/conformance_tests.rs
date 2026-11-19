@@ -1181,18 +1181,20 @@ impl RoutingSubject for KitSubject {
             config["consumers"] = consumers
                 .iter()
                 .map(|consumer| {
-                    (
-                        consumer.id.clone(),
-                        json!({
-                            "owner": (consumer.id == fixture::SUMMARY).then_some(fixture::CONSUMER),
-                            "pay_per_token": consumer.priced_only,
-                            "iq": consumer.requirements.iq,
-                            "eq": consumer.requirements.defaults.eq,
-                            "context_tokens": consumer.requirements.defaults.context_window,
-                            "max_output_tokens": consumer.requirements.defaults.max_output_tokens,
-                            "tool_capabilities": consumer.requirements.defaults.tool_capabilities,
-                        }),
-                    )
+                    let mut policy = json!({
+                        "owner": (consumer.id == fixture::SUMMARY).then_some(fixture::CONSUMER),
+                        "pay_per_token": consumer.priced_only,
+                        "iq": consumer.requirements.iq,
+                        "eq": consumer.requirements.defaults.eq,
+                        "context_tokens": consumer.requirements.defaults.context_window,
+                        "max_output_tokens": consumer.requirements.defaults.max_output_tokens,
+                        "tool_capabilities": consumer.requirements.defaults.tool_capabilities,
+                    });
+                    policy
+                        .as_object_mut()
+                        .unwrap()
+                        .retain(|_, value| !value.is_null());
+                    (consumer.id.clone(), policy)
                 })
                 .collect::<serde_json::Map<String, Value>>()
                 .into();
