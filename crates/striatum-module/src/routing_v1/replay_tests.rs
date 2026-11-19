@@ -13,6 +13,9 @@ use serde_json::{json, Value};
 use super::conformance_tests::{install_catalog, reserved, Harness, Route};
 use super::dispatch_tests::configured;
 
+mod effort_delta;
+pub(super) use effort_delta::cleared_catalog_fingerprint;
+
 const NOW: i64 = 1_800_000_000_000;
 const ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/replay");
 
@@ -107,6 +110,7 @@ async fn replay(file: &str) {
     let corpus: Corpus = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     assert!(!corpus.cases.is_empty(), "{} has no cases", path.display());
     let mut observations = Vec::new();
+    let mut fingerprint = None;
     for case in corpus.cases {
         assert!(
             !case.body_source.is_empty(),
@@ -140,6 +144,11 @@ async fn replay(file: &str) {
         if !case.config.is_null() {
             harness.edit_config(|config| merge(config, &case.config));
         }
+        if file == "report-outcomes" {
+            let digest = cleared_catalog_fingerprint(&harness);
+            assert_eq!(digest, "fdf01bf739c43b32");
+            fingerprint = Some(digest);
+        }
         let runner = harness.bind(reserved(fixture::RUNNER_ONE), None).await;
         let mut bindings = BTreeMap::from([("$consumer".into(), json!(fixture::SUMMARY))]);
         let mut steps = Vec::new();
@@ -168,10 +177,18 @@ async fn replay(file: &str) {
             .push(json!({"name": case.name, "body_source": case.body_source, "steps": steps}));
     }
     let observed = json!({"clock_ms": NOW, "cases": observations});
-    assert_or_record(file, observed);
+    assert_or_record_with_fingerprint(file, observed, fingerprint.as_deref());
 }
 
-pub(crate) fn assert_or_record(file: &str, mut observed: Value) {
+pub(crate) fn assert_or_record(file: &str, observed: Value) {
+    assert_or_record_with_fingerprint(file, observed, None);
+}
+
+pub(super) fn assert_or_record_with_fingerprint(
+    file: &str,
+    mut observed: Value,
+    fingerprint: Option<&str>,
+) {
     let native_frames = native_state::capture_for_comparison(file, &observed);
     let golden = Path::new(ROOT).join(format!("{file}.golden.json"));
     if std::env::var_os("PREFRONTAL_RECORD_ROUTING_REPLAY").is_some()
@@ -250,6 +267,21 @@ pub(crate) fn assert_or_record(file: &str, mut observed: Value) {
         }
         if let Some(frames) = native_frames {
             frames.restore_after_wire_projection(&mut observed, &mut expected);
+            effort_delta::apply(
+                file,
+                &mut expected,
+                fingerprint.expect("frozen state replay needs its catalog fingerprint"),
+            );
+        }
+        if file == "availability" {
+            for state in ["after_select", "state"] {
+                let rows = observed["cases"][7]["launches"][2][state]["model_route_decisions"]
+                    .as_array()
+                    .unwrap();
+                assert_eq!(rows.iter().map(|row| row["id"].as_str().unwrap()).collect::<Vec<_>>(),
+                    ["dec_000000000001", "dec_000000000002", "dec_000000000003", "dec_000000000000"],
+                    "catalog effort metadata must not reorder capacity-exhausted decisions in {state}");
+            }
         }
         assert!(
             observed == expected,
@@ -1002,6 +1034,7 @@ fn replay_budget_limits() {
 #[tokio::test]
 async fn replay_availability_cases() {
     let mut cases = Vec::new();
+    let mut fingerprint = None;
     for scenario in [
         "available",
         "route-cooldown",
@@ -1020,6 +1053,9 @@ async fn replay_availability_cases() {
         let _clock = crate::InjectedClock::set(NOW as u64);
         let _inputs = striatum_store::replay::Inputs::new(NOW).install();
         let (harness, route) = configured().await;
+        let digest = cleared_catalog_fingerprint(&harness);
+        assert_eq!(digest, "fdf01bf739c43b32");
+        fingerprint = Some(digest);
         let _state_write_audit = audit_state_writes(&harness, &format!("availability-{scenario}"));
         let key = "example-subscription/model-c";
         let affinity_request = json!({"consumer":fixture::SUMMARY,"requirements":{"iq":50},"affinity":"existing-live-affinity"});
@@ -1151,10 +1187,11 @@ async fn replay_availability_cases() {
     if std::env::var_os("PREFRONTAL_RECORD_ROUTING_PUBLIC_AVAILABILITY").is_some() {
         return;
     }
-    assert_or_record(
+    assert_or_record_with_fingerprint(
         "availability",
         json!({"clock_ms":NOW,
         "body_source":"routing_v1/select_options_tests.rs pin/fallback bodies; core::route_is_cooled; explicit policy probes for each availability-table cause",
-        "cases":cases}),
+         "cases":cases}),
+        fingerprint.as_deref(),
     );
 }

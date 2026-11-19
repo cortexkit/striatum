@@ -184,20 +184,6 @@ impl Choice {
     pub fn apply_selection(&self, selected: &mut striatum_core::SelectedModelRoute) {
         selected.prompt_params.variant = self.variant.clone();
         selected.prompt_params.reasoning_effort = None;
-        selected.explanation.push(format!(
-            "Reasoning effort {} from {}; Elo grade at {}, EQ grade at {}",
-            self.variant.as_deref().unwrap_or("(none)"),
-            match self.effort_source {
-                Source::Pin => "the pin",
-                Source::WorkloadDefault => "the workload default",
-                Source::Graded => "the graded effort",
-                Source::VendorDefault => "the vendor default",
-                Source::None => "no catalog default",
-                Source::MinimumRaised => "the workload minimum",
-            },
-            self.grade.elo_effort,
-            self.grade.eq_effort,
-        ));
     }
 
     pub fn append_to(&self, output: &mut Value) {

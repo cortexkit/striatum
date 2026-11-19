@@ -1488,6 +1488,8 @@ async fn replay_tier_consumer_precedence() {
     let _inputs = striatum_store::replay::Inputs::new(NOW as i64).install();
     let (harness, _) = setup(&["pro_500"], true, true);
     let _state_write_audit = super::replay_tests::audit_state_writes(&harness, "tier-consumers");
+    let fingerprint = super::replay_tests::cleared_catalog_fingerprint(&harness);
+    assert_eq!(fingerprint, "53ab34bb0b3cbf2a");
     let project = harness.store_path().parent().unwrap().join("tier-project");
     let path = project.join(".cortexkit/striatum.jsonc");
     let settings = json!({"consumers": {
@@ -1519,12 +1521,13 @@ async fn replay_tier_consumer_precedence() {
             &harness,
         ));
     }
-    super::replay_tests::assert_or_record(
+    super::replay_tests::assert_or_record_with_fingerprint(
         "tier-consumers",
         json!({
             "body_source":"service_tier_project_settings_change_the_next_routing_decision; core route_select_params resolves explicit tier consumer before pin.slot",
             "clock_ms":NOW, "settings":settings, "rows":rows,
         }),
+        Some(&fingerprint),
     );
 }
 

@@ -1,0 +1,18 @@
+# Decision-array pointer followed by rows with new fingerprint and rows with effort metadata.
+/cases/0/steps/0/state/model_route_decisions 0 0
+/cases/0/steps/1/state/model_route_decisions 0 0
+/cases/1/steps/0/state/model_route_decisions 0 0
+/cases/1/steps/1/state/model_route_decisions 0 0
+/cases/2/steps/0/state/model_route_decisions 0 0
+/cases/2/steps/1/state/model_route_decisions 0 0
+/cases/3/steps/0/state/model_route_decisions 0 0
+/cases/3/steps/1/state/model_route_decisions 0 0
+/cases/4/steps/0/state/model_route_decisions 0 0
+/cases/4/steps/1/state/model_route_decisions 0 0
+/cases/5/steps/0/state/model_route_decisions 0 0
+/cases/5/steps/1/state/model_route_decisions 0 0
+/cases/6/steps/0/state/model_route_decisions 0 0
+/cases/6/steps/1/state/model_route_decisions 0 0
+/cases/7/steps/0/state/model_route_decisions 0 0
+/cases/7/steps/1/state/model_route_decisions 0 0
+/cases/7/steps/2/state/model_route_decisions 0 0
