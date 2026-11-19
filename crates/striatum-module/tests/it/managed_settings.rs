@@ -90,7 +90,15 @@ impl Rig {
     }
 
     async fn request(&mut self, op: &str) -> Frame {
-        let frame = recv(&mut self.peer).await;
+        self.request_within(op, DEADLINE).await
+    }
+
+    async fn request_within(&mut self, op: &str, deadline: Duration) -> Frame {
+        let frame = timeout(deadline, read_frame(&mut self.peer))
+            .await
+            .unwrap_or_else(|_| panic!("module did not send {op}"))
+            .unwrap()
+            .expect("module closed connection");
         assert_eq!(
             (frame.header.ty, frame.header.channel, frame.header.epoch),
             (FrameType::Request, 0, 0)
@@ -276,6 +284,149 @@ async fn capable_daemon_gets_a_declaration_without_a_startup_flag() {
         &rig.finish().await,
         "managed (daemon advertised config.gate)",
     );
+}
+
+#[tokio::test]
+async fn unanswered_initial_get_recovers_without_a_settings_change() {
+    let mut rig = Rig::start(true, "not a valid routing file").await;
+    let declare = rig.declare().await;
+    rig.send(
+        FrameType::Response,
+        declare.header.corr,
+        vector!("config_declare_reply"),
+    )
+    .await;
+    let first = rig.request("config.get").await;
+    rig.ping().await;
+    rig.bind().await;
+    assert_eq!(rig.explain_missing().await["code"], "routing_not_ready");
+
+    let second = request_after_timeout(&mut rig, &first, "config.get").await;
+    serve_approved_view(&mut rig, &second).await;
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn timed_out_declaration_probes_and_applies_an_approved_view() {
+    let mut rig = Rig::start(true, "not a valid routing file").await;
+    let declare = rig.declare().await;
+    rig.bind().await;
+    let probe = request_after_timeout(&mut rig, &declare, "config.get").await;
+    serve_approved_view(&mut rig, &probe).await;
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn timed_out_declaration_stays_push_driven_if_probe_is_gated() {
+    let mut rig = Rig::start(true, "not a valid routing file").await;
+    let declare = rig.declare().await;
+    rig.bind().await;
+    let probe = request_after_timeout(&mut rig, &declare, "config.get").await;
+    rig.send(
+        FrameType::Error,
+        probe.header.corr,
+        vector!("config_get_error_gated"),
+    )
+    .await;
+    assert_eq!(rig.explain_missing().await["code"], "routing_not_ready");
+    assert!(
+        timeout(Duration::from_secs(3), rig.peer.peek(&mut [0]))
+            .await
+            .is_err(),
+        "a gated probe must not trigger another settings request"
+    );
+    let approved = deliver(
+        &mut rig,
+        4,
+        8,
+        json!({"retention":{"model_route_decisions_days":37}}),
+    )
+    .await;
+    assert_eq!(body(&approved), vector!("config_applied_request_ack"));
+    rig.send(
+        FrameType::Response,
+        approved.header.corr,
+        vector!("config_applied_reply"),
+    )
+    .await;
+    assert_serves_approved_view(&mut rig).await;
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn timed_out_declaration_is_resent_if_probe_requires_declaration() {
+    let mut rig = Rig::start(true, "not a valid routing file").await;
+    let first = rig.declare().await;
+    rig.bind().await;
+    let probe = request_after_timeout(&mut rig, &first, "config.get").await;
+    rig.send(
+        FrameType::Error,
+        probe.header.corr,
+        json!({"code": "declaration_order", "message": "config.declare must precede get or applied on this connection"}),
+    )
+    .await;
+    let second = rig.declare().await;
+    assert_ne!(first.header.corr, second.header.corr);
+    assert_eq!(first.body, second.body);
+    rig.send(
+        FrameType::Response,
+        second.header.corr,
+        vector!("config_declare_reply"),
+    )
+    .await;
+    let get = rig.request("config.get").await;
+    serve_approved_view(&mut rig, &get).await;
+    rig.finish().await;
+}
+
+async fn request_after_timeout(rig: &mut Rig, unanswered: &Frame, op: &str) -> Frame {
+    // The module uses a real clock. Check the socket halfway through the
+    // request's 10-second deadline, then wait for recovery without a push.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    rig.ping().await;
+    let next = rig.request_within(op, DEADLINE).await;
+    assert_ne!(next.header.corr, unanswered.header.corr);
+    rig.ping().await;
+    next
+}
+
+async fn serve_approved_view(rig: &mut Rig, get: &Frame) {
+    rig.send(
+        FrameType::Response,
+        get.header.corr,
+        json!({
+            "op": "config.get",
+            "active": {
+                "generation": 4,
+                "effective": {"retention": {"model_route_decisions_days": 37}},
+                "sources": {},
+                "layers": [],
+                "status": "active"
+            },
+            "pending": null
+        }),
+    )
+    .await;
+    assert_serves_approved_view(rig).await;
+}
+
+async fn assert_serves_approved_view(rig: &mut Rig) {
+    timeout(DEADLINE, async {
+        loop {
+            let missing = rig.explain_missing().await;
+            if missing["code"] == "not_found" {
+                assert!(missing["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("retention is 37 days"));
+                break;
+            }
+            assert_eq!(missing["code"], "routing_not_ready");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("approved settings did not become ready");
 }
 
 #[tokio::test]

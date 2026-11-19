@@ -17,6 +17,21 @@ use crate::{control_flags, send, ErrorBody, Frame, FrameType, ModuleError};
 
 pub(crate) const WAITING: &str = "waiting for the daemon's settings view";
 const CALL_TIMEOUT: Duration = Duration::from_secs(10);
+const RETRY_INITIAL: Duration = Duration::from_secs(1);
+const RETRY_MAX: Duration = Duration::from_secs(60);
+
+struct RetryDelay(Duration);
+
+impl RetryDelay {
+    fn new() -> Self {
+        Self(RETRY_INITIAL)
+    }
+
+    async fn wait(&mut self) {
+        tokio::time::sleep(self.0).await;
+        self.0 = self.0.saturating_mul(2).min(RETRY_MAX);
+    }
+}
 
 pub(crate) struct Session {
     wire: Arc<Wire>,
@@ -53,31 +68,58 @@ impl Session {
         };
         crate::info_operator(format!("[striatum] {WAITING}"));
         let task = tokio::spawn(async move {
-            let declared = match driver.call(CONFIG_DECLARE_OP, &declaration).await {
-                Ok(_) => true,
-                Err(ConfigError::Refused(refusal)) => {
-                    // Older deployments can advertise the gate before accepting routing's schema.
-                    crate::warn_operator(format!(
-                        "[striatum] config.declare refused ({}: {}); keeping the routing settings file reader",
-                        refusal.code, refusal.message,
-                    ));
-                    crate::info_operator(
-                        "[striatum] settings source: file (daemon refused config.declare)".into(),
-                    );
-                    let result = load_files(&driver.wire.settings.path).await;
-                    driver.finish_wait(result);
-                    return;
-                }
-                Err(error) => {
-                    log_error(CONFIG_DECLARE_OP, &error);
-                    false
+            enum InitialGet {
+                Fetch,
+                Probed(Result<ConfigGetReply, ConfigError>),
+                WaitForChange,
+            }
+
+            let mut retry = RetryDelay::new();
+            let initial_get = loop {
+                match driver.call(CONFIG_DECLARE_OP, &declaration).await {
+                    Ok(_) => break InitialGet::Fetch,
+                    Err(error @ ConfigError::Timeout) => {
+                        log_error(CONFIG_DECLARE_OP, &error);
+                        retry.wait().await;
+                        // A lost reply does not cancel the declaration. The daemon
+                        // accepts one per connection and checks for it before
+                        // config.get can return a view or report gated delivery.
+                        match driver.get_with_retry(&mut retry).await {
+                            Err(ConfigError::Refused(refusal))
+                                if refusal.code == "declaration_order" =>
+                            {
+                                retry.wait().await;
+                            }
+                            reply => break InitialGet::Probed(reply),
+                        }
+                    }
+                    Err(ConfigError::Refused(refusal)) => {
+                        // Older deployments can advertise the gate before accepting routing's schema.
+                        crate::warn_operator(format!(
+                            "[striatum] config.declare refused ({}: {}); keeping the routing settings file reader",
+                            refusal.code, refusal.message,
+                        ));
+                        crate::info_operator(
+                            "[striatum] settings source: file (daemon refused config.declare)"
+                                .into(),
+                        );
+                        let result = load_files(&driver.wire.settings.path).await;
+                        driver.finish_wait(result);
+                        return;
+                    }
+                    Err(error) => {
+                        log_error(CONFIG_DECLARE_OP, &error);
+                        break InitialGet::WaitForChange;
+                    }
                 }
             };
             crate::info_operator(
                 "[striatum] settings source: managed (daemon advertised config.gate)".into(),
             );
-            if declared {
-                driver.refresh().await;
+            match initial_get {
+                InitialGet::Fetch => driver.refresh().await,
+                InitialGet::Probed(reply) => driver.apply_reply(reply).await,
+                InitialGet::WaitForChange => {}
             }
             loop {
                 driver.wire.changed.notified().await;
@@ -199,13 +241,32 @@ impl Driver {
         if !self.send_report().await {
             return;
         }
-        let reply = self
-            .call(CONFIG_GET_OP, &ConfigGetRequest::new())
-            .await
-            .and_then(|body| {
-                serde_json::from_value::<ConfigGetReply>(body)
-                    .map_err(|error| ConfigError::Protocol(error.to_string()))
-            });
+        let reply = self.get_with_retry(&mut RetryDelay::new()).await;
+        self.apply_reply(reply).await;
+    }
+
+    async fn get_with_retry(
+        &mut self,
+        retry: &mut RetryDelay,
+    ) -> Result<ConfigGetReply, ConfigError> {
+        let request = ConfigGetRequest::new();
+        loop {
+            match self.call(CONFIG_GET_OP, &request).await {
+                Err(error @ ConfigError::Timeout) => {
+                    log_error(CONFIG_GET_OP, &error);
+                    retry.wait().await;
+                }
+                result => {
+                    return result.and_then(|body| {
+                        serde_json::from_value(body)
+                            .map_err(|error| ConfigError::Protocol(error.to_string()))
+                    });
+                }
+            }
+        }
+    }
+
+    async fn apply_reply(&mut self, reply: Result<ConfigGetReply, ConfigError>) {
         let reply = match reply {
             Ok(reply) => reply,
             Err(error) => {
