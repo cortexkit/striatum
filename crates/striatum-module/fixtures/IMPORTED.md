@@ -115,9 +115,10 @@ checks the original capture's digest, proving that no other fields changed.
 `broca-route-fact-1119/` contains byte-for-byte copies of the publications from
 Broca's own publisher for `admission_started_body` and `run_finished_body` on
 account `box_test`. They were supplied in
-`.cortexkit/internal-docs/research/broca-route-fact-1119/`. Before import, its
-`SHA256SUMS` was checked against the supplied prefix `fe0c7bee24ea1441`, then the
-original files were verified against the manifest.
+`.cortexkit/internal-docs/research/broca-route-fact-1119/`. Before import, the
+manifest's SHA-256 was checked against the digest prefix `fe0c7bee24ea1441`
+provided with the captures, then the original files were verified against the
+manifest.
 
 | Imported path | SHA-256 |
 | --- | --- |
