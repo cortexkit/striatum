@@ -150,11 +150,20 @@ fn review_keeps_optional_records_absent_and_preserves_supplied_shapes() {
     let tuple = schema
         .review_tuple(&[LayerValue::new(Layer::User, user.clone())], &context)
         .unwrap();
+    assert_eq!(
+        tuple.effective["consumers"]["pinned"]["pin"],
+        json!({"model": "p/m"})
+    );
+    assert_eq!(
+        tuple.effective["panels"]["audit"],
+        json!({"top_k": 2, "by": "iq", "extra": 0})
+    );
     for path in [
         "/concurrency/providers/p/limit",
         "/concurrency/providers/q/limit",
-        "/consumers/pinned/pin",
-        "/panels/audit",
+        "/consumers/pinned/pin/model",
+        "/panels/audit/top_k",
+        "/panels/audit/by",
     ] {
         assert_eq!(tuple.effective.pointer(path), user.pointer(path), "{path}");
         assert_eq!(tuple.sources.get(path), Some(&Layer::User), "{path}");
@@ -168,14 +177,17 @@ fn review_keeps_optional_records_absent_and_preserves_supplied_shapes() {
     }
 
     for (invalid, path) in [
-        (json!({"consumers":{"x":{"pin":{}}}}), "/consumers/x/pin"),
+        (
+            json!({"consumers":{"x":{"pin":{}}}}),
+            "/consumers/x/pin/model",
+        ),
         (
             json!({"panels":{"audit":{"top_k":9,"by":"iq"}}}),
-            "/panels/audit",
+            "/panels/audit/top_k",
         ),
         (
             json!({"panels":{"audit":{"top_k":2,"by":"iq","topK":2}}}),
-            "/panels/audit",
+            "/panels/audit/topK",
         ),
         (
             json!({"concurrency":{"providers":{"p":{"limit":"unlimited"}}}}),

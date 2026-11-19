@@ -228,7 +228,6 @@ fn schema_pins_field_metadata_and_omission() {
             .iter()
             .map(|(name, node)| (name.as_str(), node)),
     ) {
-        let opaque = matches!(owner, "PanelPolicy" | "SynthesizerPin");
         walk_schema(node, "", &mut |node, path| {
             for keyword in ["allOf", "anyOf", "if", "then", "else"] {
                 assert!(node.get(keyword).is_none(), "{owner}{path}: {keyword}");
@@ -241,12 +240,7 @@ fn schema_pins_field_metadata_and_omission() {
                 "{owner}{path}"
             );
             if node["type"] == "object" {
-                let closure = if opaque {
-                    "additionalProperties"
-                } else {
-                    "unevaluatedProperties"
-                };
-                assert_eq!(node[closure], false, "{owner}{path}");
+                assert_eq!(node["unevaluatedProperties"], false, "{owner}{path}");
             }
             assert!(!node["additionalProperties"].is_object(), "{owner}{path}");
             if path.is_empty() {
@@ -256,14 +250,6 @@ fn schema_pins_field_metadata_and_omission() {
                 node["description"].as_str().is_some_and(|s| !s.is_empty()),
                 "{owner}{path}"
             );
-            if opaque {
-                assert!(node
-                    .as_object()
-                    .unwrap()
-                    .keys()
-                    .all(|key| !key.starts_with("x-ck-")));
-                return;
-            }
             assert_eq!(node["x-ck-apply"], "live", "{owner}{path}");
             assert_eq!(node["x-ck-layers"], json!(["user"]), "{owner}{path}");
             match node.get("default") {
@@ -298,9 +284,11 @@ fn schema_pins_field_metadata_and_omission() {
         ("ModelFactOverride", "/context_window_tokens /cost_per_mtok_out /elo /eq /not_for /not_for/* /only_for /only_for/* /output_tokens_per_second /pin_only /pin_only_for /pin_only_for/* /service_tier /speed_multiplier /subscription /subscription_multiplier /vision"),
         ("OverqualificationSection", "/base /doubling /threshold"),
         ("PanelPolicies", "/audit /design_review /diagnose /evaluate /explain /lab /spec"),
+        ("PanelPolicy", "/extra_by /floor"),
         ("ProviderAccountsPolicy", "/floors /floors/* /hold_when_reset_within /max_hold /order /order/* /ordered /paid_credits /soft_quota_remaining_percent /spend_budget_reset_at_ms /spend_budget_usd /strategy /unknown_reset_retry"),
         ("ProviderPolicy", "/models /models/* /not_for /not_for/* /only_for /only_for/* /pin_only /pin_only_for /pin_only_for/* /service_tier /subscription /subscription_multiplier"),
         ("RunnerPolicy", "/harness /routes /routes/* /tool_capabilities/*"),
+        ("SynthesizerPin", "/variant"),
     ];
     let mut expected: Vec<_> = groups
         .into_iter()
@@ -314,16 +302,18 @@ fn schema_pins_field_metadata_and_omission() {
     actual.sort();
     assert_eq!(actual, expected);
     let defs = &schema["$defs"];
-    assert_eq!(
-        defs["ConsumerPolicy"]["properties"]["pin"]["x-ck-kind"],
-        "json"
-    );
+    let pin = &defs["ConsumerPolicy"]["properties"]["pin"];
+    assert_eq!(pin["$ref"], "#/$defs/SynthesizerPin");
+    assert!(pin.get("x-ck-kind").is_none());
+    assert!(pin.get("default").is_none());
     for panel in defs["PanelPolicies"]["properties"]
         .as_object()
         .unwrap()
         .values()
     {
-        assert_eq!(panel["x-ck-kind"], "json");
+        assert_eq!(panel["$ref"], "#/$defs/PanelPolicy");
+        assert!(panel.get("x-ck-kind").is_none());
+        assert!(panel.get("default").is_none());
     }
     assert_eq!(defs["SynthesizerPin"]["required"], json!(["model"]));
     assert_eq!(defs["PanelPolicy"]["required"], json!(["top_k", "by"]));
