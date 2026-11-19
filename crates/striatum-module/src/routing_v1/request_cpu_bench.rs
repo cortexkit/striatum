@@ -450,17 +450,20 @@ pub(crate) fn representative_fixture(counts: FixtureCounts) -> RequestFixture {
                 .unwrap_or_else(|| format!("cpu-rule-provider/excluded-{i}"));
             config["models"][key]["pin_only"] = json!(false);
         }
-        config["runners"][0]["routes"] = if counts.runner_route_rules == 0 {
-            Value::Null
+        if counts.runner_route_rules == 0 {
+            config["runners"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("routes");
         } else {
-            json!((0..counts.runner_route_rules)
+            config["runners"][0]["routes"] = json!((0..counts.runner_route_rules)
                 .map(|i| if i == 0 {
                     "cpu-provider-0".into()
                 } else {
                     format!("cpu-rule-provider/route-{i}")
                 })
-                .collect::<Vec<String>>())
-        };
+                .collect::<Vec<String>>());
+        }
     });
     {
         let shared = fixture.credentials();

@@ -1987,7 +1987,10 @@ impl RoutingSubject for KitSubject {
             // Make example_summary accessible to that fixture caller before
             // reserve setup; ordinary fixture routes retain ownership checks.
             self.harness().edit_config(|config| {
-                config["consumers"][fixture::SUMMARY]["owner"] = Value::Null;
+                config["consumers"][fixture::SUMMARY]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("owner");
             });
         }
         if let Some(scope) = &stamp.scope {
