@@ -665,7 +665,11 @@ async fn select_panel_serves_full_contract_shape() {
         "wire keys stay camelCase"
     );
     assert_eq!(result["members"][0]["temperature"], 0.2);
-    assert_eq!(result["members"][0]["promptParams"]["variant"], "xhigh");
+    // The seed-only panel fixture has no catalog effort default for its seat.
+    let removed_effort_delta = ["/members/0/promptParams/variant"];
+    for path in removed_effort_delta {
+        assert!(result.pointer(path).is_none(), "{path}: {result}");
+    }
     assert!(result["decisionID"].as_str().is_some());
     assert_eq!(result["policy"]["selection"], "class_policy");
     assert_eq!(result["policy"]["width"], 3);
