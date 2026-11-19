@@ -127,7 +127,7 @@ impl DescribeCache {
         describe: Option<&Value>,
         credentials: &mut BrocaCredentials,
         now: i64,
-    ) {
+    ) -> bool {
         // A late describe can refresh tiers, but cannot revive an already
         // expired routing declaration without a new trusted catalog row.
         self.expire(credentials, now);
@@ -142,7 +142,7 @@ impl DescribeCache {
         }) else {
             self.missed(module, "describe", credentials, now);
             self.expire(credentials, now);
-            return;
+            return false;
         };
         let previous = credentials.runner_service_tiers.get(module).cloned();
         let had_observation = credentials.runner_describe_observed.contains_key(module);
@@ -175,6 +175,7 @@ impl DescribeCache {
             };
             view_event(credentials, module, cause, now);
         }
+        true
     }
 
     pub(crate) fn missed_all(&mut self, credentials: &mut BrocaCredentials, now: i64) {

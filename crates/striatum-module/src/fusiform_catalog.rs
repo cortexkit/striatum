@@ -829,6 +829,7 @@ pub(crate) struct PlaneCatalog {
     version: Option<i64>,
     base: BTreeMap<String, Arc<ModelRates>>,
     pages: BTreeMap<(String, String), PlaneReply>,
+    retry_at: BTreeMap<(String, String), tokio::time::Instant>,
 }
 
 impl PlaneCatalog {
@@ -1704,18 +1705,25 @@ impl CatalogWire for FusiformCatalogConsumer {
                 .map_err(|_| error("credential cache lock poisoned"))?;
             (guard.plane_keys(), guard.billing_catalog.clone())
         };
+        let mut version_changed = false;
         if let Some(snapshot) = snapshot {
+            version_changed = cache.version != Some(snapshot.cursor.catalog_version);
             cache.version = Some(snapshot.cursor.catalog_version);
             cache.base = base_rates_after(std::mem::take(&mut cache.base), snapshot);
-            cache.pages.clear();
         }
-        for (provider_id, auth_method) in keys {
-            if cache
-                .pages
-                .contains_key(&(provider_id.clone(), auth_method.clone()))
+        cache.pages.retain(|key, _| keys.contains(key));
+        cache.retry_at.retain(|key, _| keys.contains(key));
+        for key in keys {
+            if !version_changed
+                && cache.pages.contains_key(&key)
+                && cache
+                    .retry_at
+                    .get(&key)
+                    .is_none_or(|due| *due > tokio::time::Instant::now())
             {
                 continue;
             }
+            let (provider_id, auth_method) = &key;
             let body = serde_json::to_vec(&CatalogGetRequest {
                 name: CATALOG_GET,
                 arguments: CatalogGetArguments {
@@ -1732,11 +1740,24 @@ impl CatalogWire for FusiformCatalogConsumer {
             let frame = self.call_frame(body).await?;
             let page = decode_plane_get(&frame.body)?;
             if let PlaneReply::Served(page) = &page {
-                if page.plane.provider_id != provider_id || page.plane.auth_method != auth_method {
+                if &page.plane.provider_id != provider_id || &page.plane.auth_method != auth_method
+                {
                     return Err(error("Fusiform replied on a different billing plane"));
                 }
             }
-            cache.pages.insert((provider_id, auth_method), page);
+            if matches!(&page, PlaneReply::Refused { code, .. } if code != "no_coverage") {
+                // Keep a usable plane during a failed refresh, but retry even if
+                // the catalog version never changes again.
+                cache
+                    .retry_at
+                    .insert(key.clone(), tokio::time::Instant::now() + RETRY_INTERVAL);
+                if matches!(cache.pages.get(&key), Some(PlaneReply::Served(_))) {
+                    continue;
+                }
+            } else {
+                cache.retry_at.remove(&key);
+            }
+            cache.pages.insert(key, page);
         }
         credentials
             .lock()
@@ -2282,8 +2303,15 @@ pub async fn catalog_refresh_loop(
                 if let Ok(mut health) = health.lock() {
                     health.set_poll_ms(cadence);
                 }
-                if wait_for_catalog_cycle(&wake, &rebind_wake, Duration::from_millis(cadence)).await
-                {
+                let retry = credentials
+                    .lock()
+                    .ok()
+                    .and_then(|guard| guard.billing_catalog.retry_at.values().min().copied());
+                let delay = retry.map_or(Duration::from_millis(cadence), |due| {
+                    Duration::from_millis(cadence)
+                        .min(due.saturating_duration_since(tokio::time::Instant::now()))
+                });
+                if wait_for_catalog_cycle(&wake, &rebind_wake, delay).await {
                     bootstrapped = false;
                 }
             }
@@ -2331,6 +2359,9 @@ async fn wait_for_catalog_cycle(
 
 #[cfg(test)]
 mod tests {
+    mod plane_retry_tests {
+        include!("fusiform_catalog/plane_retry_tests.rs");
+    }
     include!("fusiform_local_grade_tests.rs");
     include!("fusiform_catalog_login_methods_tests.rs");
     include!("operator_quality_tests.rs");
@@ -3320,6 +3351,7 @@ mod tests {
                 "rate.output": {"state":"priced", "currency":"USD", "units":4000000000_i64, "exponent":9, "inherited_from":{"basis":"family"}}
             }})).unwrap(),
             pages: ["oauth", "apikey"].into_iter().map(|method| (("openai".into(), method.into()), PlaneReply::Refused { code:"no_coverage".into(), message:"undeclared".into() })).collect(),
+            ..Default::default()
         }
     }
 
@@ -3616,6 +3648,7 @@ mod tests {
             )]
             .into_iter()
             .collect(),
+            ..Default::default()
         };
         // The fact's own rate fields mirror the live store row (input, output and
         // cache-read set, cache-write and reasoning absent). Once price_facts
@@ -3725,7 +3758,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refusals_decode_without_failing_poll_and_planes_refresh_only_on_catalog_change() {
+    async fn refusals_decode_without_failing_poll_and_version_change_refreshes_planes() {
         use cortexkit_claustrum_client::{ListedCredential, ScopedCredentialListing};
         let rig = Rig::new("plane-poll");
         let store = Arc::new(rig.store());
@@ -4627,6 +4660,7 @@ mod multiplier_fallback_tests {
                     )
                 })
                 .collect(),
+            ..Default::default()
         }
     }
 
@@ -4865,6 +4899,7 @@ mod multiplier_fallback_tests {
                 ("anthropic".to_string(), "oauth".to_string()),
                 super::PlaneReply::Served(page),
             )]),
+            ..Default::default()
         };
         let plane = priced_catalog.for_route("anthropic/claude-sonnet-4-5", &oauth_serving(), true);
         assert_eq!(plane.kind, "quota_proxy");

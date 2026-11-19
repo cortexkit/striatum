@@ -333,6 +333,64 @@ fn fixture() -> (ScratchDir, LiveQuota) {
     (scratch, live)
 }
 
+#[tokio::test]
+async fn owed_quota_snapshot_retries_on_idle_ticks_and_regular_snapshots_clear_debt() {
+    let (_scratch, live) = fixture();
+    let start = Instant::now();
+    let mut schedule = SnapshotSchedule::new(start);
+    let mut sequence = SequenceState::default();
+    schedule.set_attached(true, start);
+    let mut source = Source {
+        snapshot: snapshot_body(&body("epoch-z", 1, 10)),
+        ..Default::default()
+    };
+    maintain_inventory(&mut source, &live, &mut schedule, &mut sequence, start).await;
+
+    let bus = bus();
+    let updated = body("epoch-z", 2, 20);
+    source.snapshot = snapshot_body(&updated);
+    source.fetch_error = Some("event_not_found".into());
+    source.snapshot_error = Some("usage unavailable".into());
+    publish(&bus, &mut source, &updated).await;
+    let mut cursor = Cursor::new(&bus, &live).await;
+    cursor.verify_publication = false;
+    consume_one(&mut cursor, &mut source, &live, &mut sequence, SUBJECT)
+        .await
+        .unwrap();
+    assert_eq!(cursor.acks, 1);
+    assert_eq!(source.snapshots, 2);
+    assert_eq!(used(&live), 10.0);
+
+    source.snapshot_error = None;
+    let due = sequence.last_catch_up_attempt.unwrap() + CATCH_UP_SNAPSHOT_EVERY;
+    maintain_inventory(
+        &mut source,
+        &live,
+        &mut schedule,
+        &mut sequence,
+        due - Duration::from_secs(1),
+    )
+    .await;
+    assert_eq!(source.snapshots, 2, "idle retry must respect its deadline");
+    maintain_inventory(&mut source, &live, &mut schedule, &mut sequence, due).await;
+    assert_eq!(
+        source.snapshots, 3,
+        "idle retry did not fetch the owed snapshot"
+    );
+    assert_eq!(used(&live), 20.0);
+    assert!(!sequence.owe_snapshot);
+
+    let regular = schedule.next;
+    sequence.owe_snapshot = true;
+    sequence.last_catch_up_attempt = Some(regular - Duration::from_secs(1));
+    maintain_inventory(&mut source, &live, &mut schedule, &mut sequence, regular).await;
+    assert_eq!(source.snapshots, 4);
+    assert!(
+        !sequence.owe_snapshot,
+        "ordinary publication also pays the debt"
+    );
+}
+
 const KIMI_CREDENTIAL: &str = "apikey:kimi-for-coding";
 
 fn kimi_entry() -> Value {

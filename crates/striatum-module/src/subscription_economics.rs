@@ -40,11 +40,14 @@ enum PlanGroup {
 }
 #[derive(Default)]
 struct Runtime {
-    economics: EconomicsCache,
-    inputs: Option<Inputs>,
-    report: Value,
+    economics: Arc<EconomicsCache>,
+    inputs: Option<Arc<Inputs>>,
+    report: ReportInput,
     multipliers: multiplier::State,
     poll: multiplier::PollSchedule,
+    revision: u64,
+    #[cfg(test)]
+    rebuilds: usize,
 }
 
 struct Inputs {
@@ -54,24 +57,105 @@ struct Inputs {
     unpriced_tiers: BTreeSet<String>,
 }
 
+#[derive(Clone)]
+enum ReportInput {
+    Poll(Arc<Value>),
+    Bucket(Arc<[Arc<Value>]>),
+}
+
+impl Default for ReportInput {
+    fn default() -> Self {
+        Self::Poll(Arc::new(Value::Null))
+    }
+}
+
+impl ReportInput {
+    fn value(&self) -> Arc<Value> {
+        match self {
+            Self::Poll(report) => Arc::clone(report),
+            Self::Bucket(rows) => {
+                Arc::new(json!({"latest": rows.iter().map(Arc::as_ref).collect::<Vec<_>>()}))
+            }
+        }
+    }
+}
+
+struct Rebuild {
+    revision: u64,
+    now: i64,
+    inputs: Arc<Inputs>,
+    report: ReportInput,
+}
+
+impl Rebuild {
+    fn build(self) -> (u64, Arc<EconomicsCache>) {
+        let mut economics = build_with_credentials(
+            &self.inputs.state,
+            &self.report.value(),
+            &self.inputs.prices,
+            self.now,
+            &self.inputs.credentials,
+        );
+        economics.unpriced_tiers = self.inputs.unpriced_tiers.clone();
+        (self.revision, Arc::new(economics))
+    }
+}
+
 impl Runtime {
+    fn prepare(&mut self, now: i64) -> Option<Rebuild> {
+        self.revision = self.revision.wrapping_add(1);
+        Some(Rebuild {
+            revision: self.revision,
+            now,
+            inputs: self.inputs.clone()?,
+            report: self.report.clone(),
+        })
+    }
+
+    fn publish(
+        &mut self,
+        (revision, economics): (u64, Arc<EconomicsCache>),
+    ) -> Arc<EconomicsCache> {
+        if self.revision != revision {
+            return economics;
+        }
+        #[cfg(test)]
+        {
+            self.rebuilds += 1;
+        }
+        std::mem::replace(&mut self.economics, economics)
+    }
+
+    fn accept_bucket_batch(&mut self, items: Vec<multiplier::Update>, now: i64) -> Option<Rebuild> {
+        let mut changed = false;
+        for item in items {
+            changed |= self.multipliers.apply_update(item);
+        }
+        if !changed {
+            return None;
+        }
+        self.report = ReportInput::Bucket(self.multipliers.rows());
+        self.prepare(now)
+    }
+
+    #[cfg(test)]
     fn rebuild(&mut self, now: i64) {
-        if let Some(inputs) = &self.inputs {
-            self.economics = build_with_credentials(
-                &inputs.state,
-                &self.report,
-                &inputs.prices,
-                now,
-                &inputs.credentials,
-            );
-            self.economics.unpriced_tiers = inputs.unpriced_tiers.clone();
+        if let Some(work) = self.prepare(now) {
+            self.publish(work.build());
         }
     }
 
+    #[cfg(test)]
     fn bucket_item(&mut self, item: cortexkit_bus_client::BucketItem, now: i64) {
-        if self.multipliers.apply(item) {
-            self.report = self.multipliers.report();
-            self.rebuild(now);
+        self.bucket_batch(vec![item], now);
+    }
+
+    #[cfg(test)]
+    fn bucket_batch(&mut self, items: Vec<cortexkit_bus_client::BucketItem>, now: i64) {
+        if let Some(work) =
+            self.accept_bucket_batch(items.into_iter().map(Into::into).collect(), now)
+        {
+            self.publish(work.build());
         }
     }
 
@@ -81,7 +165,7 @@ impl Runtime {
         if self.multipliers.generation == generation
             && (report["latest"].is_array() || !(reader_bound && self.multipliers.ready))
         {
-            self.report = report;
+            self.report = ReportInput::Poll(Arc::new(report));
         }
     }
 }
@@ -90,6 +174,26 @@ static CACHE: OnceLock<Mutex<Runtime>> = OnceLock::new();
 static WARNED_AMBIGUOUS_ACCOUNTS: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
 fn cache() -> &'static Mutex<Runtime> {
     CACHE.get_or_init(|| Mutex::new(Runtime::default()))
+}
+
+async fn build_and_publish(work: Option<Rebuild>) {
+    let Some(work) = work else { return };
+    let result = crate::stage_timing::spawn_job_blocking(move || {
+        let built = striatum_store::job_timing::sync("subscription_economics", || work.build());
+        // A watch and an inventory poll can finish in either order. Only the
+        // build made from the latest inputs may replace the serving snapshot.
+        let retired = cache()
+            .lock()
+            .ok()
+            .map(|mut runtime| runtime.publish(built));
+        drop(retired);
+    })
+    .await;
+    if let Err(error) = result {
+        if error.is_panic() {
+            std::panic::resume_unwind(error.into_panic());
+        }
+    }
 }
 
 /// Join by account reference, not provider/tier spelling: Antigravity's quota
@@ -593,33 +697,37 @@ pub(crate) async fn refresh(
         striatum_store::job_timing::run("spend_report_refresh", report)
     );
     let reader_bound = multiplier::reader_bound(quota_cache);
-    striatum_store::job_timing::sync("subscription_economics", || {
-        let credential_ids = if let Ok(credentials) = credentials.lock() {
-            credentials.api_key_credentials_by_provider(now as u64)
-        } else {
-            BTreeMap::new()
-        };
-        let Some(snapshot) = state.lock().ok().map(|s| s.clone()) else {
+    let credential_ids = credentials
+        .lock()
+        .ok()
+        .map(|credentials| credentials.api_key_credentials_by_provider(now as u64))
+        .unwrap_or_default();
+    let Some(snapshot) = state.lock().ok().map(|s| s.clone()) else {
+        return;
+    };
+    let inputs = Arc::new(Inputs {
+        state: snapshot,
+        unpriced_tiers: listing
+            .map(|listing| unpriced_tiers(listing, &prices))
+            .unwrap_or_default(),
+        prices,
+        credentials: credential_ids,
+    });
+    let (work, previous_inputs) = {
+        let Ok(mut guard) = cache().lock() else {
             return;
         };
-        if let Ok(mut guard) = cache().lock() {
-            if poll_due {
-                guard.poll.completed(std::time::Instant::now());
-                // A watch update received during the call is newer than the poll's
-                // snapshot. Do not overwrite it when the slower call returns.
-                guard.poll_report(report, generation, reader_bound);
-            }
-            guard.inputs = Some(Inputs {
-                state: snapshot,
-                unpriced_tiers: listing
-                    .map(|listing| unpriced_tiers(listing, &prices))
-                    .unwrap_or_default(),
-                prices,
-                credentials: credential_ids,
-            });
-            guard.rebuild(now);
+        if poll_due {
+            guard.poll.completed(std::time::Instant::now());
+            // A watch update received during the call is newer than the poll's
+            // snapshot. Do not overwrite it when the slower call returns.
+            guard.poll_report(report, generation, reader_bound);
         }
-    });
+        let previous_inputs = guard.inputs.replace(inputs);
+        (guard.prepare(now), previous_inputs)
+    };
+    drop(previous_inputs);
+    build_and_publish(work).await;
 }
 
 fn unpriced_tiers(
@@ -676,10 +784,11 @@ pub(crate) fn overlay(
     pricing: &RoutePricing,
     pacing: PacingRule,
 ) {
-    let pools = cache()
+    let economics = cache()
         .lock()
-        .map(|c| c.economics.pools.clone())
+        .map(|c| Arc::clone(&c.economics))
         .unwrap_or_default();
+    let pools = economics.pools.clone();
     overlay_pools(pools, snapshot, facts, now, pricing, pacing);
 }
 
@@ -688,19 +797,18 @@ pub(crate) fn preview_pools(
     quota_now: i64,
     value_now: i64,
 ) -> HashMap<String, SubscriptionPool> {
-    let (report, prices, credentials) = cache()
+    let (report, inputs) = cache()
         .lock()
-        .map(|cache| {
-            let (prices, credentials) = cache.inputs.as_ref().map_or_else(
-                || (Value::Null, BTreeMap::new()),
-                |inputs| (inputs.prices.clone(), inputs.credentials.clone()),
-            );
-            (cache.report.clone(), prices, credentials)
-        })
+        .map(|cache| (cache.report.clone(), cache.inputs.clone()))
         .unwrap_or_default();
+    let empty = BTreeMap::new();
+    let (prices, credentials) = inputs.as_deref().map_or((&Value::Null, &empty), |inputs| {
+        (&inputs.prices, &inputs.credentials)
+    });
     // Rebuild quota budgets from the override, not from the live economics
     // cache. Current plan mappings and value evidence are not quota readings.
-    let mut pools = build_with_credentials(state, &report, &prices, quota_now, &credentials).pools;
+    let mut pools =
+        build_with_credentials(state, &report.value(), prices, quota_now, credentials).pools;
     for pool in pools.values_mut() {
         pool.value_now_ms = Some(value_now);
     }
@@ -721,11 +829,12 @@ pub(crate) fn test_pools(pools: HashMap<String, SubscriptionPool>) -> impl Drop 
     struct Restore(HashMap<String, SubscriptionPool>);
     impl Drop for Restore {
         fn drop(&mut self) {
-            cache().lock().unwrap().economics.pools = std::mem::take(&mut self.0);
+            Arc::make_mut(&mut cache().lock().unwrap().economics).pools =
+                std::mem::take(&mut self.0);
         }
     }
     Restore(std::mem::replace(
-        &mut cache().lock().unwrap().economics.pools,
+        &mut Arc::make_mut(&mut cache().lock().unwrap().economics).pools,
         pools,
     ))
 }
@@ -804,13 +913,13 @@ mod tests {
         let runtime = operation("subscription_economics_runtime", || {
             let now = 1_800_000_000_000;
             let mut runtime = super::Runtime {
-                inputs: Some(super::Inputs {
+                inputs: Some(Arc::new(super::Inputs {
                     state: v2_state(now),
                     prices: prices(),
                     credentials: Default::default(),
                     unpriced_tiers: Default::default(),
-                }),
-                report: report_v2(),
+                })),
+                report: ReportInput::Poll(Arc::new(report_v2())),
                 ..Default::default()
             };
             runtime.rebuild(now);
@@ -863,12 +972,12 @@ mod tests {
         now: i64,
     ) -> Runtime {
         let mut runtime = Runtime {
-            inputs: Some(Inputs {
+            inputs: Some(Arc::new(Inputs {
                 state,
                 prices: prices(),
                 credentials,
                 unpriced_tiers: BTreeSet::new(),
-            }),
+            })),
             ..Default::default()
         };
         runtime.multipliers.begin();
@@ -914,6 +1023,81 @@ mod tests {
 
     fn kimi_credentials() -> BTreeMap<String, BTreeSet<String>> {
         [(KIMI_PROVIDER.into(), [KIMI_CREDENTIAL.into()].into())].into()
+    }
+
+    #[test]
+    fn multiplier_burst_rebuilds_once_and_identical_rows_do_not_rebuild() {
+        let report = kimi_multiplier_report();
+        let mut runtime = multiplier_runtime(
+            &report,
+            AccountQuotaState::default(),
+            kimi_credentials(),
+            KIMI_NOW,
+        );
+        let builds = runtime.rebuilds;
+        let mut row = report["latest"][0].clone();
+        let unchanged = multiplier_put("opaque-0", &row);
+        row["last_eligible"]["multiplier"] = json!(6.0);
+        let first = multiplier_put("opaque-0", &row);
+        row["last_eligible"]["multiplier"] = json!(7.0);
+        runtime.bucket_batch(
+            vec![unchanged, first, multiplier_put("opaque-0", &row)],
+            KIMI_NOW,
+        );
+        assert_eq!(
+            runtime.rebuilds - builds,
+            1,
+            "one watch burst must publish just one rebuild"
+        );
+        assert_eq!(
+            credential_route_price(
+                runtime.economics.pools.clone(),
+                KIMI_NOW,
+                KIMI_PROVIDER,
+                None
+            )
+            .value_multiplier,
+            7.0
+        );
+        let generation = runtime.multipliers.generation;
+        runtime.bucket_batch(vec![multiplier_put("opaque-0", &row)], KIMI_NOW);
+        assert_eq!(runtime.rebuilds - builds, 1);
+        assert_eq!(runtime.multipliers.generation, generation);
+    }
+
+    #[test]
+    fn multiplier_publication_swaps_complete_pools_and_rejects_late_rebuilds() {
+        let report = kimi_multiplier_report();
+        let mut runtime = multiplier_runtime(
+            &report,
+            AccountQuotaState::default(),
+            kimi_credentials(),
+            KIMI_NOW,
+        );
+        let old = Arc::clone(&runtime.economics);
+        let mut row = report["latest"][0].clone();
+        row["last_eligible"]["multiplier"] = json!(6.0);
+        let late = runtime
+            .accept_bucket_batch(vec![multiplier_put("opaque-0", &row).into()], KIMI_NOW)
+            .unwrap();
+        row["last_eligible"]["multiplier"] = json!(7.0);
+        let latest = runtime
+            .accept_bucket_batch(vec![multiplier_put("opaque-0", &row).into()], KIMI_NOW)
+            .unwrap();
+        assert!(Arc::ptr_eq(&runtime.economics, &old));
+
+        let expected = latest.build();
+        let rebuilt = Arc::clone(&expected.1);
+        assert!(Arc::ptr_eq(&runtime.economics, &old));
+        runtime.publish(expected);
+        runtime.publish(late.build());
+        assert!(Arc::ptr_eq(&runtime.economics, &rebuilt));
+        let price = |snapshot: &EconomicsCache| {
+            credential_route_price(snapshot.pools.clone(), KIMI_NOW, KIMI_PROVIDER, None)
+                .value_multiplier
+        };
+        assert_eq!(price(&old), 4.4);
+        assert_eq!(price(&runtime.economics), 7.0);
     }
 
     fn kimi_report_price(
@@ -1019,8 +1203,12 @@ mod tests {
                 KIMI_NOW,
             );
             assert_eq!(bucket.multipliers.health()["planCount"], 1);
-            let price =
-                credential_route_price(bucket.economics.pools, KIMI_NOW, KIMI_PROVIDER, Some(3.0));
+            let price = credential_route_price(
+                bucket.economics.pools.clone(),
+                KIMI_NOW,
+                KIMI_PROVIDER,
+                Some(3.0),
+            );
             assert_eq!(price.plan_values[0].plan.as_deref(), Some(KIMI_PLAN));
             assert_eq!(price.value_multiplier, 3.0, "malformed {key}");
             assert_eq!(price, kimi_report_price(&malformed, KIMI_NOW, Some(3.0)));
@@ -1056,8 +1244,12 @@ mod tests {
             KIMI_NOW,
         );
         assert_eq!(bucket.multipliers.health()["planCount"], 1);
-        let price =
-            credential_route_price(bucket.economics.pools, KIMI_NOW, KIMI_PROVIDER, Some(3.0));
+        let price = credential_route_price(
+            bucket.economics.pools.clone(),
+            KIMI_NOW,
+            KIMI_PROVIDER,
+            Some(3.0),
+        );
         assert_eq!(price, kimi_report_price(&report, KIMI_NOW, Some(3.0)));
         assert_kimi_last_eligible(&price);
     }
@@ -1191,7 +1383,7 @@ mod tests {
             + 1;
         let mut runtime = multiplier_runtime(&report, v2_state(now), BTreeMap::new(), now);
         let before = runtime.economics.pools.clone();
-        let good = runtime.report.clone();
+        let good = runtime.report.value();
         let index = report["latest"]
             .as_array()
             .unwrap()
@@ -1214,7 +1406,7 @@ mod tests {
                 },
                 now,
             );
-            assert_eq!(runtime.report, good);
+            assert_eq!(runtime.report.value(), good);
             assert_eq!(runtime.economics.pools, before);
         }
         assert_eq!(
@@ -1279,16 +1471,17 @@ mod tests {
     fn multiplier_rebind_replaces_the_map_including_missing_keys_and_empty_buckets() {
         let report = report_v2();
         let mut runtime = multiplier_runtime(&report, v2_state(NOW), BTreeMap::new(), NOW);
-        let before = runtime.report.clone();
+        let before = runtime.report.value();
         runtime.multipliers.begin();
         runtime.bucket_item(multiplier_put("new-opaque-key", &report["latest"][0]), NOW);
         assert_eq!(
-            runtime.report, before,
+            runtime.report.value(),
+            before,
             "a partial snapshot must not remove live rows"
         );
         runtime.bucket_item(cortexkit_bus_client::BucketItem::CaughtUp, NOW);
         let remaining = json!({"latest":[report["latest"][0]]});
-        assert_eq!(runtime.report, remaining);
+        assert_eq!(*runtime.report.value(), remaining);
         let fresh = multiplier_runtime(&remaining, v2_state(NOW), BTreeMap::new(), NOW);
         assert_eq!(runtime.economics.pools, fresh.economics.pools);
         assert_eq!(
@@ -1297,7 +1490,7 @@ mod tests {
         );
         runtime.multipliers.begin();
         runtime.bucket_item(cortexkit_bus_client::BucketItem::CaughtUp, NOW);
-        assert_eq!(runtime.report, json!({"latest":[]}));
+        assert_eq!(*runtime.report.value(), json!({"latest":[]}));
         assert_eq!(runtime.multipliers.health()["planCount"], 0);
     }
 
@@ -1329,9 +1522,9 @@ mod tests {
             },
             NOW,
         );
-        let after_delete = runtime.report.clone();
+        let after_delete = runtime.report.value();
         runtime.poll_report(report, generation, true);
-        assert_eq!(runtime.report, after_delete);
+        assert_eq!(runtime.report.value(), after_delete);
     }
 
     use super::*;
