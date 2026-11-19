@@ -60,6 +60,7 @@
 //! only an offline VACUUM shrinks the file itself, and this pass never runs one.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -446,21 +447,48 @@ impl Default for PassBudget {
     }
 }
 
+/// Aborting the async timer cannot stop a pass already on the blocking pool.
+/// Let that pass finish its current transaction without starting another one.
+#[derive(Clone, Default)]
+pub(super) struct RetentionStop(Arc<AtomicBool>);
+
+impl RetentionStop {
+    pub(super) fn request(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    fn requested(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+
+    fn next_batch(&self, round: usize, pause: Duration) -> bool {
+        if round > 0 && !pause.is_zero() && !self.requested() {
+            std::thread::sleep(pause);
+        }
+        !self.requested()
+    }
+}
+
+struct PassControl<'a> {
+    budget: &'a PassBudget,
+    stop: &'a RetentionStop,
+}
+
 /// Run up to `max_batches` batches of one table until a batch comes back
 /// short (nothing more is due), a batch fails, or the budget is spent.
 /// `batch` returns (rows deleted, rows examined). Adds the batches it ran to
 /// `batches_so_far` and returns (rows deleted, drained).
 fn drain(
     table: &'static str,
-    budget: &PassBudget,
+    control: &PassControl<'_>,
     max_batches: usize,
     batches_so_far: &mut usize,
     batch: impl FnMut() -> Result<(usize, usize), String>,
 ) -> (usize, bool) {
     drain_batches(
         table,
-        budget.batch_rows,
-        budget,
+        control.budget.batch_rows,
+        control,
         max_batches,
         batches_so_far,
         batch,
@@ -472,7 +500,7 @@ fn drain(
 fn drain_batches(
     table: &'static str,
     batch_rows: usize,
-    budget: &PassBudget,
+    control: &PassControl<'_>,
     max_batches: usize,
     batches_so_far: &mut usize,
     mut batch: impl FnMut() -> Result<(usize, usize), String>,
@@ -485,8 +513,8 @@ fn drain_batches(
     striatum_store::job_timing::sync(name, || {
         let mut deleted = 0;
         for round in 0..max_batches {
-            if round > 0 && !budget.pause.is_zero() {
-                std::thread::sleep(budget.pause);
+            if !control.stop.next_batch(round, control.budget.pause) {
+                return (deleted, false);
             }
             *batches_so_far += 1;
             match batch() {
@@ -534,6 +562,7 @@ pub fn run_retention_pass(
         now_ms,
         budget,
         &mut AffinitySweep::default(),
+        &RetentionStop::default(),
     )
 }
 
@@ -543,7 +572,9 @@ fn run_retention_pass_with_affinity_sweep(
     now_ms: i64,
     budget: &PassBudget,
     affinity_sweep: &mut AffinitySweep,
+    stop: &RetentionStop,
 ) -> RetentionPassReport {
+    let control = &PassControl { budget, stop };
     let rows = budget.batch_rows;
     let per_table = budget.max_batches_per_table;
     let mut report = RetentionPassReport::default();
@@ -556,7 +587,7 @@ fn run_retention_pass_with_affinity_sweep(
 
     let (shadow, shadow_drained) = drain(
         "account_decision (shadow)",
-        budget,
+        control,
         budget.max_shadow_purge_batches,
         batches,
         || counted(store.purge_shadow_decisions(rows)),
@@ -565,7 +596,7 @@ fn run_retention_pass_with_affinity_sweep(
     let (admissions, admissions_drained) = drain_batches(
         "account_admission",
         rows.min(ADMISSION_DELETE_BATCH_ROWS),
-        budget,
+        control,
         per_table,
         batches,
         || {
@@ -577,7 +608,7 @@ fn run_retention_pass_with_affinity_sweep(
             ))
         },
     );
-    let (holds, holds_drained) = drain("account_hold", budget, per_table, batches, || {
+    let (holds, holds_drained) = drain("account_hold", control, per_table, batches, || {
         counted(store.prune_account_holds(history_before, rows))
     });
     let mut pins = 0;
@@ -586,6 +617,10 @@ fn run_retention_pass_with_affinity_sweep(
     let checkpoint = affinity_sweep.clone();
     let (mut affinities, mut affinities_drained) = (0, true);
     striatum_store::job_timing::sync("retention.affinity_and_pins", || {
+        if stop.requested() {
+            affinities_drained = false;
+            return;
+        }
         match affinity_sweep.plan(store, affinity_before, now_ms, scan_limit) {
             Ok(Some(plan)) => {
                 affinities_drained = plan.examined < scan_limit;
@@ -594,8 +629,9 @@ fn run_retention_pass_with_affinity_sweep(
                     .chunks(rows.min(AFFINITY_DELETE_BATCH_ROWS).max(1))
                     .enumerate()
                 {
-                    if round > 0 && !budget.pause.is_zero() {
-                        std::thread::sleep(budget.pause);
+                    if !stop.next_batch(round, budget.pause) {
+                        affinities_drained = false;
+                        break;
                     }
                     *batches += 1;
                     match crate::account_writer::prune_account_affinities(
@@ -623,7 +659,7 @@ fn run_retention_pass_with_affinity_sweep(
             Err(error) => tracing::warn!(error=%error, "affinity retention planning failed"),
         }
     });
-    let (unneeded_pins, pins_drained) = drain("account_pin", budget, per_table, batches, || {
+    let (unneeded_pins, pins_drained) = drain("account_pin", control, per_table, batches, || {
         counted(crate::account_writer::prune_account_pins(
             store,
             history_before,
@@ -632,12 +668,12 @@ fn run_retention_pass_with_affinity_sweep(
     });
     pins += unneeded_pins;
     let (decisions, decisions_drained) =
-        drain("account_decision", budget, per_table, batches, || {
+        drain("account_decision", control, per_table, batches, || {
             counted(store.prune_serve_decisions(history_before, rows))
         });
     let observed_before = before(now_ms, window_ms(windows.account_observation_days, DAY_MS));
     let (observations, observations_drained) =
-        drain("account_observation", budget, per_table, batches, || {
+        drain("account_observation", control, per_table, batches, || {
             counted(crate::account_writer::prune_account_observations(
                 store,
                 observed_before,
@@ -647,7 +683,7 @@ fn run_retention_pass_with_affinity_sweep(
     let keys_before = before(now_ms, OBSERVATION_EVENT_KEY_WINDOW_MS);
     let (observation_events, observation_events_drained) = drain(
         "account_observation_event",
-        budget,
+        control,
         per_table,
         batches,
         || {
@@ -663,18 +699,18 @@ fn run_retention_pass_with_affinity_sweep(
         window_ms(windows.model_route_decisions_days, DAY_MS),
     );
     let (route_decisions, route_decisions_drained) =
-        drain("model_route_decisions", budget, per_table, batches, || {
+        drain("model_route_decisions", control, per_table, batches, || {
             counted(store.delete_decisions_older_than(decided_before, rows))
         });
     let (parent_failures, parent_failures_drained) = drain(
         "model_route_parent_failures",
-        budget,
+        control,
         per_table,
         batches,
         || counted(store.prune_parent_failures(decided_before, rows)),
     );
     let usage_before = before(now_ms, window_ms(windows.model_route_usage_days, DAY_MS));
-    let (usage, usage_drained) = drain("model_route_usage", budget, per_table, batches, || {
+    let (usage, usage_drained) = drain("model_route_usage", control, per_table, batches, || {
         counted(store.prune_route_usage(usage_before, rows))
     });
     let full_detail_before = before(
@@ -685,7 +721,7 @@ fn run_retention_pass_with_affinity_sweep(
     let (details_stripped, details_drained) = drain_batches(
         "model_route_decisions (detail)",
         budget.detail_batch_rows,
-        budget,
+        control,
         budget.max_detail_batches,
         batches,
         || {
@@ -707,7 +743,7 @@ fn run_retention_pass_with_affinity_sweep(
     // retire a finished run's whole lineage.
     let continuation_before = before(now_ms, CONTINUATION_WINDOW_MS);
     let (continuations, continuations_drained) =
-        drain("account_continue", budget, per_table, batches, || {
+        drain("account_continue", control, per_table, batches, || {
             counted(crate::account_writer::prune_account_continuations(
                 store,
                 continuation_before,
@@ -717,7 +753,7 @@ fn run_retention_pass_with_affinity_sweep(
     let replay_before = before(now_ms, V1_REPLAY_WINDOW_MS);
     let (mut v1_reports, mut v1_report_deliveries) = (0, 0);
     let (v1_decisions, v1_decisions_drained) =
-        drain("routing_v1_decision", budget, per_table, batches, || {
+        drain("routing_v1_decision", control, per_table, batches, || {
             crate::account_writer::prune_v1_decisions(store, replay_before, rows)
                 .map(|batch| {
                     v1_reports += batch.reports;
@@ -727,18 +763,18 @@ fn run_retention_pass_with_affinity_sweep(
                 .map_err(|error| error.0)
         });
     let (orphan_reports, orphan_reports_drained) =
-        drain("routing_v1_report", budget, per_table, batches, || {
+        drain("routing_v1_report", control, per_table, batches, || {
             counted(store.prune_orphan_v1_reports(replay_before, rows))
         });
     let (orphan_deliveries, orphan_deliveries_drained) = drain(
         "routing_v1_report_delivery",
-        budget,
+        control,
         per_table,
         batches,
         || counted(store.prune_orphan_v1_report_deliveries(replay_before, rows)),
     );
     let (v1_admissions, v1_admissions_drained) =
-        drain("routing_v1_admission", budget, per_table, batches, || {
+        drain("routing_v1_admission", control, per_table, batches, || {
             counted(crate::account_writer::prune_v1_admissions(
                 store,
                 replay_before,
@@ -746,7 +782,7 @@ fn run_retention_pass_with_affinity_sweep(
             ))
         });
     let (v1_affinities, v1_affinities_drained) =
-        drain("routing_v1_affinity", budget, per_table, batches, || {
+        drain("routing_v1_affinity", control, per_table, batches, || {
             counted(crate::account_writer::prune_v1_affinities(
                 store,
                 replay_before,
@@ -760,7 +796,7 @@ fn run_retention_pass_with_affinity_sweep(
     let speed_cap_before = before(now_ms, SPEED_SAMPLE_CAP_MS);
     let (speed_samples, speed_samples_drained) = drain(
         "model_route_speed_samples",
-        budget,
+        control,
         per_table,
         batches,
         || {
@@ -774,12 +810,12 @@ fn run_retention_pass_with_affinity_sweep(
     );
     let calls_before = before(now_ms, ROUTING_CALL_COUNT_WINDOW_MS);
     let (call_counts, call_counts_drained) =
-        drain("routing_call_count", budget, per_table, batches, || {
+        drain("routing_call_count", control, per_table, batches, || {
             counted(store.prune_routing_call_counts(calls_before, rows))
         });
     let retired_before = before(now_ms, RETIRED_FENCE_ORIGIN_WINDOW_MS);
     let (retired_origins, retired_origins_drained) =
-        drain("retirement_tombstone", budget, per_table, batches, || {
+        drain("retirement_tombstone", control, per_table, batches, || {
             counted(crate::account_writer::prune_retired_fence_origins(
                 store,
                 retired_before,
@@ -788,14 +824,14 @@ fn run_retention_pass_with_affinity_sweep(
         });
     let (unscored, unscored_drained) = drain(
         "routing_unscored_admissible_models",
-        budget,
+        control,
         per_table,
         batches,
         || counted(store.prune_unscored_admissible_models(decided_before, rows)),
     );
     let readings_before = striatum_core::quota_poll::reading_log_retention_cutoff(now_ms);
     let (quota_readings, quota_readings_drained) =
-        drain("quota_reading_log", budget, per_table, batches, || {
+        drain("quota_reading_log", control, per_table, batches, || {
             counted(store.prune_quota_reading_log(readings_before, rows))
         });
     report.shadow_decisions = shadow;
@@ -851,7 +887,11 @@ fn run_retention_pass_with_affinity_sweep(
 /// The periodic retention pass. Each pass re-reads the windows from the
 /// routing file and runs on a blocking thread, so selection and admission
 /// never wait on it except for one short batch at a time.
-pub async fn retention_loop(store: Arc<SqliteRouteStateStore>, config_path: PathBuf) {
+pub(super) async fn retention_loop(
+    store: Arc<SqliteRouteStateStore>,
+    config_path: PathBuf,
+    stop: RetentionStop,
+) {
     let mut last_warnings: Vec<String> = Vec::new();
     let mut affinity_sweep = AffinitySweep::default();
     loop {
@@ -866,6 +906,7 @@ pub async fn retention_loop(store: Arc<SqliteRouteStateStore>, config_path: Path
         }
         let pass_store = Arc::clone(&store);
         let mut pass_sweep = std::mem::take(&mut affinity_sweep);
+        let pass_stop = stop.clone();
         let outcome = striatum_store::job_timing::run(
             "retention",
             crate::stage_timing::spawn_job_blocking(move || {
@@ -875,6 +916,7 @@ pub async fn retention_loop(store: Arc<SqliteRouteStateStore>, config_path: Path
                     crate::account_selection::now_ms(),
                     &PassBudget::default(),
                     &mut pass_sweep,
+                    &pass_stop,
                 );
                 (report, pass_sweep)
             }),
@@ -922,6 +964,121 @@ pub async fn retention_loop(store: Arc<SqliteRouteStateStore>, config_path: Path
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn shutdown_during_a_retention_batch_closes_without_draining_the_backlog() {
+        for table in ["account_decision", "account_affinity"] {
+            stop_during_first_delete(table);
+        }
+    }
+
+    fn stop_during_first_delete(table: &'static str) {
+        use std::sync::mpsc;
+
+        let (dir, path, store) = scratch_store(table);
+        if table == "account_decision" {
+            store
+                .account_transaction(|tx| {
+                    for id in ["first", "second"] {
+                        tx.insert_decision(&shadow_admit(id.into(), 1))?;
+                    }
+                    Ok(())
+                })
+                .unwrap();
+        } else {
+            for id in ["first", "second"] {
+                seed_pin_affinity(&path, &store, id, NOW - 2 * HOUR_MS);
+            }
+        }
+
+        let (entered, first_delete) = tokio::sync::oneshot::channel();
+        let (release, finish_delete) = mpsc::channel();
+        store
+            .with_writer_for_test(|conn| {
+                let mut entered = Some(entered);
+                conn.create_scalar_function(
+                    "retention_test_pause_first_delete",
+                    0,
+                    rusqlite::functions::FunctionFlags::default(),
+                    move |_| {
+                        if let Some(entered) = entered.take() {
+                            entered.send(()).unwrap();
+                            finish_delete.recv().unwrap();
+                        }
+                        Ok(0)
+                    },
+                )?;
+                conn.execute_batch(&format!(
+                    "CREATE TEMP TRIGGER stop_in_first_delete AFTER DELETE ON {table}
+                BEGIN SELECT retention_test_pause_first_delete(); END;"
+                ))
+            })
+            .unwrap();
+
+        let (closed, did_close) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let shutdown = crate::shutdown::Shutdown::default();
+            let store = Arc::new(store);
+            runtime.block_on(async {
+                let mut loops = crate::background::BackgroundLoops::default();
+                let pass_store = Arc::clone(&store);
+                let pass_stop = loops.retention_stop();
+                loops.spawn("retention", async move {
+                    tokio::task::spawn_blocking(move || {
+                        run_retention_pass_with_affinity_sweep(
+                            &pass_store,
+                            &RetentionWindows::default(),
+                            NOW,
+                            &PassBudget {
+                                batch_rows: 1,
+                                ..no_pause()
+                            },
+                            &mut AffinitySweep::default(),
+                            &pass_stop,
+                        )
+                    })
+                    .await
+                    .unwrap();
+                });
+                tokio::time::timeout(Duration::from_secs(3), first_delete)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                shutdown.begin();
+                loops.shutdown().await;
+                release.send(()).unwrap();
+            });
+            drop(runtime);
+            drop(
+                Arc::try_unwrap(store)
+                    .ok()
+                    .expect("blocking pass still owns the store"),
+            );
+            closed.send(()).unwrap();
+        });
+        did_close
+            .recv_timeout(Duration::from_secs(3))
+            .expect("retention must stop and close before the watchdog");
+        worker.join().unwrap();
+        for sidecar in [
+            "store.db-wal",
+            "store.db-shm",
+            "history.db-wal",
+            "history.db-shm",
+        ] {
+            assert!(!dir.join(sidecar).exists(), "clean stop left {sidecar}");
+        }
+        assert_eq!(
+            count(&path, &format!("SELECT count(*) FROM {table}")),
+            1,
+            "{table}: the active batch must commit but the second must stay queued"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     fn seed_carbon_retention_rows(
         store: &SqliteRouteStateStore,
         residue: usize,

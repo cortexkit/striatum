@@ -30,14 +30,20 @@ use crate::{
 pub(super) struct BackgroundLoops {
     tasks: tokio::task::JoinSet<()>,
     names: HashMap<tokio::task::Id, &'static str>,
+    retention_stop: crate::retention::RetentionStop,
 }
 
 impl BackgroundLoops {
     /// Stop delivery before the final cache flush. Aborting alone does not wait
     /// for a task already polling to finish its publication and acknowledgement.
     pub(super) async fn shutdown(mut self) {
+        self.retention_stop.request();
         self.tasks.abort_all();
         while self.tasks.join_next().await.is_some() {}
+    }
+
+    pub(super) fn retention_stop(&self) -> crate::retention::RetentionStop {
+        self.retention_stop.clone()
     }
 
     pub(super) fn spawn<F>(&mut self, name: &'static str, task: F)
@@ -70,6 +76,12 @@ impl BackgroundLoops {
             "routing background loop `{name}` stopped unexpectedly ({how}); \
              exiting so the daemon restarts the module"
         ))
+    }
+}
+
+impl Drop for BackgroundLoops {
+    fn drop(&mut self) {
+        self.retention_stop.request();
     }
 }
 
@@ -163,7 +175,11 @@ pub(super) async fn start(
     loops.spawn("history mover", history_mover_loop(Arc::clone(store)));
     loops.spawn(
         "retention",
-        retention::retention_loop(Arc::clone(&store), config_overrides::config_path()),
+        retention::retention_loop(
+            Arc::clone(store),
+            config_overrides::config_path(),
+            loops.retention_stop(),
+        ),
     );
     // The quota event consumer starts from the restored per-account views.
     loops.spawn(
