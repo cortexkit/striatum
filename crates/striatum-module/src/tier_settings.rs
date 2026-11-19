@@ -203,15 +203,6 @@ pub(crate) fn without_context(params: &serde_json::Value) -> serde_json::Value {
     params
 }
 
-pub(crate) fn record_requested(document: &mut String, tier: Option<ServiceTier>) {
-    if let Some(tier) = tier {
-        let mut value: serde_json::Value =
-            serde_json::from_str(document).expect("decision requirements are JSON");
-        value["service_tier_requested"] = serde_json::json!(tier);
-        *document = value.to_string();
-    }
-}
-
 fn load(path: &Path) -> Arc<Document> {
     static CACHE: OnceLock<Mutex<HashMap<PathBuf, Cached>>> = OnceLock::new();
     let mut cache = CACHE.get_or_init(Default::default).lock().unwrap();

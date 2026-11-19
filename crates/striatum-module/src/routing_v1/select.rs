@@ -5,7 +5,7 @@
 //! entitlement fences and operator exclusions every route
 //! selection reads ([`crate::prepare_selection_inputs`],
 //! [`crate::price_selection_inputs`]), the scorer
-//! ([`select_policy::select_candidates`]) and the pin admission
+//! and the pin admission
 //! ([`crate::work_model_pin::select_with_availability`]). What this module
 //! adds is the v1 request: which runners can serve, the requirements the
 //! scorer has no input for, the consumer's policy, the project's pin and the
@@ -766,7 +766,6 @@ impl RequestInputs {
             facts: self.facts.clone(),
             snapshot,
             quota_signal_json,
-            quota_note: stale_age_ms.map(|age| crate::stale_quota_note(age, last_error.as_deref())),
         })
     }
 }
@@ -985,7 +984,6 @@ async fn prepare_selection(
         mut facts,
         snapshot,
         quota_signal_json,
-        quota_note: _,
     } = shared.prepare_for_sweep(deps, evaluation.map(|view| view.accounts))?;
     let catalog_targets = &shared.catalog_targets;
     let sources = SelectionPolicySources {
@@ -2687,7 +2685,7 @@ struct Selection<'a> {
     operator_exclude: &'a [String],
     consumer_exclude: &'a [String],
     subscription_keys: &'a HashSet<String>,
-    /// Route-local refusals, by route key ([`select_policy::candidate_rejections`]).
+    /// Route-local refusals, by route key.
     rejections: &'a HashMap<String, String>,
     runtime_unavailable: &'a HashSet<String>,
     recovery_available: &'a HashSet<String>,
@@ -3200,7 +3198,6 @@ impl<'a> Selection<'a> {
             target_agent: self.consumer,
             requirements: self.demand,
             facts: self.facts,
-            snapshot: self.snapshot,
             exclude: self.exclude,
             operator_exclude: self.operator_exclude,
             required_capabilities: self.required_capabilities,
@@ -3209,11 +3206,7 @@ impl<'a> Selection<'a> {
             min_band: self.min_band,
             prefer_prompt_cache: self.prefer_prompt_cache,
             providers_without_prompt_cache: &self.providers_without_prompt_cache,
-            consumer_exclude: self.consumer_exclude,
-            rejections: self.rejections,
             config: self.routing_config,
-            slots: self.slots,
-            concurrency: self.use_concurrency.get().then_some(self.concurrency),
             operator_config: self.sources.operator_config,
             policy_memo: self.policy_memo,
         }

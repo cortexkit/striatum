@@ -422,14 +422,13 @@ impl<'a> AccountCommand<'a> {
             }),
         }
     }
-
+    #[cfg(test)]
     pub(crate) fn existing_salt(&self) -> RouteStateResult<Option<String>> {
         match &self.state {
             Some(state) => Ok(state.selection_salt.as_deref().cloned()),
             None => self.sql.existing_salt(),
         }
     }
-
     pub(crate) fn salt(
         &mut self,
         now: i64,
@@ -1477,7 +1476,7 @@ impl AccountCommand<'_> {
         }
         self.sql.sync_fence_rechecks()
     }
-
+    #[cfg(test)]
     pub(crate) fn prune_account_admissions(
         &mut self,
         before: i64,

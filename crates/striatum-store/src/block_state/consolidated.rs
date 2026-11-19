@@ -1207,7 +1207,7 @@ impl BlockState {
         }
         Ok(())
     }
-
+    #[cfg(test)]
     fn check_block(&self, conn: &Connection, kind: &str, origin_key: &str) -> rusqlite::Result<()> {
         let statement = format!(
             "{} {} WHERE kind=?1 AND origin_key=?2",
@@ -1222,7 +1222,6 @@ impl BlockState {
             .and_then(|rowid| table.rows.get(rowid).map(|(_, row)| (*rowid, row.as_ref())));
         self.compare_rows(conn, 0, &statement, [kind, origin_key], held.into_iter())
     }
-
     pub fn check_clock(
         &self,
         conn: &Connection,

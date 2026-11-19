@@ -294,11 +294,11 @@ impl Pins {
         Ok(())
     }
 }
-
 impl ExcludeGroups {
     /// The exclusion list a consumer group names, or nothing when no group of
     /// that name exists. Looked up through the serialized field names so a
     /// group added to this struct is found without a second list to update.
+    #[cfg(test)]
     pub fn named_group(&self, group: &str) -> Vec<String> {
         if group == "all" {
             return Vec::new();
@@ -310,7 +310,6 @@ impl ExcludeGroups {
             .unwrap_or_default()
     }
 }
-
 /// A runner module `routing/v1` answers with (`runners[]`).
 /// Listed in preference order: the first listed runner that can serve the
 /// answered route is named.

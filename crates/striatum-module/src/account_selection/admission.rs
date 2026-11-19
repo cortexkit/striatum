@@ -134,12 +134,12 @@ pub(super) fn invalid_pool(pool: Option<&str>) -> Option<OpReply> {
         json!({ "code": "invalid_request", "field": "pool" }),
     ))
 }
-
 /// The demand the allocator can charge to `roster`'s accounts. Each account's
 /// admissions are read from its [`demand_floor`] on, so a decision never
 /// loads history the allocator would ignore; admissions of accounts outside
 /// the roster are never read, because the allocator only prices roster
 /// accounts.
+#[cfg(test)]
 pub(super) fn load_demand(
     tx: &AccountTx<'_>,
     provider: &str,
@@ -1242,7 +1242,7 @@ pub(crate) fn preflight_model(
 ) -> Result<(), (String, String)> {
     preflight_model_for_class(ctx, provider, model, false)
 }
-
+#[cfg(test)]
 pub(crate) fn preflight_model_for_class(
     ctx: &Ctx<'_>,
     provider: &str,
@@ -1252,7 +1252,6 @@ pub(crate) fn preflight_model_for_class(
     preflight_model_for_class_with_reset(ctx, provider, model, priced_per_token)
         .map_err(|refusal| (refusal.code, refusal.message))
 }
-
 pub(crate) struct PreflightRefusal {
     pub code: String,
     pub message: String,

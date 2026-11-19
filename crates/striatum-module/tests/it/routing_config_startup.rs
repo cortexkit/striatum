@@ -1,11 +1,6 @@
 //! Exercise startup before a daemon connection: bad operator policy must stop
 //! the real process rather than silently permit models the operator excluded.
 
-#[path = "../../src/config_convert.rs"]
-mod config_convert;
-#[path = "../../src/test_config.rs"]
-mod test_config;
-
 use std::path::{Path, PathBuf};
 use std::process::Output;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -68,7 +63,7 @@ fn stderr(output: Output) -> String {
 
 fn invalid_startup(document: &str, token: &str) {
     let home = Home::new();
-    test_config::write_raw(home.config_dir(true).join("striatum.jsonc"), document).unwrap();
+    std::fs::write(home.config_dir(true).join("striatum.jsonc"), document).unwrap();
     let message = stderr(home.run(true));
     assert!(message.contains(token), "{message}");
     assert!(message.contains("striatum.jsonc"), "{message}");
@@ -90,7 +85,7 @@ fn old_explicit_only_providers_refuses_startup_with_converter() {
 #[test]
 fn absent_routing_file_with_xdg_does_not_read_home_file() {
     let home = Home::new();
-    test_config::write_raw(home.config_dir(false).join("striatum.jsonc"), "not json").unwrap();
+    std::fs::write(home.config_dir(false).join("striatum.jsonc"), "not json").unwrap();
     let message = stderr(home.run(true));
     assert!(
         message.contains(Path::new("missing-connection-file").to_str().unwrap()),
@@ -106,7 +101,7 @@ fn striatum_startup_and_check_config_name_the_settings_file() {
             let directory = home.config_dir(xdg);
             let primary = directory.join("striatum.jsonc");
             if primary_exists {
-                test_config::write_raw(&primary, "{}").unwrap();
+                std::fs::write(&primary, "{}").unwrap();
             }
             let startup = stderr(home.run(xdg));
             assert!(startup.contains("missing-connection-file"), "{startup}");
@@ -131,7 +126,7 @@ fn removed_model_naming_refuses_startup_and_check_config() {
     ] {
         let home = Home::new();
         let primary = home.config_dir(true).join("striatum.jsonc");
-        test_config::write_raw(&primary, document).unwrap();
+        std::fs::write(&primary, document).unwrap();
         for output in [
             home.run(true),
             home.run_with_args(true, &["--check-config"]),
@@ -152,7 +147,7 @@ fn removed_model_naming_refuses_startup_and_check_config() {
 fn striatum_invalid_settings_file_refuses_startup_and_check_config() {
     let home = Home::new();
     let primary = home.config_dir(true).join("striatum.jsonc");
-    test_config::write_raw(&primary, "not json").unwrap();
+    std::fs::write(&primary, "not json").unwrap();
     for output in [
         home.run(true),
         home.run_with_args(true, &["--check-config"]),
@@ -184,7 +179,7 @@ fn one_shot_output_modes_add_no_stderr_logging() {
 fn check_config_binary_prints_five_anonymous_count_lines_offline() {
     let home = Home::new();
     let primary = home.config_dir(true).join("striatum.jsonc");
-    test_config::write_raw(
+    std::fs::write(
         &primary,
         r#"{
         "providers":{"private-provider":{"subscription":true,"pin_only":false}},

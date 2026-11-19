@@ -210,7 +210,6 @@ pub(crate) fn observe_authorized(
     )
     .unwrap_or_else(store_error)
 }
-
 /// `fresh_event`: the caller minted `parsed.event_id` itself inside this
 /// command (a continuation's own exhaustion report), so no stored observation
 /// can carry it and the duplicate lookup in `account_observation` is skipped.
@@ -277,7 +276,7 @@ pub(super) fn record_observation(
         received_at: now,
     })?;
     let mut effects: Vec<Value> = Vec::new();
-    let mut bound = false;
+    let bound;
     let served_providers: BTreeSet<String> =
         if allow_served_account && parsed.kind == "transient_backoff" {
             ctx.classes

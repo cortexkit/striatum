@@ -79,15 +79,14 @@ pub(crate) const LADDER_IQ_TIERS: [u8; 7] = [30, 50, 60, 70, 80, 90, 100];
 /// agent whose launch policy insists on explicit demand, so the resolved EQ is
 /// the plain default rather than a specialist fallback.
 const LADDER_TARGET_AGENT: &str = "mason";
-
 /// Selections arriving through `route.select` on the caller's own host list.
+#[cfg(test)]
 pub(crate) const SUBSTRATE_HOST: &str = "opencode-host";
 /// Selections that send through Broca: `route.select_panel` and `route.select`
 /// called with substrate broca.
 pub(crate) const SUBSTRATE_BROCA: &str = crate::legacy_wire::BROCA;
 /// Caller class of `route.select_panel` recordings: panels carry no target agent.
 pub(crate) const CALLER_CLASS_PANEL: &str = "panel";
-
 /// How long a recorded list keeps contributing to its key's union after it was
 /// last seen. Callers of one class arrive minutes apart (the live flap
 /// interleaved plugin explore launches and seed-catalog explore selections

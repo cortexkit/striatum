@@ -1245,16 +1245,6 @@ impl CredentialData {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn mark_copy_listing_gap(&mut self) {
-        for method in self.serving.values_mut() {
-            if method.reason == "ambiguous (single listed method: )" {
-                method.reason =
-                    "serving method not verified live: no listing in a store copy".into();
-            }
-        }
-    }
-
     /// The key pool of a routing provider that exists only as vault credential
     /// mappings: every llm-provider API key whose `provider_ids` names it, in
     /// any lifecycle state (a key the vault marks unusable is reported as such,

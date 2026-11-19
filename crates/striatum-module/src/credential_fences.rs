@@ -27,12 +27,13 @@
 //! Entitlement refusals always keep the timed probe: quota utilization says
 //! nothing about entitlement, so a reading cannot lift or convert that fence.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
+#[cfg(test)]
+use std::collections::HashSet;
 
 use striatum_core::route_state_store::{CredentialEntitlementFence, CredentialRefusal};
 use striatum_core::{
-    CredentialRefusalMark, ModelFact, ModelRouteStateSnapshot, RouteStateResult,
-    REASON_CREDENTIAL_BILLING_EXHAUSTED, REASON_CREDENTIAL_UNENTITLED,
+    RouteStateResult, REASON_CREDENTIAL_BILLING_EXHAUSTED, REASON_CREDENTIAL_UNENTITLED,
 };
 use striatum_store::SqliteRouteStateStore;
 
@@ -46,6 +47,7 @@ use crate::broca_credentials::{ListingLookup, SharedBrocaCredentials};
 /// Billing fences use this interval only without a quota signal (see
 /// [`probe_allowed`]). A subscription's billing hold uses its quota reset and
 /// headroom readings instead; entitlement refusals always keep timed probes.
+#[cfg(test)]
 pub(crate) const FENCE_PROBE_RECHECK_MS: i64 = CREDENTIAL_REFUSED_REPROBE_MS;
 
 /// A non-quota refused credential is blocked for at most one hour. A pooled API key gets this
@@ -71,25 +73,9 @@ pub(crate) const QUOTA_HOLD_USED_THRESHOLD: f64 = 99.0;
 /// probes. An entitlement refusal is independent of quota utilization: only a
 /// real request can discover a provider-side reversal without a listing change
 /// or an operator lift, so it keeps the one-hour probe even with quota readings.
+#[cfg(test)]
 pub(crate) fn probe_allowed(code: &str, has_quota_signal: bool, age_ms: i64) -> bool {
     (!is_billing_code(code) || !has_quota_signal) && age_ms > FENCE_PROBE_RECHECK_MS
-}
-
-/// Whether routing holds any quota reading for `credential_id`'s account.
-/// The join is by vault account id only, never by provider name: Insula's
-/// provider spelling (for example the usage feed) and routing's provider id
-/// (the catalog vendor) need not match. Any non-tombstoned reading counts as
-/// quota window counts as a signal, even a stale one: a subscription account
-/// keeps its signal while its reading ages. A spend-only balance is not a quota.
-pub(crate) fn has_quota_signal(
-    quota: &crate::account_quota::AccountQuotaState,
-    credentials: &crate::broca_credentials::CredentialAccounts,
-    credential_id: &str,
-) -> bool {
-    let Some(account_id) = credential_account_id(credentials, credential_id) else {
-        return false;
-    };
-    has_quota_signal_for_account(quota, &account_id)
 }
 
 /// The reset a quota hold on `credential_id` runs until, when its latest
@@ -688,92 +674,11 @@ pub(crate) fn live(
     live_with_eligibility(store, credentials, false)
 }
 
-/// A fence whose refusal is older than the recheck interval: the next
-/// account admission may reserve one probe request on it and stamp it fresh.
-fn is_stale(fence: &CredentialEntitlementFence, now_ms: i64) -> bool {
-    probe_allowed(
-        &fence.code,
-        false,
-        now_ms.saturating_sub(fence.observed_at_ms),
-    )
-}
-
-/// Split live fences into fresh restrictions and potential account-admission
-/// probes. Every fence counts as billing or entitlement: the reason
-/// a route refusal carries is one of the two, so age alone decides. This
-/// age-only split is kept for callers with no quota view. Account selection
-/// checks [`probe_allowed`] with the credential's quota signal instead.
-pub(crate) fn split(
-    fences: &[CredentialEntitlementFence],
-    now_ms: i64,
-) -> (
-    Vec<CredentialEntitlementFence>,
-    Vec<CredentialEntitlementFence>,
-) {
-    let mut enforcing = Vec::new();
-    let mut stale = Vec::new();
-    for fence in fences {
-        if is_stale(fence, now_ms) {
-            stale.push(fence.clone());
-        } else {
-            enforcing.push(fence.clone());
-        }
-    }
-    (enforcing, stale)
-}
-
 /// The explanation line a probed pick carries in its decision.
 pub(crate) fn probe_note(provider_id: &str, credential_id: &str) -> String {
     format!(
         "fence probe: {provider_id} via {credential_id} is due for one scheduled recheck; refusal evidence remains until recovery",
     )
-}
-
-/// The stale-fenced credentials a probe of `provider_id` may launch on: every
-/// serving identity is fenced, but at least one only by a stale fence, so the
-/// route is selectable only as a probe. Empty when the route was never fenced
-/// or is still fenced by a fresh refusal.
-pub(crate) fn probe_credentials(
-    full: &[CredentialEntitlementFence],
-    enforcing: &[CredentialEntitlementFence],
-    provider_id: &str,
-    identities: &[(String, Option<String>)],
-) -> Vec<String> {
-    if unentitled(full, provider_id, identities).is_empty() {
-        return Vec::new();
-    }
-    let fresh: HashSet<&str> = enforcing
-        .iter()
-        .filter(|fence| fence.provider_id == provider_id)
-        .map(|fence| fence.credential_id.as_str())
-        .collect();
-    identities
-        .iter()
-        .filter(|(credential, _)| !fresh.contains(credential.as_str()))
-        .map(|(credential, _)| credential.clone())
-        .collect()
-}
-
-/// End a successful non-quota refusal on the serving (provider, credential)
-/// pair. Quota holds use the scoped success proof inside the same admission or
-/// report transaction; unknown or unrelated pools are never guessed here.
-pub(crate) fn lift_after_success(
-    store: &SqliteRouteStateStore,
-    provider_id: &str,
-    credential_id: &str,
-    admitted_at: i64,
-) -> Result<bool, String> {
-    let provider = provider_id.to_owned();
-    let credential = credential_id.to_owned();
-    let now = crate::now_ms() as i64;
-    let lifted = crate::account_writer::repair(store, move |tx| {
-        lift_after_success_in(tx, &provider, &credential, now, admitted_at)
-    })
-    .map_err(|error| error.to_string())?;
-    if lifted {
-        eprintln!("[striatum] credential entitlement fence lifted provider={provider_id} credential={credential_id}: the probe run succeeded");
-    }
-    Ok(lifted)
 }
 
 /// End every fence naming `credential_id`, as an operator does right after
@@ -839,6 +744,7 @@ pub(crate) fn unentitled(
 }
 
 /// The serving identities a launch on `provider_id` may still use.
+#[cfg(test)]
 pub(crate) fn entitled<'a>(
     fences: &[CredentialEntitlementFence],
     provider_id: &str,
@@ -853,46 +759,6 @@ pub(crate) fn entitled<'a>(
         .iter()
         .filter(|(credential, _)| !fenced.contains(credential.as_str()))
         .collect()
-}
-
-/// Mark every catalog route whose serving credentials are all fenced, so
-/// admission rejects it as `credential_unentitled`. The mark is set on the
-/// model's capacity key, which covers every variant of the model.
-pub(crate) fn apply(
-    snapshot: &mut ModelRouteStateSnapshot,
-    facts: &[ModelFact],
-    fences: &[CredentialEntitlementFence],
-    credentials: &SharedBrocaCredentials,
-) {
-    if fences.is_empty() {
-        return;
-    }
-    let Ok(guard) = credentials.lock() else {
-        return;
-    };
-    for fact in facts {
-        if !fences
-            .iter()
-            .any(|fence| fence.provider_id == fact.provider_id)
-        {
-            continue;
-        }
-        let refused = unentitled(fences, &fact.provider_id, &guard.serving_identities(fact));
-        if refused.is_empty() {
-            continue;
-        }
-        snapshot
-            .by_capacity
-            .entry(striatum_core::make_capacity_key(
-                &fact.provider_id,
-                &fact.model_id,
-            ))
-            .or_default()
-            .credential_refusal = Some(CredentialRefusalMark {
-            reason: rejection_reason(fences, &fact.provider_id, &refused),
-            credential_ids: refused,
-        });
-    }
 }
 
 /// The rejection reason for a route whose serving credentials `refused` are all

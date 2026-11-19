@@ -106,17 +106,6 @@ mod lease_id_tests {
     }
 }
 
-#[cfg(any(test, feature = "test-support"))]
-fn key_states(
-    conn: &Connection,
-    provider: &str,
-    now_ms: i64,
-    excluded_lease: Option<&str>,
-) -> rusqlite::Result<BTreeMap<String, PoolKeyState>> {
-    crate::fence_rechecks::sync_on(&crate::AccountTx::sql(conn), crate::now_ms())?;
-    read_key_states(conn, provider, now_ms, excluded_lease)
-}
-
 /// One key's row: credential, last use, wall and cooldown deadlines.
 type KeyRow = (String, Option<i64>, Option<i64>, Option<i64>);
 

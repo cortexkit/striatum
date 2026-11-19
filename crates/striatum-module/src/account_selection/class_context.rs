@@ -87,6 +87,9 @@ impl AccountBlock {
 }
 
 /// Why a legacy launch could not claim the probes its route needs.
+// Keep the details in test failures when a legacy launch is unexpectedly refused.
+#[cfg(test)]
+#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) enum LaunchRefusal {
     /// Another request holds the probe, or it is not due yet: the caller
@@ -96,6 +99,7 @@ pub(crate) enum LaunchRefusal {
     Refused { code: String, message: String },
 }
 
+#[cfg(test)]
 impl LaunchRefusal {
     /// A store failure, including a writer batch whose state disagreed with
     /// SQL on both of its runs: the caller cannot tell whether any account
@@ -653,6 +657,7 @@ impl ClassContext {
             .filter(|at| *at > self.now_ms)
             .max()
     }
+    #[cfg(test)]
     pub(crate) fn fence_config(&self) -> &crate::config_overrides::LiveConfig {
         &self.config
     }
@@ -1683,6 +1688,7 @@ impl ClassContext {
         resolved
     }
 
+    #[cfg(test)]
     pub(crate) fn revalidate_credential(&mut self, credential: &str) {
         self.continuation_credential = Some(credential.into());
     }
@@ -2177,11 +2183,6 @@ impl ClassContext {
             .max()
     }
 
-    fn has_quota_signal(&self, provider: &str, credential: &str) -> bool {
-        crate::credential_fences::has_quota_signal(&self.quota, &self.account_ids, credential)
-            || self.quota_hold_reset(provider, credential).is_some()
-    }
-
     /// A stale refusal is a fallback, never a reason to probe while an
     /// unfenced eligible identity in the same payment class can serve.
     pub(super) fn eligible_rows<'a>(
@@ -2647,24 +2648,6 @@ impl ClassContext {
         )
     }
 
-    /// Read dated account recovery even when a quota recheck has temporarily
-    /// removed every account from eligibility. Permanent credential and policy
-    /// failures remain in force; this view is used only for retry diagnostics.
-    pub(crate) fn recovery_reset(&self, provider: &str, model: &str, priced: bool) -> Option<i64> {
-        self.recovery_reset_with_keep_free(provider, model, priced, 0.0)
-    }
-
-    pub(crate) fn recovery_reset_with_keep_free(
-        &self,
-        provider: &str,
-        model: &str,
-        priced: bool,
-        keep_free: f64,
-    ) -> Option<i64> {
-        self.account_recovery_with_keep_free(provider, model, priced, keep_free)
-            .and_then(|block| block.reset_at_ms)
-    }
-
     /// One route's recovery in a fresh [`recovery_view::RecoveryView`]. A caller
     /// reading several routes builds the view once and reads each from it.
     pub(crate) fn account_recovery_with_keep_free(
@@ -2836,6 +2819,7 @@ impl ClassContext {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn launch_credential(
         &self,
         provider: &str,
@@ -2871,6 +2855,7 @@ impl ClassContext {
     /// decided on, never on this context's older read: a block recorded on
     /// another login since the read still requires the pin, so the send
     /// cannot land on the blocked login.
+    #[cfg(test)]
     pub(crate) fn claim_launch_credential(
         &self,
         store: &SqliteRouteStateStore,
@@ -3087,6 +3072,7 @@ impl ClassContext {
     /// account-scoped clock among `rechecks` (the clocks a claim decides on,
     /// never only this context's older read), a continuation, or a refusal,
     /// eligibility fact, size refusal or route fence this context read.
+    #[cfg(test)]
     fn needs_credential_pin_with(
         &self,
         rechecks: &[striatum_store::FenceRecheck],

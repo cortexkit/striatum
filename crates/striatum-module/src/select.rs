@@ -145,9 +145,6 @@ pub(super) struct PreparedSelectionInputs {
     pub(super) facts: Vec<ModelFact>,
     pub(super) snapshot: ModelRouteStateSnapshot,
     pub(super) quota_signal_json: String,
-    /// Set when the quota snapshot was too old to use: the explanation line
-    /// saying so, which a selected route carries.
-    pub(super) quota_note: Option<String>,
 }
 
 #[derive(Clone)]
@@ -354,15 +351,12 @@ pub(super) fn prepare_selection_inputs_for_sweep(
             stale_age_ms,
         },
     );
-    let quota_note =
-        stale_age_ms.map(|age_ms| stale_quota_note(age_ms, quota_last_error.as_deref()));
     Ok(PreparedSelectionInputs {
         catalog_snapshot,
         now,
         facts,
         snapshot,
         quota_signal_json,
-        quota_note,
     })
 }
 
@@ -430,6 +424,7 @@ pub(super) fn price_selection_inputs(
 /// Evaluations pass private sweep accounts and `reserve_probes: false`:
 /// they never claim a credential's next retry after a provider refusal.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(super) fn price_selection_inputs_with_catalog(
     facts: &mut Vec<ModelFact>,
     quota_signal_json: String,
@@ -621,23 +616,13 @@ impl RouteSelectTiming {
         );
     }
 
+    #[cfg(test)]
     pub(super) fn add_snapshot_closure(&self, elapsed: Duration) {
         self.snapshot_closure_ms.set(
             self.snapshot_closure_ms
                 .get()
                 .saturating_add(elapsed.as_millis().min(u64::MAX as u128) as u64),
         );
-    }
-
-    pub(super) fn record_selection(&self, elapsed: Duration) {
-        // Adds rather than sets: a rejected pin with a fallback runs a second
-        // selection, and both count.
-        add_stage_ms(&self.selection_ms, elapsed);
-    }
-
-    pub(super) fn record_reply(&self, elapsed: Duration) {
-        self.reply_ms
-            .set(elapsed.as_millis().min(u64::MAX as u128) as u64);
     }
 
     pub(super) fn line_at(&self, now: Instant) -> Option<String> {

@@ -304,10 +304,10 @@ pub(super) fn record_quota_readings(
         tracing::warn!(error, "quota reading log: sample not recorded");
     }
 }
-
 /// Append healthy entries to the consumption estimate's reading log, resolving
 /// providers and per-model capacity keys the same way as the quota overlay.
 /// Return write failures so the delivery adapter leaves the event unacknowledged.
+#[cfg(test)]
 fn write_quota_readings(
     store: &SqliteRouteStateStore,
     fresh: &[ProviderUsage],
@@ -319,7 +319,6 @@ fn write_quota_readings(
         .map_err(|e| e.to_string())?;
     Ok(())
 }
-
 pub(super) fn quota_reading_rows(
     store: &SqliteRouteStateStore,
     fresh: &[ProviderUsage],

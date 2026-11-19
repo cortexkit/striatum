@@ -25,17 +25,6 @@ pub(crate) fn considered(
         ))
 }
 
-pub(crate) fn capture(
-    store: &striatum_store::SqliteRouteStateStore,
-    classes: Option<&crate::account_selection::ClassContext>,
-    facts: &[striatum_core::ModelFact],
-    priced: bool,
-    now: i64,
-    consider: impl Fn(&striatum_core::ModelFact) -> bool,
-) -> striatum_core::RouteStateResult<ConcurrencyAvailability> {
-    capture_with_snapshot(store, classes, facts, priced, now, None, consider)
-}
-
 /// An operator preview supplies its captured account-state snapshot. Live
 /// requests load account state lazily only when a considered route has a cap
 /// and at least one eligible account.

@@ -18,9 +18,6 @@ pub(crate) struct Refusal {
     pub message: String,
     /// The specific admission or scoring rejection behind a summary code.
     pub cause: Option<String>,
-    /// When a probe this request lost to another request opens again; such a
-    /// refusal is answered as a timed wait.
-    pub retry_at: Option<i64>,
 }
 
 fn refuse(code: &str, message: String) -> Refusal {
@@ -28,7 +25,6 @@ fn refuse(code: &str, message: String) -> Refusal {
         code: code.into(),
         message,
         cause: None,
-        retry_at: None,
     }
 }
 

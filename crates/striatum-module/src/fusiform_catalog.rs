@@ -1217,6 +1217,7 @@ mod media_grades;
 #[cfg(test)]
 pub(crate) use media_grades::{count_calls, inherit_calls};
 
+#[cfg(test)]
 pub(crate) fn decode_catalog_get(
     bytes: impl AsRef<[u8]>,
 ) -> Result<Arc<CatalogSnapshot>, FusiformCatalogError> {
@@ -1496,19 +1497,6 @@ pub struct FusiformCatalogConsumer {
 }
 
 impl FusiformCatalogConsumer {
-    #[cfg(test)]
-    pub(crate) async fn dry_run_refresh(
-        &mut self,
-        store: &SqliteRouteStateStore,
-        credentials: crate::broca_credentials::SharedBrocaCredentials,
-    ) -> Result<(), FusiformCatalogError> {
-        self.credentials = Some(credentials);
-        let snapshot = media_grades::refresh_snapshot(self).await?;
-        self.refresh_planes(Some(&snapshot)).await?;
-        apply_catalog_snapshot(store, &snapshot, None, None, None, "dry run copy")?;
-        self.close().await
-    }
-
     pub async fn connect(
         connection_file_path: &Path,
         project_root: &Path,

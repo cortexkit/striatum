@@ -1566,26 +1566,18 @@ fn admission_from_row(row: &Row<'_>) -> rusqlite::Result<AccountAdmissionRow> {
         last_observed_at: row.get(25)?,
     })
 }
-
-const FENCE_COLUMNS: &str = "fence_id, provider, account_id, scope_json, fence_json, source, \
-     observed_at, principal, admission_id, observation_id, created_at, cleared_at, cleared_reason";
-
-fn fence_from_row(row: &Row<'_>) -> rusqlite::Result<AccountFenceRow> {
-    rows::fence_at(row, 0)
-}
-
 /// Row decoders shared by the SQL readers and the in-memory block state,
 /// which reads the same columns back after each write. Each decodes its
 /// reader's columns, in that reader's order, starting at column `at`.
 pub(crate) mod rows {
-    use super::{
-        AccountEligibilityFact, AccountExclusionRow, AccountFenceRow, AccountRouteFence,
-        AccountSizeRefusal,
-    };
+    use super::AccountEligibilityFact;
+    #[cfg(any(test, feature = "test-support"))]
+    use super::{AccountExclusionRow, AccountFenceRow, AccountRouteFence, AccountSizeRefusal};
     use rusqlite::Row;
+    #[cfg(any(test, feature = "test-support"))]
     use striatum_core::route_state_store::CredentialEntitlementFence;
 
-    /// `FENCE_COLUMNS`.
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn fence_at(row: &Row<'_>, at: usize) -> rusqlite::Result<AccountFenceRow> {
         Ok(AccountFenceRow {
             fence_id: row.get(at)?,
@@ -1620,6 +1612,7 @@ pub(crate) mod rows {
     }
 
     /// `provider,credential_id,model,size_class,expires_at,observed_at`.
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn size_refusal_at(
         row: &Row<'_>,
         at: usize,
@@ -1635,6 +1628,7 @@ pub(crate) mod rows {
     }
 
     /// `provider,credential_id,model,until_ms,decision_id,recorded_at`.
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn route_fence_at(row: &Row<'_>, at: usize) -> rusqlite::Result<AccountRouteFence> {
         Ok(AccountRouteFence {
             provider: row.get(at)?,
@@ -1648,6 +1642,7 @@ pub(crate) mod rows {
 
     /// `principal,admission_id,credential_id,runner_view_digest,
     /// roster_view_digest,observation_id,recorded_at`.
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn exclusion_at(row: &Row<'_>, at: usize) -> rusqlite::Result<AccountExclusionRow> {
         Ok(AccountExclusionRow {
             principal: row.get(at)?,
@@ -1661,6 +1656,7 @@ pub(crate) mod rows {
     }
 
     /// `provider_id,credential_id,code,listing_fingerprint,observed_at_ms`.
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn entitlement_at(
         row: &Row<'_>,
         at: usize,
@@ -2674,6 +2670,7 @@ impl AccountTx<'_> {
 }
 
 impl SqliteRouteStateStore {
+    #[cfg(any(test, feature = "test-support"))]
     fn begin_account_write<'a>(&self, conn: &'a Connection) -> rusqlite::Result<Transaction<'a>> {
         let tx = crate::write_transaction(conn)?;
         #[cfg(any(test, feature = "test-support"))]
@@ -2734,6 +2731,7 @@ impl SqliteRouteStateStore {
         self.direct_account_transaction(f)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn direct_account_transaction<T>(
         &self,
         f: impl FnOnce(&AccountTx<'_>) -> RouteStateResult<T>,
@@ -2741,6 +2739,7 @@ impl SqliteRouteStateStore {
         self.direct_account_transaction_with_error(f)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn direct_account_transaction_with_error<
         T,
         E: From<striatum_core::RouteStateStoreError>,

@@ -227,24 +227,6 @@ impl AccountTx<'_> {
         }
         Ok(())
     }
-    pub(crate) fn successful_quota_pools(
-        &self,
-        id: &str,
-        observed: i64,
-    ) -> RouteStateResult<Vec<striatum_core::accounts::PoolKey>> {
-        if !enabled(self.conn).map_err(err)? {
-            return Ok(Vec::new());
-        }
-        let mut statement = self
-            .conn
-            .prepare("SELECT pool_key_json FROM success_proof WHERE fence_id=?1 AND evidence_at=?2")
-            .map_err(err)?;
-        let rows = statement
-            .query_map(params![id, observed], |row| row.get::<_, String>(0))
-            .map_err(err)?;
-        rows.map(|raw| serde_json::from_str(&raw.map_err(err)?).map_err(err))
-            .collect()
-    }
 
     /// Success can heal only evidence older than this request's admission. A
     /// late completion of an older run must not erase a more recent refusal.

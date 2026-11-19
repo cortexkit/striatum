@@ -98,7 +98,7 @@ use std::{
     fmt,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, Once, OnceLock},
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, Instant},
 };
 
 use background::next_frame_or_loop_stop;
@@ -268,7 +268,6 @@ fn resolve_storage_descriptor(
         .into_owned();
     Ok(dev_descriptor(module_id, path))
 }
-
 fn main() -> Result<(), ModuleError> {
     initialize_logging();
     shutdown::run_main()

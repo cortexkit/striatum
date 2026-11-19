@@ -18,15 +18,16 @@ use striatum_core::model_facts::{
     Confidence, ModelFact, ModelScores, RoutePricing, ScoreProvenance,
 };
 use striatum_core::{
-    make_route_key, FailureBackoffConfig, ModelRoutingPolicyInput, OverqualificationConfig,
-    RoutingConfig, DEFAULT_CONSECUTIVE_TERMINAL_FAILURE_THRESHOLD, DEFAULT_DEMAND_EXPONENT,
-    DEFAULT_OVERQUALIFICATION,
+    make_route_key, ModelRoutingPolicyInput, OverqualificationConfig, RoutingConfig,
+    DEFAULT_DEMAND_EXPONENT, DEFAULT_OVERQUALIFICATION,
 };
 #[cfg(test)]
-use striatum_core::{model_facts_seed, CatalogFactField, FactSource, RouteStateStore};
+use striatum_core::{
+    model_facts_seed, CatalogFactField, FactSource, FailureBackoffConfig, RouteStateStore,
+    DEFAULT_CONSECUTIVE_TERMINAL_FAILURE_THRESHOLD,
+};
 use striatum_store::ReasoningCatalog;
 use subc_jsonc::jsonc_to_json;
-
 const CONFIG_RELATIVE_PATH: &str = "cortexkit/striatum.jsonc";
 // Fusiform's catalog-changed events reach routing through its durable NATS
 // consumer (`m_striatum`) and trigger an immediate refresh, so this poll is
@@ -149,7 +150,6 @@ impl CompiledPolicy {
         }
     }
 }
-
 impl Default for LiveConfig {
     fn default() -> Self {
         Self::new(RoutingConfigFile::default(), None)
@@ -985,7 +985,7 @@ impl LiveConfig {
             .max_by_key(|(length, _)| *length)
             .map(|(_, pin)| pin)
     }
-
+    #[cfg(test)]
     pub fn failure_backoff(&self) -> FailureBackoffConfig {
         FailureBackoffConfig {
             consecutive_terminal_failure_threshold: self
@@ -995,7 +995,6 @@ impl LiveConfig {
                 .unwrap_or(DEFAULT_CONSECUTIVE_TERMINAL_FAILURE_THRESHOLD),
         }
     }
-
     pub fn catalog_poll_ms(&self) -> u64 {
         self.config
             .catalog

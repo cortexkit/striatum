@@ -89,13 +89,12 @@ pub(crate) struct ProviderCooldownRow {
     pub(crate) wall_class: Option<String>,
     pub(crate) last_error: Option<String>,
 }
-
+#[cfg(any(test, feature = "test-support"))]
 impl ProviderCooldownRow {
     pub(crate) fn provider_key(&self) -> &str {
         &self.provider_key
     }
 }
-
 /// Decode [`provider_cooldown_columns`] from column `at`.
 pub(crate) fn provider_row_at(r: &Row<'_>, at: usize) -> rusqlite::Result<ProviderCooldownRow> {
     Ok(ProviderCooldownRow {
@@ -143,7 +142,7 @@ pub(crate) fn provider_cooldown(
 }
 
 /// The frozen schema-93 provider reader used only by differential tests.
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 pub(crate) fn legacy_read_provider_cooldown(
     conn: &Connection,
     provider_key: &str,
@@ -165,7 +164,7 @@ pub(crate) fn legacy_read_provider_cooldown(
 }
 
 /// The frozen schema-93 snapshot reader used only by differential tests.
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 pub(crate) fn legacy_read_snapshot(
     conn: &Connection,
     now: f64,

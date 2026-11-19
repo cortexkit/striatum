@@ -155,18 +155,12 @@ pub(crate) fn needs_sync(conn: &Connection) -> rusqlite::Result<bool> {
 #[path = "fence_rechecks/legacy/tests.rs"]
 pub(crate) mod legacy;
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) use legacy::{quarantined_origins, retire_expired, snapshot_origins, sync, sync_at};
+pub(crate) use legacy::{quarantined_origins, sync};
+#[cfg(test)]
+pub(crate) use legacy::{retire_expired, snapshot_origins, sync_at};
 #[cfg(test)]
 #[path = "fence_rechecks/native_fixture/tests.rs"]
 mod native_fixture;
-
-pub(crate) fn register(conn: &Connection, kind: &str, key: &str) -> rusqlite::Result<()> {
-    if !enabled(conn)? {
-        return Ok(());
-    }
-    let tx = crate::AccountTx::sql(conn);
-    register_on(&tx, kind, key)
-}
 
 /// Reconcile the command's captured source rows with their durable clocks.
 /// Evidence retired here is archived before its enforcement trigger clears it.
@@ -500,6 +494,7 @@ fn load_blocks(conn: &Connection, now: i64) -> rusqlite::Result<LoadedBlocks> {
 }
 
 /// The `block` columns [`clock_row`] decodes, in its order.
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) const CLOCK_COLUMNS: &str = "kind,origin_key,provider,account_id,credential_id,model,size_class,principal,admission_id,evidence,evidence_at,quota,classified,next_recheck_at,reset_check_at,last_claimed_at,claim_owner,claim_generation,cleared_at";
 
 /// Stored clocks keyed by source kind and origin key, each with its
@@ -544,6 +539,7 @@ pub(crate) fn clock_row(
 /// One `fence_recheck_route_clear` row: a model cleared from a route-wide
 /// origin while that origin's evidence is unchanged.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) struct RouteClear {
     pub(crate) kind: String,
     pub(crate) origin_key: String,
@@ -553,6 +549,7 @@ pub(crate) struct RouteClear {
 
 /// Attach each clear, in the order given, to the clock whose current evidence
 /// it names. A clear recorded for older evidence no longer applies.
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn attach_route_clears(clocks: &mut Clocks, clears: &[RouteClear]) {
     for clear in clears {
         if let Some((block, _)) = clocks.get_mut(&(clear.kind.clone(), clear.origin_key.clone())) {
@@ -583,6 +580,7 @@ pub struct ViewOrigin {
 }
 
 /// Decode the view's 14 columns starting at `at`, in the view's order.
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn view_origin(r: &rusqlite::Row<'_>, at: usize) -> rusqlite::Result<ViewOrigin> {
     Ok(ViewOrigin {
         kind: r.get(at)?,

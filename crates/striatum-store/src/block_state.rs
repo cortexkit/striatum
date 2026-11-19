@@ -305,20 +305,6 @@ fn view_branch(kind: &str) -> u8 {
 }
 
 impl crate::AccountTx<'_> {
-    pub(crate) fn store_source(
-        &self,
-        row: &crate::block_storage::StoredBlock,
-    ) -> striatum_core::RouteStateResult<usize> {
-        self.current_blocks()?
-            .check_source(
-                self.conn,
-                &row.block.kind,
-                &row.block.origin_key,
-                &row.block.scope.provider,
-            )
-            .map_err(crate::err)?;
-        crate::block_storage::write_source(self.conn, row).map_err(crate::err)
-    }
     pub(crate) fn current_blocks(
         &self,
     ) -> striatum_core::RouteStateResult<std::borrow::Cow<'_, BlockState>> {

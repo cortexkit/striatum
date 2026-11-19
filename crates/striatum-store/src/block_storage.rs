@@ -400,7 +400,7 @@ pub(crate) fn decode(row: &Row<'_>) -> rusqlite::Result<StoredBlock> {
         meta,
     })
 }
-
+#[cfg(test)]
 pub(crate) fn read(conn: &Connection) -> rusqlite::Result<Vec<StoredBlock>> {
     conn.prepare(&format!(
         "{} {}",
@@ -410,7 +410,6 @@ pub(crate) fn read(conn: &Connection) -> rusqlite::Result<Vec<StoredBlock>> {
     .query_map([], decode)?
     .collect()
 }
-
 impl StoredBlock {
     pub(crate) fn is_origin(&self) -> bool {
         self.is_origin
@@ -493,11 +492,11 @@ impl StoredBlock {
         }
     }
 }
-
 /// Derive the effective set without SQL. A hidden route is still stored, so
 /// the route-state snapshot can schedule its own cooldown deadline, but it
 /// does not become a second effective origin while matching provider-wide
 /// refusal evidence already covers it.
+#[cfg(test)]
 pub(crate) fn effective(
     rows: &[StoredBlock],
     now: i64,

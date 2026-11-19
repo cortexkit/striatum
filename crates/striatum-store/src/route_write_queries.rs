@@ -11,10 +11,9 @@ macro_rules! route_write_read {
         "/* route state write read */ "
     };
 }
-
 /// The marker [`route_write_read`] puts on those reads, for the read trace.
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) const ROUTE_WRITE_READ: &str = route_write_read!();
-
 // The marked reads, one constant per statement, so the reviewed list of
 // exempt reads (`reviewed_exempt_reads`) names exactly these texts.
 pub(crate) const ROUTE_READ_PROVIDER_PRIOR_OBSERVED: &str = concat!(

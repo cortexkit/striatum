@@ -1,12 +1,10 @@
 //! Apply consumer exclusions and select pinned models without quality ranking.
 
-use crate::config_policy::SynthesizerPin;
 use serde::Deserialize;
 use std::collections::HashMap;
 use striatum_core::model_facts::ModelRequirements;
 use striatum_core::model_router::{SelectModelRouteInput, SelectedModelRoute};
-use striatum_core::provider_model_spec::ExclusionPolicy;
-use striatum_core::{ConcurrencySlots, RoutingConfig};
+use striatum_core::RoutingConfig;
 
 use striatum_core::model_facts::{fact_to_route, ModelFact};
 
@@ -19,17 +17,12 @@ pub(crate) struct SelectionPass<'a> {
     pub requirements: ModelRequirements,
     pub required_capabilities: Option<striatum_core::model_router::RequiredCapabilities>,
     pub facts: &'a [ModelFact],
-    pub snapshot: &'a striatum_core::ModelRouteStateSnapshot,
     pub exclude: &'a [String],
     pub operator_exclude: &'a [String],
-    pub consumer_exclude: &'a [String],
     pub subscription_keys: &'a std::collections::HashSet<String>,
     pub priced_per_token: bool,
     pub classifier: bool,
-    pub rejections: &'a HashMap<String, String>,
     pub config: &'a RoutingConfig,
-    pub slots: Option<&'a ConcurrencySlots>,
-    pub concurrency: Option<&'a striatum_core::concurrency_availability::ConcurrencyAvailability>,
     pub min_band: Option<f64>,
     pub prefer_prompt_cache: bool,
     pub providers_without_prompt_cache: &'a [String],
@@ -110,98 +103,6 @@ impl<'a> SelectionPass<'a> {
             providers_without_cache_write_reports: Default::default(),
         }
     }
-
-    pub fn score(
-        &self,
-        available: &std::collections::HashSet<String>,
-    ) -> Result<SelectedModelRoute, striatum_core::model_router::NoRouteError> {
-        self.score_with_policy(available, false)
-    }
-
-    pub fn score_with_policy(
-        &self,
-        available: &std::collections::HashSet<String>,
-        pinned: bool,
-    ) -> Result<SelectedModelRoute, striatum_core::model_router::NoRouteError> {
-        self.score_with_variant(available, pinned, None)
-    }
-
-    fn score_with_variant(
-        &self,
-        available: &std::collections::HashSet<String>,
-        pinned: bool,
-        variant: Option<&str>,
-    ) -> Result<SelectedModelRoute, striatum_core::model_router::NoRouteError> {
-        let allowed = available
-            .iter()
-            .filter(|route| {
-                self.operator_config
-                    .route_allowed(self.consumer, route, pinned)
-            })
-            .cloned()
-            .collect();
-        let mut input = self.input_with_policy(&allowed, self.snapshot.clone(), pinned);
-        apply_explicit_variant(&mut input, variant);
-        let result = if self.concurrency.is_none() {
-            select_candidates(
-                input,
-                &self.routing_config(),
-                self.slots,
-                self.consumer_exclude,
-                self.rejections,
-            )
-        } else {
-            striatum_core::model_router::evaluate_model_route_with_concurrency(
-                input,
-                &self.routing_config(),
-                self.slots,
-                self.consumer_exclude,
-                self.rejections,
-                &Default::default(),
-                None,
-                self.concurrency,
-            )
-            .map_err(describe_filter_refusal)
-        };
-        explain_dotted_exclusions(result, self.operator_config, self.consumer)
-    }
-
-    pub fn select<E>(
-        &self,
-        available: &std::collections::HashSet<String>,
-        request_pin: Option<&str>,
-        project_pin: Option<&str>,
-        continuing: Option<&str>,
-        admit_pin: impl FnMut(&str) -> Result<SelectedModelRoute, E>,
-    ) -> Result<
-        (SelectedModelRoute, OrderBasis, Option<String>),
-        OrderFailure<E, striatum_core::model_router::NoRouteError>,
-    > {
-        let policy = self.operator_config.consumer_policy(
-            self.consumer,
-            &crate::config_policy::ConsumerPolicy::default(),
-            &std::collections::BTreeMap::new(),
-        );
-        let mut explicit_variant = None;
-        select_ordered(
-            available,
-            request_pin,
-            project_pin,
-            continuing,
-            admit_pin,
-            |only| self.score(only),
-            || {
-                select_in_order(available, &policy, |only, variant, _| {
-                    let result = self.score_with_variant(only, policy.operator_ladder(), variant);
-                    if result.is_ok() {
-                        explicit_variant = variant.map(str::to_owned);
-                    }
-                    result
-                })
-            },
-        )
-        .map(|(selected, basis)| (selected, basis, explicit_variant))
-    }
 }
 
 /// Score the explicitly requested effort while retaining model-level availability.
@@ -221,9 +122,6 @@ pub(crate) fn apply_explicit_variant(input: &mut SelectModelRouteInput<'_>, vari
 }
 
 pub(crate) enum CandidateSource<'a> {
-    Host {
-        auth_types: &'a HashMap<String, String>,
-    },
     Vault {
         credentials: &'a crate::broca_credentials::SharedBrocaCredentials,
         /// The fences selection enforces: live fences except the stale ones a
@@ -244,24 +142,6 @@ pub(crate) struct Candidates {
     pub available: std::collections::HashSet<String>,
     pub subscription_keys: std::collections::HashSet<String>,
     pub rejected: HashMap<String, String>,
-    pub filters: HashMap<String, String>,
-}
-
-pub(crate) fn select_candidates(
-    input: SelectModelRouteInput<'_>,
-    config: &RoutingConfig,
-    slots: Option<&ConcurrencySlots>,
-    consumer_exclude: &[String],
-    rejected: &HashMap<String, String>,
-) -> Result<SelectedModelRoute, striatum_core::model_router::NoRouteError> {
-    striatum_core::model_router::select_model_route_with_availability(
-        input,
-        config,
-        slots,
-        consumer_exclude,
-        rejected,
-    )
-    .map_err(describe_filter_refusal)
 }
 
 /// A ladder tries its configured entries in order. Credential refusals stay in
@@ -410,29 +290,6 @@ pub(crate) fn prepare_candidates(
     let mut subscription_keys = std::collections::HashSet::new();
     let filters;
     match source {
-        CandidateSource::Host { auth_types } => {
-            // Return before touching any vault or account API. A host can route
-            // even when routing has no credentials or account sets of its own.
-            for fact in facts {
-                let route = fact_to_route(fact);
-                if specs.resolve(
-                    &route.route_key,
-                    auth_types
-                        .get(&fact.provider_id)
-                        .is_some_and(|kind| kind == "oauth"),
-                ) {
-                    subscription_keys.insert(route.route_key);
-                }
-            }
-            filters = candidate_rejections_priced(
-                facts,
-                consumer,
-                priced_per_token,
-                allowed_providers,
-                subscription_plan_providers,
-                None,
-            );
-        }
         CandidateSource::Vault {
             credentials,
             fences,
@@ -583,14 +440,11 @@ pub(crate) fn prepare_candidates(
                 })
         })
         .collect();
-    let mut filters = filters;
-    filters.extend(structural.clone());
     rejected.extend(structural);
     Candidates {
         available,
         subscription_keys,
         rejected,
-        filters,
     }
 }
 
@@ -834,6 +688,7 @@ pub(crate) fn subscription_covered(
 
 /// Admission uses these route-local refusals after exclusions and before scoring,
 /// including for pins. Neither an explicit model nor a quota retry lifts them.
+#[cfg(test)]
 pub(crate) fn candidate_rejections(
     facts: &[ModelFact],
     consumer: Option<Consumer>,
@@ -929,157 +784,6 @@ where
         ));
     }
     Ok(Some(ids))
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-pub(crate) enum Pin {
-    Slot(PinSlotRequest),
-    Model(SynthesizerPin),
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct PinSlotRequest {
-    slot: PinSlot,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum PinSlot {
-    Synthesizer,
-    LabPlanner,
-    SpecDesigner,
-}
-
-impl PinSlot {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Synthesizer => "synthesizer",
-            Self::LabPlanner => "lab_planner",
-            Self::SpecDesigner => "spec_designer",
-        }
-    }
-}
-
-impl Pin {
-    /// The pin a request names, or `None` when it names a slot the operator
-    /// left unset; the request is then selected like an unpinned one.
-    ///
-    /// A slot is read from `consumers.<slot>.pin`. The model and variant are
-    /// kept as stored.
-    pub(crate) fn resolve(
-        &self,
-        slot_pin: impl Fn(&str) -> Option<SynthesizerPin>,
-    ) -> Option<SynthesizerPin> {
-        match self {
-            Self::Slot(PinSlotRequest { slot }) => slot_pin(slot.name()),
-            Self::Model(pin) => Some(pin.clone()),
-        }
-    }
-}
-
-#[derive(Debug, Default, Clone, Copy, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum PinFallback {
-    Route,
-    #[default]
-    None,
-}
-
-pub(crate) fn select_pin_with_availability(
-    pin: &SynthesizerPin,
-    mut input: SelectModelRouteInput<'_>,
-    config: &RoutingConfig,
-    slots: Option<&ConcurrencySlots>,
-    availability_rejections: &std::collections::HashMap<String, String>,
-) -> Result<SelectedModelRoute, String> {
-    let (provider, model) = pin.model.split_once('/').ok_or("invalid_model_pin")?;
-    if provider.is_empty()
-        || model.is_empty()
-        || pin.model.chars().any(char::is_whitespace)
-        || pin
-            .variant
-            .as_ref()
-            .is_some_and(|variant| variant.trim().is_empty())
-    {
-        return Err("invalid_model_pin".into());
-    }
-    let mut fact = input
-        .facts
-        .iter()
-        .filter(|fact| fact.provider_id == provider && fact.model_id == model)
-        .min_by_key(|fact| {
-            if fact.variant == pin.variant {
-                0
-            } else if fact.variant.is_none() {
-                1
-            } else {
-                2
-            }
-        })
-        .cloned()
-        .ok_or("unknown_model")?;
-    if let Some(variant) = &pin.variant {
-        fact.variant = Some(variant.clone());
-        let defaults = fact.prompt_defaults.get_or_insert_with(Default::default);
-        defaults.variant = Some(variant.clone());
-        defaults.reasoning_effort = None;
-    }
-    input.facts = vec![fact];
-    input.operator_exclude_keys.clear();
-    let admission = striatum_core::model_router::admit_routes_with_availability(
-        &input.facts,
-        input.runtime_snapshot.as_ref(),
-        ExclusionPolicy::caller_only(&input.exclude_route_keys),
-        &[],
-        input.required_capabilities,
-        &input.available_models,
-        &input.requirements,
-        config,
-        availability_rejections,
-    );
-    let adequacy = admission
-        .admitted
-        .first()
-        .ok_or_else(|| pin_rejection(&admission.rejected[0].reason))?
-        .adequacy
-        .clone();
-    // A pin chooses a model rather than ranking it by quality. The normal router
-    // still checks availability and quota reserved for head sessions, but a low
-    // quality score must not reject or substitute the caller's explicit choice.
-    input.requirements = ModelRequirements { iq: 0.0, eq: 0.0 };
-    input
-        .required_capabilities
-        .get_or_insert_with(Default::default)
-        .min_context
-        .get_or_insert(0.0);
-    let mut selected = striatum_core::model_router::select_model_route_with_availability(
-        input,
-        config,
-        slots,
-        &[],
-        availability_rejections,
-    )
-    .map_err(|error| {
-        error.rejected.first().map_or_else(
-            || error.reason.as_str().into(),
-            |route| pin_rejection(&route.reason),
-        )
-    })?;
-    selected.score.adequacy = adequacy.adequacy;
-    selected.score.raw_adequacy = adequacy.raw_adequacy;
-    selected.score.metrics = adequacy.metrics;
-    selected.below_floor = None;
-    selected.explanation = vec![format!("admission-only pin: {}", pin.model)];
-    Ok(selected)
-}
-
-fn pin_rejection(reason: &str) -> String {
-    match reason {
-        "excluded" => "caller_excluded".into(),
-        reason => reason.into(),
-    }
 }
 
 #[cfg(test)]

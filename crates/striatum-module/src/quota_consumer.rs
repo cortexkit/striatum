@@ -255,15 +255,14 @@ impl QuotaConsumer {
     ) -> Result<Vec<u8>, QuotaConsumerError> {
         self.usage_get_body(serde_json::json!({})).await
     }
-
     /// Preserve the raw body substring: the notice digest covers the producer's
     /// bytes, not a consumer's reserialized JSON tree.
+    #[cfg(test)]
     pub async fn events_get_raw(&mut self, event_key: &str) -> Result<Vec<u8>, QuotaConsumerError> {
         let body = self.events_get_raw_on_open_route(event_key).await?;
         self.goodbye().await?;
         Ok(body)
     }
-
     /// Read an event without closing the route so a long-lived consumer can reuse it.
     pub(crate) async fn events_get_raw_on_open_route(
         &mut self,
