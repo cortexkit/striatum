@@ -315,6 +315,7 @@
           "$ref": "#/$defs/SynthesizerPin",
           "description": "Prefer a specific model and optional variant for this consumer.",
           "x-ck-apply": "live",
+          "x-ck-kind": "json",
           "x-ck-layers": [
             "user"
           ],
@@ -847,6 +848,7 @@
           "$ref": "#/$defs/PanelPolicy",
           "description": "Model selection for audit panels. Omit to use the built-in audit policy.",
           "x-ck-apply": "live",
+          "x-ck-kind": "json",
           "x-ck-layers": [
             "user"
           ],
@@ -856,6 +858,7 @@
           "$ref": "#/$defs/PanelPolicy",
           "description": "Model selection for design review panels. Omit to use the built-in design review policy.",
           "x-ck-apply": "live",
+          "x-ck-kind": "json",
           "x-ck-layers": [
             "user"
           ],
@@ -865,6 +868,7 @@
           "$ref": "#/$defs/PanelPolicy",
           "description": "Model selection for diagnosis panels. Omit to use the built-in diagnosis policy.",
           "x-ck-apply": "live",
+          "x-ck-kind": "json",
           "x-ck-layers": [
             "user"
           ],
@@ -874,6 +878,7 @@
           "$ref": "#/$defs/PanelPolicy",
           "description": "Model selection for evaluation panels. Omit to use the built-in evaluation policy.",
           "x-ck-apply": "live",
+          "x-ck-kind": "json",
           "x-ck-layers": [
             "user"
           ],
@@ -883,6 +888,7 @@
           "$ref": "#/$defs/PanelPolicy",
           "description": "Model selection for explanation panels. Omit to use the built-in explanation policy.",
           "x-ck-apply": "live",
+          "x-ck-kind": "json",
           "x-ck-layers": [
             "user"
           ],
@@ -892,6 +898,7 @@
           "$ref": "#/$defs/PanelPolicy",
           "description": "Model selection for lab panels. Omit to use the built-in lab policy.",
           "x-ck-apply": "live",
+          "x-ck-kind": "json",
           "x-ck-layers": [
             "user"
           ],
@@ -901,6 +908,7 @@
           "$ref": "#/$defs/PanelPolicy",
           "description": "Model selection for specification panels. Omit to use the built-in specification policy.",
           "x-ck-apply": "live",
+          "x-ck-kind": "json",
           "x-ck-layers": [
             "user"
           ],
@@ -920,24 +928,14 @@
             "eq",
             "cost"
           ],
-          "type": "string",
-          "x-ck-apply": "live",
-          "x-ck-layers": [
-            "user"
-          ],
-          "x-ck-required": true
+          "type": "string"
         },
         "extra": {
           "default": 0,
           "description": "Number of additional models to select, from 0 to 8 minus the leading count.",
-          "format": "uint8",
           "maximum": 7,
           "minimum": 0,
-          "type": "integer",
-          "x-ck-apply": "live",
-          "x-ck-layers": [
-            "user"
-          ]
+          "type": "integer"
         },
         "extra_by": {
           "description": "How to choose the additional models. Required when the additional count is above 0.",
@@ -947,44 +945,26 @@
             "eq",
             "cost"
           ],
-          "type": "string",
-          "x-ck-apply": "live",
-          "x-ck-layers": [
-            "user"
-          ],
-          "x-ck-required": false
+          "type": "string"
         },
         "floor": {
           "description": "Minimum quality score for a panel seat, from 0 to 100. Omit to use the request's quality rules.",
-          "format": "uint8",
           "maximum": 100,
           "minimum": 0,
-          "type": "integer",
-          "x-ck-apply": "live",
-          "x-ck-layers": [
-            "user"
-          ],
-          "x-ck-required": false
+          "type": "integer"
         },
         "top_k": {
           "description": "Number of leading models to select, from 1 to 8.",
-          "format": "uint8",
           "maximum": 8,
           "minimum": 1,
-          "type": "integer",
-          "x-ck-apply": "live",
-          "x-ck-layers": [
-            "user"
-          ],
-          "x-ck-required": true
+          "type": "integer"
         }
       },
       "required": [
         "top_k",
         "by"
       ],
-      "type": "object",
-      "unevaluatedProperties": false
+      "type": "object"
     },
     "ProjectPolicy": {
       "additionalProperties": false,
@@ -1492,29 +1472,18 @@
         "model": {
           "description": "Route to pin, written as provider/model.",
           "pattern": "^[^/\\s]+/[^\\s]+$",
-          "type": "string",
-          "x-ck-apply": "live",
-          "x-ck-layers": [
-            "user"
-          ],
-          "x-ck-required": true
+          "type": "string"
         },
         "variant": {
           "description": "Optional named model variant. Omit to use the model's usual variant.",
           "pattern": "\\S",
-          "type": "string",
-          "x-ck-apply": "live",
-          "x-ck-layers": [
-            "user"
-          ],
-          "x-ck-required": false
+          "type": "string"
         }
       },
       "required": [
         "model"
       ],
-      "type": "object",
-      "unevaluatedProperties": false
+      "type": "object"
     }
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",

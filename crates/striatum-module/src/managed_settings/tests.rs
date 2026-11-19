@@ -12,26 +12,8 @@ fn snapshot(document: &str) -> ConfigLayerSnapshot {
     )
 }
 
-// The SDK must accept this schema on its own. It uses only the routing fields
-// exercised here, without relying on optional scalar declarations.
 fn review_schema() -> Schema {
-    Schema::new(json!({
-        "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "type": "object", "unevaluatedProperties": false,
-        "x-ck-layers": ["user"], "x-ck-apply": "live",
-        "properties": {
-            "catalog": {"type": "object", "unevaluatedProperties": false, "properties": {
-                "poll_ms": {"type": "integer", "description": "Catalog poll interval", "default": 600000}
-            }},
-            "panels": {"type": "object", "unevaluatedProperties": false, "properties": {
-                "audit": {"type": "object", "unevaluatedProperties": false, "properties": {
-                    "top_k": {"type": "integer", "description": "Leading models", "default": 3},
-                    "extra": {"type": "integer", "description": "Additional models", "default": 0},
-                    "by": {"type": "string", "description": "Ranking", "default": "iq"}
-                }}
-            }}
-        }
-    })).unwrap()
+    Schema::new(emitted_schema().clone()).expect("accept the full routing settings declaration")
 }
 
 #[test]
@@ -47,31 +29,28 @@ fn review_accepts_a_jsonc_change_and_reports_value_and_source_changes() {
         vec![],
         ConfigStatus::Active,
     );
-    base.sources
-        .insert("/panels/audit/extra".into(), Layer::User);
+    base.sources.insert("/demand_exponent".into(), Layer::User);
     let reply = review(
         &schema,
         "striatum",
         ConfigReviewRequest::new(
             3,
-            vec![snapshot(
-                "// Catalog refresh\n{\"catalog\":{\"poll_ms\":2000,},}",
-            )],
+            vec![snapshot("// Terminal failures before avoidance\n{\"consecutive_terminal_failure_threshold\":4,}")],
             Some(base),
         ),
     );
     assert!(reply.refusals.is_empty(), "{:?}", reply.refusals);
     assert_eq!(reply.fields.len(), 2);
     let changed = &reply.fields[0];
-    assert_eq!(changed.path, "/catalog/poll_ms");
-    assert_eq!(changed.old, RecordedValue::new(json!(600000)));
-    assert_eq!(changed.new, RecordedValue::new(json!(2000)));
+    assert_eq!(changed.path, "/consecutive_terminal_failure_threshold");
+    assert_eq!(changed.old, RecordedValue::new(json!(3)));
+    assert_eq!(changed.new, RecordedValue::new(json!(4)));
     assert_eq!(
         (changed.old_source, changed.new_source, changed.apply),
         (Layer::Default, Layer::User, ApplyKind::Live)
     );
     let source_only = &reply.fields[1];
-    assert_eq!(source_only.path, "/panels/audit/extra");
+    assert_eq!(source_only.path, "/demand_exponent");
     assert_eq!(source_only.old, source_only.new);
     assert_eq!(
         (source_only.old_source, source_only.new_source),
@@ -98,8 +77,8 @@ fn review_names_an_explicit_null() {
 
 #[test]
 fn review_names_an_old_key() {
-    let refusal = review_refusal(r#"{"panels":{"audit":{"topK":2}}}"#);
-    assert_eq!(refusal.paths, ["/panels/audit/topK"]);
+    let refusal = review_refusal(r#"{"models":{"p/m":{"context_window":4096}}}"#);
+    assert_eq!(refusal.paths, ["/models/p~1m/context_window"]);
 }
 
 #[test]
@@ -111,7 +90,8 @@ fn review_names_the_fields_in_each_panel_cross_field_rule() {
     );
     assert!(ordering.reasons[0].contains("extra_by is required"));
 
-    let width = review_refusal(r#"{"panels":{"audit":{"top_k":8,"by":"iq","extra":1}}}"#);
+    let width =
+        review_refusal(r#"{"panels":{"audit":{"top_k":8,"by":"iq","extra":1,"extra_by":"iq"}}}"#);
     assert_eq!(width.paths, ["/panels/audit/top_k", "/panels/audit/extra"]);
     assert!(width.reasons[0].contains("top_k + extra must be <= 8"));
 }
@@ -123,8 +103,7 @@ fn review_refuses_a_duplicate_field_even_after_the_tuple_collapses_it() {
     assert!(refusal.reasons[0].contains("duplicate field `poll_ms`"));
 }
 
-#[test]
-fn delivered_effective_settings_match_the_file_and_ignore_later_edits() {
+fn live_settings_source() -> String {
     let sample = r#"{
         // Keep the non-export case executable in ordinary test runs.
         "catalog": {"poll_ms": 3210},
@@ -133,9 +112,86 @@ fn delivered_effective_settings_match_the_file_and_ignore_later_edits() {
         "models": {"p/m": {"context_window_tokens": 4096, "output_tokens_per_second": 42}},
         "panels": {"audit": {"top_k": 2, "by": "iq"}}
     }"#;
-    let source = std::env::var_os("STRIATUM_TEST_LIVE_SETTINGS")
-        .map(|path| std::fs::read_to_string(path).expect("read the isolated live settings export"))
-        .unwrap_or_else(|| sample.to_owned());
+    if let Some(path) = std::env::var_os("STRIATUM_TEST_LIVE_SETTINGS") {
+        return std::fs::read_to_string(path).expect("read the isolated live settings export");
+    }
+    let export = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../.cortexkit/internal-docs/research/striatum-live-settings.jsonc");
+    match std::fs::read_to_string(export) {
+        Ok(source) => source,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => sample.to_owned(),
+        Err(error) => panic!("read the isolated live settings export: {error}"),
+    }
+}
+
+#[test]
+fn full_schema_reviews_live_settings_as_the_user_layer() {
+    let source = live_settings_source();
+    let json = subc_jsonc::jsonc_to_json(&source).unwrap();
+    let user = serde_json::from_str(&json).unwrap();
+    let tuple = review_schema()
+        .review_tuple(
+            &[LayerValue::new(Layer::User, user)],
+            &ValidationContext::new("striatum", None),
+        )
+        .unwrap_or_else(|error| panic!("routing user layer refused: {error}"));
+    config_overrides::validate_document(&tuple.effective.to_string()).unwrap();
+}
+
+#[test]
+fn review_keeps_optional_records_absent_and_preserves_supplied_shapes() {
+    let schema = review_schema();
+    let context = ValidationContext::new("striatum", None);
+    let user = json!({
+        "concurrency": {"providers": {"p": {"limit": "none"}, "q": {"limit": 1}}},
+        "consumers": {"pinned": {"pin": {"model": "p/m"}}, "unbound": {}},
+        "panels": {"audit": {"top_k": 2, "by": "iq"}},
+    });
+    let tuple = schema
+        .review_tuple(&[LayerValue::new(Layer::User, user.clone())], &context)
+        .unwrap();
+    for path in [
+        "/concurrency/providers/p/limit",
+        "/concurrency/providers/q/limit",
+        "/consumers/pinned/pin",
+        "/panels/audit",
+    ] {
+        assert_eq!(tuple.effective.pointer(path), user.pointer(path), "{path}");
+        assert_eq!(tuple.sources.get(path), Some(&Layer::User), "{path}");
+    }
+    for path in [
+        "/concurrency/providers/p/scope",
+        "/consumers/unbound/pin",
+        "/panels/lab",
+    ] {
+        assert!(tuple.effective.pointer(path).is_none(), "{path}");
+    }
+
+    for (invalid, path) in [
+        (json!({"consumers":{"x":{"pin":{}}}}), "/consumers/x/pin"),
+        (
+            json!({"panels":{"audit":{"top_k":9,"by":"iq"}}}),
+            "/panels/audit",
+        ),
+        (
+            json!({"panels":{"audit":{"top_k":2,"by":"iq","topK":2}}}),
+            "/panels/audit",
+        ),
+        (
+            json!({"concurrency":{"providers":{"p":{"limit":"unlimited"}}}}),
+            "/concurrency/providers/p/limit",
+        ),
+    ] {
+        let error = schema
+            .review_tuple(&[LayerValue::new(Layer::User, invalid)], &context)
+            .unwrap_err();
+        assert_eq!(error.path, path, "{error}");
+    }
+}
+
+#[test]
+fn delivered_effective_settings_match_the_file_and_ignore_later_edits() {
+    let source = live_settings_source();
     let scratch = ScratchDir::new("routing-managed-versus-file");
     let file = scratch.path().join("file.jsonc");
     let path = scratch.path().join("managed.jsonc");

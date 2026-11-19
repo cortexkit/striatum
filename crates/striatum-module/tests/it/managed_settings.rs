@@ -354,8 +354,15 @@ async fn module_delivery_vectors_drive_review_wait_ack_and_nack() {
     assert_eq!(waiting["code"], "routing_not_ready");
     assert_eq!(waiting["detail"]["retryable"], true);
 
-    rig.send(FrameType::Request, 83, vector!("config_review_request"))
-        .await;
+    let mut review_request = vector!("config_review_request");
+    review_request["base"] = Value::Null;
+    review_request["layers"] = json!([ConfigLayerSnapshot::file(
+        "striatum",
+        ConfigLayer::User,
+        rig.config.to_str().unwrap(),
+        Some(br#"{"retention":{"model_route_decisions_days":37}}"#.to_vec()),
+    )]);
+    rig.send(FrameType::Request, 83, review_request).await;
     let review = recv(&mut rig.peer).await;
     assert_eq!(
         (
@@ -367,14 +374,19 @@ async fn module_delivery_vectors_drive_review_wait_ack_and_nack() {
         (FrameType::Response, 0, 0, 83)
     );
     let review = body(&review);
-    // This SDK cannot accept the production schema's optional scalar leaves.
     assert_eq!(review["op"], "config.review");
-    assert_eq!(review["fields"], json!([]));
-    assert_eq!(review["refusals"][0]["code"], "schema_invalid");
-    assert_eq!(
-        review["refusals"][0]["paths"],
-        json!(["/accounts/floors/*/model"])
-    );
+    assert_eq!(review["refusals"], json!([]));
+    let user_changes: Vec<_> = review["fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|field| field["new_source"] == "user")
+        .collect();
+    assert_eq!(user_changes.len(), 1, "{review}");
+    let change = user_changes[0];
+    assert_eq!(change["path"], "/retention/model_route_decisions_days");
+    assert_eq!(change["new"], json!({"kind":"value","value":37}));
+    assert_eq!(change["apply"], "live");
 
     let valid = json!({"retention":{"model_route_decisions_days":37}});
     let pending = deliver(&mut rig, 4, 8, valid).await;

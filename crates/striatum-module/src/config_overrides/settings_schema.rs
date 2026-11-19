@@ -30,10 +30,23 @@ pub(super) fn render() -> String {
     defs.retain(|name, _| !scalar_defs.contains_key(name));
     reshape(&mut schema, &scalar_defs, "", "");
     for (name, node) in defs.iter_mut() {
-        reshape(node, &scalar_defs, name, "");
+        if is_opaque_record(name) {
+            for (key, child) in node["properties"].as_object_mut().unwrap() {
+                reshape(child, &scalar_defs, name, key);
+                // SUBC rejects format annotations inside opaque records. The
+                // explicit minimum and maximum already constrain these integers.
+                child.as_object_mut().unwrap().remove("format");
+            }
+        } else {
+            reshape(node, &scalar_defs, name, "");
+        }
     }
     schema["$defs"] = json!(defs);
     serde_json::to_string_pretty(&schema).unwrap() + "\n"
+}
+
+fn is_opaque_record(name: &str) -> bool {
+    matches!(name, "SynthesizerPin" | "PanelPolicy")
 }
 
 fn reshape(node: &mut Value, scalars: &Map<String, Value>, owner: &str, field: &str) {
@@ -60,7 +73,13 @@ fn reshape(node: &mut Value, scalars: &Map<String, Value>, owner: &str, field: &
         node.extend(variants[0].as_object().unwrap().clone());
     }
     if let Some(reference) = node.get("$ref").and_then(Value::as_str) {
-        if let Some(scalar) = scalars.get(reference.strip_prefix("#/$defs/").unwrap()) {
+        let name = reference.strip_prefix("#/$defs/").unwrap();
+        if is_opaque_record(name) {
+            // An absent pin or panel override must stay absent so routing
+            // can inherit its policy. Structural objects synthesize defaults
+            // from their children, even when the object is optional.
+            node.insert("x-ck-kind".into(), json!("json"));
+        } else if let Some(scalar) = scalars.get(name) {
             node.remove("$ref");
             for (key, value) in scalar.as_object().unwrap() {
                 node.entry(key.clone()).or_insert_with(|| value.clone());

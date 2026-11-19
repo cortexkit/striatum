@@ -228,6 +228,7 @@ fn schema_pins_field_metadata_and_omission() {
             .iter()
             .map(|(name, node)| (name.as_str(), node)),
     ) {
+        let opaque = matches!(owner, "PanelPolicy" | "SynthesizerPin");
         walk_schema(node, "", &mut |node, path| {
             for keyword in ["allOf", "anyOf", "if", "then", "else"] {
                 assert!(node.get(keyword).is_none(), "{owner}{path}: {keyword}");
@@ -240,7 +241,12 @@ fn schema_pins_field_metadata_and_omission() {
                 "{owner}{path}"
             );
             if node["type"] == "object" {
-                assert_eq!(node["unevaluatedProperties"], false, "{owner}{path}");
+                let closure = if opaque {
+                    "additionalProperties"
+                } else {
+                    "unevaluatedProperties"
+                };
+                assert_eq!(node[closure], false, "{owner}{path}");
             }
             assert!(!node["additionalProperties"].is_object(), "{owner}{path}");
             if path.is_empty() {
@@ -250,6 +256,14 @@ fn schema_pins_field_metadata_and_omission() {
                 node["description"].as_str().is_some_and(|s| !s.is_empty()),
                 "{owner}{path}"
             );
+            if opaque {
+                assert!(node
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .all(|key| !key.starts_with("x-ck-")));
+                return;
+            }
             assert_eq!(node["x-ck-apply"], "live", "{owner}{path}");
             assert_eq!(node["x-ck-layers"], json!(["user"]), "{owner}{path}");
             match node.get("default") {
@@ -284,11 +298,9 @@ fn schema_pins_field_metadata_and_omission() {
         ("ModelFactOverride", "/context_window_tokens /cost_per_mtok_out /elo /eq /not_for /not_for/* /only_for /only_for/* /output_tokens_per_second /pin_only /pin_only_for /pin_only_for/* /service_tier /speed_multiplier /subscription /subscription_multiplier /vision"),
         ("OverqualificationSection", "/base /doubling /threshold"),
         ("PanelPolicies", "/audit /design_review /diagnose /evaluate /explain /lab /spec"),
-        ("PanelPolicy", "/extra_by /floor"),
         ("ProviderAccountsPolicy", "/floors /floors/* /hold_when_reset_within /max_hold /order /order/* /ordered /paid_credits /soft_quota_remaining_percent /spend_budget_reset_at_ms /spend_budget_usd /strategy /unknown_reset_retry"),
         ("ProviderPolicy", "/models /models/* /not_for /not_for/* /only_for /only_for/* /pin_only /pin_only_for /pin_only_for/* /service_tier /subscription /subscription_multiplier"),
         ("RunnerPolicy", "/harness /routes /routes/* /tool_capabilities/*"),
-        ("SynthesizerPin", "/variant"),
     ];
     let mut expected: Vec<_> = groups
         .into_iter()
@@ -301,6 +313,20 @@ fn schema_pins_field_metadata_and_omission() {
     expected.sort();
     actual.sort();
     assert_eq!(actual, expected);
+    let defs = &schema["$defs"];
+    assert_eq!(
+        defs["ConsumerPolicy"]["properties"]["pin"]["x-ck-kind"],
+        "json"
+    );
+    for panel in defs["PanelPolicies"]["properties"]
+        .as_object()
+        .unwrap()
+        .values()
+    {
+        assert_eq!(panel["x-ck-kind"], "json");
+    }
+    assert_eq!(defs["SynthesizerPin"]["required"], json!(["model"]));
+    assert_eq!(defs["PanelPolicy"]["required"], json!(["top_k", "by"]));
     for table in ["DefaultAccountsPolicy", "ProviderAccountsPolicy"] {
         for key in ["max_hold", "hold_when_reset_within", "unknown_reset_retry"] {
             let field = &schema["$defs"][table]["properties"][key];
@@ -323,67 +349,9 @@ fn schema_pins_field_metadata_and_omission() {
 }
 
 #[test]
-fn pinned_daemon_sdk_refuses_only_optional_leaves_and_cap_type_lists() {
-    use serde_json::{json, Value};
-    use subc_client_rs::config::Schema;
-
-    // The locked subc-config SDK returns only the first refusal. Test each version difference
-    // separately, then pass both projections together to uncover any others.
-    fn project_for_older_sdk(node: &mut Value, optional: bool, caps: bool) {
-        if optional
-            && node["x-ck-required"] == false
-            && node["type"].as_str().is_some_and(|t| t != "object")
-        {
-            // A sample is only for this compatibility test. Putting these
-            // values in the real defaults would override inherited settings.
-            let sample = node["enum"]
-                .as_array()
-                .and_then(|choices| choices.first())
-                .cloned()
-                .unwrap_or_else(|| match node["type"].as_str().unwrap() {
-                    "array" => json!([]),
-                    "boolean" => json!(false),
-                    "integer" | "number" => json!(1),
-                    "string" if node["x-ck-kind"] == "duration" => json!("1s"),
-                    "string" => json!("example"),
-                    kind => panic!("unexpected optional type {kind}"),
-                });
-            node.as_object_mut().unwrap().remove("x-ck-required");
-            node["default"] = sample;
-        }
-        if caps && node["type"] == json!(["integer", "string"]) {
-            node["type"] = json!("integer");
-        }
-        for keyword in ["$defs", "properties", "patternProperties"] {
-            if let Some(children) = node.get_mut(keyword).and_then(Value::as_object_mut) {
-                for child in children.values_mut() {
-                    project_for_older_sdk(child, optional, caps);
-                }
-            }
-        }
-        if let Some(items) = node.get_mut("items") {
-            project_for_older_sdk(items, optional, caps);
-        }
-    }
-    let real: Value = serde_json::from_str(&super::routing_config_schema()).unwrap();
-    let check_refusal = |schema, path| {
-        let actual = Schema::new(schema)
-            .err()
-            .expect("the locked SDK rejects this declaration");
-        assert_eq!(
-            serde_json::to_value(actual).unwrap(),
-            json!({"code":"schema_invalid", "path":path, "project_id":null})
-        );
-    };
-    check_refusal(real.clone(), "/accounts/floors/*/model");
-    let mut no_caps = real.clone();
-    project_for_older_sdk(&mut no_caps, false, true);
-    check_refusal(no_caps, "/accounts/floors/*/model");
-    let mut no_omission = real;
-    project_for_older_sdk(&mut no_omission, true, false);
-    check_refusal(no_omission.clone(), "/concurrency/accounts/*/limit");
-    project_for_older_sdk(&mut no_omission, false, true);
-    if let Err(error) = Schema::new(no_omission) {
-        panic!("unexpected SDK refusal after removing the two known version differences: {error}");
+fn subc_accepts_the_full_routing_settings_schema() {
+    let schema = serde_json::from_str(&super::routing_config_schema()).unwrap();
+    if let Err(error) = subc_client_rs::config::Schema::new(schema) {
+        panic!("full routing settings declaration refused: {error}");
     }
 }
