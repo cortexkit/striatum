@@ -1111,7 +1111,7 @@ pub(super) fn prepare_roster(
     let mut route_fenced = BTreeMap::new();
     let mut roster = match ctx.classes.as_ref() {
         Some(classes) => {
-            let (roster, fenced) = classes.roster_and_fences_for(
+            let (roster, fenced) = classes.roster_before_login_conditions(
                 &provider,
                 &normalize(&parsed.model),
                 class == striatum_core::accounts::AllowedAccountClass::PricedPerTokenOnly,
@@ -1214,6 +1214,20 @@ pub(super) fn prepare_roster(
                 .request_input_tokens
                 .unwrap_or_else(|| parsed.initial_input_bytes.div_ceil(4)),
         );
+        let detail = classes.filter_login_conditions(&mut roster, |account, credential| {
+            parsed.candidates.as_ref().is_none_or(|candidates| {
+                candidates.accounts.iter().any(|candidate| {
+                    candidate.account_id == account && candidate.credential_id == credential
+                })
+            })
+        });
+        if let Some(detail) = detail.filter(|_| route_fenced.is_empty()) {
+            return Err(because("login_condition", OpReply::typed(
+                "auth_required",
+                "The vault lists a provider condition that requires action on the offered logins.",
+                detail.detail(),
+            )));
+        }
     }
     Ok((roster, route_fenced, class, selection))
 }

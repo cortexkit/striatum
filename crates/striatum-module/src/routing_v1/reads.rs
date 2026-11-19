@@ -243,5 +243,16 @@ pub(super) fn account_status(
             answer["reset_at_ms"] = json!(reset);
         }
     }
+    if let Ok(credentials) = deps.broca_credentials.lock() {
+        let quota = ctx.accounts.and_then(|state| state.lock().ok());
+        let marked = credentials.credential_conditions(
+            &crate::account_selection::normalize(&request.provider),
+            &request.account_id,
+            quota.as_deref(),
+        );
+        if !marked.is_empty() {
+            answer["credentials"] = json!(marked);
+        }
+    }
     Ok(answer)
 }

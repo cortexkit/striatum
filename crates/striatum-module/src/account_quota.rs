@@ -622,7 +622,7 @@ pub struct VaultRoster {
 }
 
 mod listing;
-pub(crate) use listing::restore_credential_listing;
+pub(crate) use listing::{condition_json, restore_credential_listing};
 
 /// Vault account ids are the join key. Ambiguous ids across adapters are not
 /// selectable: choosing the first would silently bind the wrong credential.
@@ -1621,6 +1621,7 @@ pub fn apply_roster_listing(
         // Quota identities omit API keys without account ids. Persist the
         // full non-secret view too, for admission immediately after restart.
         value["listing"] = listing::encode(listing);
+        value["listing_includes_conditions"] = Value::Bool(true);
         PersistedVaultRoster {
             view: roster.view.clone(),
             roster_json: value.to_string(),
@@ -1875,13 +1876,7 @@ pub async fn account_quota_loop(
         .ok()
         .and_then(Result::ok)
         .flatten()
-        // Save the full listing even when its view matches an older snapshot
-        // that persisted only quota identities.
-        .filter(|row| {
-            serde_json::from_str::<Value>(&row.roster_json)
-                .is_ok_and(|roster| roster.get("listing").is_some_and(Value::is_object))
-        })
-        .map(|row| row.view);
+        .and_then(listing::persisted_view);
     let persisted_view = Arc::new(tokio::sync::Mutex::new(persisted_view));
     let latest_listing = Arc::new(Mutex::new(None));
     let maintenance_wake = Arc::new(tokio::sync::Notify::new());

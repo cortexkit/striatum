@@ -13,6 +13,8 @@ use crate::{account_quota, BrocaCredentials};
 
 const NOW: u64 = 1_800_000_000_000;
 
+mod login_condition_tests;
+
 fn request(id: &str, legacy: bool) -> Value {
     let mut request = json!({"provider":"deepseek", "model":"model",
         "conversation_key": format!("conversation-{id}"), "admission_id":id});

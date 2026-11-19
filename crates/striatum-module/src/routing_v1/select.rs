@@ -2064,6 +2064,34 @@ async fn select_at_tier_attempt(
                     &no_route,
                 );
             }
+            if let Some(classes) = priced.classes.as_ref().filter(|_| !available.is_empty()) {
+                let mut conditions = account_selection::class_context::LoginConditions::default();
+                let all_marked = available.iter().all(|key| {
+                    no_route
+                        .rejected
+                        .iter()
+                        .any(|row| row.route_key == *key && row.reason == "login_condition")
+                        && RouteRef::parse_pin(key)
+                            .and_then(|route| {
+                                classes.login_condition_detail(
+                                    &route.provider,
+                                    &route.model,
+                                    priced_per_token,
+                                )
+                            })
+                            .is_some_and(|detail| {
+                                conditions.extend(detail);
+                                true
+                            })
+                });
+                if all_marked {
+                    return Err(Refusal::with(
+                        RefusalCode::AuthRequired,
+                        "The vault lists provider conditions that require action on the available logins.",
+                        &conditions.detail(),
+                    ));
+                }
+            }
             let test_in_flight = no_route.earliest_reset_route.as_ref().is_some_and(|key| {
                 account_blocks.get(key).is_some_and(|block| {
                     block.test_check_at_ms.map(|at| at as f64) == no_route.earliest_reset
@@ -3198,6 +3226,21 @@ impl<'a> Selection<'a> {
                 &format!("{}/{}", parsed.provider, parsed.model),
             );
         let refused = |code: &str, cause: Option<String>, message: String| {
+            if code == "login_condition" || cause.as_deref() == Some("login_condition") {
+                if let Some(detail) = self.classes.and_then(|classes| {
+                    classes.login_condition_detail(
+                        &parsed.provider,
+                        &parsed.model,
+                        self.priced_per_token,
+                    )
+                }) {
+                    return Refusal::with(
+                        RefusalCode::AuthRequired,
+                        "The vault lists a provider condition that requires action on the pinned route's logins.",
+                        &detail.detail(),
+                    );
+                }
+            }
             let reserve_limited =
                 code == "subscription_reserve" || cause.as_deref() == Some("subscription_reserve");
             let provider_limited = (code == "not_available" || code == RUNNER_PROVIDER_LIMIT)

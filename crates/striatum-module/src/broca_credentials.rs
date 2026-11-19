@@ -940,6 +940,46 @@ impl CredentialData {
             .collect()
     }
 
+    pub(crate) fn credential_conditions(
+        &self,
+        provider: &str,
+        account_id: &str,
+        quota: Option<&crate::account_quota::AccountQuotaState>,
+    ) -> Vec<serde_json::Value> {
+        let mut rows = self
+            .listed
+            .iter()
+            .filter_map(|row| Some((row, row.condition.as_ref()?)))
+            .filter(|(row, _)| {
+                credential_providers(row, &self.catalog_providers)
+                    .iter()
+                    .any(|id| id == provider)
+            })
+            .peekable();
+        if rows.peek().is_none() {
+            return Vec::new();
+        }
+        let joined = quota.map(|quota| self.quota_account_ids(quota));
+        let mut entries = BTreeMap::new();
+        for (row, condition) in rows {
+            let id = row
+                .account_id
+                .as_deref()
+                .or_else(|| joined.as_ref()?.get(&row.id)?.as_deref())
+                .unwrap_or(&row.id);
+            if id == account_id {
+                entries.insert(
+                    &row.id,
+                    serde_json::json!({
+                        "credential_id": row.id,
+                        "condition": crate::account_quota::condition_json(condition),
+                    }),
+                );
+            }
+        }
+        entries.into_values().collect()
+    }
+
     /// Only metered consumers learn vault payment methods in admission-only
     /// copies. Other consumers keep the catalog facts, as do availability and billing.
     pub(crate) fn admission_facts(

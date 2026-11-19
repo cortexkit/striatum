@@ -245,6 +245,9 @@ pub(crate) fn choices_for_harness_with_effort_detail(
             false,
             |_| true,
         );
+        if class.rows.iter().all(|row| row.condition.is_some()) && !class.rows.is_empty() {
+            continue;
+        }
         let allowed = |variant: Option<&str>, pinned: bool| {
             let route = striatum_core::make_route_key(provider, model, variant);
             config.route_allowed_with_default("head", &route, pinned, !class.subscription)
@@ -281,12 +284,14 @@ pub(crate) fn choices_for_harness_with_effort_detail(
         let mut service_tiers = vec!["standard".into()];
         for tier in ["fast", "ultrafast"] {
             if credentials.listed_credentials().iter().any(|row| {
-                service_tiers::model_offers_for_method(
-                    credentials,
-                    fact,
-                    row.auth_method.as_deref(),
-                    tier,
-                ) && broca_credentials::credential_serves_fact(row, fact, &providers, credentials)
+                row.condition.is_none()
+                    && service_tiers::model_offers_for_method(
+                        credentials,
+                        fact,
+                        row.auth_method.as_deref(),
+                        tier,
+                    )
+                    && broca_credentials::credential_serves_fact(row, fact, &providers, credentials)
                     && fact
                         .billing_plane
                         .as_ref()
