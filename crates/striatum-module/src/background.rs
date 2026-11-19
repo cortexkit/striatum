@@ -93,8 +93,23 @@ pub(super) async fn next_frame_or_loop_stop<R>(
 where
     R: AsyncRead + Unpin,
 {
+    frame_or_loop_stop(read_next_frame(read_half), loops).await
+}
+
+pub(super) async fn read_next_frame<R: AsyncRead + Unpin>(
+    read_half: &mut R,
+) -> Result<Option<Frame>, ModuleError> {
+    read_frame(read_half)
+        .await
+        .map_err(|error| ModuleError::Message(error.to_string()))
+}
+
+pub(super) async fn frame_or_loop_stop(
+    frame: impl std::future::Future<Output = Result<Option<Frame>, ModuleError>>,
+    loops: &mut BackgroundLoops,
+) -> Result<Option<Frame>, ModuleError> {
     tokio::select! {
-        frame = read_frame(read_half) => frame.map_err(|e| ModuleError::Message(e.to_string())),
+        result = frame => result,
         stopped = loops.next_stop() => {
             eprintln!("[striatum] background-loop-stopped: {stopped}");
             Err(stopped)

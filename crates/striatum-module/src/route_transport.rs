@@ -146,17 +146,7 @@ pub(super) async fn handle_frame(
 ) -> Result<bool, ModuleError> {
     match frame.header.ty {
         FrameType::Ping if frame.header.channel == 0 => {
-            let pong = Frame::build_with_version(
-                frame.header.ver,
-                FrameType::Pong,
-                frame.header.flags,
-                0,
-                0,
-                frame.header.corr,
-                Vec::new(),
-            )
-            .map_err(|e| ModuleError::Message(e.to_string()))?;
-            send(writer, pong).await?;
+            send_pong(writer, &frame).await?;
             Ok(true)
         }
         FrameType::Goodbye if frame.header.channel == 0 => Ok(false),
@@ -399,6 +389,27 @@ pub(super) async fn handle_control_request(
     broca_credentials: &SharedBrocaCredentials,
     quota_cache: &SharedQuotaCache,
 ) -> Result<(), ModuleError> {
+    handle_control_request_with_readiness(
+        frame,
+        writer,
+        route_epochs,
+        catalog_health,
+        broca_credentials,
+        quota_cache,
+        None,
+    )
+    .await
+}
+
+pub(super) async fn handle_control_request_with_readiness(
+    frame: Frame,
+    writer: &mpsc::Sender<Frame>,
+    route_epochs: &mut RouteEpochs,
+    catalog_health: &SharedCatalogHealth,
+    broca_credentials: &SharedBrocaCredentials,
+    quota_cache: &SharedQuotaCache,
+    not_ready: Option<&str>,
+) -> Result<(), ModuleError> {
     let request = match serde_json::from_slice::<ModuleControlRequest>(&frame.body) {
         Ok(request) => request,
         Err(error) => {
@@ -512,6 +523,7 @@ pub(super) async fn handle_control_request(
                     "routing pricing not ready: awaiting first billing-plane load".to_string()
                 }),
                 quota_detail,
+                not_ready.map(str::to_owned),
             ]
             .into_iter()
             .flatten()
@@ -547,6 +559,23 @@ pub(super) async fn handle_control_request(
             send(writer, response).await
         }
     }
+}
+
+pub(super) async fn send_pong(
+    writer: &mpsc::Sender<Frame>,
+    ping: &Frame,
+) -> Result<(), ModuleError> {
+    let pong = Frame::build_with_version(
+        ping.header.ver,
+        FrameType::Pong,
+        ping.header.flags,
+        0,
+        0,
+        ping.header.corr,
+        Vec::new(),
+    )
+    .map_err(|error| ModuleError::Message(error.to_string()))?;
+    send(writer, pong).await
 }
 
 /// The method envelope, decoded first so an unknown method reports `unknown_method`
