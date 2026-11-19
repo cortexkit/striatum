@@ -298,17 +298,9 @@ async fn gateway_reach_is_runner_and_harness_local_on_select_choices_and_what_if
             )
             .await;
         assert_eq!(ty, FrameType::Response, "{preview}");
-        let mut expected_models = choices["result"]["models"].clone();
-        for model in expected_models.as_array_mut().unwrap() {
-            model["effort_source"] = json!("none");
-            model["variant"] = json!(null);
-            model["grade"] = json!({"elo":55.0,"eq":1700.0,
-                "elo_effort":"unrecorded","eq_effort":"unrecorded"});
-        }
-        assert_eq!(
-            preview["result"]["head_choices"]["models"], expected_models,
-            "{preview}"
-        );
+        let expected =
+            super::what_if_tests::expected_head_effort_detail(&choices["result"], 55.0, 1700.0);
+        assert_eq!(preview["result"]["head_choices"], expected, "{preview}");
     }
     for (module, harness_name) in [("broca", "broca"), (RUNNER, "direct-api")] {
         let reply = consumer

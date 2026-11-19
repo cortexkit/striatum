@@ -43,6 +43,17 @@ async fn evaluate(route: &Route, extra: Value) -> Value {
     reply["result"].clone()
 }
 
+pub(super) fn expected_head_effort_detail(public_picker: &Value, elo: f64, eq: f64) -> Value {
+    let mut expected = public_picker.clone();
+    for model in expected["models"].as_array_mut().unwrap() {
+        model["effort_source"] = json!("none");
+        model["variant"] = Value::Null;
+        model["grade"] = json!({"elo":elo,"eq":eq,
+            "elo_effort":"unrecorded","eq_effort":"unrecorded"});
+    }
+    expected
+}
+
 #[tokio::test]
 async fn decommissioned_what_if_excludes_route_from_adequacy_and_keeps_reason() {
     let (harness, _) = configured().await;
@@ -335,7 +346,10 @@ async fn what_if_head_choices_matches_installed_declaration_and_keeps_live_state
         )
         .await;
     assert_eq!(ty, FrameType::Response, "{installed}");
-    assert_eq!(preview["head_choices"], installed["result"]);
+    assert_eq!(
+        preview["head_choices"],
+        expected_head_effort_detail(&installed["result"], 1800.0, 1800.0)
+    );
     let replacement = evaluate(
         &operator,
         json!({
@@ -344,7 +358,8 @@ async fn what_if_head_choices_matches_installed_declaration_and_keeps_live_state
     )
     .await;
     assert_eq!(
-        replacement["head_choices"], baseline["result"],
+        replacement["head_choices"],
+        expected_head_effort_detail(&baseline["result"], 1800.0, 1800.0),
         "{replacement}"
     );
     let (ty, still_installed) = operator
