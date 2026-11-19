@@ -90,6 +90,8 @@ fn scenario_pools(
                                 banked_resets: if banked { 2 } else { 0 },
                                 banked_expires_at_ms: Some(2_000_000),
                                 banked_credit_expiries_ms: vec![],
+                                banked_kind_expiries_ms: Vec::new(),
+                                scoped_windows: Vec::new(),
                                 prepaid_credits: false,
                             })
                             .collect(),

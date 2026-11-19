@@ -59,6 +59,8 @@ fn plan(multiplier: f64, used: f64) -> SubscriptionPlan {
             banked_resets: 0,
             banked_expires_at_ms: None,
             banked_credit_expiries_ms: vec![],
+            banked_kind_expiries_ms: Vec::new(),
+            scoped_windows: Vec::new(),
             prepaid_credits: false,
         }],
     }
@@ -93,6 +95,52 @@ fn metered_uses_list_rates_and_no_multiplier() {
     assert_eq!(
         price.cache_write_ttl,
         BTreeMap::from([("30m".into(), 3.125), ("12h".into(), 5.0)])
+    );
+}
+
+#[test]
+fn estimate_reasoning_uses_the_selected_plane_mode_threshold_and_divisor() {
+    let mut model = model();
+    let plane = model.billing_plane.as_mut().unwrap();
+    plane.rates.extend([
+        priced("rate.reasoning", 200.0),
+        priced("rate.input.mode.fast", 22.0),
+        priced("rate.output.mode.fast", 44.0),
+        priced("rate.reasoning.mode.fast", 66.0),
+        (
+            "rate.reasoning.above_context.100.mode.fast".into(),
+            BillingRate::Unpriced,
+        ),
+    ]);
+    let mut metered = plane.clone();
+    metered
+        .rates
+        .insert("rate.reasoning.mode.fast".into(), BillingRate::NotBilled);
+    let pricing = SubscriptionPool::default()
+        .price(1.0, Some(22.0), 0.0, false)
+        .unwrap();
+    let req = |tokens| PriceRateRequest {
+        service_tier: Some("fast"),
+        input_tokens: Some(tokens),
+        ..Default::default()
+    };
+    assert_eq!(
+        resolve(&model, subscription(&pricing), req(100)).reasoning,
+        ReasoningRate::Separate(3.0)
+    );
+    assert_eq!(
+        resolve(&model, subscription(&pricing), req(101)).reasoning,
+        ReasoningRate::Unpriced
+    );
+    let mixed = PriceBilling {
+        covering_metered: true,
+        metered_fallback: true,
+        metered_plane: Some(&metered),
+        ..subscription(&pricing)
+    };
+    assert_eq!(
+        resolve(&model, mixed, req(100)).reasoning,
+        ReasoningRate::Separate(0.0)
     );
 }
 

@@ -1711,6 +1711,8 @@ impl RoutingSubject for KitSubject {
                                 banked_resets: 0,
                                 banked_expires_at_ms: None,
                                 banked_credit_expiries_ms: vec![],
+                                banked_kind_expiries_ms: Vec::new(),
+                                scoped_windows: Vec::new(),
                                 prepaid_credits: false,
                             };
                             account_count

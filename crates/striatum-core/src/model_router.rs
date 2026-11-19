@@ -3412,6 +3412,8 @@ mod task_profile_pricing_tests {
                         banked_resets: 0,
                         banked_expires_at_ms: None,
                         banked_credit_expiries_ms: Vec::new(),
+                        banked_kind_expiries_ms: Vec::new(),
+                        scoped_windows: Vec::new(),
                         prepaid_credits: false,
                     }],
                 }],

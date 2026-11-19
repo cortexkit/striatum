@@ -20,6 +20,16 @@ pub struct PriceRates {
     pub cache_read: Option<f64>,
     pub cache_write: Option<f64>,
     pub cache_write_ttl: BTreeMap<String, f64>,
+    /// For the task estimate only; the public rate table has no reasoning field.
+    pub reasoning: ReasoningRate,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub enum ReasoningRate {
+    #[default]
+    IncludedInOutput,
+    Separate(f64),
+    Unpriced,
 }
 
 /// Credential coverage must be for the answered route, not merely its provider.
@@ -95,6 +105,10 @@ pub fn resolve_price_rates(
         billing.metered_plane.or(model.billing_plane.as_ref())
     };
     let input_size = request.input_size();
+    let valid_rate = |value: f64| {
+        let value = value / divisor;
+        (value.is_finite() && value >= 0.0).then_some(value)
+    };
     let rate = |key: &str| {
         let value = match plane {
             Some(plane) => plane_rate(plane, key, tier, input_size),
@@ -106,8 +120,15 @@ pub fn resolve_price_rates(
                 _ => None,
             },
             None => None,
-        }? / divisor;
-        (value.is_finite() && value >= 0.0).then_some(value)
+        }?;
+        valid_rate(value)
+    };
+    let reasoning = match plane {
+        Some(plane) => {
+            plane_rate_key(plane, "rate.reasoning", tier, input_size).map(|key| plane.rate(key))
+        }
+        None if tier.is_none() => model.reasoning_rate.map(Some),
+        None => None,
     };
     let mut cache_write_ttl = BTreeMap::new();
     if let Some(plane) = plane {
@@ -134,10 +155,25 @@ pub fn resolve_price_rates(
         cache_read: rate("rate.cache_read"),
         cache_write: rate("rate.cache_write"),
         cache_write_ttl,
+        reasoning: match reasoning {
+            None => ReasoningRate::IncludedInOutput,
+            Some(rate) => rate
+                .and_then(valid_rate)
+                .map_or(ReasoningRate::Unpriced, ReasoningRate::Separate),
+        },
     })
 }
 
 fn plane_rate(plane: &BillingPlane, key: &str, tier: Option<&str>, input: f64) -> Option<f64> {
+    plane.rate(plane_rate_key(plane, key, tier, input)?)
+}
+
+fn plane_rate_key<'a>(
+    plane: &'a BillingPlane,
+    key: &str,
+    tier: Option<&str>,
+    input: f64,
+) -> Option<&'a str> {
     let suffix = tier.map(|tier| format!(".mode.{tier}"));
     let prefix = format!("{key}.above_context.");
     let selected = plane
@@ -154,7 +190,12 @@ fn plane_rate(plane: &BillingPlane, key: &str, tier: Option<&str>, input: f64) -
         .max_by_key(|(threshold, _)| *threshold)
         .map(|(_, key)| key);
     let base = format!("{key}{}", suffix.as_deref().unwrap_or_default());
-    plane.rate(selected.unwrap_or(&base))
+    selected.or_else(|| {
+        plane
+            .rates
+            .get_key_value(&base)
+            .map(|(key, _)| key.as_str())
+    })
 }
 
 #[cfg(test)]

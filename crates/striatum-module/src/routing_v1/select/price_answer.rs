@@ -9,7 +9,7 @@ use cortexkit_role_routing::{
 use serde_json::Number;
 use striatum_core::model_router::SelectedModelRoute;
 use striatum_core::price_rates::{
-    resolve_price_rates, PriceBasis, PriceBilling, PriceRateRequest, PriceRates,
+    resolve_price_rates, PriceBasis, PriceBilling, PriceRateRequest, PriceRates, ReasoningRate,
 };
 use striatum_core::task_profile::TokenVector;
 use striatum_core::ModelFact;
@@ -161,28 +161,47 @@ fn build(rates: &PriceRates, tokens: Option<TokenVector>) -> Option<Price> {
             Price::subscription_equivalent(wire, number(rates.multiplier?)?)
         }
     };
-    if let Some(estimate) = tokens.and_then(|tokens| estimate(tokens, &price.rates_per_mtok)) {
+    if let Some(estimate) =
+        tokens.and_then(|tokens| estimate(tokens, &price.rates_per_mtok, rates.reasoning))
+    {
         price = price.with_estimated_task_usd(estimate);
     }
     price.check().ok()?;
     Some(price)
 }
 
-fn estimate(tokens: TokenVector, rates: &RatesPerMtok) -> Option<Number> {
+fn estimate(tokens: TokenVector, rates: &RatesPerMtok, reasoning: ReasoningRate) -> Option<Number> {
     let mut cost = 0.0;
-    for (tokens, rate) in [
-        (tokens.fresh_input, Some(&rates.input)),
-        (tokens.cached_read, rates.cache_read.as_ref()),
-        (tokens.cache_write, rates.cache_write.as_ref()),
-        (
+    let (output, reasoning_tokens, reasoning_rate) = match reasoning {
+        ReasoningRate::IncludedInOutput => (
             tokens.output_excluding_reasoning + tokens.reasoning,
-            Some(&rates.output),
+            0.0,
+            None,
         ),
+        ReasoningRate::Separate(rate) => (
+            tokens.output_excluding_reasoning,
+            tokens.reasoning,
+            Some(rate),
+        ),
+        ReasoningRate::Unpriced => (tokens.output_excluding_reasoning, tokens.reasoning, None),
+    };
+    for (tokens, rate) in [
+        (tokens.fresh_input, rates.input.as_f64()),
+        (
+            tokens.cached_read,
+            rates.cache_read.as_ref().and_then(Number::as_f64),
+        ),
+        (
+            tokens.cache_write,
+            rates.cache_write.as_ref().and_then(Number::as_f64),
+        ),
+        (output, rates.output.as_f64()),
+        (reasoning_tokens, reasoning_rate),
     ] {
         if tokens == 0.0 {
             continue;
         }
-        cost += tokens * rate?.as_f64()? / 1_000_000.0;
+        cost += tokens * rate? / 1_000_000.0;
     }
     number(cost)
 }

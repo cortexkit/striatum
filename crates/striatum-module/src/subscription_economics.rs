@@ -3,13 +3,15 @@
 
 use crate::{
     account_quota::{
-        parse_rfc3339_ms, AccountEntry, AccountQuotaState, AgeBand, SharedAccountQuota,
+        map_scoped_window, parse_rfc3339_ms, scope_family_for_model, AccountEntry,
+        AccountQuotaState, AgeBand, SharedAccountQuota,
     },
     quota_consumer::QuotaConsumer,
 };
 use serde_json::{json, Value};
 
 pub(crate) mod multiplier;
+mod saved_resets;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     path::Path,
@@ -19,8 +21,8 @@ use striatum_core::{
     model_facts::{make_capacity_key, RoutePricing},
     model_router::ModelRouteStateSnapshot,
     subscription::{
-        MeasuredValue, PacingRule, PlanMeasurements, QuotaAccount, SubscriptionPlan,
-        SubscriptionPool, DEFAULT_PLAN_FEE_USD,
+        MeasuredValue, PacingRule, PlanMeasurements, QuotaAccount, QuotaConstraint,
+        SubscriptionPlan, SubscriptionPool, DEFAULT_PLAN_FEE_USD,
     },
     ModelFact,
 };
@@ -221,25 +223,22 @@ fn carries_prepaid_credits(reading: &Value) -> bool {
     })
 }
 
-fn account(reading: &Value, now: i64) -> Option<QuotaAccount> {
+fn account(reading: &Value, now: i64, account_id: &str) -> Option<QuotaAccount> {
     let usage = reading.get("usage")?;
-    let mut windows: Vec<&Value> = ["primary", "secondary", "tertiary"]
+    let windows: Vec<&Value> = ["primary", "secondary", "tertiary"]
         .iter()
         .filter_map(|k| usage.get(*k).filter(|w| w.is_object()))
         .collect();
-    if let Some(extra) = usage["extraRateWindows"].as_array() {
-        windows.extend(extra.iter().filter_map(|w| w.get("window")));
-    }
     // A past reset does not make last-good free. Even a short window with expired
     // usage makes a stale account unknown until a new observation arrives.
-    if reading.get("stale").is_some_and(|stale| !stale.is_null())
-        && windows.iter().any(|window| {
-            window["resetsAt"]
-                .as_str()
-                .and_then(parse_rfc3339_ms)
-                .is_some_and(|reset| reset <= now)
-        })
-    {
+    let stale = reading.get("stale").is_some_and(|stale| !stale.is_null());
+    let expired = |window: &Value| {
+        window["resetsAt"]
+            .as_str()
+            .and_then(parse_rfc3339_ms)
+            .is_some_and(|reset| reset <= now)
+    };
+    if stale && windows.iter().any(|window| expired(window)) {
         return None;
     }
     let weekly = windows.iter().find(|w| {
@@ -275,79 +274,53 @@ fn account(reading: &Value, now: i64) -> Option<QuotaAccount> {
     for w in windows.iter().filter(|w| !std::ptr::eq(**w, *weekly)) {
         if let (Some(use_percent), Some((time, _))) = (used(w), remaining(w)) {
             short_walled |= use_percent >= 100.0;
-            short_windows.push(striatum_core::subscription::QuotaConstraint {
+            short_windows.push(QuotaConstraint {
                 window_minutes: w["windowMinutes"].as_i64().unwrap_or(0),
                 remaining_points: 100.0 - use_percent,
                 remaining_fraction: time,
             });
         }
     }
-    let mut quota = QuotaAccount {
+    let scoped_windows = usage["extraRateWindows"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|extra| {
+            let window = extra.get("window")?;
+            let minutes = window["windowMinutes"].as_i64()?;
+            let scope = map_scoped_window(
+                reading["provider"].as_str()?,
+                extra["id"].as_str(),
+                Some(minutes),
+            )?;
+            if stale && expired(window) {
+                // A stale reset is not fresh headroom, but only this model scope loses it.
+                return Some((scope.family, None));
+            }
+            Some((
+                scope.family,
+                Some(QuotaConstraint {
+                    window_minutes: minutes,
+                    remaining_points: 100.0 - used(window)?,
+                    remaining_fraction: remaining(window)?.0,
+                }),
+            ))
+        })
+        .collect();
+    let saved = saved_resets::decode(&reading["savedResets"], account_id);
+    Some(QuotaAccount {
         weekly_used: used(weekly)?,
         weekly_remaining_fraction: time,
         hours_to_reset: hours,
         short_walled,
         short_windows,
-        banked_resets: reading["savedResets"]["availableCount"]
-            .as_u64()
-            .unwrap_or(0)
-            .min(u32::MAX as u64) as u32,
-        banked_expires_at_ms: reading["savedResets"]["soonestExpiresAt"]
-            .as_str()
-            .and_then(parse_rfc3339_ms)
-            .or_else(|| {
-                reading["savedResets"]["credits"]
-                    .as_array()
-                    .and_then(|credits| {
-                        credits
-                            .iter()
-                            .filter_map(|credit| {
-                                credit["expiresAt"].as_str().and_then(parse_rfc3339_ms)
-                            })
-                            .min()
-                    })
-            }),
-        banked_credit_expiries_ms: reading["savedResets"]["credits"]
-            .as_array()
-            .map(|credits| {
-                credits
-                    .iter()
-                    .filter_map(|credit| credit["expiresAt"].as_str().and_then(parse_rfc3339_ms))
-                    .collect()
-            })
-            .unwrap_or_default(),
+        scoped_windows,
+        banked_resets: saved.count,
+        banked_expires_at_ms: saved.soonest,
+        banked_credit_expiries_ms: saved.credits,
+        banked_kind_expiries_ms: saved.kinds,
         prepaid_credits: carries_prepaid_credits(reading),
-    };
-    if let Some(kinds) = reading["savedResets"].get("kinds") {
-        quota.banked_resets = 0;
-        quota.banked_expires_at_ms = None;
-        quota.banked_credit_expiries_ms.clear();
-        for kind in kinds
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter(|kind| matches!(kind["kind"].as_str(), Some("weekly" | "full")))
-        {
-            let count = kind["availableCount"]
-                .as_u64()
-                .unwrap_or(0)
-                .min(u32::MAX as u64) as u32;
-            quota.banked_resets = quota.banked_resets.saturating_add(count);
-            if let Some(expiry) = kind["soonestExpiresAt"].as_str().and_then(parse_rfc3339_ms) {
-                quota.banked_expires_at_ms = Some(
-                    quota
-                        .banked_expires_at_ms
-                        .map_or(expiry, |soonest| soonest.min(expiry)),
-                );
-                // The aggregate credits have no kind. Expire every credit at its
-                // kind's earliest expiry so none is counted beyond that boundary.
-                quota
-                    .banked_credit_expiries_ms
-                    .extend(std::iter::repeat_n(expiry, count as usize));
-            }
-        }
-    }
-    Some(quota)
+    })
 }
 
 fn build(state: &AccountQuotaState, report: &Value, prices: &Value, now: i64) -> EconomicsCache {
@@ -433,7 +406,7 @@ fn build(state: &AccountQuotaState, report: &Value, prices: &Value, now: i64) ->
                 now_ms: now,
                 ..Default::default()
             });
-        let Some(account) = account(&reading.entry, now) else {
+        let Some(account) = account(&reading.entry, now, &reading.account_id) else {
             continue;
         };
         let group = astro_plan.as_ref().map_or_else(
@@ -784,17 +757,63 @@ pub(crate) fn overlay_pools(
         .into_iter()
         .map(|(key, value)| (key, Arc::new(value)))
         .collect();
+    let mut scoped = HashMap::new();
     for fact in facts {
         let state = snapshot
             .by_capacity
             .entry(make_capacity_key(&fact.provider_id, &fact.model_id))
             .or_default();
-        state.subscription_pool = shared.get(&fact.provider_id).cloned();
+        state.subscription_pool = shared.get(&fact.provider_id).map(|pool| {
+            let Some(scope) = scope_family_for_model(&fact.model_id) else {
+                return pool.clone();
+            };
+            scoped
+                .entry((fact.provider_id.as_str(), scope.family))
+                .or_insert_with(|| pool_for_scope(pool, scope.family))
+                .clone()
+        });
     }
+}
+
+fn pool_for_scope(pool: &Arc<SubscriptionPool>, family: &str) -> Arc<SubscriptionPool> {
+    if !pool
+        .plans
+        .iter()
+        .flat_map(|plan| &plan.accounts)
+        .any(|account| {
+            account
+                .scoped_windows
+                .iter()
+                .any(|(scope, _)| *scope == family)
+        })
+    {
+        return Arc::clone(pool);
+    }
+    // Keep the provider budget shared. Only models that use the same scope
+    // share this narrower projection of its accounts and window pressure.
+    let mut scoped = (**pool).clone();
+    for account in scoped.plans.iter_mut().flat_map(|plan| &mut plan.accounts) {
+        for (scope, window) in std::mem::take(&mut account.scoped_windows) {
+            if scope != family {
+                continue;
+            }
+            match window {
+                Some(window) => {
+                    account.short_walled |= window.remaining_points <= 0.0;
+                    account.short_windows.push(window);
+                }
+                None => account.short_walled = true,
+            }
+        }
+    }
+    Arc::new(scoped)
 }
 
 #[cfg(test)]
 mod tests {
+    fn account(reading: &Value, now: i64) -> Option<QuotaAccount> {
+        super::account(reading, now, reading["account"].as_str().unwrap_or("test"))
+    }
     #[cfg(feature = "heap-measure")]
     #[test]
     #[ignore = "repository subscription-economics heap profile; run alone"]
@@ -1723,6 +1742,113 @@ mod tests {
     }
 
     #[test]
+    fn scoped_fable_quota_does_not_change_opus_budget_or_pressure() {
+        let facts: Vec<ModelFact> = ["claude-opus-5", "claude-fable-5"]
+            .map(|model| crate::tests::fact("anthropic", model))
+            .into();
+        let pricing = RoutePricing {
+            keep_free_percent: HashMap::from([("anthropic".into(), 10.0)]),
+            ..Default::default()
+        };
+        let quote = |fable_used| {
+            let mut s = state(30.0, None);
+            let entry = &mut s.readings.readings.values_mut().next().unwrap().entry;
+            entry["usage"]["primary"] = json!({"usedPercent":20,"windowMinutes":300,
+                "resetsAt":"2026-10-09T06:00:00Z"});
+            entry["usage"]["extraRateWindows"] = json!([{"id":"Fable", "window":{
+                "usedPercent":fable_used,"windowMinutes":10080,"resetsAt":"2026-10-15T00:00:00Z"}}]);
+            let mut snapshot = ModelRouteStateSnapshot::default();
+            overlay_pools(
+                build(&s, &Value::Null, &Value::Null, NOW).pools,
+                &mut snapshot,
+                &facts,
+                NOW,
+                &pricing,
+                PacingRule::Max,
+            );
+            ["anthropic/claude-opus-5", "anthropic/claude-fable-5"].map(|key| {
+                let pool = snapshot.by_capacity[key]
+                    .subscription_pool
+                    .as_ref()
+                    .unwrap();
+                assert_eq!(
+                    pool.available(10.0, false),
+                    pool.price(1.0, None, 10.0, false).is_some()
+                );
+                pool.price(1.0, None, 10.0, false)
+            })
+        };
+        let [opus_open, fable_open] = quote(99.0);
+        let [opus_full, fable_full] = quote(100.0);
+        assert_eq!(
+            opus_full, opus_open,
+            "a Fable wall must not change Opus economics"
+        );
+        let opus = opus_full.unwrap();
+        let fable = fable_open.unwrap();
+        assert_eq!(opus.available_points, Some(60.0));
+        assert!(fable.plan_pressure > opus.plan_pressure);
+        assert!(fable_full.is_none());
+    }
+
+    #[test]
+    fn saved_reset_decoder_bounds_counts_and_does_not_expand_kind_expiries() {
+        let s = state(95.0, None);
+        let mut entry = s.readings.readings.values().next().unwrap().entry.clone();
+        entry["account"] = json!("banked-reset-regression");
+        let expiry = "2026-12-10T22:00:00Z";
+        for (first, second) in [(10_001, 0), (6_000, 4_001)] {
+            entry["savedResets"] = json!({"kinds":[
+                {"kind":"weekly","availableCount":first,"soonestExpiresAt":expiry},
+                {"kind":"full","availableCount":second,"soonestExpiresAt":expiry}
+            ]});
+            assert_eq!(
+                account(&entry, NOW).unwrap().banked_resets,
+                0,
+                "{first} + {second}"
+            );
+        }
+        entry["savedResets"] = json!({"availableCount":10_001});
+        assert_eq!(account(&entry, NOW).unwrap().banked_resets, 0);
+        let warnings = crate::take_operator_warnings();
+        assert_eq!(
+            warnings
+                .iter()
+                .filter(|warning| warning.contains("banked-reset-regression"))
+                .count(),
+            1,
+            "{warnings:?}"
+        );
+
+        entry["savedResets"] = json!({"kinds":[
+            {"kind":"weekly","availableCount":10_000,"soonestExpiresAt":expiry}
+        ]});
+        let quota = account(&entry, NOW).unwrap();
+        assert_eq!(quota.banked_resets, 10_000);
+        assert!(quota.banked_credit_expiries_ms.is_empty());
+        assert_eq!(
+            quota.banked_kind_expiries_ms,
+            vec![(parse_rfc3339_ms(expiry).unwrap(), 10_000)]
+        );
+        let check_window = |now_ms| {
+            SubscriptionPool {
+                now_ms,
+                banked_as_capacity: true,
+                plans: vec![SubscriptionPlan {
+                    accounts: vec![quota.clone()],
+                    ..fallback_plan()
+                }],
+                ..Default::default()
+            }
+            .price(1.0, None, 0.0, false)
+            .unwrap()
+            .banked_resets_applied
+        };
+        assert_eq!(check_window(NOW), 10_000);
+        assert_eq!(check_window(parse_rfc3339_ms(expiry).unwrap()), 0);
+    }
+
+    #[test]
     fn error_only_restart_keeps_last_good_in_subscription_budget() {
         use crate::account_quota::apply_usage_reply;
         let good = |id: &str, fetched| {
@@ -2325,7 +2451,7 @@ mod tests {
         let expiry = parse_rfc3339_ms("2026-12-10T22:00:00Z").unwrap();
         assert_eq!(quota.banked_resets, 1);
         assert_eq!(quota.banked_expires_at_ms, Some(expiry));
-        assert_eq!(quota.banked_credit_expiries_ms, vec![expiry]);
+        assert_eq!(quota.banked_kind_expiries_ms, vec![(expiry, 1)]);
 
         let mut pools = build(&s, &report(), &prices(), NOW).pools;
         set_banked_allowance(&mut pools, NOW);
@@ -2366,7 +2492,7 @@ mod tests {
         let expiry = parse_rfc3339_ms("2026-12-10T22:00:00Z").unwrap();
         assert_eq!(quota.banked_resets, 2);
         assert_eq!(quota.banked_expires_at_ms, Some(expiry));
-        assert_eq!(quota.banked_credit_expiries_ms, vec![expiry, expiry]);
+        assert_eq!(quota.banked_kind_expiries_ms, vec![(expiry, 2)]);
 
         entry["savedResets"]["kinds"][0] = json!({
             "availableCount": 1, "kind": "weekly", "soonestExpiresAt": "2026-11-01T00:00:00Z"
@@ -2376,8 +2502,8 @@ mod tests {
         assert_eq!(quota.banked_resets, 3);
         assert_eq!(quota.banked_expires_at_ms, Some(weekly_expiry));
         assert_eq!(
-            quota.banked_credit_expiries_ms,
-            vec![weekly_expiry, expiry, expiry]
+            quota.banked_kind_expiries_ms,
+            vec![(weekly_expiry, 1), (expiry, 2)]
         );
     }
 

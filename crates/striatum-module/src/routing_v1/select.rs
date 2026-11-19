@@ -52,6 +52,7 @@ mod eligible_routes_tests;
 mod price_answer;
 #[cfg(test)]
 mod price_answer_tests;
+mod tier_catalog;
 
 /// The members a v1 select may carry.
 const MEMBERS: &[&str] = &[
@@ -1370,6 +1371,7 @@ async fn select_at_tier_attempt(
             sticky_credential,
         );
     }
+    let tier_catalog = std::sync::OnceLock::new();
     let runs = |runner: &RunnerPolicy, route_key: &str, capacity_key: &str| -> bool {
         registry.runs(runner, route_key, capacity_key)
             && service_tier
@@ -1377,12 +1379,9 @@ async fn select_at_tier_attempt(
                 .filter(|tier| !tier.is_standard())
                 .is_none_or(|tier| {
                     priced.classes.as_ref().is_some_and(|classes| {
-                        facts
-                            .iter()
-                            // Pins may add a reasoning variant absent from the catalog's
-                            // fact rows. Service tiers belong to the underlying model,
-                            // while registry.runs above still checks the exact route.
-                            .find(|fact| fact_to_route(fact).capacity_key == capacity_key)
+                        tier_catalog
+                            .get_or_init(|| tier_catalog::TierCatalog::new(&facts))
+                            .get(capacity_key)
                             .is_some_and(|fact| {
                                 registry.get(runner).is_some_and(|runner| {
                                     classes.tier_runner_serves(runner, fact, tier.as_str())
