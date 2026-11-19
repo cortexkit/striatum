@@ -408,16 +408,6 @@ refusal_case!(
     r#"{"consumers":{"mason":{"surprise":{}}}}"#,
     "unknown field `surprise`"
 );
-refusal_case!(
-    negated_variant_key,
-    r#"{"model_routing":{"variants":{"all":{"-openai/gpt-6":"high"}}}}"#,
-    "model_routing.variants.all: key \"-openai/gpt-6\" must be provider, provider/model or provider/model/variant"
-);
-refusal_case!(
-    blank_variant_value,
-    r#"{"model_routing":{"variants":{"mason":{"openai/gpt-6":" "}}}}"#,
-    "must be one non-empty word"
-);
 // Pricing and reserve values are checked when a document is published, so an
 // invalid multiplier or reserve never reaches a selection's pricing snapshot.
 refusal_case!(
@@ -456,137 +446,47 @@ refusal_case!(
     "invalid keep_free_percent for anthropic"
 );
 
-fn reasoning_catalog(entries: &[(&str, &[&str])]) -> ReasoningCatalogSource {
-    let catalog = ReasoningCatalog {
-        models: entries
-            .iter()
-            .map(|(model, efforts)| {
-                (
-                    (*model).to_string(),
-                    striatum_store::PublishedEfforts::Published(
-                        efforts.iter().map(|effort| (*effort).to_string()).collect(),
-                    ),
-                )
-            })
-            .collect(),
-    };
-    Arc::new(move || Ok(catalog.clone()))
-}
-
 #[test]
-fn variant_overrides_are_checked_against_the_catalog_at_load_and_on_reload() {
-    let mut rig = Rig::new();
-    let accepted = r#"{"model_routing":{"variants":{
-        "all":{"openai/gpt-6.1-sol":"high"},
-        "athena":{"openai/gpt-6.1-sol":"xhigh","anthropic/claude-opus-5-5":"xhigh"},
-        "mason":{"anthropic/claude-opus-5-5":"high"}
-    }}}"#;
-    rig.write(accepted);
-    initialize_config(&rig.path).unwrap();
-    let catalog = reasoning_catalog(&[
-        ("openai/gpt-6.1-sol", &["low", "medium", "high", "xhigh"]),
+fn retired_variant_keys_are_refused_at_startup_and_reload_with_exact_paths() {
+    let cases = [
+        (r#"{"variants":{"openai/gpt-6":"high"}}"#, "variants"),
         (
-            "anthropic/claude-opus-5-5",
-            &["low", "medium", "high", "xhigh", "max"],
+            r#"{"model_routing":{"variants":null}}"#,
+            "model_routing.variants",
         ),
-    ]);
-    attach_reasoning_catalog(&rig.path, catalog).unwrap();
-    let held = live_config(&rig.path);
-    assert_eq!(
-        held.variant_groups().consumers["athena"]["anthropic/claude-opus-5-5"],
-        "xhigh"
-    );
+        (
+            r#"{"consumers":{"prefrontal-core.athena":{"variants":{}}}}"#,
+            r#"consumers."prefrontal-core.athena".variants"#,
+        ),
+    ];
+    for (document, path) in cases {
+        let expected = format!("config_key_removed: {path}; delete this key");
+        let mut fresh = Rig::new();
+        fresh.write(document);
+        let error = initialize_config(&fresh.path).unwrap_err();
+        assert!(error.contains(&expected), "{error}");
+        let error = crate::config_convert::convert_value(serde_json::from_str(document).unwrap())
+            .unwrap_err();
+        assert!(error.contains(&expected), "{error}");
 
-    // A reload naming a variant the route does not publish keeps the last good
-    // config and names the route, the variant and the published list.
-    rig.write(r#"{"model_routing":{"variants":{"athena":{"openai/gpt-6.1-sol":"max"}}}}"#);
-    let now = Instant::now();
-    let mut reports = Vec::new();
-    for elapsed in [Duration::ZERO, RELOAD_DEBOUNCE] {
-        let next = live_config_at_with_reporter(&rig.path, now + elapsed, |error| {
-            reports.push(error.to_owned())
-        })
-        .unwrap();
-        assert!(Arc::ptr_eq(&held, &next));
+        let mut rig = Rig::new();
+        rig.write(r#"{"consumers":{"prefrontal-core.athena":{"workload":"reason"}}}"#);
+        initialize_config(&rig.path).unwrap();
+        let held = live_config(&rig.path);
+        rig.write(document);
+        let now = Instant::now();
+        let mut reports = Vec::new();
+        for elapsed in [Duration::ZERO, RELOAD_DEBOUNCE] {
+            let next = live_config_at_with_reporter(&rig.path, now + elapsed, |error| {
+                reports.push(error.to_owned())
+            })
+            .unwrap();
+            assert!(Arc::ptr_eq(&held, &next));
+        }
+        assert_eq!(reports.len(), 1, "{reports:?}");
+        assert!(reports[0].contains(&expected), "{reports:?}");
     }
-    assert_eq!(reports.len(), 1, "{reports:?}");
-    assert!(
-        reports[0].contains(
-            "variant_not_published: model_routing.variants.athena.openai/gpt-6.1-sol: route openai/gpt-6.1-sol does not publish variant max; published: low, medium, high, xhigh"
-        ),
-        "{}",
-        reports[0]
-    );
-
-    // When the routing store opens, the module attaches its catalog and checks
-    // the config that is already active. A catalog that no longer publishes an
-    // active override (xhigh here) fails that check, and the module refuses to
-    // start.
-    let mut fresh = Rig::new();
-    fresh.write(accepted);
-    initialize_config(&fresh.path).unwrap();
-    let error = attach_reasoning_catalog(
-        &fresh.path,
-        reasoning_catalog(&[
-            ("openai/gpt-6.1-sol", &["low", "medium", "high"]),
-            (
-                "anthropic/claude-opus-5-5",
-                &["low", "medium", "high", "max"],
-            ),
-        ]),
-    )
-    .unwrap_err();
-    assert!(error.contains("does not publish variant xhigh"), "{error}");
-    catalog_sources().lock().unwrap().remove(&rig.path);
-    catalog_sources().lock().unwrap().remove(&fresh.path);
 }
-
-#[test]
-fn check_config_offline_reads_the_store_or_says_why_it_skipped() {
-    let mut rig = Rig::new();
-    rig.write(r#"{"model_routing":{"variants":{"all":{"openai/gpt-6.1-sol":"high"}}}}"#);
-    let missing = rig.dir.join("no-such-store.db");
-    let report = check_config_offline(&rig.path, Some(&missing)).unwrap();
-    assert!(
-        report.starts_with("catalog check skipped: ") && report.contains("does not exist"),
-        "{report}"
-    );
-    let report = check_config_offline(&rig.path, None).unwrap();
-    assert!(report.starts_with("catalog check skipped: "), "{report}");
-
-    // A store whose catalog publishes only low and medium for the route refuses
-    // the configured variant high.
-    let store_path = rig.dir.join("store.db");
-    let connection = rusqlite::Connection::open(&store_path).unwrap();
-    connection
-        .execute_batch(
-            "CREATE TABLE model_facts (route_key TEXT, provider_id TEXT, model_id TEXT, reasoning_efforts_json TEXT);
-             INSERT INTO model_facts VALUES ('openai/gpt-6.1-sol', 'openai', 'gpt-6.1-sol', '[\"low\",\"medium\"]');",
-        )
-        .unwrap();
-    drop(connection);
-    let error = check_config_offline(&rig.path, Some(&store_path)).unwrap_err();
-    assert!(
-        error.contains(
-            "route openai/gpt-6.1-sol does not publish variant high; published: low, medium"
-        ),
-        "{error}"
-    );
-    let connection = rusqlite::Connection::open(&store_path).unwrap();
-    connection
-        .execute(
-            "UPDATE model_facts SET reasoning_efforts_json = '[\"low\",\"high\"]'",
-            [],
-        )
-        .unwrap();
-    drop(connection);
-    let report = check_config_offline(&rig.path, Some(&store_path)).unwrap();
-    assert!(
-        report.starts_with("catalog check passed against "),
-        "{report}"
-    );
-}
-
 #[test]
 fn check_config_counts_are_anonymous_and_available_without_variants_or_store() {
     let mut rig = Rig::new();

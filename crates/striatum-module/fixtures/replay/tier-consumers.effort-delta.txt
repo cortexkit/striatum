@@ -1,0 +1,5 @@
+# Decision-array pointer followed by rows with new fingerprint and rows with effort metadata.
+/rows/0/state/model_route_decisions 0 0
+/rows/1/state/model_route_decisions 0,1 0,1
+/rows/2/state/model_route_decisions 0,1,2 0,1,2
+/rows/3/state/model_route_decisions 0,1,2,3 0,1,2,3

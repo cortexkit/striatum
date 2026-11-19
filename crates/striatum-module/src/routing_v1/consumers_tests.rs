@@ -1094,22 +1094,16 @@ fn variant_ladder_harness(first_variant: &str, legacy: bool) -> Arc<Harness> {
         if legacy {
             config["consumers"][consumer]["pay_per_token"] = json!(false);
         }
-        config["consumers"][consumer]["variants"] = json!({
-            (SETTINGS_LADDER[0]): "low", (SETTINGS_LADDER[1]): "low", (SETTINGS_LADDER[2]): "low"
-        });
         // Disable pin-only restrictions to test suffix preservation independently.
         config["providers"]["example-provider"]["pin_only"] = json!(false);
         config["models"][SETTINGS_LADDER[1]]["pin_only_for"] = json!([]);
     });
-    for mut fact in h.store().get_facts().unwrap() {
-        if SETTINGS_LADDER.contains(&format!("{}/{}", fact.provider_id, fact.model_id).as_str()) {
-            fact.prompt_defaults
-                .get_or_insert_with(Default::default)
-                .variant = Some("low".into());
-            h.store()
-                .upsert_fact(&fact, striatum_core::FactSource::Override)
-                .unwrap();
-        }
+    for route in SETTINGS_LADDER {
+        super::effort_preview::seed_for_test(
+            h.store_path(),
+            route,
+            super::effort_preview::test_graded("low", &["low", "medium", "high"]),
+        );
     }
     h.attach_reasoning_catalog(striatum_store::ReasoningCatalog {
         models: SETTINGS_LADDER

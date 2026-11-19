@@ -94,11 +94,21 @@ fn median_of(values: impl Iterator<Item = f64>) -> Option<f64> {
     })
 }
 
-fn observed_route_key_for_fact(fact: &ModelFact) -> String {
-    let observed_variant = fact
-        .prompt_defaults
-        .as_ref()
-        .and_then(|defaults| defaults.variant.as_deref())
+fn observed_route_key_for_fact(
+    fact: &ModelFact,
+    efforts: &BTreeMap<String, CatalogEfforts>,
+) -> String {
+    // The shared speed overlay is built before a consumer is known. Use the
+    // catalog's workload-less default to find measured speed for that model.
+    let model = striatum_core::make_route_key(&fact.provider_id, &fact.model_id, None);
+    let observed_variant = efforts
+        .get(&model)
+        .and_then(|efforts| {
+            efforts
+                .graded
+                .as_deref()
+                .or(efforts.vendor_default.as_deref())
+        })
         .or(fact.variant.as_deref());
     striatum_core::make_route_key(&fact.provider_id, &fact.model_id, observed_variant)
 }
@@ -132,15 +142,16 @@ impl SqliteRouteStateStore {
     pub(super) fn overlay_observed_speed(
         &self,
         facts: Vec<ModelFact>,
+        efforts: &BTreeMap<String, CatalogEfforts>,
         now: f64,
         pricing: &striatum_core::RoutePricing,
     ) -> RouteStateResult<Vec<ModelFact>> {
         let ephemeral_vector = self.get_class_vector("ephemeral", now)?;
-        // Multiple catalog facts can resolve to the same prompt-default variant.
+        // Multiple catalog facts can share a model's measured default speed.
         // Deduplicating here prevents repeated seeks without consulting usage for keys.
         let observed_route_keys = facts
             .iter()
-            .map(observed_route_key_for_fact)
+            .map(|fact| observed_route_key_for_fact(fact, efforts))
             .collect::<BTreeSet<_>>();
         let observed_speeds = self.get_observed_speeds(&observed_route_keys, now)?;
         // A route with too few samples has NO speed, which is not the same as being
@@ -162,7 +173,7 @@ impl SqliteRouteStateStore {
         for mut fact in facts {
             fact.class_vector = ephemeral_vector.clone();
             fact.class_vector_is_overlay = ephemeral_vector.is_some();
-            let observed_route_key = observed_route_key_for_fact(&fact);
+            let observed_route_key = observed_route_key_for_fact(&fact, efforts);
             if let Some(speed) = observed_speeds.get(&observed_route_key) {
                 fact.scores.speed = *speed;
             } else if fact.scores.speed <= 0.0 {
@@ -196,7 +207,8 @@ impl SqliteRouteStateStore {
         pricing: &striatum_core::RoutePricing,
     ) -> RouteStateResult<(Arc<CatalogFactsSnapshot>, Vec<ModelFact>)> {
         let snapshot = self.get_selection_catalog()?;
-        let facts = self.overlay_observed_speed(snapshot.facts.clone(), now, pricing)?;
+        let facts =
+            self.overlay_observed_speed(snapshot.facts.clone(), &snapshot.efforts, now, pricing)?;
         Ok((snapshot, facts))
     }
 

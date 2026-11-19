@@ -91,7 +91,7 @@ pub(crate) fn route_keys(
 /// publishes for the model (Fusiform's `reasoning_options`, which Broca also
 /// admits by), following a provider with no catalog rows to the catalog
 /// provider whose rows it borrows (`catalog_targets`, resolved through the
-/// vault's `serves`), as the `model_routing.variants` check does. A variant
+/// vault's `serves`). A variant
 /// outside a published list is refused. When the catalog has not been read for
 /// the model yet, or no catalog is attached, the pin is admitted with a
 /// warning and Broca decides.

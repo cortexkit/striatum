@@ -599,8 +599,8 @@ mod tests {
         for (document, key) in [
             (r#"{"runners":[]}"#, "runners"),
             (
-                r#"{"consumers":{"sidekick":{"variants":{}}}}"#,
-                "consumers.sidekick.variants",
+                r#"{"consumers":{"sidekick":{"workload":"lookup"}}}"#,
+                "consumers.sidekick.workload",
             ),
             (
                 r#"{"models":{"openai/test":{"iq":50}}}"#,

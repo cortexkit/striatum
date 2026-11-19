@@ -11,9 +11,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use striatum_core::panel::{ClassPanelPolicy, PanelExtraOrder};
 
-use super::{
-    effort_preview, operator_config, provider_refusal, select, store_refusal, Caller, Deps,
-};
+use super::{operator_config, provider_refusal, select, store_refusal, Caller, Deps};
 
 #[path = "concurrency_snapshot.rs"]
 mod concurrency;
@@ -32,14 +30,7 @@ struct Params {
     runner_declarations: Option<BTreeMap<String, Value>>,
     head_choices: Option<Value>,
     panel: Option<PanelParams>,
-    effort_source: Option<EffortSource>,
     workloads: Option<BTreeMap<String, String>>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum EffortSource {
-    Catalog,
 }
 
 /// A dry-run panel. Member values are passed to `route.select_panel`'s own
@@ -185,30 +176,17 @@ pub(super) async fn what_if_with_profile_lookup(
         routing_config_path: deps.routing_config_path,
         operator_config_path: deps.operator_config_path,
     };
-    let catalog_efforts = if params.effort_source.is_some() {
-        Some(effort_preview::Preview {
-            models: deps.store.catalog_efforts().map_err(store_refusal)?,
-            workloads: params.workloads.unwrap_or_default(),
-        })
-    } else {
-        None
-    };
     let head_choices = params
         .head_choices
         .as_ref()
-        .map(|request| {
-            super::reads::head_choices_with_preview(
-                request,
-                &deps,
-                &operator,
-                catalog_efforts.as_ref(),
-            )
-        })
+        .map(|request| super::reads::head_choices_with_config(request, &deps, &operator, true))
         .transpose()?;
     // Retain repairs in a private account-state copy for the whole sweep.
     // Never publish preview classification or healing into the live state.
     let accounts = crate::account_selection::Sweep::capture(deps.store).map_err(store_refusal)?;
-    let inputs = select::RequestInputs::read_with_config(&deps, live.clone(), operator.clone())?;
+    let mut inputs =
+        select::RequestInputs::read_with_config(&deps, live.clone(), operator.clone())?;
+    inputs.efforts.workloads = params.workloads.unwrap_or_default();
     let concurrency = concurrency::Snapshot::from_snapshot(
         &deps,
         &live,
@@ -238,13 +216,12 @@ pub(super) async fn what_if_with_profile_lookup(
             iq,
             eq: params.eq,
             evidence: Mutex::new(Default::default()),
-            catalog_efforts: catalog_efforts.as_ref(),
             effort_diagnostics: Mutex::new(Default::default()),
         };
         let result = select::evaluate(&request, caller, &deps, &view, profile_lookup).await;
         let evidence = view.evidence.into_inner().unwrap();
         let effort_diagnostics = view.effort_diagnostics.into_inner().unwrap();
-        let minimum_unverified_count = catalog_efforts.as_ref().map(|_| {
+        let minimum_unverified_count = {
             // The count describes candidates that reached the quality check,
             // including candidates whose grade missed the current floor.
             let blocked = evidence
@@ -254,7 +231,7 @@ pub(super) async fn what_if_with_profile_lookup(
                 .map(|rejected| rejected.route_key.as_str())
                 .collect();
             effort_diagnostics.unverified_models(&blocked)
-        });
+        };
         let mut excluded: Vec<_> = evidence
             .excluded
             .into_iter()
@@ -272,9 +249,7 @@ pub(super) async fn what_if_with_profile_lookup(
         excluded.extend(effort_diagnostics.exclusions());
         let mut row = json!({"iq": iq, "bar": evidence.bar, "top_routable": evidence.top_routable,
             "adequate": evidence.adequate, "pick": null, "excluded": excluded});
-        if let Some(count) = minimum_unverified_count {
-            row["minimum_unverified_count"] = json!(count);
-        }
+        row["minimum_unverified_count"] = json!(minimum_unverified_count);
         match result {
             Ok(pick) => row["pick"] = pick,
             Err(refusal) => {
@@ -293,7 +268,6 @@ pub(super) async fn what_if_with_profile_lookup(
             accounts: &accounts,
             inputs: &inputs,
             profile_lookup,
-            catalog_efforts: catalog_efforts.as_ref(),
         };
         let mut rows = Vec::with_capacity(panels.len());
         for panel in panels {
@@ -437,7 +411,10 @@ fn panel_row(
             row["shortfall"] = json!(evaluated.shortfall);
             row["funnel"] = json!(evaluated.funnel);
             if let Some(diagnostics) = evaluated.effort_diagnostics {
-                row["excluded"] = diagnostics.exclusions().collect();
+                let exclusions: Vec<_> = diagnostics.exclusions().collect();
+                if !exclusions.is_empty() {
+                    row["excluded"] = json!(exclusions);
+                }
                 row["minimum_unverified_count"] =
                     json!(diagnostics.unverified_models(&Default::default()));
             }

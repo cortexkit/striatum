@@ -206,13 +206,6 @@ fn expand_variants(
             ))
         })
         .collect();
-    variants.extend(facts.iter().filter_map(|fact| {
-        Some((
-            fact.provider_id.clone(),
-            fact.model_id.clone(),
-            Some(fact.prompt_defaults.as_ref()?.variant.clone()?),
-        ))
-    }));
     for ((provider, model), _) in &templates {
         if let Some(PublishedEfforts::Published(efforts)) =
             crate::variant_policy::published(catalog, aliases, provider, model)
@@ -737,7 +730,7 @@ mod tests {
     }
 
     #[test]
-    fn published_and_observed_efforts_have_profiles_without_separate_fact_rows() {
+    fn catalog_workload_and_observed_efforts_have_profiles_without_separate_fact_rows() {
         let rig = Rig::new("efforts");
         let sol = rig.model("openai", "gpt-6-sol");
         for i in 0..20 {
@@ -749,13 +742,40 @@ mod tests {
             [],
         )
         .unwrap();
-        raw.execute("UPDATE model_facts SET reasoning_efforts_json='[\"high\",\"low\"]' WHERE provider_id='openai' AND model_id='gpt-6-sol'", []).unwrap();
+        let catalog = crate::fusiform_catalog::decode_catalog_get(
+            &serde_json::to_vec(&serde_json::json!({
+                "catalog_version": 1, "resolved_at_ms": NOW,
+                "models": {"openai/gpt-6-sol": {
+                "existence":"present",
+                    "capability.reasoning_options":[{"type":"effort","values":["high","low"]}],
+                    "quality.graded_effort":"high",
+                    "capability.reasoning_default":{"type":"effort","value":"high"},
+                    "workload.code.effort_default":"low"
+                }}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let (updates, _) = catalog.parts();
+        crate::routing_v1::effort_preview::seed_for_test(
+            rig.dir.join("routing.sqlite"),
+            "openai/gpt-6-sol",
+            updates[0].catalog_efforts.clone().unwrap(),
+        );
+        let efforts = crate::routing_v1::effort_preview::Efforts {
+            models: rig.store.get_selection_catalog().unwrap().efforts.clone(),
+            workloads: Default::default(),
+        };
+        let choice = efforts
+            .resolve(&sol, &Default::default(), Some("code"), false, None)
+            .unwrap();
+        assert_eq!(choice.variant.as_deref(), Some("low"));
         let cache = ProfileCache::default();
         rig.rebuild(&cache, NOW);
         let mut high = sol.clone();
         high.variant = Some("high".into());
         let mut low = sol;
-        low.variant = Some("low".into());
+        low.variant = choice.variant;
         let profiles = cache.snapshot().lookup("mason", 75.0, &[high.clone(), low]);
         assert_eq!(
             profiles["openai/gpt-6-sol/high"].level,
@@ -774,10 +794,8 @@ mod tests {
     }
 
     #[test]
-    fn expansion_keeps_curated_defaults_and_follows_catalog_aliases() {
-        let mut generic = crate::tests::fact("catalog", "sol");
-        generic.prompt_defaults =
-            serde_json::from_value(serde_json::json!({"variant":"curated"})).ok();
+    fn expansion_uses_published_options_and_follows_catalog_aliases() {
+        let generic = crate::tests::fact("catalog", "sol");
         let mut exact = generic.clone();
         exact.variant = Some("high".into());
         exact.cost_per_m_tok_out = Some(123.0);
@@ -792,7 +810,12 @@ mod tests {
         };
         expand_variants(&mut facts, &[], &catalog, &aliases);
         for provider in ["catalog", "platform"] {
-            for variant in ["curated", "high", "low"] {
+            assert!(
+                !facts.iter().any(|fact| fact.provider_id == provider
+                    && fact.variant.as_deref() == Some("curated")),
+                "{provider}/curated is not published"
+            );
+            for variant in ["high", "low"] {
                 assert!(
                     facts.iter().any(|fact| fact.provider_id == provider
                         && fact.variant.as_deref() == Some(variant)),

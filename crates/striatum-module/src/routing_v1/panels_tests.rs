@@ -522,11 +522,24 @@ async fn panel_athena_and_spec_match_frozen_seats_variants_and_budgets() {
     catalog.runners[0].route_keys = catalog.models.iter().map(|m| m.route_key()).collect();
     install_catalog(&h, &catalog);
     h.install_facts(&facts);
+    for fact in &facts {
+        let route = format!("{}/{}", fact.provider_id, fact.model_id);
+        let policy = frozen["policy"]["model_routing"]["variants"]["athena"][&route].as_str();
+        let default = fact
+            .prompt_defaults
+            .as_ref()
+            .and_then(|d| d.variant.as_deref());
+        if let Some(variant) = policy.or(default) {
+            super::effort_preview::seed_for_test(
+                h.store_path(),
+                &route,
+                super::effort_preview::test_graded(variant, &[variant]),
+            );
+        }
+    }
     h.edit_config(|c| {
         c["demand_exponent"] = json!(1.0);
         c["consumers"]["athena"] = json!({"owner":"prefrontal-core"});
-        c["consumers"]["athena"]["variants"] =
-            frozen["policy"]["model_routing"]["variants"]["athena"].clone();
     });
     let route = h.bind(reserved("prefrontal-core"), None).await;
     for case in frozen["panels"].as_array().unwrap() {

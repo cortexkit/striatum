@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use cortexkit_claustrum_client::{ListedCredential, ScopedCredentialListing};
 use serde_json::{json, Value};
-use striatum_core::{make_route_key, ModelPromptDefaults, RouteStateStore};
+use striatum_core::{make_route_key, RouteStateStore};
 use subc_protocol::FrameType;
 
 use super::conformance_tests::{reserved, Harness, Route};
@@ -43,10 +43,6 @@ fn fixture() -> (Arc<Harness>, BrocaCredentials) {
         fact("unmapped", "absent-account"),
     ])
     .collect();
-    facts[0].prompt_defaults = Some(ModelPromptDefaults {
-        variant: Some("medium".into()),
-        ..Default::default()
-    });
     facts
         .iter_mut()
         .find(|fact| fact.model_id == "unscored")
@@ -67,6 +63,8 @@ fn fixture() -> (Arc<Harness>, BrocaCredentials) {
         (format!("{}/{}", fact.provider_id, fact.model_id), json!({
             "existence": "present", "capability.tool_call": fact.model_id != "no-tools",
             "capability.reasoning_options": [{"type":"effort", "values":["low","medium","high","xhigh"]}],
+            "quality.graded_effort": (fact.model_id == "a-head").then_some("high"),
+            "workload.code.effort_default": (fact.model_id == "a-head").then_some("low"),
             "model.status": if fact.model_id == "deprecated" { json!("deprecated") } else { Value::Null },
             "rate.output.mode.fast": {"state":"priced", "currency":"USD", "units":10, "exponent":0},
             "rate.output.mode.ultrafast": {"state":"priced", "currency":"USD", "units":20, "exponent":0},
@@ -167,8 +165,7 @@ fn fixture() -> (Arc<Harness>, BrocaCredentials) {
         config["providers"] = json!({"openai":{"models":["a-head","pinned","blocked","only-mason","no-tools","deprecated","unscored"]}});
         config["models"] = json!({"openai/pinned":{"pin_only":true},
             "openai/blocked":{"not_for":["head"]}, "openai/only-mason":{"only_for":["mason"]}});
-        config["variants"] = json!({"openai/a-head":"low"});
-        config["consumers"]["head"] = json!({"variants":{"openai/a-head":"high"}});
+        config["consumers"]["head"] = json!({"workload":"code"});
     });
     harness.set_credentials(credentials.clone());
     (harness, credentials)
@@ -216,11 +213,24 @@ fn broca_live_catalog_fixture() -> Arc<Harness> {
         harness.store().upsert_fact(&model, source).unwrap();
         facts.push(model);
     }
-    let catalog = json!({
+    let mut catalog = json!({
         "catalog_version": input["catalog_version"], "resolved_at_ms": 1794680117849_i64,
         "quality_scores": {"graded_by":"operator", "graded_at_ms":1794404263000_i64},
         "models": input["catalog_models"]
     });
+    // The captured November 14 catalog has no graded efforts. Supply the
+    // matching facts so the client picker test vectors still contain the
+    // defaults that previously came from routing's store.
+    for (route, effort) in [
+        ("anthropic/claude-opus-5-5", "high"),
+        ("google/antigravity-gemini-3.8-flash", "high"),
+        ("openai/gpt-6-astra", "xhigh"),
+        ("openai/gpt-6-luna", "xhigh"),
+        ("openai/gpt-6.1-sol", "xhigh"),
+        ("xai/grok-4.7", "xhigh"),
+    ] {
+        catalog["models"][route]["quality.graded_effort"] = json!(effort);
+    }
     let snapshot =
         fusiform_catalog::decode_catalog_get(&serde_json::to_vec(&catalog).unwrap()).unwrap();
     let (updates, cursor) = snapshot.parts();

@@ -6,7 +6,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use striatum_core::model_facts::{
-    Confidence, ModelFact, ModelPromptDefaults, ModelScores, RoutePricing, ScoreProvenance,
+    Confidence, ModelFact, ModelScores, RoutePricing, ScoreProvenance,
 };
 use striatum_core::{
     admit_routes, derive_provider_key, make_capacity_key, make_route_key, relax_earliest_reset,
@@ -2047,14 +2047,13 @@ fn aggregated_observed_speeds_match_the_former_per_fact_overlay() {
     let rig = Rig::new("usage-aggregate-overlay");
     let store = rig.open();
 
-    let mut prompt_default = fact("p", "prompt-default");
-    prompt_default.prompt_defaults = Some(ModelPromptDefaults {
-        variant: Some("high".into()),
-        ..Default::default()
-    });
     store
-        .upsert_fact(&prompt_default, FactSource::Override)
+        .upsert_fact(&fact("p", "prompt-default"), FactSource::Override)
         .unwrap();
+    rusqlite::Connection::open(rig.db_path()).unwrap().execute(
+        "UPDATE model_facts SET fusiform_present = 1, catalog_efforts_json = '{\"graded\":\"high\",\"offered\":[\"high\"],\"vendor_default\":null,\"elo\":{},\"eq\":{},\"workloads\":{}}'
+         WHERE route_key = 'p/prompt-default'", [],
+    ).unwrap();
 
     let mut own_variant = fact("p", "own-variant");
     own_variant.variant = Some("low".into());
@@ -2102,24 +2101,21 @@ fn aggregated_observed_speeds_match_the_former_per_fact_overlay() {
     }
 
     let now = 10_000.0;
-    // This is the former per-fact path kept as the test oracle: derive the same
-    // prompt-default route key, call the singular query, and fall back to catalog speed.
+    // Call the singular query with the fixture's expected measurement key,
+    // independently of the aggregate overlay's key resolution.
     let expected: std::collections::HashMap<String, f64> = store
         .get_facts()
         .unwrap()
         .into_iter()
         .filter(|fact| fact.provider_id == "p")
         .map(|fact| {
-            let observed_variant = fact
-                .prompt_defaults
-                .as_ref()
-                .and_then(|defaults| defaults.variant.clone())
-                .or_else(|| fact.variant.clone());
-            let observed_route_key = make_route_key(
-                &fact.provider_id,
-                &fact.model_id,
-                observed_variant.as_deref(),
-            );
+            let observed_variant = if fact.model_id == "prompt-default" {
+                Some("high")
+            } else {
+                fact.variant.as_deref()
+            };
+            let observed_route_key =
+                make_route_key(&fact.provider_id, &fact.model_id, observed_variant);
             let route_key =
                 make_route_key(&fact.provider_id, &fact.model_id, fact.variant.as_deref());
             let observed_speed = store
@@ -4717,4 +4713,44 @@ fn observed_speed_and_class_vector_match_unsplit_before_the_mover_and_after_rest
     compare(&new);
     drop(new);
     compare(&new_rig.open());
+}
+
+#[test]
+fn migration_100_clears_legacy_defaults_without_removing_explicit_fact_rows() {
+    let rig = Rig::new("clear-curated-efforts");
+    let descriptor = dev_descriptor("old", rig.db_path());
+    let old = SqliteRouteStateStore::open_at_version_for_test(&descriptor, 99).unwrap();
+    let mut pinned = fact("migration-example", "model");
+    pinned.variant = Some("high".into());
+    old.upsert_fact(&pinned, FactSource::Override).unwrap();
+    drop(old);
+    let sql = rusqlite::Connection::open(rig.db_path()).unwrap();
+    sql.execute(
+        "UPDATE model_facts SET prompt_defaults_json = '{\"variant\":\"low\",\"temperature\":0.4}'
+         WHERE provider_id = 'migration-example'",
+        [],
+    )
+    .unwrap();
+    let count = || {
+        sql.query_row(
+        "SELECT count(*) FROM model_facts WHERE json_type(prompt_defaults_json, '$.variant') IS NOT NULL",
+        [], |row| row.get::<_, i64>(0),
+    ).unwrap()
+    };
+    assert!(
+        count() > 1,
+        "old schema must include the historical seed defaults"
+    );
+    let store = SqliteRouteStateStore::open(&descriptor).unwrap();
+    assert_eq!(count(), 0, "all persisted default variants must be removed");
+    let rows = store.get_facts().unwrap();
+    let explicit = rows
+        .iter()
+        .find(|f| f.provider_id == "migration-example")
+        .unwrap();
+    assert_eq!(explicit.variant.as_deref(), Some("high"));
+    assert_eq!(
+        explicit.prompt_defaults.as_ref().unwrap().temperature,
+        Some(0.4)
+    );
 }

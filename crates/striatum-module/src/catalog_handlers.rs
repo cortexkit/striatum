@@ -64,8 +64,6 @@ pub(super) struct ModelUpsertParams {
     #[serde(default)]
     pub(super) supports_tool_use: Option<bool>,
     #[serde(default)]
-    pub(super) default_variant: Option<String>,
-    #[serde(default)]
     pub(super) notes: Option<String>,
 }
 
@@ -185,11 +183,6 @@ pub(super) fn merge_model_upsert(
     if params.supports_tool_use.is_some() {
         fact.supports_tool_use = params.supports_tool_use;
     }
-    if let Some(default_variant) = params.default_variant.clone() {
-        let mut defaults = fact.prompt_defaults.clone().unwrap_or_default();
-        defaults.variant = Some(default_variant);
-        fact.prompt_defaults = Some(defaults);
-    }
     if params.notes.is_some() {
         fact.notes = params.notes.clone();
     }
@@ -213,6 +206,20 @@ pub(super) async fn handle_model_upsert(
         frame.header.epoch,
         frame.header.corr,
     );
+    if serde_json::from_slice::<serde_json::Value>(&frame.body)
+        .is_ok_and(|body| body["params"].get("defaultVariant").is_some())
+    {
+        return send_route_error(
+            writer,
+            ver,
+            channel,
+            epoch,
+            corr,
+            "invalid_request",
+            "defaultVariant was removed; reasoning effort defaults come from the model catalog",
+        )
+        .await;
+    }
     let params: ModelUpsertParams = match serde_json::from_slice::<ModelUpsertBody>(&frame.body) {
         Ok(body) if body.params.canonical_id.is_some() => {
             return handle_canonical_model_upsert(
@@ -462,7 +469,6 @@ async fn handle_canonical_model_upsert(
         ("costPerMTokOut", params.cost_per_m_tok_out.is_some()),
         ("supportsVision", params.supports_vision.is_some()),
         ("supportsToolUse", params.supports_tool_use.is_some()),
-        ("defaultVariant", params.default_variant.is_some()),
     ]
     .into_iter()
     .filter_map(|(name, set)| set.then_some(name))

@@ -47,42 +47,74 @@
     "models": [
       {
         "billing": "per_token",
+        "effort_source": "none",
+        "grade": {
+          "elo": 1800.0,
+          "elo_effort": "unrecorded",
+          "eq": 1800.0,
+          "eq_effort": "unrecorded"
+        },
         "model": "model-a",
         "pin_only": false,
         "provider": "example-provider",
         "service_tiers": [
           "standard"
         ],
+        "variant": null,
         "variants": []
       },
       {
         "billing": "per_token",
+        "effort_source": "none",
+        "grade": {
+          "elo": 1800.0,
+          "elo_effort": "unrecorded",
+          "eq": 1800.0,
+          "eq_effort": "unrecorded"
+        },
         "model": "model-b",
         "pin_only": true,
         "provider": "example-provider",
         "service_tiers": [
           "standard"
         ],
+        "variant": null,
         "variants": []
       },
       {
         "billing": "subscription",
+        "effort_source": "none",
+        "grade": {
+          "elo": 1800.0,
+          "elo_effort": "unrecorded",
+          "eq": 1800.0,
+          "eq_effort": "unrecorded"
+        },
         "model": "model-c",
         "pin_only": false,
         "provider": "example-subscription",
         "service_tiers": [
           "standard"
         ],
+        "variant": null,
         "variants": []
       },
       {
         "billing": "subscription",
+        "effort_source": "none",
+        "grade": {
+          "elo": 1800.0,
+          "elo_effort": "unrecorded",
+          "eq": 1800.0,
+          "eq_effort": "unrecorded"
+        },
         "model": "model-d",
         "pin_only": false,
         "provider": "example-subscription",
         "service_tiers": [
           "standard"
         ],
+        "variant": null,
         "variants": []
       }
     ],
@@ -368,8 +400,16 @@
         }
       ],
       "iq": 0.0,
+      "minimum_unverified_count": 0,
       "pick": {
         "cost_usd": null,
+        "effort_source": "none",
+        "grade": {
+          "elo": 1800.0,
+          "elo_effort": "unrecorded",
+          "eq": 1800.0,
+          "eq_effort": "unrecorded"
+        },
         "route": "example-subscription/model-d",
         "variant": null
       },
@@ -678,8 +718,16 @@
         }
       ],
       "iq": 5.0,
+      "minimum_unverified_count": 0,
       "pick": {
         "cost_usd": null,
+        "effort_source": "none",
+        "grade": {
+          "elo": 1800.0,
+          "elo_effort": "unrecorded",
+          "eq": 1800.0,
+          "eq_effort": "unrecorded"
+        },
         "route": "example-subscription/model-d",
         "variant": null
       },
@@ -988,8 +1036,16 @@
         }
       ],
       "iq": 50.0,
+      "minimum_unverified_count": 0,
       "pick": {
         "cost_usd": null,
+        "effort_source": "none",
+        "grade": {
+          "elo": 1800.0,
+          "elo_effort": "unrecorded",
+          "eq": 1800.0,
+          "eq_effort": "unrecorded"
+        },
         "route": "example-subscription/model-d",
         "variant": null
       },
@@ -1298,8 +1354,16 @@
         }
       ],
       "iq": 100.0,
+      "minimum_unverified_count": 0,
       "pick": {
         "cost_usd": null,
+        "effort_source": "none",
+        "grade": {
+          "elo": 1800.0,
+          "elo_effort": "unrecorded",
+          "eq": 1800.0,
+          "eq_effort": "unrecorded"
+        },
         "route": "example-subscription/model-d",
         "variant": null
       },

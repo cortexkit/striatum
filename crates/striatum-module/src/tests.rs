@@ -9,7 +9,7 @@ include!("replay_model_facts_tests.rs");
 use super::*;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use striatum_core::model_facts::{Confidence, ModelFact, ModelPromptDefaults, ModelScores};
+use striatum_core::model_facts::{Confidence, ModelFact, ModelScores};
 use striatum_core::model_router::select_model_route_with_config;
 use striatum_core::{FactSource, NativeUsageFacts, UsageObservation};
 

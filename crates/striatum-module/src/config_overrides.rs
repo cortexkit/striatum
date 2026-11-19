@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::config_policy::{
-    ConsumerPolicy, ExcludeGroups, PanelPolicies, Pins, ProviderPolicy, RunnerPolicy, VariantGroups,
+    ConsumerPolicy, ExcludeGroups, PanelPolicies, Pins, ProviderPolicy, RunnerPolicy,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -74,10 +74,10 @@ mod heap_measurements {
     #[ignore = "repository settings snapshot heap profile; run alone"]
     fn repository_settings_heap() {
         use crate::memory_measurements::{operation, profiler, release};
-        let document = crate::config_convert::convert(include_str!(
+        let document = crate::test_config::convert_archived(include_str!(
             "../fixtures/routing-config-live-2026-10-24.jsonc"
         ))
-        .unwrap();
+        .to_string();
         println!(
             "COUNTS repository_settings_document_bytes={}",
             document.len()
@@ -326,24 +326,19 @@ fn live_configs() -> &'static Mutex<HashMap<PathBuf, LiveConfigCache>> {
 /// Reads the reasoning efforts the catalog currently publishes.
 pub type ReasoningCatalogSource = Arc<dyn Fn() -> Result<ReasoningCatalog, String> + Send + Sync>;
 
-/// The catalog each config path's variant overrides are checked against. Absent
-/// until the routing store opens; config loaded before then gets only the shape
-/// checks, and the store's opening re-checks the active config.
+/// The live catalog for pin validation, attached when the routing store opens.
 fn catalog_sources() -> &'static Mutex<HashMap<PathBuf, ReasoningCatalogSource>> {
     static SOURCES: OnceLock<Mutex<HashMap<PathBuf, ReasoningCatalogSource>>> = OnceLock::new();
     SOURCES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Attach the live catalog to `path`, then check the active config against it.
-/// Every later load or reload of `path` is checked the same way. An error means
-/// the active config names a variant the catalog does not publish.
+/// Attach the published reasoning options used to validate explicit pins.
 pub fn attach_reasoning_catalog(path: &Path, source: ReasoningCatalogSource) -> Result<(), String> {
     catalog_sources()
         .lock()
         .unwrap()
         .insert(path.to_path_buf(), source);
-    let active = live_config_at(path, Instant::now())?;
-    check_variants_against_catalog(path, &active.config)
+    Ok(())
 }
 
 pub(super) fn attach_store_catalog(path: &Path, store: &crate::SharedStore) -> Result<(), String> {
@@ -376,56 +371,10 @@ pub fn reasoning_catalog_for(path: &Path) -> Option<ReasoningCatalog> {
     }
 }
 
-fn check_variants_against_catalog(path: &Path, config: &RoutingConfigFile) -> Result<(), String> {
-    let section = &config.model_routing;
-    if section.variants.is_empty() {
-        return Ok(());
-    }
-    let Some(source) = catalog_sources().lock().unwrap().get(path).cloned() else {
-        return Ok(());
-    };
-    let catalog = source().map_err(|error| format!("variant_catalog_unreadable: {error}"))?;
-    report_variant_warnings(path, check_variants_with(config, &catalog)?);
-    Ok(())
-}
-
-/// Check one config's variant overrides against a catalog snapshot.
-fn check_variants_with(
-    config: &RoutingConfigFile,
-    catalog: &ReasoningCatalog,
-) -> Result<Vec<String>, String> {
-    let section = &config.model_routing;
-    let mut groups = section.variants.clone();
-    let mut warnings = Vec::new();
-    for entries in groups.maps_mut() {
-        entries.retain(|key, _| {
-            let provider = key.split('/').next().unwrap_or(key);
-            if catalog.models_of(provider).next().is_some() {
-                true
-            } else {
-                warnings.push(format!(
-                    "variants for {key} await the provider's credential-to-catalog resolution"
-                ));
-                false
-            }
-        });
-    }
-    warnings.extend(
-        crate::variant_policy::check_against_catalog(&groups, &BTreeMap::new(), catalog)
-            .map_err(|error| format!("variant_not_published: {error}"))?,
-    );
-    Ok(warnings)
-}
-
-fn report_variant_warnings(path: &Path, warnings: Vec<String>) {
-    for warning in warnings {
-        eprintln!("[striatum] {}: {warning}", path.display());
-    }
-}
-
 /// Where the module's routing store lives when the daemon manages storage:
 /// `$XDG_DATA_HOME/cortexkit/striatum/store.db`, defaulting
 /// `XDG_DATA_HOME` to `~/.local/share`.
+/// Where the module's routing store lives when the daemon manages storage.
 pub fn default_store_path() -> Option<PathBuf> {
     let data_home = std::env::var_os("XDG_DATA_HOME")
         .filter(|value| !value.is_empty())
@@ -443,13 +392,10 @@ pub fn default_store_path() -> Option<PathBuf> {
     )
 }
 
-/// Validate the config at `path` and check its variant overrides against the
-/// store at `store_path`, read-only. Returns one line describing the catalog
-/// check: passed, or skipped and why.
+/// Validate the config and report counts from the store at `store_path`, read-only.
 pub fn check_config_offline(path: &Path, store_path: Option<&Path>) -> Result<String, String> {
     initialize_config(path)?;
     let active = live_config_at(path, Instant::now())?;
-    let report = check_catalog_offline(&active, store_path)?;
     let (facts, roster) = store_path
         .map(striatum_store::read_counts_offline)
         .unwrap_or_else(|| {
@@ -463,30 +409,8 @@ pub fn check_config_offline(path: &Path, store_path: Option<&Path>) -> Result<St
         Err(reason) => format!("unavailable ({reason})"),
     };
     let (subscription_count, exclusion_count, runner_count) = active.rule_counts();
-    Ok(format!("{report}\nsubscription_rules={}\nexclusion_rules={exclusion_count}\nrunner_route_rules={runner_count}\ncatalog_facts={}\nvault_roster_credentials={}",
+    Ok(format!("subscription_rules={}\nexclusion_rules={exclusion_count}\nrunner_route_rules={runner_count}\ncatalog_facts={}\nvault_roster_credentials={}",
         subscription_count, count(facts), count(roster)))
-}
-
-fn check_catalog_offline(active: &LiveConfig, store_path: Option<&Path>) -> Result<String, String> {
-    if active.config.model_routing.variants.is_empty() {
-        return Ok("catalog check: no model_routing.variants to check".into());
-    }
-    let Some(store_path) = store_path else {
-        return Ok(
-            "catalog check skipped: no routing store path (neither XDG_DATA_HOME nor HOME is set)"
-                .into(),
-        );
-    };
-    let catalog = match striatum_store::read_reasoning_catalog_offline(store_path) {
-        Ok(catalog) => catalog,
-        Err(error) => return Ok(format!("catalog check skipped: {error}")),
-    };
-    let warnings = check_variants_with(&active.config, &catalog)?;
-    let mut report = format!("catalog check passed against {}", store_path.display());
-    for warning in warnings {
-        report.push_str(&format!("\nwarning: {warning}"));
-    }
-    Ok(report)
 }
 
 pub fn live_config(path: &Path) -> Arc<LiveConfig> {
@@ -572,6 +496,7 @@ fn parse_config_with_reporter(
             crate::config_convert::COMMAND
         ));
     }
+    crate::config_convert::reject_removed_variants(&value)?;
     for key in ["model_routing", "account_selection", "pins", "score_alias"] {
         if value.get(key).is_some() {
             return Err(format!(
@@ -723,7 +648,6 @@ fn live_config_at_with_reporter(
                 .map_err(|error| format!("invalid config in {}: {error}", path.display()))?,
             None => RoutingConfigFile::default(),
         };
-        check_variants_against_catalog(path, &config)?;
         Ok(LiveConfig::new(config, document))
     })();
     let mut caches = live_configs().lock().unwrap();
@@ -797,7 +721,6 @@ fn validate_live_config(config: &RoutingConfigFile) -> Result<(), String> {
     }
     section.panels.validate()?;
     section.pins.validate()?;
-    section.variants.validate()?;
     validate_v1_policy(section)?;
     for (provider, value) in &section.subscription_multipliers {
         if provider.trim().is_empty() || !value.is_finite() || *value <= 0.0 {
@@ -930,7 +853,7 @@ fn v1_consumer_ids(section: &ModelRoutingSection) -> Vec<String> {
         Some(consumers) => consumers.clone(),
         None => crate::select_policy::Consumer::ALL
             .into_iter()
-            .filter_map(|consumer| crate::variant_policy::consumer_group(Some(consumer)))
+            .map(crate::select_policy::Consumer::exclusion_group)
             .map(str::to_owned)
             .collect(),
     };
@@ -941,10 +864,6 @@ fn v1_consumer_ids(section: &ModelRoutingSection) -> Vec<String> {
 impl LiveConfig {
     pub fn exclude_groups(&self) -> &ExcludeGroups {
         &self.config.model_routing.exclude
-    }
-
-    pub fn variant_groups(&self) -> &VariantGroups {
-        &self.config.model_routing.variants
     }
 
     pub fn panels(&self) -> &PanelPolicies {
@@ -1330,8 +1249,6 @@ struct RoutingConfigFile {
     model_routing: ModelRoutingSection,
     #[serde(default)]
     providers: BTreeMap<String, ProviderPolicy>,
-    #[serde(default, rename = "variants")]
-    default_variants: BTreeMap<String, String>,
     #[serde(default)]
     consumers: BTreeMap<String, ConsumerPolicy>,
     #[serde(default)]
@@ -1372,7 +1289,6 @@ impl Default for RoutingConfigFile {
             concurrency: Default::default(),
             model_routing: Default::default(),
             providers: Default::default(),
-            default_variants: Default::default(),
             consumers: Default::default(),
             runners: Default::default(),
             pin_origin_callers: default_pin_origin_callers(),
@@ -1663,12 +1579,6 @@ struct ModelRoutingSection {
     /// admitted when the route is otherwise servable.
     #[serde(skip)]
     exclude: ExcludeGroups,
-    /// Reasoning-variant overrides by consumer, grouped like `exclude`. A
-    /// selection runs at the caller's named variant, else `variants.<consumer>`,
-    /// else `variants.all`, else the route's curated default. Each value must
-    /// be an effort the catalog publishes for the matched models.
-    #[serde(skip)]
-    variants: VariantGroups,
     #[serde(default)]
     panels: PanelPolicies,
     #[serde(skip)]

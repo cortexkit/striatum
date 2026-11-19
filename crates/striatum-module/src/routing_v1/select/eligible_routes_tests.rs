@@ -152,7 +152,7 @@ async fn explicit_pin_variants_require_exact_eligible_identity() {
 }
 
 #[tokio::test]
-async fn curated_variants_match_exactly_without_stripping_or_substitution() {
+async fn graded_variants_match_exactly_even_with_explicit_sibling_rows() {
     let (harness, route) = configured().await;
     for catalog_variant in [false, true] {
         let mut facts: Vec<_> = fixture::catalog()
@@ -163,9 +163,6 @@ async fn curated_variants_match_exactly_without_stripping_or_substitution() {
                 let mut fact = super::super::conformance_tests::catalog_fact(model, rank);
                 if model.route_key() == B {
                     fact.variant = catalog_variant.then(|| "high".into());
-                    fact.prompt_defaults
-                        .get_or_insert_with(Default::default)
-                        .variant = Some("high".into());
                 }
                 fact
             })
@@ -179,17 +176,20 @@ async fn curated_variants_match_exactly_without_stripping_or_substitution() {
                 .unwrap()
                 .clone();
             low.variant = Some("low".into());
-            low.prompt_defaults.as_mut().unwrap().variant = Some("low".into());
             facts.push(low);
         }
         harness.install_facts(&facts);
-        let mut unavailable = vec![route_ref(B)];
-        if !catalog_variant {
-            unavailable.push(route_ref(&format!("{B}:low")));
-        } else {
+        crate::routing_v1::effort_preview::seed_for_test(
+            harness.store_path(),
+            B,
+            crate::routing_v1::effort_preview::test_graded("high", &["low", "high"]),
+        );
+        let unavailable = vec![route_ref(B), route_ref(&format!("{B}:low"))];
+        if catalog_variant {
             let low = answer(
                 &route,
-                json!({"eligible_routes":[route_ref(&format!("{B}:low"))]}),
+                json!({"pin":format!("{B}:low"),
+                "eligible_routes":[route_ref(&format!("{B}:low"))]}),
             )
             .await;
             assert_eq!(low["route"], route_ref(&format!("{B}:low")), "{low}");
@@ -218,11 +218,13 @@ async fn curated_variants_match_exactly_without_stripping_or_substitution() {
 }
 
 #[tokio::test]
-async fn routing_variant_policy_is_resolved_before_eligibility_not_changed_to_fit_it() {
+async fn catalog_effort_is_resolved_before_eligibility_not_changed_to_fit_it() {
     let (harness, route) = configured().await;
-    harness.edit_config(|config| {
-        config["model_routing"]["variants"] = json!({"all":{B:"high"}});
-    });
+    crate::routing_v1::effort_preview::seed_for_test(
+        harness.store_path(),
+        B,
+        crate::routing_v1::effort_preview::test_graded("high", &["low", "high"]),
+    );
     assert_eq!(
         answer(&route, json!({})).await["route"],
         route_ref(&format!("{B}:high"))

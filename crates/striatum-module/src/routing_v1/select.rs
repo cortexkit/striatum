@@ -245,7 +245,6 @@ pub(super) struct Evaluation<'a> {
     pub iq: f64,
     pub eq: Option<f64>,
     pub evidence: std::sync::Mutex<striatum_core::model_router::RouteEvaluation>,
-    pub catalog_efforts: Option<&'a effort_preview::Preview>,
     pub effort_diagnostics: std::sync::Mutex<effort_preview::Diagnostics>,
 }
 
@@ -645,6 +644,7 @@ pub(super) struct RequestInputs {
     pub(super) live_config: std::sync::Arc<config_overrides::LiveConfig>,
     pub(super) operator_config: std::sync::Arc<config_overrides::LiveConfig>,
     pub(super) catalog_snapshot: std::sync::Arc<striatum_store::CatalogFactsSnapshot>,
+    pub(super) efforts: effort_preview::Efforts,
     facts: Vec<ModelFact>,
     pub(super) catalog_targets: std::collections::BTreeMap<String, String>,
     policy_memo: std::sync::Arc<config_overrides::SelectionPolicyMemo>,
@@ -688,6 +688,10 @@ impl RequestInputs {
         Ok(Self {
             live_config,
             operator_config,
+            efforts: effort_preview::Efforts {
+                models: catalog_snapshot.efforts.clone(),
+                workloads: Default::default(),
+            },
             catalog_snapshot,
             facts,
             catalog_targets,
@@ -1686,9 +1690,12 @@ async fn select_at_tier_attempt(
     )
     .map_err(store_refusal)?;
     let use_concurrency = std::cell::Cell::new(!concurrency.full_routes.is_empty());
+    let live_effort_diagnostics = std::sync::Mutex::new(effort_preview::Diagnostics::default());
     let selection = Selection {
-        catalog_efforts: evaluation.and_then(|view| view.catalog_efforts),
-        effort_diagnostics: evaluation.map(|view| &view.effort_diagnostics),
+        efforts: &shared.efforts,
+        effort_diagnostics: evaluation
+            .map_or(&live_effort_diagnostics, |view| &view.effort_diagnostics),
+        panel_seat,
         policy_memo: &shared.policy_memo,
         concurrency: &concurrency,
         use_concurrency: &use_concurrency,
@@ -1734,13 +1741,8 @@ async fn select_at_tier_attempt(
     // Ordinary route.what_if model previews still return all three diagnostics.
     if let Some(view) = evaluation.filter(|_| !panel_seat) {
         let mut evidence = view.evidence.lock().unwrap();
-        let _ = selection.score_candidates_evaluated(
-            &usable,
-            consumer_policy.operator_ladder() && selection.catalog_efforts.is_none(),
-            None,
-            None,
-            Some(&mut evidence),
-        );
+        let _ =
+            selection.score_candidates_evaluated(&usable, false, None, None, Some(&mut evidence));
     }
 
     let project_pin = request
@@ -2159,7 +2161,7 @@ async fn select_at_tier_attempt(
     if consumer_policy.operator_ladder() {
         selection.check_ladder_variant(&selected, explicit_variant.as_deref())?;
     }
-    let catalog_choice = selection.catalog_efforts.map(|preview| {
+    let catalog_choice = {
         let fact = facts
             .iter()
             .filter(|fact| {
@@ -2168,33 +2170,26 @@ async fn select_at_tier_attempt(
             })
             .min_by_key(|fact| fact_to_route(fact).route_key != selected.route_key)
             .expect("selection has a model fact");
-        let pinned = matches!(
-            basis,
-            Basis::RequestPin | Basis::ConsumerPin | Basis::ProjectPin
-        ) || consumer_policy.operator_ladder();
-        preview
-            .resolve(
+        let pinned = !panel_seat
+            && (matches!(
+                basis,
+                Basis::RequestPin | Basis::ConsumerPin | Basis::ProjectPin
+            ) || (!classifier
+                && matches!(basis, Basis::Automatic)
+                && consumer_policy.operator_ladder()));
+        selection
+            .effort(
                 fact,
-                catalog_targets,
-                preview.workload(&consumer, operator_config),
                 pinned,
-                explicit_variant.as_deref(),
+                if panel_seat {
+                    None
+                } else {
+                    explicit_variant.as_deref()
+                },
             )
             .expect("the catalog scorer removed workload-ineligible models")
-    });
-    let variant_choice = if let Some(choice) = &catalog_choice {
-        selected.prompt_params.variant = choice.variant.clone();
-        None
-    } else {
-        Some(crate::apply_variant_policy(
-            &mut selected,
-            &operator_config,
-            deps.operator_config_path,
-            &catalog_targets,
-            Some(&consumer),
-            explicit_variant.as_deref(),
-        ))
     };
+    catalog_choice.apply_selection(&mut selected);
 
     let runner = select_policy::choose_runner(
         &runners,
@@ -2211,9 +2206,7 @@ async fn select_at_tier_attempt(
             "variant": selected.prompt_params.variant,
             "cost_usd": selected.score.objective.task_pricing.as_ref().filter(|price| price.price_unit == "task").and_then(|price| price.final_cost_usd),
         });
-        if let Some(choice) = &catalog_choice {
-            choice.append_to(&mut preview);
-        }
+        catalog_choice.append_to(&mut preview);
         if selected
             .explanation
             .iter()
@@ -2285,7 +2278,7 @@ async fn select_at_tier_attempt(
             );
             selection.detail = (request.detail == Some(true)).then(|| json!({
                 "basis": basis.as_str(), "explanation": selected.explanation,
-                "rejected": selected.rejected, "score": selected.score, "variant": variant_choice,
+                "rejected": selected.rejected, "score": selected.score, "reasoning": catalog_choice,
             }));
             selection.project_settings = tier_trace.project_settings.clone();
             preview["selection"] = serde_json::to_value(selection).map_err(store_refusal)?;
@@ -2318,6 +2311,15 @@ async fn select_at_tier_attempt(
         .min(max_hold_s);
     let mut input: Value =
         serde_json::from_str(&decision.requirements_json).map_err(store_refusal)?;
+    catalog_choice.append_to(&mut input);
+    let workload_exclusions: Vec<_> = live_effort_diagnostics
+        .lock()
+        .unwrap()
+        .exclusions()
+        .collect();
+    if !workload_exclusions.is_empty() {
+        input["workload_exclusions"] = json!(workload_exclusions);
+    }
     input["hold_wait_max_s"] = json!(hold_cap);
     let requested_tier = tier_settings.resolve(
         &operator_config,
@@ -2554,7 +2556,7 @@ async fn select_at_tier_attempt(
             "explanation": selected.explanation,
             "rejected": selected.rejected,
             "score": selected.score,
-            "variant": variant_choice,
+            "reasoning": catalog_choice,
         })
     });
     // A fell-back answer always says why the pin was skipped, asked or not.
@@ -2595,8 +2597,9 @@ fn concurrency_rejected_routes(refusal: &Refusal) -> Vec<String> {
 
 /// Everything one select's automatic and pinned attempts share.
 struct Selection<'a> {
-    catalog_efforts: Option<&'a effort_preview::Preview>,
-    effort_diagnostics: Option<&'a std::sync::Mutex<effort_preview::Diagnostics>>,
+    efforts: &'a effort_preview::Efforts,
+    effort_diagnostics: &'a std::sync::Mutex<effort_preview::Diagnostics>,
+    panel_seat: bool,
     policy_memo: &'a config_overrides::SelectionPolicyMemo,
     concurrency: &'a striatum_core::concurrency_availability::ConcurrencyAvailability,
     use_concurrency: &'a std::cell::Cell<bool>,
@@ -2655,8 +2658,9 @@ impl<'a> Selection<'a> {
             })
             .cloned()
             .collect();
-        let input = self.pass().input(&allowed, Default::default());
-        let rejections = self.eligible_rejections(&input.facts, None);
+        let mut input = self.pass().input(&allowed, Default::default());
+        let variants = self.catalog_scoring(&mut input, false, None, None, false);
+        let rejections = self.eligible_rejections(&input.facts, &variants);
         // Reuse static admission so exclusions cannot hide a policy or capability
         // refusal. Ignore quota walls, blocks and cooldowns here: a hostable route
         // behind a cooldown still belongs to ranking and keeps the scorer's timed
@@ -2949,7 +2953,7 @@ impl<'a> Selection<'a> {
                     self.pass()
                         .input_with_policy(&recovery_available, recovery_snapshot, pinned);
                 select_policy::apply_explicit_variant(&mut recovery_input, explicit_variant);
-                self.catalog_scoring(
+                let variants = self.catalog_scoring(
                     &mut recovery_input,
                     pinned,
                     recovery_key,
@@ -2957,7 +2961,7 @@ impl<'a> Selection<'a> {
                     false,
                 );
                 let mut recovery_rejections =
-                    self.eligible_rejections(&recovery_input.facts, explicit_variant);
+                    self.eligible_rejections(&recovery_input.facts, &variants);
                 recovery_rejections.to_mut().retain(|key, reason| {
                     !account_recoveries.get(key).is_some_and(|block| {
                         block
@@ -3018,14 +3022,9 @@ impl<'a> Selection<'a> {
             pinned,
             pinned_route,
             explicit_variant,
-            evaluation.is_some(),
+            evaluation.is_some() || !pinned,
         );
-        let catalog = catalog_variants
-            .is_none()
-            .then(|| config_overrides::reasoning_catalog_for(self.sources.operator_config_path))
-            .flatten();
-        let rejections = self.eligible_rejections(&input.facts, explicit_variant);
-        let groups = self.sources.operator_config.variant_groups();
+        let rejections = self.eligible_rejections(&input.facts, &catalog_variants);
         let mut identities = Vec::new();
         let mut shortlist = Vec::new();
         for fact in &input.facts {
@@ -3035,28 +3034,7 @@ impl<'a> Selection<'a> {
             {
                 continue;
             }
-            let variant = if let Some(variants) = &catalog_variants {
-                variants.get(&route.route_key).cloned().flatten()
-            } else {
-                crate::variant_policy::resolve(
-                    groups,
-                    self.sources.catalog_targets,
-                    catalog.as_ref(),
-                    &crate::variant_policy::VariantRequest {
-                        route_key: &route.route_key,
-                        provider_id: &fact.provider_id,
-                        model_id: &fact.model_id,
-                        explicit: explicit_variant,
-                        curated: fact
-                            .prompt_defaults
-                            .as_ref()
-                            .and_then(|p| p.variant.as_deref())
-                            .or(fact.variant.as_deref()),
-                        consumer: Some(self.consumer),
-                    },
-                )
-                .variant
-            };
+            let variant = catalog_variants.get(&route.route_key).cloned().flatten();
             let mut served = fact.clone();
             served.variant = variant;
             // Profiles follow the variant that will run, while routing keeps
@@ -3088,6 +3066,22 @@ impl<'a> Selection<'a> {
         )
     }
 
+    fn effort(
+        &self,
+        fact: &ModelFact,
+        pinned: bool,
+        explicit: Option<&str>,
+    ) -> Result<effort_preview::Choice, effort_preview::Rejection> {
+        self.efforts.resolve(
+            fact,
+            self.sources.catalog_targets,
+            self.efforts
+                .workload(self.consumer, self.sources.operator_config),
+            pinned,
+            explicit,
+        )
+    }
+
     fn catalog_scoring(
         &self,
         input: &mut striatum_core::SelectModelRouteInput<'_>,
@@ -3095,27 +3089,17 @@ impl<'a> Selection<'a> {
         pinned_route: Option<&str>,
         explicit_variant: Option<&str>,
         record: bool,
-    ) -> Option<HashMap<String, Option<String>>> {
-        let preview = self.catalog_efforts?;
-        let workload = preview.workload(self.consumer, self.sources.operator_config);
-        let mut diagnostics = if record {
-            self.effort_diagnostics.map(|lock| lock.lock().unwrap())
-        } else {
-            None
-        };
+    ) -> HashMap<String, Option<String>> {
+        let mut diagnostics = record.then(|| self.effort_diagnostics.lock().unwrap());
         let mut variants = HashMap::new();
         let available = &input.available_models;
         input.facts.retain_mut(|fact| {
             let route = fact_to_route(fact);
-            let pinned = pinned && pinned_route.is_none_or(|key| route.capacity_key == key);
+            let pinned = pinned
+                && !self.panel_seat
+                && pinned_route.is_none_or(|key| route.capacity_key == key);
             let explicit = pinned.then_some(explicit_variant).flatten();
-            match preview.resolve(
-                fact,
-                self.sources.catalog_targets,
-                workload,
-                pinned,
-                explicit,
-            ) {
+            match self.effort(fact, pinned, explicit) {
                 Ok(choice) => {
                     if available.contains(&route.route_key)
                         || available.contains(&route.capacity_key)
@@ -3141,7 +3125,7 @@ impl<'a> Selection<'a> {
                 }
             }
         });
-        Some(variants)
+        variants
     }
 
     fn pass(&self) -> select_policy::SelectionPass<'_> {

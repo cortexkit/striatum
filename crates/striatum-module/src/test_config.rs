@@ -3,6 +3,21 @@
 
 use std::path::Path;
 
+#[cfg(test)]
+pub fn convert_archived(document: &str) -> serde_json::Value {
+    let mut value: serde_json::Value =
+        serde_json::from_str(&subc_jsonc::jsonc_to_json(document).unwrap()).unwrap();
+    // The frozen inputs document an older deployment; the current parser can
+    // load the rest of the settings only after the retired table is removed.
+    if let Some(policy) = value
+        .get_mut("model_routing")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        policy.remove("variants");
+    }
+    super::config_convert::convert_value(value).unwrap()
+}
+
 pub fn document(document: &str) -> String {
     let value = subc_jsonc::jsonc_to_json(document)
         .ok()

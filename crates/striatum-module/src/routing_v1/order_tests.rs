@@ -785,12 +785,19 @@ async fn the_answer_carries_route_runner_variant_limits_decision_and_expiry() {
     );
 }
 
+fn seed_code_effort(harness: &Harness) {
+    use super::effort_preview::{seed_for_test, test_graded};
+    let mut efforts = test_graded("low", &["low", "xhigh"]);
+    efforts.workloads.entry("code".into()).or_default().default = Some("xhigh".into());
+    seed_for_test(harness.store_path(), CHEAP, efforts);
+}
+
 #[tokio::test]
-async fn a_nonlegacy_consumer_runs_its_inherited_variant_in_scoring_and_launch() {
+async fn a_nonlegacy_consumer_runs_its_inherited_workload_effort_in_scoring_and_launch() {
     let harness = harness(&[(CHEAP, true, true, 200_000)]);
+    seed_code_effort(&harness);
     harness.edit_config(|config| {
-        config["variants"] = json!({ CHEAP: "low" });
-        config["consumers"]["mc_summary"]["variants"] = json!({ CHEAP: "xhigh" });
+        config["consumers"]["mc_summary"]["workload"] = json!("code");
         config["consumers"]["mc_summary.child"] = json!({});
     });
     let route = harness.bind(reserved("example-consumer"), None).await;
@@ -821,10 +828,11 @@ async fn a_nonlegacy_consumer_runs_its_inherited_variant_in_scoring_and_launch()
 }
 
 #[tokio::test]
-async fn a_mason_runs_the_configured_consumer_variant() {
+async fn a_mason_runs_the_catalog_code_effort() {
     let harness = harness(&[(CHEAP, true, true, 200_000)]);
+    seed_code_effort(&harness);
     harness.edit_config(|config| {
-        config["consumers"]["prefrontal-core.mason"]["variants"] = json!({ CHEAP: "xhigh" });
+        config["consumers"]["prefrontal-core.mason"]["workload"] = json!("code");
     });
     let route = harness.bind(reserved("example-consumer"), None).await;
     let v1 = route

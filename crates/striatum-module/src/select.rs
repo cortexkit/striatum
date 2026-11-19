@@ -1550,23 +1550,29 @@ async fn handle_select_panel(
         },
         canonical_ids,
     };
-    // Seats are matched back to their catalog model to apply variant overrides;
-    // the facts move into the selection below.
-    let seat_models: HashMap<String, (String, String)> = if live_config.variant_groups().is_empty()
-    {
-        HashMap::new()
-    } else {
-        prepared
-            .facts
-            .iter()
-            .map(|fact| {
-                (
-                    fact_to_route(fact).route_key,
-                    (fact.provider_id.clone(), fact.model_id.clone()),
-                )
-            })
-            .collect()
+    let efforts = routing_v1::effort_preview::Efforts {
+        models: prepared.catalog_snapshot.efforts.clone(),
+        workloads: Default::default(),
     };
+    let workload = efforts.workload(panel_consumer.id(), &operator_config);
+    let mut choices = HashMap::new();
+    let mut workload_exclusions = Vec::new();
+    prepared.facts.retain_mut(|fact| {
+        let key = fact_to_route(fact).route_key;
+        match efforts.resolve(fact, &catalog_targets, workload, false, None) {
+            Ok(choice) => {
+                choice.apply_scores(fact);
+                choices.insert(key, choice);
+                true
+            }
+            Err(reason) => {
+                let mut rejected = json!(reason);
+                rejected["route"] = json!(key);
+                workload_exclusions.push(rejected);
+                false
+            }
+        }
+    });
     let mut availability_rejections = mapped_availability.rejected;
     let session_root = pool_session(
         params.task_id.as_deref(),
@@ -1613,17 +1619,25 @@ async fn handle_select_panel(
                 .await;
             }
         };
-        // Every seat, the extra draws included, is an automatic choice for the
-        // class's consumer: lab panels read `variants.lab`, every other class
-        // `variants.athena`.
-        apply_panel_variant_policy(
-            &mut panel,
-            &live_config,
-            routing_config_path,
-            &catalog_targets,
-            panel_consumer,
-            &seat_models,
-        );
+        for member in &mut panel.members {
+            if let Some(choice) = choices.get(&member.route_key) {
+                choice.apply_prompt_map(&mut member.prompt_params);
+            }
+        }
+        for spare in &mut panel.runner_up {
+            if let Some(choice) = choices.get(&spare.route_key) {
+                choice.apply_prompt_map(&mut spare.prompt_params);
+            }
+        }
+        if let Some(policy) = &mut panel.policy {
+            for (seated, member) in policy.seated_variants.iter_mut().zip(&panel.members) {
+                if let Some(choice) = choices.get(&member.route_key) {
+                    seated.reasoning_variant = choice.variant.clone();
+                    seated.reasoning_variant_source =
+                        (choice.source() != "none").then(|| choice.source().into());
+                }
+            }
+        }
         // Vault-mapped providers need the selected credential and launch target in
         // promptParams.runner so core can persist and dispatch each member correctly.
         let mut leases = Vec::new();
@@ -1770,13 +1784,24 @@ async fn handle_select_panel(
                 .insert("service_tier_requested".into(), json!(requested));
         }
     }
-    let decision = panel_decision_input(
+    let mut decision = panel_decision_input(
         &params,
         &panel,
         availability_substrate,
         &provenance,
         &policy_sources_line(&operator_policy),
     );
+    let mut inputs: serde_json::Value = serde_json::from_str(&decision.requirements_json)
+        .map_err(|e| ModuleError::Message(e.to_string()))?;
+    inputs["seat_efforts"] = json!(panel
+        .members
+        .iter()
+        .map(|member| choices.get(&member.route_key))
+        .collect::<Vec<_>>());
+    if !workload_exclusions.is_empty() {
+        inputs["workload_exclusions"] = json!(workload_exclusions);
+    }
+    decision.requirements_json = inputs.to_string();
     let decision_id =
         match store.record_decision_with_selection(&decision, Some(legacy_wire::BROCA), None) {
             Ok(id) => id,
@@ -1830,55 +1855,6 @@ async fn handle_select_panel(
     send(writer, response).await
 }
 
-/// Run a selected route at the variant the operator's overrides choose, and
-/// record which rule chose it (and any override the catalog no longer
-/// publishes) in the selection's explanation, which the decision log keeps.
-pub(super) fn apply_variant_policy(
-    selected: &mut SelectedModelRoute,
-    config: &config_overrides::LiveConfig,
-    config_path: &Path,
-    catalog_targets: &std::collections::BTreeMap<String, String>,
-    consumer: Option<&str>,
-    explicit: Option<&str>,
-) -> variant_policy::VariantChoice {
-    let groups = config.variant_groups();
-    let catalog = if groups.is_empty() {
-        None
-    } else {
-        config_overrides::reasoning_catalog_for(config_path)
-    };
-    let curated = selected.prompt_params.variant.clone();
-    let choice = variant_policy::resolve(
-        groups,
-        catalog_targets,
-        catalog.as_ref(),
-        &variant_policy::VariantRequest {
-            route_key: &selected.route_key,
-            provider_id: &selected.model.provider_id,
-            model_id: &selected.model.model_id,
-            explicit,
-            curated: curated.as_deref(),
-            consumer,
-        },
-    );
-    if choice.variant != curated {
-        selected.prompt_params.variant = choice.variant.clone();
-        // Core launches a run from promptParams; a curated default effort left
-        // there would be sent beside the chosen variant and could contradict it,
-        // so it is dropped, as it is for an explicit pin.
-        selected.prompt_params.reasoning_effort = None;
-    }
-    // With no `model_routing.variants` entries the selection's explanation is
-    // left unchanged; otherwise the variant lines are appended. The reply's
-    // `variantSelection` names the rule either way.
-    if !groups.is_empty() {
-        selected
-            .explanation
-            .extend(choice.explanation_lines(&selected.route_key));
-    }
-    choice
-}
-
 pub(super) fn remember_provider_identity(
     store: &SharedStore,
     decision_id: &str,
@@ -1912,82 +1888,6 @@ pub(super) fn remember_provider_identity(
         }
     }
     Ok(())
-}
-
-/// Apply the variant overrides to every seated member and runner-up of an
-/// automatic panel, recording each seat's variant and rule beside its entry in
-/// the policy's `seatedVariants`.
-pub(super) fn apply_panel_variant_policy(
-    panel: &mut SelectedPanel,
-    config: &config_overrides::LiveConfig,
-    config_path: &Path,
-    catalog_targets: &std::collections::BTreeMap<String, String>,
-    consumer: select_policy::Consumer,
-    seat_models: &HashMap<String, (String, String)>,
-) {
-    let groups = config.variant_groups();
-    if groups.is_empty() {
-        return;
-    }
-    let catalog = config_overrides::reasoning_catalog_for(config_path);
-    let choose = |route_key: &str,
-                  prompt_params: &mut serde_json::Map<String, serde_json::Value>| {
-        let (provider_id, model_id) = seat_models.get(route_key).cloned().unwrap_or_else(|| {
-            let (provider, model) = route_key.split_once('/').unwrap_or((route_key, ""));
-            (provider.to_string(), model.to_string())
-        });
-        let curated = prompt_params
-            .get("variant")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string);
-        let choice = variant_policy::resolve(
-            groups,
-            catalog_targets,
-            catalog.as_ref(),
-            &variant_policy::VariantRequest {
-                route_key,
-                provider_id: &provider_id,
-                model_id: &model_id,
-                explicit: None,
-                curated: curated.as_deref(),
-                consumer: Some(consumer.id()),
-            },
-        );
-        if choice.variant != curated {
-            match &choice.variant {
-                Some(variant) => {
-                    prompt_params.insert("variant".into(), json!(variant));
-                }
-                None => {
-                    prompt_params.remove("variant");
-                }
-            }
-            prompt_params.remove("reasoningEffort");
-        }
-        choice
-    };
-    let mut choices = Vec::with_capacity(panel.members.len());
-    for member in &mut panel.members {
-        choices.push(choose(&member.route_key, &mut member.prompt_params));
-    }
-    for runner_up in &mut panel.runner_up {
-        choose(&runner_up.route_key, &mut runner_up.prompt_params);
-    }
-    if let Some(policy) = &mut panel.policy {
-        for seated in &mut policy.seated_variants {
-            let Some(choice) = choices.get(seated.slot) else {
-                continue;
-            };
-            seated.reasoning_variant = choice.variant.clone();
-            seated.reasoning_variant_source = Some(
-                serde_json::to_value(choice.source)
-                    .ok()
-                    .and_then(|value| value.as_str().map(str::to_string))
-                    .unwrap_or_default(),
-            );
-            seated.reasoning_variant_fallbacks = choice.fallbacks.clone();
-        }
-    }
 }
 
 pub(super) fn panel_decision_input(
@@ -2070,12 +1970,10 @@ pub(super) fn decision_input_for(
     let quota_signal_json = provenance.map(|value| value.quota_signal_json.clone());
     let policy_revision = provenance.map(|value| value.policy_revision.clone());
     let anchor_version = provenance.map_or(ANCHOR_VERSION, |value| value.anchor_version);
-    let consumer = variant_policy::consumer_group(
-        params
-            .consumer
-            .or_else(|| select_policy::Consumer::from_id(target_agent)),
-    )
-    .map(str::to_string);
+    let consumer = params
+        .consumer
+        .or_else(|| select_policy::Consumer::from_id(target_agent))
+        .map(|consumer| consumer.exclusion_group().to_owned());
     match selected {
         Some(sel) => DecisionInput {
             allowed_account_class: Default::default(),

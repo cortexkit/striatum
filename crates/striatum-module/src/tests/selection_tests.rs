@@ -114,15 +114,16 @@ fn prepared_inputs_price_and_reserve_every_candidate_on_the_held_configuration()
 fn prepare_selection_inputs_preserves_the_catalog_observed_speed_overlay() {
     let rig = Rig::new("selection-input-observed-speed");
     let store = Arc::new(rig.open_store());
-    let mut base = fact("observed-caller", "fixture");
-    base.prompt_defaults = Some(ModelPromptDefaults {
-        variant: Some("high".into()),
-        ..Default::default()
-    });
+    let base = fact("observed-caller", "fixture");
     let mut sibling = base.clone();
     sibling.variant = Some("low".into());
     store.upsert_fact(&base, FactSource::Override).unwrap();
     store.upsert_fact(&sibling, FactSource::Override).unwrap();
+    crate::routing_v1::effort_preview::seed_for_test(
+        rig.dir.join("store.db"),
+        "observed-caller/fixture",
+        crate::routing_v1::effort_preview::test_graded("high", &["low", "high"]),
+    );
 
     let observed_at = now_ms().saturating_sub(10_000) as f64;
     for index in 0..25 {
@@ -399,6 +400,25 @@ async fn n_pick_wire_matches_policy_fixture_and_decision_explanation() {
         .unwrap()
         .replace("$decisionID", decision_id);
     let mut expected: serde_json::Value = serde_json::from_str(&expected).unwrap();
+    // The archived Sol Pro row has no catalog effort facts; the old seed's
+    // xhigh prompt default must no longer appear in the legacy panel reply.
+    let removed_effort_delta = [(
+        "/result/members/0/promptParams",
+        "openai/gpt-5.6-sol-pro",
+        "xhigh",
+    )];
+    for (path, route, old_variant) in removed_effort_delta {
+        assert_eq!(expected["result"]["members"][0]["routeKey"], route);
+        assert_eq!(
+            expected
+                .pointer_mut(path)
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .remove("variant"),
+            Some(json!(old_variant))
+        );
+    }
     for member in expected["result"]["members"].as_array_mut().unwrap() {
         member["harness"] = json!("broca");
     }
@@ -645,7 +665,11 @@ async fn select_panel_serves_full_contract_shape() {
         "wire keys stay camelCase"
     );
     assert_eq!(result["members"][0]["temperature"], 0.2);
-    assert_eq!(result["members"][0]["promptParams"]["variant"], "xhigh");
+    // The seed-only panel fixture has no catalog effort default for its seat.
+    let removed_effort_delta = ["/members/0/promptParams/variant"];
+    for path in removed_effort_delta {
+        assert!(result.pointer(path).is_none(), "{path}: {result}");
+    }
     assert!(result["decisionID"].as_str().is_some());
     assert_eq!(result["policy"]["selection"], "class_policy");
     assert_eq!(result["policy"]["width"], 3);

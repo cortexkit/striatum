@@ -1,5 +1,8 @@
 use super::*;
 
+#[path = "what_if_live_effort_tests.rs"]
+mod live_tests;
+
 const A: &str = "example-provider/model-a";
 const B: &str = "example-provider/model-b";
 const C: &str = "example-subscription/model-c";
@@ -16,7 +19,7 @@ fn serve_efforts(harness: &Harness, customize: impl Fn(&str, &mut Value)) {
             "limit.context":fact.context_window.unwrap_or(100_000.0) as u64,
             "limit.output":fact.max_output_tokens.unwrap_or(8192),
             "model.lineage":fact.model_id,
-            "capability.reasoning_options":[{"type":"effort","values":["low","medium","high","xhigh"]}],
+            "capability.reasoning_options":[{"type":"effort","values":["low","medium","high","xhigh","max"]}],
         });
         customize(&route, &mut row);
         (route, row)
@@ -38,7 +41,7 @@ fn serve_efforts(harness: &Harness, customize: impl Fn(&str, &mut Value)) {
 }
 
 fn profiles() -> Value {
-    json!({"effort_source":"catalog", "workloads":{(fixture::SUMMARY):"code"}, "iqs":[0],
+    json!({"workloads":{(fixture::SUMMARY):"code"}, "iqs":[0],
         "runner_declarations":{"broca":broad_runner_slot()}})
 }
 
@@ -271,32 +274,7 @@ async fn catalog_effort_settings_inherit_and_an_unknown_request_workload_shadows
 }
 
 #[tokio::test]
-async fn catalog_effort_omission_preserves_recorded_reply_bytes() {
-    let _clock = crate::InjectedClock::set(1_800_000_000_000);
-    let (harness, _) = configured().await;
-    prepare_runner_preview(&harness);
-    Connection::open(harness.store_path().with_file_name("history.db")).unwrap().execute_batch(
-        "INSERT INTO account_size_refusal VALUES ('example-provider','old','model-a',17,1,0);
-         INSERT INTO credential_entitlement_fences VALUES ('example-provider','removed','auth_required','old-listing',0);"
-    ).unwrap();
-    let direct = operator(&harness).await;
-    let mut actual = evaluate(&direct, json!({
-        "iqs":[0,5,50,100], "policy_patch":{"models":{(B):{"pin_only":true}}},
-        "runner_declarations":{"broca":broad_runner_slot()}, "head_choices":{"runner_module":"broca"},
-    })).await;
-    // Wall-clock durations aren't routing evidence and vary between requests.
-    actual.as_object_mut().unwrap().remove("snapshot_ms");
-    actual.as_object_mut().unwrap().remove("elapsed_ms");
-    let recorded: Value =
-        serde_json::from_str(include_str!("../../fixtures/s8a3-what-if-base.json")).unwrap();
-    assert_eq!(
-        serde_json::to_string(&actual).unwrap(),
-        serde_json::to_string(&recorded).unwrap()
-    );
-}
-
-#[tokio::test]
-async fn catalog_effort_preview_does_not_change_live_selection_or_head_pin_admission() {
+async fn what_if_workloads_do_not_change_live_selection_or_head_pin_admission() {
     let (harness, consumer) = configured().await;
     serve_efforts(&harness, |route, row| {
         row["quality.graded_effort"] = json!("high");
@@ -307,8 +285,6 @@ async fn catalog_effort_preview_does_not_change_live_selection_or_head_pin_admis
         }
     });
     harness.edit_config(|c| {
-        c["variants"][A] = json!("xhigh");
-        c["variants"][B] = json!("xhigh");
         c["models"][A]["pin_only"] = json!(false);
         for route in [C, D] {
             c["models"][route]["not_for"] = json!([fixture::SUMMARY]);
@@ -321,7 +297,7 @@ async fn catalog_effort_preview_does_not_change_live_selection_or_head_pin_admis
     };
     let before = live(consumer.call("route.select", &request).await);
     assert_eq!(before["model"], "model-a");
-    assert_eq!(before["variant"], "xhigh");
+    assert_eq!(before["variant"], "high");
     let direct = operator(&harness).await;
     let state_before = rows(&harness);
     let mut params = profiles();

@@ -636,6 +636,18 @@ impl Consumer {
             Consumer::Flow => "basal.flow",
         }
     }
+
+    pub(crate) const fn exclusion_group(self) -> &'static str {
+        match self {
+            Consumer::Mason => "mason",
+            Consumer::Sidekick => "sidekick",
+            Consumer::Athena => "athena",
+            Consumer::Lab => "lab",
+            Consumer::Core => "core",
+            Consumer::Codemode => "codemode",
+            Consumer::Flow => "flow",
+        }
+    }
 }
 
 pub(crate) fn explain_dotted_exclusions(
@@ -862,7 +874,7 @@ pub(crate) fn candidate_rejections_priced(
             {
                 Some(format!(
                     "consumer {} requires a priced-per-token account, known metered auth methods and a metered billing plane with a known output price",
-                    crate::variant_policy::consumer_group(consumer).unwrap_or("pay_per_token")
+                    consumer.map_or("pay_per_token", Consumer::exclusion_group)
                 ))
             } else {
                 None

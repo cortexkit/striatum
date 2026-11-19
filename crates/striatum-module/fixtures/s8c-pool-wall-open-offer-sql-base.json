@@ -260,8 +260,16 @@
         }
       ],
       "iq": 0.0,
+      "minimum_unverified_count": 0,
       "pick": {
         "cost_usd": null,
+        "effort_source": "none",
+        "grade": {
+          "elo": 1300.0,
+          "elo_effort": "unrecorded",
+          "eq": 1300.0,
+          "eq_effort": "unrecorded"
+        },
         "route": "catalog-provider/model-a",
         "variant": null
       },
@@ -506,8 +514,16 @@
         }
       ],
       "iq": 30.0,
+      "minimum_unverified_count": 0,
       "pick": {
         "cost_usd": null,
+        "effort_source": "none",
+        "grade": {
+          "elo": 1300.0,
+          "elo_effort": "unrecorded",
+          "eq": 1300.0,
+          "eq_effort": "unrecorded"
+        },
         "route": "catalog-provider/model-a",
         "variant": null
       },
@@ -721,6 +737,7 @@
         }
       ],
       "iq": 100.0,
+      "minimum_unverified_count": 0,
       "pick": null,
       "refusal": {
         "code": "no_route",

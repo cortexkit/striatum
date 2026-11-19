@@ -113,10 +113,9 @@ use select::{
     RouteSelectLogLimiter, RouteSelectTiming, SelectPanelBody,
 };
 use select::{
-    apply_variant_policy, decision_input_for, handle_select_request, policy_sources_line,
-    prepare_selection_inputs, provider_auth_types, remember_provider_identity,
-    warn_ignored_caller_policy_once, DecisionProvenance, PreparedSelectionInputs, SelectParams,
-    SelectionPolicySources,
+    decision_input_for, handle_select_request, policy_sources_line, prepare_selection_inputs,
+    provider_auth_types, remember_provider_identity, warn_ignored_caller_policy_once,
+    DecisionProvenance, PreparedSelectionInputs, SelectParams, SelectionPolicySources,
 };
 
 use broca_credentials::{BrocaCredentials, SharedBrocaCredentials};

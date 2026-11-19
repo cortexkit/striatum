@@ -1,5 +1,4 @@
-//! The catalog effort chain is a call-local input to `route.what_if`, not a
-//! setting that could change a live selection.
+//! Resolve reasoning effort and its matching grade from the catalog snapshot.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -15,12 +14,44 @@ use crate::fusiform_catalog::efforts::{rank, WORKLOADS};
 #[path = "effort_preview_tests.rs"]
 mod tests;
 
-pub(crate) struct Preview {
-    pub models: BTreeMap<String, CatalogEfforts>,
+#[cfg(test)]
+pub(crate) fn test_graded(grade: &str, offered: &[&str]) -> CatalogEfforts {
+    CatalogEfforts {
+        graded: Some(grade.into()),
+        offered: Some(offered.iter().map(|effort| (*effort).into()).collect()),
+        ..Default::default()
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn seed_for_test(path: impl AsRef<std::path::Path>, route: &str, facts: CatalogEfforts) {
+    let (provider, model) = route.split_once('/').unwrap();
+    let db = rusqlite::Connection::open(path).unwrap();
+    let changed = db
+        .execute(
+            "UPDATE model_facts SET fusiform_present = 1, catalog_efforts_json = ?1,
+         reasoning_efforts_json = ?2 WHERE provider_id = ?3 AND model_id = ?4",
+            rusqlite::params![
+                serde_json::to_string(&facts).unwrap(),
+                facts
+                    .offered
+                    .as_ref()
+                    .map(|offered| serde_json::to_string(offered).unwrap()),
+                provider,
+                model
+            ],
+        )
+        .unwrap();
+    assert!(changed > 0, "missing test catalog row {route}");
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct Efforts {
+    pub models: std::sync::Arc<BTreeMap<String, CatalogEfforts>>,
     pub workloads: BTreeMap<String, String>,
 }
 
-impl Preview {
+impl Efforts {
     pub fn workload<'a>(&'a self, consumer: &str, settings: &'a LiveConfig) -> Option<&'a str> {
         self.workloads
             .iter()
@@ -126,9 +157,33 @@ pub(crate) struct Grade {
 }
 
 impl Choice {
+    pub fn source(&self) -> &'static str {
+        match self.effort_source {
+            Source::Pin => "pin",
+            Source::WorkloadDefault => "workload_default",
+            Source::Graded => "graded",
+            Source::VendorDefault => "vendor_default",
+            Source::None => "none",
+            Source::MinimumRaised => "minimum_raised",
+        }
+    }
+
+    pub fn apply_prompt_map(&self, params: &mut serde_json::Map<String, Value>) {
+        params.remove("variant");
+        params.remove("reasoningEffort");
+        if let Some(variant) = &self.variant {
+            params.insert("variant".into(), json!(variant));
+        }
+    }
+
     pub fn apply_scores(&self, fact: &mut ModelFact) {
         fact.scores.elo = self.grade.elo;
         fact.scores.eq = self.grade.eq;
+    }
+
+    pub fn apply_selection(&self, selected: &mut striatum_core::SelectedModelRoute) {
+        selected.prompt_params.variant = self.variant.clone();
+        selected.prompt_params.reasoning_effort = None;
     }
 
     pub fn append_to(&self, output: &mut Value) {

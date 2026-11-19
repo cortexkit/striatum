@@ -20,9 +20,39 @@ fn entry<'a>(root: &'a mut Map<String, Value>, section: &str, key: &str) -> &'a 
         .or_insert_with(|| json!({}))
 }
 
+/// Both the loader and converter refuse overrides instead of silently dropping them.
+pub(crate) fn reject_removed_variants(value: &Value) -> Result<(), String> {
+    let removed = |path| {
+        Err(format!("config_key_removed: {path}; delete this key (reasoning defaults come from the model catalog)"))
+    };
+    if value.get("variants").is_some() {
+        return removed("variants".to_owned());
+    }
+    if value
+        .get("model_routing")
+        .and_then(|section| section.get("variants"))
+        .is_some()
+    {
+        return removed("model_routing.variants".to_owned());
+    }
+    if let Some(consumers) = value
+        .get("consumers")
+        .and_then(serde_json::Value::as_object)
+    {
+        for (name, policy) in consumers {
+            if policy.get("variants").is_some() {
+                let name = serde_json::Value::String(name.clone());
+                return removed(format!("consumers.{name}.variants"));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Convert a parsed document, retaining operational tuning not replaced by the
 /// entity policy. Earlier entity-policy documents lose the retired account flag.
 pub fn convert_value(value: Value) -> Result<Value, String> {
+    reject_removed_variants(&value)?;
     let mut root = value
         .as_object()
         .cloned()
@@ -50,7 +80,6 @@ pub fn convert_value(value: Value) -> Result<Value, String> {
             .any(|key| root.contains_key(*key))
     {
         move_elo_overrides(&mut root)?;
-        remove_empty_consumer_variants(&mut root);
         return Ok(Value::Object(root));
     }
     let data = defaults();
@@ -221,35 +250,6 @@ pub fn convert_value(value: Value) -> Result<Value, String> {
             &key,
         )["not_for"] = json!(not_for);
     }
-    if let Some(groups) = old.remove("variants") {
-        let groups = groups.as_object().ok_or("variants must be an object")?;
-        if let Some(all) = groups.get("all") {
-            root.insert("variants".into(), all.clone());
-        }
-        let ids: Vec<_> = root["consumers"]
-            .as_object()
-            .unwrap()
-            .keys()
-            .cloned()
-            .collect();
-        for id in ids {
-            let mut variants = json!({});
-            if let Some(specific) = groups.get(&id) {
-                variants
-                    .as_object_mut()
-                    .ok_or("variants must be an object")?
-                    .extend(
-                        specific
-                            .as_object()
-                            .ok_or("variants must be an object")?
-                            .clone(),
-                    );
-            }
-            if !variants.as_object().unwrap().is_empty() {
-                entry(&mut root, "consumers", &id)["variants"] = variants;
-            }
-        }
-    }
     if let Some(pins) = old.remove("pins") {
         for (slot, pin) in pins.as_object().ok_or("pins must be an object")? {
             entry(&mut root, "consumers", slot)["pin"] = pin.clone();
@@ -301,23 +301,7 @@ pub fn convert_value(value: Value) -> Result<Value, String> {
     }
     remove_account_model_families(&mut root);
     remove_account_flag(&mut root)?;
-    remove_empty_consumer_variants(&mut root);
     Ok(Value::Object(root))
-}
-
-fn remove_empty_consumer_variants(root: &mut Map<String, Value>) {
-    let Some(consumers) = root.get_mut("consumers").and_then(Value::as_object_mut) else {
-        return;
-    };
-    for consumer in consumers.values_mut().filter_map(Value::as_object_mut) {
-        if consumer
-            .get("variants")
-            .and_then(Value::as_object)
-            .is_some_and(Map::is_empty)
-        {
-            consumer.remove("variants");
-        }
-    }
 }
 
 fn move_elo_overrides(root: &mut Map<String, Value>) -> Result<(), String> {
