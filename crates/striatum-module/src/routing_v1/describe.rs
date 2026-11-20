@@ -10,8 +10,8 @@ use super::{operator_config, Deps};
 
 const ACCOUNT_CONTINUE_RESUME: &str = "account_continue_resume";
 
-// Keep callers from sending explicit needs until every harness currently
-// running workers declares submit_tool, final_text and plans.
+// Keep callers from sending `requirements.harness_capabilities` until every
+// harness currently running workers declares submit_tool, final_text and plans.
 pub(super) const ADVERTISE_SELECT_HARNESS_CAPABILITIES: bool = false;
 
 /// The optional routing/v1 groups this provider serves, listed in
