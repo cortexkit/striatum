@@ -1094,16 +1094,15 @@ async fn prepare_selection(
         .collect();
     if runners.is_empty() {
         return Err(if let Some(harness) = &request.harness {
-            let mut refusal = Refusal::no_route(NoRouteReason::HarnessUnavailable, None);
+            let mut refusal = registry.task_harness_unavailable(&request, &runners);
             refusal.message = format!("no session-starting runner declares harness {harness}");
             refusal
+        } else if request.requirements.harness_capabilities.is_some()
+            || (consumer_policy.runners.is_some() && consumer_policy.runner.is_none())
+        {
+            registry.task_harness_unavailable(&request, &runners)
         } else {
-            let reason = if consumer_policy.runners.is_some() && consumer_policy.runner.is_none() {
-                NoRouteReason::HarnessUnavailable
-            } else {
-                NoRouteReason::NoAvailableModel
-            };
-            Refusal::no_route(reason, None)
+            Refusal::no_route(NoRouteReason::NoAvailableModel, None)
         });
     }
     let runners: Vec<RunnerPolicy> = runners
@@ -1115,7 +1114,7 @@ async fn prepare_selection(
         })
         .collect();
     if runners.is_empty() {
-        return Err(Refusal::no_route(NoRouteReason::HarnessUnavailable, None));
+        return Err(registry.task_harness_unavailable(&request, &runners));
     }
     // Declarations narrow the configured placements before any caller filters.
     let runners: Vec<RunnerPolicy> = runners
@@ -1127,7 +1126,7 @@ async fn prepare_selection(
         })
         .collect();
     if runners.is_empty() && placement.is_some() {
-        return Err(Refusal::no_route(NoRouteReason::HarnessUnavailable, None));
+        return Err(registry.task_harness_unavailable(&request, &runners));
     }
     let runners: Vec<RunnerPolicy> = runners
         .into_iter()
@@ -1150,25 +1149,23 @@ async fn prepare_selection(
         })
         .collect();
     if runners.is_empty() {
-        let mut refusal = Refusal::no_route(NoRouteReason::HarnessUnavailable, None);
+        let mut refusal = registry.task_harness_unavailable(&request, &runners);
         if let Some(harness) = &request.harness {
             refusal.message = format!("no session-starting runner declares harness {harness}");
         }
         return Err(refusal);
     }
-    let runners: Vec<RunnerPolicy> = runners
-        .into_iter()
-        .filter(|runner| {
-            registry
-                .get(runner)
-                .is_some_and(|runner| runner.hosts_task())
-        })
-        .collect();
-    if runners.is_empty() {
-        return Err(Refusal::no_route(NoRouteReason::HarnessUnavailable, None));
+    let hosts_task = |policy: &RunnerPolicy| {
+        registry
+            .get(policy)
+            .is_some_and(|runner| runner.hosts_task(&request.requirements))
+    };
+    if !runners.iter().any(&hosts_task) {
+        return Err(registry.task_harness_unavailable(&request, &runners));
     }
     let runners: Vec<RunnerPolicy> = runners
         .into_iter()
+        .filter(hosts_task)
         .filter(|runner| {
             tags.iter()
                 .all(|tag| runner.tool_capabilities.contains(tag))

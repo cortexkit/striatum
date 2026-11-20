@@ -390,9 +390,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-routing"
-version = "0.7.37"
+version = "0.7.38"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4a6c026e0785f49572168da77481d0e7a6e3590112e9b577070ee749ae4249fc"
+checksum = "b68ad84dee0e6443532fce912004f33b2ebc43accebe8f6f4172cb2650fd9e36"
 dependencies = [
  "cortexkit-role-media",
  "serde",
@@ -401,9 +401,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-routing-conformance"
-version = "0.10.42"
+version = "0.10.43"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1b5fb01039600336ece5ef07d83e45e872469d14fd0d28995d18341bef74b81"
+checksum = "df585a60a6981273989d3ef79f2d0e0ba62e9ff5fbe3158c22b7743b8ba03148"
 dependencies = [
  "async-trait",
  "cortexkit-role-routing",

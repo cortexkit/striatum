@@ -104,16 +104,12 @@ impl RunnerDeclaration {
         if !self.declares_harness_facts() {
             return true;
         }
-        matches!(
-            capability,
-            HarnessCapability::OneOff
-                | HarnessCapability::ForkAnswer
-                | HarnessCapability::OutputCap
-        ) && self
-            .limits_for_harness(Some(harness))
-            .ok()
-            .and_then(|limits| limits.capabilities)
-            .is_some_and(|capabilities| capabilities.contains(capability))
+        capability.is_known()
+            && self
+                .limits_for_harness(Some(harness))
+                .ok()
+                .and_then(|limits| limits.capabilities)
+                .is_some_and(|capabilities| capabilities.contains(capability))
     }
 
     pub(crate) fn harness_excludes(&self, harness: &str, route: &str) -> bool {

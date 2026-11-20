@@ -48,7 +48,11 @@ pub(super) async fn select_panel(
         return replace(request, caller, deps).await;
     }
     super::shapes::settings(params)?;
-    super::shapes::closed(params, "requirements", &["context_window", "modalities"])?;
+    super::shapes::closed(
+        params,
+        "requirements",
+        &["context_window", "modalities", "harness_capabilities"],
+    )?;
     let request = parse_select_panel_request_serving(params, &super::describe::capabilities())?;
     let config = operator_config(deps);
     super::consumers::effective(&config).admit(&request.consumer, caller)?;
@@ -506,17 +510,6 @@ fn seat_select(
         .and_then(Value::as_str)
         .map(str::to_owned);
     select["pin"] = json!(route.pin());
-    // Panel policy, not the consumer's ordinary single-model quality defaults,
-    // has already ranked and admitted this candidate.
-    select["requirements"] = json!({"iq":0});
-    if let Some(requirements) = &request.requirements {
-        if let Some(window) = requirements.context_window {
-            select["requirements"]["context_window"] = json!(window);
-        }
-        if let Some(modalities) = &requirements.modalities {
-            select["requirements"]["modalities"] = json!(modalities);
-        }
-    }
     Ok((select, route))
 }
 

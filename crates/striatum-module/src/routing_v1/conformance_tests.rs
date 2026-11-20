@@ -2053,7 +2053,15 @@ const NOT_APPLICABLE: &[&str] = &[
 // Consumer priority is read for classification. concurrency_full is a refusal
 // reason, not a capability: `route.account_for` serves it only with
 // concurrency enforcement on, and `select` does not serve it yet.
-const PENDING_READERS: &[(&str, &[&str])] = &[];
+const PENDING_READERS: &[(&str, &[&str])] =
+    if super::describe::ADVERTISE_SELECT_HARNESS_CAPABILITIES {
+        &[]
+    } else {
+        &[(
+            cortexkit_role_routing::capabilities::SELECT_HARNESS_CAPABILITIES,
+            &["select_harness_capabilities_matched"],
+        )]
+    };
 const PENDING_REFUSAL_REASONS: &[&str] = &[];
 
 fn assert_no_pending_refusal(reply: &Frame, enforced: impl FnOnce() -> bool) {
@@ -2144,7 +2152,17 @@ async fn routing_v1_conformance_kit_matches_served_checks() {
     let report = run_suite(&subject).await;
     eprintln!("{}", report.render());
     assert_eq!(report.checks.len(), CHECKS.len());
+    let (active_harness_check, inactive_harness_check) =
+        if super::describe::ADVERTISE_SELECT_HARNESS_CAPABILITIES {
+            (
+                "select_harness_capabilities_matched",
+                Some("undeclared_select_harness_capabilities_refused"),
+            )
+        } else {
+            ("undeclared_select_harness_capabilities_refused", None)
+        };
     for check in [
+        active_harness_check,
         "select_pin_origin_enrolled",
         "select_pin_origin_unenrolled",
         "select_pin_origin_unknown",
@@ -2202,6 +2220,7 @@ async fn routing_v1_conformance_kit_matches_served_checks() {
     let expected_not_applicable: Vec<_> = NOT_APPLICABLE
         .iter()
         .copied()
+        .chain(inactive_harness_check)
         .chain(
             PENDING_READERS
                 .iter()
@@ -2211,6 +2230,27 @@ async fn routing_v1_conformance_kit_matches_served_checks() {
     let actual: std::collections::BTreeSet<_> = report.not_applicable().into_iter().collect();
     let expected: std::collections::BTreeSet<_> = expected_not_applicable.into_iter().collect();
     assert_eq!(actual, expected, "{}", report.render());
+}
+
+#[tokio::test]
+async fn routing_v1_explicit_harness_needs_conformance_case() {
+    let subject = KitSubject {
+        observe_blocks: Mutex::new(false),
+        media: Mutex::new(Default::default()),
+        harness: Mutex::new(Harness::new("kit-harness-capabilities")),
+    };
+    let report = super::describe::with_candidate_capabilities(
+        &[cortexkit_role_routing::capabilities::SELECT_HARNESS_CAPABILITIES],
+        run_suite(&subject),
+    )
+    .await;
+    assert_eq!(
+        report.outcome("select_harness_capabilities_matched"),
+        Some(&cortexkit_role_routing_conformance::CheckOutcome::Passed),
+        "{}",
+        report.render()
+    );
+    assert!(report.failing().is_empty(), "{}", report.render());
 }
 
 #[tokio::test]

@@ -1,7 +1,7 @@
 //! `role.describe`: the role, its ops, the configured consumers and the
 //! requirement members this provider reads.
 
-use cortexkit_role_routing::capabilities::SELECT_WORKLOAD;
+use cortexkit_role_routing::capabilities::{SELECT_HARNESS_CAPABILITIES, SELECT_WORKLOAD};
 use cortexkit_role_routing::describe::{ConsumerEntry, RoleDescribe};
 use cortexkit_role_routing::errors::Refusal;
 use serde_json::Value;
@@ -10,11 +10,23 @@ use super::{operator_config, Deps};
 
 const ACCOUNT_CONTINUE_RESUME: &str = "account_continue_resume";
 
+// Keep callers from sending explicit needs until every harness currently
+// running workers declares submit_tool, final_text and plans.
+pub(super) const ADVERTISE_SELECT_HARNESS_CAPABILITIES: bool = false;
+
 /// The optional routing/v1 groups this provider serves, listed in
 /// `role.describe` as `capabilities` and passed to the select and account request
 /// parsers, so declarations and accepted members agree. Harnesses come from
 /// runner declarations.
-pub(super) const CAPABILITIES: &[&str] = &[
+pub(super) const CAPABILITIES: &[&str] = if ADVERTISE_SELECT_HARNESS_CAPABILITIES {
+    ALL_CAPABILITIES
+} else {
+    ALL_CAPABILITIES.split_first().unwrap().1
+};
+
+const ALL_CAPABILITIES: &[&str] = &[
+    // Keep the rollout-gated group first so CAPABILITIES can omit it.
+    SELECT_HARNESS_CAPABILITIES,
     cortexkit_role_routing::capabilities::CONSUMER_DECLARATIONS,
     cortexkit_role_routing::capabilities::CONSUMER_PRIORITY,
     SELECT_WORKLOAD,
@@ -188,7 +200,11 @@ pub(super) fn describe(deps: &Deps<'_>) -> Result<Value, Refusal> {
             cortexkit_role_routing::select::OPTIONAL_REQUIREMENT_FIELDS
                 .iter()
                 .copied()
-                .filter(|field| *field != "workload" || capabilities.contains(&SELECT_WORKLOAD))
+                .filter(|field| match *field {
+                    "workload" => capabilities.contains(&SELECT_WORKLOAD),
+                    "harness_capabilities" => capabilities.contains(&SELECT_HARNESS_CAPABILITIES),
+                    _ => true,
+                })
                 .map(|field| Value::String(field.into())),
         );
         if capabilities.contains(&"select_media") {
