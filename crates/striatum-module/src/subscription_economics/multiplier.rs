@@ -71,6 +71,7 @@ pub(super) enum Update {
     Put(String, Option<Arc<Value>>),
     Delete(String),
     CaughtUp,
+    Reset,
     Other,
 }
 
@@ -211,6 +212,15 @@ impl State {
                 ));
                 true
             }
+            Update::Reset => {
+                // The replacement bucket is a new source; its invalid rows must
+                // not recover values from the deleted bucket.
+                self.entries.clear();
+                self.initial = Some(BTreeMap::new());
+                self.warned.clear();
+                self.generation = self.generation.wrapping_add(1);
+                return true;
+            }
             Update::Other => false,
         };
         if !changed || self.initial.is_some() {
@@ -273,6 +283,14 @@ pub(crate) async fn watch(client: &BusClient) {
     }
 }
 
+fn watch_update(item: cortexkit_bus_client::Result<BucketItem>) -> Result<Update, String> {
+    match item {
+        Ok(item) => Ok(item.into()),
+        Err(cortexkit_bus_client::Error::BucketReset { .. }) => Ok(Update::Reset),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
 async fn session(client: &BusClient) -> Result<(), String> {
     let mut changes = client.connection_changes();
     changes.borrow_and_update();
@@ -310,7 +328,15 @@ async fn session(client: &BusClient) -> Result<(), String> {
                 deadline = None;
             }
             item = watch.next() => {
-                batch.push(item.map_err(|e| e.to_string())?.into());
+                let update = watch_update(item)?;
+                if matches!(update, Update::Reset) {
+                    // Queued updates belong to the deleted bucket, not its replacement.
+                    batch.clear();
+                    publish_batch(vec![update]).await;
+                    deadline = None;
+                    continue;
+                }
+                batch.push(update);
                 if batch.len() == MAX_BATCH {
                     publish_batch(std::mem::take(&mut batch)).await;
                     deadline = None;
@@ -342,6 +368,37 @@ mod tests {
             revision: 1,
             value: serde_json::to_vec(&value).unwrap().into(),
         }
+    }
+
+    #[test]
+    fn multiplier_bucket_reset_rebuilds_without_fallback() {
+        let mut runtime = super::super::Runtime::default();
+        let mut schedule = PollSchedule::default();
+        let now = Instant::now();
+        let a = json!({"quota_provider":"a", "plan":null, "multiplier":2.0});
+        let b = json!({"quota_provider":"b", "plan":null, "multiplier":3.0});
+        let b_new = json!({"quota_provider":"b", "plan":null, "multiplier":7.0});
+        runtime.multipliers.begin();
+        for item in [put("A", a), put("B", b), BucketItem::CaughtUp] {
+            runtime.accept_bucket_batch(vec![watch_update(Ok(item)).unwrap()], 0);
+        }
+        assert_eq!(runtime.multipliers.health()["keys"], json!(["A", "B"]));
+        let reset = cortexkit_bus_client::Error::BucketReset {
+            bucket: "multiplier".into(),
+        };
+        runtime.accept_bucket_batch(vec![watch_update(Err(reset)).unwrap()], 0);
+        assert_eq!(*runtime.report.value(), json!({"latest":[]}));
+        assert!(runtime.multipliers.ready);
+        assert!(schedule.due(runtime.multipliers.ready, now));
+        schedule.completed(now);
+        assert_eq!(schedule.interval(), BACKSTOP);
+        for item in [put("B", b_new.clone()), BucketItem::CaughtUp] {
+            runtime.accept_bucket_batch(vec![watch_update(Ok(item)).unwrap()], 0);
+        }
+        assert_eq!(runtime.multipliers.health()["keys"], json!(["B"]));
+        assert_eq!(*runtime.report.value(), json!({"latest":[b_new]}));
+        assert!(runtime.multipliers.ready);
+        assert!(!schedule.due(runtime.multipliers.ready, now + FALLBACK));
     }
 
     #[test]
