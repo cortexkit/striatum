@@ -10,22 +10,11 @@ use super::{operator_config, Deps};
 
 const ACCOUNT_CONTINUE_RESUME: &str = "account_continue_resume";
 
-// Keep callers from sending `requirements.harness_capabilities` until every
-// harness currently running workers declares submit_tool, final_text and plans.
-pub(super) const ADVERTISE_SELECT_HARNESS_CAPABILITIES: bool = false;
-
 /// The optional routing/v1 groups this provider serves, listed in
 /// `role.describe` as `capabilities` and passed to the select and account request
 /// parsers, so declarations and accepted members agree. Harnesses come from
 /// runner declarations.
-pub(super) const CAPABILITIES: &[&str] = if ADVERTISE_SELECT_HARNESS_CAPABILITIES {
-    ALL_CAPABILITIES
-} else {
-    ALL_CAPABILITIES.split_first().unwrap().1
-};
-
-const ALL_CAPABILITIES: &[&str] = &[
-    // Keep the rollout-gated group first so CAPABILITIES can omit it.
+pub(super) const CAPABILITIES: &[&str] = &[
     SELECT_HARNESS_CAPABILITIES,
     cortexkit_role_routing::capabilities::CONSUMER_DECLARATIONS,
     cortexkit_role_routing::capabilities::CONSUMER_PRIORITY,

@@ -182,10 +182,7 @@ async fn explicit_harness_needs_apply_to_each_panel_seat() {
 async fn explicit_harness_needs_advertisement_and_parsing_follow_the_group() {
     let (_harness, route) = configured().await;
     let production = route.call("role.describe", &json!({})).await;
-    assert_advertised(
-        &production.1["result"],
-        describe::ADVERTISE_SELECT_HARNESS_CAPABILITIES,
-    );
+    assert_advertised(&production.1["result"], true);
     describe::without_capability(GROUP, async {
         let off = route.call("role.describe", &json!({})).await;
         assert_advertised(&off.1["result"], false);
