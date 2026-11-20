@@ -255,12 +255,10 @@ pub struct TaskRoutePricing {
     pub value_multiplier: f64,
     pub value_source: String,
     pub pressure: f64,
-    /// Subscription pacing inputs needed to recompute this price. Metered
-    /// routes leave all three absent.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pacing: Option<crate::subscription::PacingRule>,
+    /// Weekly pressure for subscription pricing, absent on metered routes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub weekly_pressure: Option<f64>,
+    /// The highest pressure from a short-window pool with under 25% left.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub short_window_pressure: Option<f64>,
     pub final_cost_usd: Option<f64>,
@@ -273,11 +271,10 @@ impl TaskRoutePricing {
     fn explanation_json(&self) -> String {
         // Keep the established explanation-line JSON shape stable by leaving
         // the pacing breakdown to the decision's structured pricing objects.
-        if self.pacing.is_none() {
+        if self.weekly_pressure.is_none() && self.short_window_pressure.is_none() {
             return serde_json::to_string(self).expect("task pricing contains finite numbers");
         }
         let mut legacy = self.clone();
-        legacy.pacing = None;
         legacy.weekly_pressure = None;
         legacy.short_window_pressure = None;
         serde_json::to_string(&legacy).expect("task pricing contains finite numbers")
@@ -1502,7 +1499,6 @@ fn compute_profile_objective(
         value_multiplier,
         value_source,
         pressure,
-        pacing: objective.subscription_pricing.as_ref().map(|p| p.pacing),
         weekly_pressure: objective
             .subscription_pricing
             .as_ref()
@@ -1581,7 +1577,6 @@ fn record_cold_start_pricing(
             "cold-start effective rate".to_string()
         },
         pressure,
-        pacing: objective.subscription_pricing.as_ref().map(|p| p.pacing),
         weekly_pressure: objective
             .subscription_pricing
             .as_ref()

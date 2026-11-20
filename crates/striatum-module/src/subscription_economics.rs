@@ -21,8 +21,8 @@ use striatum_core::{
     model_facts::{make_capacity_key, RoutePricing},
     model_router::ModelRouteStateSnapshot,
     subscription::{
-        MeasuredValue, PacingRule, PlanMeasurements, QuotaAccount, QuotaConstraint,
-        SubscriptionPlan, SubscriptionPool, DEFAULT_PLAN_FEE_USD,
+        MeasuredValue, PlanMeasurements, QuotaAccount, QuotaConstraint, SubscriptionPlan,
+        SubscriptionPool, DEFAULT_PLAN_FEE_USD,
     },
     ModelFact,
 };
@@ -772,37 +772,13 @@ pub(crate) fn overlay(
     facts: &[ModelFact],
     now: i64,
     pricing: &RoutePricing,
-    pacing: PacingRule,
 ) {
     let economics = cache()
         .lock()
         .map(|c| Arc::clone(&c.economics))
         .unwrap_or_default();
     let pools = economics.pools.clone();
-    overlay_pools(pools, snapshot, facts, now, pricing, pacing);
-}
-
-pub(crate) fn preview_pools(
-    state: &AccountQuotaState,
-    quota_now: i64,
-    value_now: i64,
-) -> HashMap<String, SubscriptionPool> {
-    let (report, inputs) = cache()
-        .lock()
-        .map(|cache| (cache.report.clone(), cache.inputs.clone()))
-        .unwrap_or_default();
-    let empty = BTreeMap::new();
-    let (prices, credentials) = inputs.as_deref().map_or((&Value::Null, &empty), |inputs| {
-        (&inputs.prices, &inputs.credentials)
-    });
-    // Rebuild quota budgets from the override, not from the live economics
-    // cache. Current plan mappings and value evidence are not quota readings.
-    let mut pools =
-        build_with_credentials(state, &report.value(), prices, quota_now, credentials).pools;
-    for pool in pools.values_mut() {
-        pool.value_now_ms = Some(value_now);
-    }
-    pools
+    overlay_pools(pools, snapshot, facts, now, pricing);
 }
 
 #[cfg(test)]
@@ -844,13 +820,12 @@ pub(crate) fn test_pools(pools: HashMap<String, SubscriptionPool>) -> impl Drop 
 /// pool whose provider has no fact here: `set_banked_allowance` compares pools
 /// with each other, so one pool on a reserve read at an earlier refresh would
 /// change whether the others may spend banked resets.
-pub(crate) fn overlay_pools(
+fn overlay_pools(
     mut pools: HashMap<String, SubscriptionPool>,
     snapshot: &mut ModelRouteStateSnapshot,
     facts: &[ModelFact],
     now: i64,
     pricing: &RoutePricing,
-    pacing: PacingRule,
 ) {
     for fact in facts {
         let pool = pools
@@ -866,7 +841,6 @@ pub(crate) fn overlay_pools(
     for (provider, pool) in pools.iter_mut() {
         pool.keep_free_percent = pricing.keep_free_percent(provider);
         pool.banked_as_capacity = pricing.banked_resets_capacity.contains(provider);
-        pool.pacing = pacing;
         let elapsed = (now - pool.now_ms).max(0) as f64 / 3_600_000.0;
         for plan in &mut pool.plans {
             if elapsed > 0.25 {
@@ -1640,14 +1614,7 @@ mod tests {
         }))
         .unwrap();
         fact.subscription_multiplier = operator;
-        overlay_pools(
-            pools,
-            &mut snapshot,
-            &[fact.clone()],
-            now,
-            &pricing,
-            PacingRule::Max,
-        );
+        overlay_pools(pools, &mut snapshot, &[fact.clone()], now, &pricing);
         select_model_route(SelectModelRouteInput {
             target_agent: "alfonso".into(),
             target_is_head: true,
@@ -1984,7 +1951,6 @@ mod tests {
                 &facts,
                 NOW,
                 &pricing,
-                PacingRule::Max,
             );
             ["anthropic/claude-opus-5", "anthropic/claude-fable-5"].map(|key| {
                 let pool = snapshot.by_capacity[key]
@@ -2335,7 +2301,6 @@ mod tests {
                     &[fact.clone()],
                     now,
                     &pricing,
-                    PacingRule::Max,
                 );
                 let selected = select_model_route(SelectModelRouteInput {
                     target_agent: "mason".into(),
@@ -2633,7 +2598,7 @@ mod tests {
         .unwrap()];
         let mut snapshot = ModelRouteStateSnapshot::default();
 
-        overlay_pools(pools, &mut snapshot, &facts, NOW, &pricing, PacingRule::Max);
+        overlay_pools(pools, &mut snapshot, &facts, NOW, &pricing);
 
         // Under the selection's reserve anthropic has no free headroom, so the
         // nearly spent openai plan may fall back on its banked resets. Judged on

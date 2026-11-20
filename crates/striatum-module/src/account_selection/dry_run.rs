@@ -10,7 +10,6 @@ use striatum_store::DryRunRepair;
 
 pub(crate) struct Sweep {
     pub(crate) initial: Arc<AccountState>,
-    pub(crate) quota_override: Option<Box<crate::routing_v1::quota_override::QuotaOverride>>,
     state: Mutex<AccountState>,
     #[cfg(test)]
     pub(super) oracle: Option<Arc<SqliteRouteStateStore>>,
@@ -22,7 +21,6 @@ impl Sweep {
         Ok(Self {
             state: Mutex::new((*initial).clone()),
             initial,
-            quota_override: None,
             #[cfg(test)]
             oracle: if std::env::var_os("STRIATUM_SWEEP_SQL_ORACLE").is_some() {
                 Some(Arc::new(store.private_account_copy_for_test(

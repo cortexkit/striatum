@@ -201,7 +201,8 @@
             "tokens": null,
             "unpricedDimensions": [],
             "valueMultiplier": 1.0,
-            "valueSource": "unmeasured"
+            "valueSource": "unmeasured",
+            "weeklyPressure": 1.0
           }
         }
       ],
@@ -519,7 +520,8 @@
             "tokens": null,
             "unpricedDimensions": [],
             "valueMultiplier": 1.0,
-            "valueSource": "unmeasured"
+            "valueSource": "unmeasured",
+            "weeklyPressure": 1.0
           }
         }
       ],
@@ -837,7 +839,8 @@
             "tokens": null,
             "unpricedDimensions": [],
             "valueMultiplier": 1.0,
-            "valueSource": "unmeasured"
+            "valueSource": "unmeasured",
+            "weeklyPressure": 1.0
           }
         }
       ],
@@ -1155,7 +1158,8 @@
             "tokens": null,
             "unpricedDimensions": [],
             "valueMultiplier": 1.0,
-            "valueSource": "unmeasured"
+            "valueSource": "unmeasured",
+            "weeklyPressure": 1.0
           }
         }
       ],

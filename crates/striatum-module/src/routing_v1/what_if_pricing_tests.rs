@@ -297,18 +297,9 @@ fn kimi_lookup(
     lookup
 }
 
-async fn kimi_sweep(
-    operator: &Route,
-    consumer: &str,
-    fixture: &Value,
-    iqs: Vec<f64>,
-    pacing: Option<&str>,
-) -> Value {
+async fn kimi_sweep(operator: &Route, consumer: &str, fixture: &Value, iqs: Vec<f64>) -> Value {
     let lookup = kimi_lookup(consumer, fixture);
-    let mut request = json!({"consumer":consumer,"iqs":iqs});
-    if let Some(pacing) = pacing {
-        request["pacing"] = json!(pacing);
-    }
+    let request = json!({"consumer":consumer,"iqs":iqs});
     operator
         .what_if_with_profiles(&request, &lookup)
         .await
@@ -387,7 +378,6 @@ async fn kimi_join_mason_what_if_uses_last_eligible_multiplier() {
         "prefrontal.mason",
         &fixture,
         (50..=70).map(f64::from).collect(),
-        None,
     )
     .await;
     if std::env::var_os("STRIATUM_KIMI_SWEEP").is_some() {
@@ -470,129 +460,55 @@ fn kimi_join_ignores_another_credential() {
 }
 
 #[tokio::test]
-async fn quota_override_matches_historical_kimi_and_leaves_live_select_unchanged() {
-    let wall = KIMI_NOW + 10 * 60_000;
-    let _clock = crate::InjectedClock::set(wall as u64);
+async fn live_route_select_prices_kimis_expiring_week() {
+    let now = 1_795_104_000_000; // 2026-11-19 16:00 UTC
+    let _clock = crate::InjectedClock::set(now as u64);
     let (harness, scenario, fixture) = setup(false);
     let listing = install_key_only_kimi(&harness);
-    let mut live_state = kimi_state(&listing, false);
-    let mut live_reading = kimi_reading();
-    live_reading["usage"]["secondary"]["usedPercent"] = json!(50.0);
+    let mut state = kimi_state(&listing, false);
+    let mut reading = kimi_reading();
+    reading["fetchedAt"] = json!(crate::account_selection::rfc3339(now));
     crate::account_quota::apply_usage_reply(
-        &mut live_state,
-        &serde_json::to_vec(&json!({"result":[live_reading]})).unwrap(),
-        wall,
+        &mut state,
+        &serde_json::to_vec(&json!({"result":[reading]})).unwrap(),
+        now,
     )
     .unwrap();
-    let mut live_pools = scenario_pools(&fixture, false);
-    live_pools.extend(crate::subscription_economics::test_account_pools(
-        &live_state,
+    let mut pools = scenario_pools(&fixture, false);
+    pools.extend(crate::subscription_economics::test_account_pools(
+        &state,
         &Value::Null,
-        wall,
+        now,
     ));
     drop(scenario);
-    let _pools = crate::subscription_economics::test_pools(live_pools);
-    publish_kimi_state(live_state);
-    let operator = operator(&harness).await;
-    let consumer = harness.bind(reserved(fixture::CONSUMER), None).await;
-    let lookup = kimi_lookup("prefrontal.mason", &fixture);
-    let live_request = json!({"consumer":"prefrontal.mason","requirements":{"iq":50},"pin":KIMI_ROUTE,"detail":true});
-    let live_before = consumer
-        .select_with_profiles(&live_request, &lookup)
-        .await
-        .unwrap();
-    let before = kimi_sweep(&operator, "prefrontal.mason", &fixture, vec![50.0], None).await;
-    let before_rows = rows(&harness);
-    let historical = kimi_state(&listing, true);
-    let mut pools =
-        crate::subscription_economics::test_account_pools(&historical, &Value::Null, KIMI_NOW);
-    let pool = pools.get_mut(KIMI_PROVIDER).unwrap();
-    for (name, pacing) in [
-        ("max", striatum_core::subscription::PacingRule::Max),
-        ("expiry", striatum_core::subscription::PacingRule::Expiry),
-    ] {
-        pool.pacing = pacing;
-        let answer = operator
-            .what_if_with_profiles(
-                &json!({
-                    "consumer":"prefrontal.mason", "iqs":[50], "pacing":name,
-                    "quota_override":[kimi_reading()], "quota_override_at_ms":KIMI_NOW
-                }),
-                &lookup,
-            )
-            .await
-            .unwrap();
-        let expected = pool.price(1.0, None, 0.0, false).unwrap();
-        let actual = route_task_pricing(&answer, 0, KIMI_ROUTE);
-        assert_eq!(actual["pacing"], name);
-        assert_eq!(actual["pressure"], expected.plan_pressure, "{actual}");
-        assert_ne!(
-            actual["pressure"],
-            route_task_pricing(&before, 0, KIMI_ROUTE)["pressure"]
-        );
-        assert_eq!(actual["weeklyPressure"], expected.weekly_pressure);
-        assert_eq!(
-            actual.get("shortWindowPressure").and_then(Value::as_f64),
-            expected.short_window_pressure
-        );
-    }
-    assert_eq!(before_rows, rows(&harness));
-    let after = kimi_sweep(&operator, "prefrontal.mason", &fixture, vec![50.0], None).await;
-    assert_eq!(
-        serde_json::to_vec(&before["results"]).unwrap(),
-        serde_json::to_vec(&after["results"]).unwrap()
-    );
-    assert!(route_task_pricing(&after, 0, KIMI_ROUTE)
-        .get("pacing")
-        .is_none());
-    let live_after = consumer
-        .select_with_profiles(&live_request, &lookup)
-        .await
-        .unwrap();
-    assert_eq!(live_before["route"], live_after["route"]);
-    assert_eq!(
-        live_before["detail"]["score"],
-        live_after["detail"]["score"]
-    );
-}
+    let _pools = crate::subscription_economics::test_pools(pools);
+    publish_kimi_state(state);
 
-#[tokio::test]
-async fn quota_override_expires_full_banked_metadata_at_the_quota_clock() {
-    let _clock = crate::InjectedClock::set((KIMI_NOW + 10 * 60_000) as u64);
-    let (harness, _pools, fixture) = setup(false);
-    let listing = install_key_only_kimi(&harness);
-    publish_kimi_state(kimi_state(&listing, false));
-    let operator = operator(&harness).await;
-    let lookup = kimi_lookup("prefrontal.mason", &fixture);
-    let mut reading = kimi_reading();
-    reading["savedResets"] = json!({"availableCount":2,"kinds":[{"kind":"full","availableCount":2,
-        "soonestExpiresAt":crate::account_selection::rfc3339(KIMI_NOW + 60_000)}]});
-    for (at, share) in [
-        (KIMI_NOW, 293.79 / 300.0),
-        (KIMI_NOW + 60_000, 93.79 / 100.0),
-    ] {
-        let answer = operator
-            .what_if_with_profiles(
-                &json!({
-                    "consumer":"prefrontal.mason", "iqs":[50], "pacing":"expiry",
-                    "quota_override":[reading], "quota_override_at_ms":at,
-                    "pricing_patch":{"banked_resets":{(KIMI_PROVIDER):"capacity"}},
-                }),
-                &lookup,
-            )
-            .await
-            .unwrap();
-        let usage = &reading["usage"]["primary"]["resetsAt"];
-        let reset = crate::account_quota::parse_rfc3339_ms(usage.as_str().unwrap()).unwrap();
-        let expected = striatum_core::subscription::plan_pressure(
-            (reset - at) as f64 / (10_080.0 * 60_000.0),
-            share,
-        );
-        assert!(
-            (route_pressure(&answer, 0, KIMI_ROUTE) - expected).abs() < 1e-12,
-            "{answer}"
-        );
-    }
+    let consumer = harness.bind(reserved(fixture::CONSUMER), None).await;
+    let (frame, reply) = consumer
+        .call(
+            "route.select",
+            &json!({"consumer":"prefrontal.mason","requirements":{"iq":50},"pin":KIMI_ROUTE,"detail":true}),
+        )
+        .await;
+    assert_eq!(frame, FrameType::Response, "{reply}");
+    let selection = &reply["result"];
+    assert_eq!(selection["route"]["provider"], KIMI_PROVIDER);
+    assert_eq!(selection["route"]["model"], "k3.1-pro");
+    let price = &selection["detail"]["score"]["objective"]["taskPricing"];
+    let pressure = price["pressure"].as_f64().expect("live task pricing");
+    assert!(
+        (pressure - 0.015).abs() < 0.001,
+        "Kimi pressure: {pressure}"
+    );
+    assert_eq!(price["pressure"], price["weeklyPressure"]);
+    assert!(price.get("shortWindowPressure").is_none());
+    assert!(price.get("pacing").is_none());
+    let stored = super::super::profile_tests::task_pricing(
+        &harness,
+        selection["decision_id"].as_str().unwrap(),
+    );
+    assert_eq!(stored, *price);
 }
 
 #[tokio::test]
@@ -607,7 +523,7 @@ async fn credential_ref_kimi_reading_drives_mason_and_effort_preview_sweeps() {
     for consumer in ["prefrontal.mason", "prefrontal.sidekick", "basal.codemode"] {
         before.insert(
             consumer,
-            kimi_sweep(&operator, consumer, &fixture, levels.clone(), None).await,
+            kimi_sweep(&operator, consumer, &fixture, levels.clone()).await,
         );
     }
     drop(before_pools);
@@ -635,10 +551,13 @@ async fn credential_ref_kimi_reading_drives_mason_and_effort_preview_sweeps() {
     let mut changes = Vec::new();
     let mut sweep = Vec::new();
     for (consumer, before) in before {
-        let after = kimi_sweep(&operator, consumer, &fixture, levels.clone(), None).await;
+        let after = kimi_sweep(&operator, consumer, &fixture, levels.clone()).await;
         for (index, level) in levels.iter().enumerate() {
             assert_eq!(route_pressure(&before, index, KIMI_ROUTE), 1.0);
             let pressure = route_pressure(&after, index, KIMI_ROUTE);
+            let pricing = route_task_pricing(&after, index, KIMI_ROUTE);
+            assert_eq!(pricing["pressure"], pricing["weeklyPressure"]);
+            assert!(pricing.get("shortWindowPressure").is_none());
             assert!(
                 pressure > 0.0 && pressure < 1.0,
                 "{consumer} IQ{level}: {pressure}"
@@ -661,101 +580,6 @@ async fn credential_ref_kimi_reading_drives_mason_and_effort_preview_sweeps() {
             json!({"rows":sweep,"changes":changes})
         );
     }
-}
-
-#[tokio::test]
-async fn expiry_pacing_preview_is_call_local_and_preserves_default_pricing_shape() {
-    let _clock = crate::InjectedClock::set(KIMI_NOW as u64);
-    let (harness, before_pools, fixture) = setup(false);
-    let listing = install_key_only_kimi(&harness);
-    let operator = operator(&harness).await;
-    let state = kimi_state(&listing, true);
-    let kimi_pool =
-        crate::subscription_economics::test_account_pools(&state, &json!({"prices":[]}), KIMI_NOW);
-    drop(before_pools);
-    let mut pools = scenario_pools(&fixture, false);
-    pools.extend(kimi_pool);
-    let _pools = crate::subscription_economics::test_pools(pools);
-    publish_kimi_state(state);
-
-    let control = kimi_sweep(&operator, "prefrontal.mason", &fixture, vec![50.0], None).await;
-    let repeated = kimi_sweep(&operator, "prefrontal.mason", &fixture, vec![50.0], None).await;
-    assert_eq!(
-        serde_json::to_vec(&control["results"]).unwrap(),
-        serde_json::to_vec(&repeated["results"]).unwrap()
-    );
-    for candidate in control["results"][0]["adequate"].as_array().unwrap() {
-        let pricing = candidate["task_pricing"].as_object().unwrap();
-        assert_eq!(
-            pricing.len(),
-            11,
-            "legacy task pricing gained a field: {pricing:?}"
-        );
-        assert!(!pricing.contains_key("pacing"));
-        assert!(!pricing.contains_key("weeklyPressure"));
-        assert!(!pricing.contains_key("shortWindowPressure"));
-    }
-
-    let preview = kimi_sweep(
-        &operator,
-        "prefrontal.mason",
-        &fixture,
-        vec![50.0],
-        Some("expiry"),
-    )
-    .await;
-    let control_price = route_task_pricing(&control, 0, KIMI_ROUTE);
-    let preview_price = route_task_pricing(&preview, 0, KIMI_ROUTE);
-    assert_eq!(preview_price["pacing"], "expiry");
-    assert_eq!(preview_price["weeklyPressure"], preview_price["pressure"]);
-    assert!(preview_price.get("shortWindowPressure").is_none());
-    assert!(
-        preview_price["pressure"].as_f64().unwrap() < control_price["pressure"].as_f64().unwrap()
-    );
-
-    let live_route = harness.bind(reserved(fixture::CONSUMER), None).await;
-    let lookup = kimi_lookup("prefrontal.mason", &fixture);
-    let live = live_route
-        .select_with_profiles(
-            &json!({"consumer":"prefrontal.mason","requirements":{"iq":50},"pin":KIMI_ROUTE,"detail":true}),
-            &lookup,
-        )
-        .await
-        .unwrap();
-    let live_price = &live["detail"]["score"]["objective"]["taskPricing"];
-    assert_eq!(live_price["pressure"], control_price["pressure"]);
-    assert_eq!(live_price["pacing"], "max");
-    assert_eq!(
-        live_price["weeklyPressure"],
-        preview_price["weeklyPressure"]
-    );
-    assert_eq!(live_price["shortWindowPressure"], control_price["pressure"]);
-    let stored =
-        super::super::profile_tests::task_pricing(&harness, live["decision_id"].as_str().unwrap());
-    assert_eq!(
-        stored, *live_price,
-        "the decision must retain its pacing inputs"
-    );
-    let connection = rusqlite::Connection::open(harness.store_path()).unwrap();
-    let explanation: String = connection
-        .query_row(
-            "SELECT explanation_json FROM model_route_decisions WHERE id = ?1",
-            [live["decision_id"].as_str().unwrap()],
-            |row| row.get(0),
-        )
-        .unwrap();
-    let explanation: Value = serde_json::from_str(&explanation).unwrap();
-    let pricing_line = explanation
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter_map(Value::as_str)
-        .find(|line| line.contains("task pricing"))
-        .unwrap();
-    assert!(pricing_line.contains("\"pressure\""));
-    assert!(!pricing_line.contains("\"pacing\""));
-    assert!(!pricing_line.contains("\"weeklyPressure\""));
-    assert!(!pricing_line.contains("\"shortWindowPressure\""));
 }
 
 #[tokio::test]

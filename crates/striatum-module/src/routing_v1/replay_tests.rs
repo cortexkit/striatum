@@ -675,12 +675,11 @@ fn project_additive_pricing_members(value: &mut Value) {
 }
 
 fn remove_additive_pricing_members(object: &mut serde_json::Map<String, Value>) {
-    // Frozen decisions predate the pacing breakdown. Dedicated selection
-    // previews and decision tests check those exact values; leave every other
-    // member in this whole-recording comparison.
+    // Frozen decisions predate the two pressure inputs. Keep all other
+    // pricing members in the whole-recording comparison.
     for field in ["taskPricing", "subscriptionPricing"] {
         if let Some(pricing) = object.get_mut(field).and_then(Value::as_object_mut) {
-            for added in ["pacing", "weeklyPressure", "shortWindowPressure"] {
+            for added in ["weeklyPressure", "shortWindowPressure"] {
                 pricing.remove(added);
             }
         }
@@ -688,11 +687,11 @@ fn remove_additive_pricing_members(object: &mut serde_json::Map<String, Value>) 
 }
 
 #[test]
-fn additive_pricing_projection_accepts_only_the_three_pacing_members() {
+fn additive_pricing_projection_ignores_only_the_two_pressure_inputs() {
     let observed = json!({"objective":{
-        "taskPricing":{"pressure":1.0,"pacing":"max","weeklyPressure":1.0,
+        "taskPricing":{"pressure":1.0,"weeklyPressure":1.0,
             "shortWindowPressure":0.4,"finalCostUsd":4.0},
-        "subscriptionPricing":{"planPressure":1.0,"pacing":"max","weeklyPressure":1.0,
+        "subscriptionPricing":{"planPressure":1.0,"weeklyPressure":1.0,
             "shortWindowPressure":0.4,"keepFreePercent":0.0}
     }});
     let expected = json!({"objective":{
