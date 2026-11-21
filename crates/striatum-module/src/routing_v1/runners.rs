@@ -79,7 +79,8 @@ pub(crate) fn can_offer_account(
     row: &cortexkit_claustrum_client::ListedCredential,
 ) -> bool {
     // Broca's subscription candidates require a vault provider account id;
-    // API-key candidates instead fall back to the credential id. Insula's
+    // API-key and company-gateway candidates instead fall back to the
+    // credential id, because Broca offers each key as its own account. Insula's
     // credentialRef join cannot supply metadata to Broca's separate listing.
     // Replace the module-specific rule with a runner declaration capability
     // such as candidates_require_provider_account when the contract exposes it.
@@ -87,7 +88,7 @@ pub(crate) fn can_offer_account(
     // until the declaration can advertise that candidate requirement.
     module != crate::legacy_wire::BROCA
         || !follows_account_choice
-        || row.auth_method.as_deref() == Some("apikey")
+        || matches!(row.auth_method.as_deref(), Some("apikey" | "gateway"))
         || row.account_id.is_some()
 }
 

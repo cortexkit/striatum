@@ -61,6 +61,37 @@ fn gateway_is_not_an_implicit_fallback_for_an_exhausted_subscription() {
     }
 }
 
+/// Broca offers a gateway key with its credential id as the account id, the
+/// same as a paid API key, so a gateway login without a separate vault
+/// account id must still reach Broca. A sign-in still needs one.
+#[test]
+fn broca_offers_gateway_keys_without_a_vault_account_id() {
+    let row = |auth: &str| ListedCredential {
+        id: format!("{auth}:anthropic-gw-acme"),
+        state: "active".into(),
+        provider_ids: vec!["anthropic-gw-acme".into()],
+        credential_type: "apikey".into(),
+        auth_method: Some(auth.into()),
+        ..Default::default()
+    };
+    let broca = crate::legacy_wire::BROCA;
+    assert!(super::runners::can_offer_account(
+        broca,
+        true,
+        &row("gateway")
+    ));
+    assert!(super::runners::can_offer_account(
+        broca,
+        true,
+        &row("apikey")
+    ));
+    assert!(!super::runners::can_offer_account(
+        broca,
+        true,
+        &row("oauth")
+    ));
+}
+
 #[test]
 fn explicit_metered_account_class_accepts_gateways_but_not_subscriptions() {
     let facts = crate::tests::fact("anthropic", "claude");
