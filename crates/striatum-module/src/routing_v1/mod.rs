@@ -295,25 +295,26 @@ async fn scoped_settings(
     ),
     Refusal,
 > {
-    let project = caller.stamped_project();
+    let stamped_project = caller.stamped_project();
     if let Some(settings) = settings {
-        settings.check_project_stamp(project)?;
+        settings.check_project_stamp(stamped_project)?;
     }
-    let Some(project) = project else {
+    let tier_project = settings.and_then(|settings| settings.project_id.as_deref());
+    let Some(project) = stamped_project.or(tier_project) else {
         return Ok((crate::tier_settings::Layers::new(None, None), None));
     };
     let enrolled = runners::enrollment::enrolled(
         &config.v1_runners(),
         &*deps.broca_credentials.lock().map_err(store_refusal)?,
     );
-    let (layers, status) =
+    let (mut layers, status) =
         crate::project_settings::layers(project, deps.routing_config_path, &enrolled).await;
-    // Tiers are a caller-visible wire opt-in. Runner placement is operator
-    // policy keyed by the daemon's scope even when the caller omits settings.
-    let tier_status = settings
-        .and_then(|settings| settings.project_id.as_ref())
-        .map(|_| status);
-    Ok((layers, tier_status))
+    // The wire contract lets an unscoped caller opt into tier settings, but
+    // runner placement is operator policy keyed only by the daemon's stamp.
+    if stamped_project.is_none() {
+        layers.retain_tiers_only();
+    }
+    Ok((layers, tier_project.map(|_| status)))
 }
 
 /// Answer one v1 request on its route and send the reply frame.

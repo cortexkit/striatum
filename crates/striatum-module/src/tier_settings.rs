@@ -399,7 +399,7 @@ pub(crate) fn at_level(
 
 pub(crate) struct Layers {
     documents: Vec<LoadedDocument>,
-    enrolled: Vec<RunnerPolicy>,
+    enrolled: Option<Vec<RunnerPolicy>>,
 }
 
 impl Layers {
@@ -442,7 +442,7 @@ impl Layers {
         Ok((
             Self {
                 documents,
-                enrolled: enrolled.to_vec(),
+                enrolled: Some(enrolled.to_vec()),
             },
             applied,
         ))
@@ -466,11 +466,16 @@ impl Layers {
                     }
                 })
                 .collect(),
-            enrolled: Vec::new(),
+            enrolled: None,
         }
     }
 
+    pub(crate) fn retain_tiers_only(&mut self) {
+        self.enrolled = None;
+    }
+
     pub(crate) fn runners(&self, consumer: &str) -> Option<Vec<RunnerPolicy>> {
+        let enrolled = self.enrolled.as_deref()?;
         self.documents
             .iter()
             .filter(|layer| layer.present)
@@ -491,7 +496,7 @@ impl Layers {
                 Some(
                     choices
                         .iter()
-                        .filter_map(|choice| choice.narrow(&self.enrolled))
+                        .filter_map(|choice| choice.narrow(enrolled))
                         .collect(),
                 )
             })

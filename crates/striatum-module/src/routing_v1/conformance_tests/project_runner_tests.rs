@@ -108,6 +108,12 @@ async fn mason_uses_project_harness_order_and_other_scopes_keep_broca() {
             let answer = result(caller.call("route.select", &params).await);
             assert_eq!(answer["runner"]["module"], "broca");
         }
+        let unscoped = harness.bind(reserved(fixture::CONSUMER), None).await;
+        let mut tiers_only = params.clone();
+        tiers_only["settings"] = json!({"project_id":ID});
+        let answer = result(unscoped.call("route.select", &tiers_only).await);
+        assert_eq!(answer["project_settings"], "applied");
+        assert_eq!(answer["runner"]["module"], "broca");
     }
 }
 

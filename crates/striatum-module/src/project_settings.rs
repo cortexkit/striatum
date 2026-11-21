@@ -386,8 +386,8 @@ pub(crate) fn initialize(connection: &Path, bind_root: &Path) {
 }
 
 /// Resolve a settings project id to file layers and `applied`, `none` or
-/// `unresolved`. The project id must come from the caller's daemon stamp, not
-/// the request body. The config path
+/// `unresolved`. Only a daemon-stamped project id may supply runner overrides;
+/// unscoped tier lookups discard them. The config path
 /// identifies the caller's routing configuration in isolated test harnesses.
 pub(crate) async fn layers(
     project: &str,
