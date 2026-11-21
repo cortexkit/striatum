@@ -25,7 +25,7 @@ A project can choose its own ordered runner list for a consumer and its dotted d
 }
 ```
 
-The daemon-stamped project selects the file. A matching project list replaces the workspace and user lists; otherwise the workspace list can replace the user list. Requests in other projects without their own overrides keep using the user settings. See [the routing spec](docs/specs/model-routing.md#runner-placement) for validation and precedence.
+Routing reads the file of the project the request comes from, as the daemon records it on the caller's connection; a request body can't choose another project. A matching project list replaces the workspace and user lists; otherwise the workspace list can replace the user list. Requests in other projects without their own overrides keep using the user settings. See [the routing spec](docs/specs/model-routing.md#runner-placement) for validation and precedence.
 
 Tracing warnings and errors go to stderr, one event per line, as `LEVEL message key=value`.
 The daemon adds timestamps and the module prefix. The default threshold is `warn`.
