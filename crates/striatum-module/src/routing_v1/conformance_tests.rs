@@ -1711,6 +1711,8 @@ impl RoutingSubject for KitSubject {
                                 banked_resets: 0,
                                 banked_expires_at_ms: None,
                                 banked_credit_expiries_ms: vec![],
+                                banked_kind_expiries_ms: Vec::new(),
+                                scoped_windows: Vec::new(),
                                 prepaid_credits: false,
                             };
                             account_count
@@ -2046,6 +2048,9 @@ const NOT_APPLICABLE: &[&str] = &[
     // Serving decision_harness means routing names a harness rather than
     // omitting an ambiguous one, so the kit skips the omission case.
     "unrequested_harness_uses_declaration",
+    // Routing advertises select_harness_capabilities, so the kit's case for a
+    // router that has not declared the group does not apply.
+    "undeclared_select_harness_capabilities_refused",
 ];
 
 // Consumer priority is read for classification. concurrency_full is a refusal
@@ -2143,6 +2148,7 @@ async fn routing_v1_conformance_kit_matches_served_checks() {
     eprintln!("{}", report.render());
     assert_eq!(report.checks.len(), CHECKS.len());
     for check in [
+        "select_harness_capabilities_matched",
         "select_pin_origin_enrolled",
         "select_pin_origin_unenrolled",
         "select_pin_origin_unknown",
@@ -2209,6 +2215,27 @@ async fn routing_v1_conformance_kit_matches_served_checks() {
     let actual: std::collections::BTreeSet<_> = report.not_applicable().into_iter().collect();
     let expected: std::collections::BTreeSet<_> = expected_not_applicable.into_iter().collect();
     assert_eq!(actual, expected, "{}", report.render());
+}
+
+#[tokio::test]
+async fn routing_v1_explicit_harness_needs_conformance_case() {
+    let subject = KitSubject {
+        observe_blocks: Mutex::new(false),
+        media: Mutex::new(Default::default()),
+        harness: Mutex::new(Harness::new("kit-harness-capabilities")),
+    };
+    let report = super::describe::with_candidate_capabilities(
+        &[cortexkit_role_routing::capabilities::SELECT_HARNESS_CAPABILITIES],
+        run_suite(&subject),
+    )
+    .await;
+    assert_eq!(
+        report.outcome("select_harness_capabilities_matched"),
+        Some(&cortexkit_role_routing_conformance::CheckOutcome::Passed),
+        "{}",
+        report.render()
+    );
+    assert!(report.failing().is_empty(), "{}", report.render());
 }
 
 #[tokio::test]

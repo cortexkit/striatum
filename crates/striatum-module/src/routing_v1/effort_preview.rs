@@ -1,6 +1,6 @@
 //! Resolve reasoning effort and its matching grade from the catalog snapshot.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Mutex;
 
 use serde::Serialize;
@@ -144,12 +144,25 @@ impl Efforts {
     }
 }
 
+static WARNED_UNKNOWN_WORKLOADS: Mutex<VecDeque<(String, String)>> = Mutex::new(VecDeque::new());
+const UNKNOWN_WORKLOAD_WARNING_LIMIT: usize = 256;
+
 fn warn_unknown_workload(consumer: &str, name: &str) {
-    static WARNED: Mutex<BTreeSet<(String, String)>> = Mutex::new(BTreeSet::new());
-    let first = WARNED
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert((consumer.to_owned(), name.to_owned()));
+    let first = {
+        let mut warned = WARNED_UNKNOWN_WORKLOADS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if warned.iter().any(|(c, n)| c == consumer && n == name) {
+            false
+        } else {
+            // Request-supplied names need not come from a finite vocabulary.
+            if warned.len() == UNKNOWN_WORKLOAD_WARNING_LIMIT {
+                warned.pop_front();
+            }
+            warned.push_back((consumer.to_owned(), name.to_owned()));
+            true
+        }
+    };
     if first {
         crate::warn_operator(format!(
             "[striatum] ignoring unknown workload {name:?} for consumer {consumer:?}"

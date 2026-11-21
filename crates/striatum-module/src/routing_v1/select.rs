@@ -52,6 +52,7 @@ mod eligible_routes_tests;
 mod price_answer;
 #[cfg(test)]
 mod price_answer_tests;
+mod tier_catalog;
 
 /// The members a v1 select may carry.
 const MEMBERS: &[&str] = &[
@@ -645,7 +646,6 @@ pub(super) struct RequestInputs {
     pub(super) operator_config: std::sync::Arc<config_overrides::LiveConfig>,
     pub(super) catalog_snapshot: std::sync::Arc<striatum_store::CatalogFactsSnapshot>,
     pub(super) efforts: effort_preview::Efforts,
-    pub(super) pacing: striatum_core::subscription::PacingRule,
     facts: Vec<ModelFact>,
     pub(super) catalog_targets: std::collections::BTreeMap<String, String>,
     policy_memo: std::sync::Arc<config_overrides::SelectionPolicyMemo>,
@@ -693,7 +693,6 @@ impl RequestInputs {
                 models: catalog_snapshot.efforts.clone(),
                 workloads: Default::default(),
             },
-            pacing: Default::default(),
             catalog_snapshot,
             facts,
             catalog_targets,
@@ -715,7 +714,6 @@ impl RequestInputs {
                 .and_then(|blocks| blocks.route_state_snapshot(now)),
         }
         .map_err(store_refusal)?;
-        let quota = sweep.and_then(|sweep| sweep.quota_override.as_ref());
         let (
             windows,
             available,
@@ -723,27 +721,16 @@ impl RequestInputs {
             retained_degraded_count,
             last_error,
             restored_from_ms,
-        ) = if let Some(quota) = quota {
-            (
-                quota.windows.clone(),
-                true,
-                quota.wall_clock as u64,
-                0,
-                None,
-                None,
-            )
-        } else {
-            match deps.quota_cache.lock() {
-                Ok(cache) => (
-                    cache.windows.clone(),
-                    cache.available,
-                    cache.refreshed_at_ms,
-                    cache.retained_degraded_since_ms.len(),
-                    cache.last_error.clone(),
-                    cache.restored_from_ms,
-                ),
-                Err(_) => (Vec::new(), false, 0, 0, Some("cache poisoned".into()), None),
-            }
+        ) = match deps.quota_cache.lock() {
+            Ok(cache) => (
+                cache.windows.clone(),
+                cache.available,
+                cache.refreshed_at_ms,
+                cache.retained_degraded_since_ms.len(),
+                cache.last_error.clone(),
+                cache.restored_from_ms,
+            ),
+            Err(_) => (Vec::new(), false, 0, 0, Some("cache poisoned".into()), None),
         };
         let stale_age_ms = (!windows.is_empty())
             .then(|| crate::stale_quota_age_ms(refreshed_at_ms, now as u64))
@@ -756,24 +743,12 @@ impl RequestInputs {
                 self.live_config.quota_model_pools_ref(),
             );
         }
-        if let Some(quota) = quota {
-            crate::subscription_economics::overlay_pools(
-                quota.pools.clone(),
-                &mut snapshot,
-                &self.facts,
-                quota.at,
-                self.live_config.pricing(),
-                self.pacing,
-            );
-        } else {
-            crate::subscription_economics::overlay(
-                &mut snapshot,
-                &self.facts,
-                now as i64,
-                self.live_config.pricing(),
-                self.pacing,
-            );
-        }
+        crate::subscription_economics::overlay(
+            &mut snapshot,
+            &self.facts,
+            now as i64,
+            self.live_config.pricing(),
+        );
         let quota_signal_json = crate::select::quota_signal_json(
             &snapshot,
             &crate::select::QuotaSignalView {
@@ -1093,16 +1068,15 @@ async fn prepare_selection(
         .collect();
     if runners.is_empty() {
         return Err(if let Some(harness) = &request.harness {
-            let mut refusal = Refusal::no_route(NoRouteReason::HarnessUnavailable, None);
+            let mut refusal = registry.task_harness_unavailable(&request, &runners);
             refusal.message = format!("no session-starting runner declares harness {harness}");
             refusal
+        } else if request.requirements.harness_capabilities.is_some()
+            || (consumer_policy.runners.is_some() && consumer_policy.runner.is_none())
+        {
+            registry.task_harness_unavailable(&request, &runners)
         } else {
-            let reason = if consumer_policy.runners.is_some() && consumer_policy.runner.is_none() {
-                NoRouteReason::HarnessUnavailable
-            } else {
-                NoRouteReason::NoAvailableModel
-            };
-            Refusal::no_route(reason, None)
+            Refusal::no_route(NoRouteReason::NoAvailableModel, None)
         });
     }
     let runners: Vec<RunnerPolicy> = runners
@@ -1114,7 +1088,7 @@ async fn prepare_selection(
         })
         .collect();
     if runners.is_empty() {
-        return Err(Refusal::no_route(NoRouteReason::HarnessUnavailable, None));
+        return Err(registry.task_harness_unavailable(&request, &runners));
     }
     // Declarations narrow the configured placements before any caller filters.
     let runners: Vec<RunnerPolicy> = runners
@@ -1126,7 +1100,7 @@ async fn prepare_selection(
         })
         .collect();
     if runners.is_empty() && placement.is_some() {
-        return Err(Refusal::no_route(NoRouteReason::HarnessUnavailable, None));
+        return Err(registry.task_harness_unavailable(&request, &runners));
     }
     let runners: Vec<RunnerPolicy> = runners
         .into_iter()
@@ -1149,25 +1123,23 @@ async fn prepare_selection(
         })
         .collect();
     if runners.is_empty() {
-        let mut refusal = Refusal::no_route(NoRouteReason::HarnessUnavailable, None);
+        let mut refusal = registry.task_harness_unavailable(&request, &runners);
         if let Some(harness) = &request.harness {
             refusal.message = format!("no session-starting runner declares harness {harness}");
         }
         return Err(refusal);
     }
-    let runners: Vec<RunnerPolicy> = runners
-        .into_iter()
-        .filter(|runner| {
-            registry
-                .get(runner)
-                .is_some_and(|runner| runner.hosts_task())
-        })
-        .collect();
-    if runners.is_empty() {
-        return Err(Refusal::no_route(NoRouteReason::HarnessUnavailable, None));
+    let hosts_task = |policy: &RunnerPolicy| {
+        registry
+            .get(policy)
+            .is_some_and(|runner| runner.hosts_task(&request.requirements))
+    };
+    if !runners.iter().any(&hosts_task) {
+        return Err(registry.task_harness_unavailable(&request, &runners));
     }
     let runners: Vec<RunnerPolicy> = runners
         .into_iter()
+        .filter(hosts_task)
         .filter(|runner| {
             tags.iter()
                 .all(|tag| runner.tool_capabilities.contains(tag))
@@ -1370,6 +1342,7 @@ async fn select_at_tier_attempt(
             sticky_credential,
         );
     }
+    let tier_catalog = std::sync::OnceLock::new();
     let runs = |runner: &RunnerPolicy, route_key: &str, capacity_key: &str| -> bool {
         registry.runs(runner, route_key, capacity_key)
             && service_tier
@@ -1377,12 +1350,9 @@ async fn select_at_tier_attempt(
                 .filter(|tier| !tier.is_standard())
                 .is_none_or(|tier| {
                     priced.classes.as_ref().is_some_and(|classes| {
-                        facts
-                            .iter()
-                            // Pins may add a reasoning variant absent from the catalog's
-                            // fact rows. Service tiers belong to the underlying model,
-                            // while registry.runs above still checks the exact route.
-                            .find(|fact| fact_to_route(fact).capacity_key == capacity_key)
+                        tier_catalog
+                            .get_or_init(|| tier_catalog::TierCatalog::new(&facts))
+                            .get(capacity_key)
                             .is_some_and(|fact| {
                                 registry.get(runner).is_some_and(|runner| {
                                     classes.tier_runner_serves(runner, fact, tier.as_str())
@@ -2289,15 +2259,12 @@ async fn select_at_tier_attempt(
     )
     .ok_or_else(|| Refusal::no_route(NoRouteReason::NoAvailableModel, None))?;
 
-    if let Some(evaluation) = evaluation {
+    if evaluation.is_some() {
         let mut preview = json!({
             "route": selected.route_key,
             "variant": selected.prompt_params.variant,
             "cost_usd": selected.score.objective.task_pricing.as_ref().filter(|price| price.price_unit == "task").and_then(|price| price.final_cost_usd),
         });
-        if evaluation.accounts.quota_override.is_some() {
-            super::quota_override::describe_plan(&selected, &mut preview);
-        }
         catalog_choice.append_to(&mut preview);
         if selected
             .explanation

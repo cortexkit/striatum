@@ -15,6 +15,8 @@ use tokio::sync::broadcast;
 
 use super::super::conformance_tests::{install_catalog, reserved, Harness};
 
+const SLOW_RUNNER: &str = "slow-describe-runner";
+
 #[derive(Clone, Debug)]
 enum Command {
     Push(Vec<u64>),
@@ -29,9 +31,12 @@ struct DaemonState {
     generation: AtomicU64,
     watch_up: AtomicBool,
     block_describe: AtomicBool,
+    slow_runner: AtomicBool,
+    catalog_fails: AtomicBool,
     lists: AtomicUsize,
     watches: AtomicUsize,
     describes: AtomicUsize,
+    slow_describes: AtomicUsize,
     pushes: AtomicUsize,
     connections: AtomicUsize,
 }
@@ -117,9 +122,21 @@ async fn serve(
                         json!({"op":"server.describe","protocol_ver":1,"subc_ops":[],
                             "capabilities":["route-close-reasons/v1"],"connected_clients":1})).await,
                     Some("catalog.list") => {
-                        reply(&mut stream, &request, FrameType::Response,
-                            json!({"op":"catalog.list","generation":state.generation.load(Ordering::SeqCst),
-                                "modules":modules(state.declared.load(Ordering::SeqCst)),"subc_ops":[]})).await;
+                        let mut modules = modules(state.declared.load(Ordering::SeqCst));
+                        if state.slow_runner.load(Ordering::SeqCst) {
+                            let mut slow = modules[0].clone();
+                            slow["module_id"] = json!(SLOW_RUNNER);
+                            slow["spawn"] = json!(8);
+                            modules.as_array_mut().unwrap().push(slow);
+                        }
+                        if state.catalog_fails.load(Ordering::SeqCst) {
+                            reply(&mut stream, &request, FrameType::Error,
+                                json!({"code":"unavailable","message":"catalog read failed"})).await;
+                        } else {
+                            reply(&mut stream, &request, FrameType::Response,
+                                json!({"op":"catalog.list","generation":state.generation.load(Ordering::SeqCst),
+                                    "modules":modules,"subc_ops":[]})).await;
+                        }
                         state.lists.fetch_add(1, Ordering::SeqCst);
                     }
                     Some("catalog.watch") => {
@@ -133,12 +150,18 @@ async fn serve(
                                 json!({"code":"watch_unavailable","message":"watch down"})).await;
                         }
                     }
-                    Some("route.open") => reply(&mut stream, &request, FrameType::Response,
-                        json!({"op":"route.open","route_channel":7,"route_epoch":3,
-                            "target":{"first_party":true,"kind":"spawn","incarnation":"daemon-a",
-                                "spawn":7,"authority_epoch":2,"approved_declarations_digest":"sha256:approved"}})).await,
+                    Some("route.open") => {
+                        let channel = if body["target"]["module_id"] == SLOW_RUNNER { 8 } else { 7 };
+                        reply(&mut stream, &request, FrameType::Response,
+                            json!({"op":"route.open","route_channel":channel,"route_epoch":3,
+                                "target":{"first_party":true,"kind":"spawn","incarnation":"daemon-a",
+                                    "spawn":channel,"authority_epoch":2,"approved_declarations_digest":"sha256:approved"}})).await;
+                    }
                     Some("route.close") => reply(&mut stream, &request, FrameType::Response,
                         json!({"op":"route.close"})).await,
+                    _ if body["method"] == "role.describe" && request.header.channel == 8 => {
+                        state.slow_describes.fetch_add(1, Ordering::SeqCst);
+                    }
                     _ if body["method"] == "role.describe" => {
                         state.describes.fetch_add(1, Ordering::SeqCst);
                         if state.block_describe.load(Ordering::SeqCst) {
@@ -439,4 +462,38 @@ async fn catalog_watch_daemon_restart_rebuilds_consumer_and_refreshes() {
     )
     .await;
     assert_eq!(rig.select().await.0, FrameType::Response);
+}
+
+#[tokio::test]
+async fn runner_describe_misses_do_not_reconnect_or_reprobe_healthy_runners() {
+    let rig = Rig::new("watch-runner-miss").await;
+    let connections = rig.state.connections.load(Ordering::SeqCst);
+    let watches = rig.state.watches.load(Ordering::SeqCst);
+    let lists = rig.state.lists.load(Ordering::SeqCst);
+    rig.state.declared.store(true, Ordering::SeqCst);
+    rig.state.slow_runner.store(true, Ordering::SeqCst);
+    rig.push(vec![2]);
+    until(
+        || rig.state.slow_describes.load(Ordering::SeqCst) >= 2,
+        Duration::from_secs(10),
+        "the slow runner was not retried",
+    )
+    .await;
+    assert_eq!(
+        rig.state.connections.load(Ordering::SeqCst),
+        connections,
+        "one runner's miss replaced the healthy catalog connection"
+    );
+    assert_eq!(rig.state.watches.load(Ordering::SeqCst), watches);
+    assert_eq!(rig.state.lists.load(Ordering::SeqCst), lists + 1);
+    assert_eq!(rig.state.describes.load(Ordering::SeqCst), 1);
+
+    rig.state.catalog_fails.store(true, Ordering::SeqCst);
+    rig.push(vec![3]);
+    until(
+        || rig.state.connections.load(Ordering::SeqCst) > connections,
+        Duration::from_secs(10),
+        "a failed catalog exchange did not reconnect",
+    )
+    .await;
 }

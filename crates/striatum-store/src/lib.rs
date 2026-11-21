@@ -62,6 +62,8 @@ mod operator_quality;
 mod prune_facts;
 pub use operator_quality::{OperatorQuality, UnscoredAdmissibleModel};
 mod block_state;
+#[cfg(feature = "test-support")]
+pub use block_state::{count_recheck_rows, recheck_row_visits};
 mod block_storage;
 mod catalog_efforts;
 mod engine_measurements;
@@ -326,7 +328,7 @@ const MIGRATION_068: &str = include_str!("../migrations/068_account_demand_by_ac
 const MIGRATION_069: &str = include_str!("../migrations/069_task_workload.sql");
 const MIGRATION_071: &str = include_str!("../migrations/071_service_tiers.sql");
 
-fn route_state_migrations() -> [Migration; 99] {
+fn route_state_migrations() -> [Migration; 100] {
     [
         Migration {
             version: 1,
@@ -720,6 +722,10 @@ fn route_state_migrations() -> [Migration; 99] {
         Migration {
             version: 100,
             statements: include_str!("../migrations/100_clear_curated_efforts.sql"),
+        },
+        Migration {
+            version: 101,
+            statements: include_str!("../migrations/101_bounded_writer_lookups.sql"),
         },
     ]
 }

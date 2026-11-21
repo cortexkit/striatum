@@ -74,3 +74,17 @@ fn catalog_effort_grade_falls_back_per_metric_and_names_the_measured_effort() {
         json!({"elo":1100.0,"eq":1400.0,"elo_effort":"low","eq_effort":"high"})
     );
 }
+
+#[test]
+fn unknown_workload_warnings_are_bounded_and_dedupe_recent_names() {
+    let consumer = "workload-dedupe-regression";
+    for n in 0..300 {
+        warn_unknown_workload(consumer, &format!("unknown-{n}"));
+    }
+    assert!(WARNED_UNKNOWN_WORKLOADS.lock().unwrap().len() <= 256);
+    let _ = crate::take_operator_warnings();
+    warn_unknown_workload(consumer, "unknown-299");
+    assert!(crate::take_operator_warnings()
+        .iter()
+        .all(|w| !w.contains(consumer)));
+}

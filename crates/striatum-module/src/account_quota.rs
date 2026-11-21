@@ -101,9 +101,6 @@ pub const SCOPE_FAMILIES: &[ScopeFamily] = &[ScopeFamily {
 
 /// The scope family governing a routing model, if any. Accepts a bare model id
 /// or a `provider/model` route key, with or without a bracketed variant.
-/// The first caller will be the step that assigns an account to new work; until
-/// that exists only tests use it.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn scope_family_for_model(model: &str) -> Option<&'static ScopeFamily> {
     let bare = model.rsplit('/').next().unwrap_or(model);
     let base = bare.split('[').next().unwrap_or(bare);
@@ -966,7 +963,7 @@ fn valid_general_window(windows: &[WindowView], minutes: i64) -> Option<WindowVi
         .cloned()
 }
 
-fn map_scoped_window(
+pub(crate) fn map_scoped_window(
     provider: &str,
     id: Option<&str>,
     minutes: Option<i64>,

@@ -1,7 +1,7 @@
 //! `role.describe`: the role, its ops, the configured consumers and the
 //! requirement members this provider reads.
 
-use cortexkit_role_routing::capabilities::SELECT_WORKLOAD;
+use cortexkit_role_routing::capabilities::{SELECT_HARNESS_CAPABILITIES, SELECT_WORKLOAD};
 use cortexkit_role_routing::describe::{ConsumerEntry, RoleDescribe};
 use cortexkit_role_routing::errors::Refusal;
 use serde_json::Value;
@@ -15,6 +15,7 @@ const ACCOUNT_CONTINUE_RESUME: &str = "account_continue_resume";
 /// parsers, so declarations and accepted members agree. Harnesses come from
 /// runner declarations.
 pub(super) const CAPABILITIES: &[&str] = &[
+    SELECT_HARNESS_CAPABILITIES,
     cortexkit_role_routing::capabilities::CONSUMER_DECLARATIONS,
     cortexkit_role_routing::capabilities::CONSUMER_PRIORITY,
     SELECT_WORKLOAD,
@@ -188,7 +189,11 @@ pub(super) fn describe(deps: &Deps<'_>) -> Result<Value, Refusal> {
             cortexkit_role_routing::select::OPTIONAL_REQUIREMENT_FIELDS
                 .iter()
                 .copied()
-                .filter(|field| *field != "workload" || capabilities.contains(&SELECT_WORKLOAD))
+                .filter(|field| match *field {
+                    "workload" => capabilities.contains(&SELECT_WORKLOAD),
+                    "harness_capabilities" => capabilities.contains(&SELECT_HARNESS_CAPABILITIES),
+                    _ => true,
+                })
                 .map(|field| Value::String(field.into())),
         );
         if capabilities.contains(&"select_media") {

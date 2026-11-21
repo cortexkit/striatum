@@ -5,6 +5,9 @@ use serde_json::{json, Value};
 use striatum_core::RouteStateStore;
 use subc_protocol::FrameType;
 
+#[path = "harness_choice_tests/explicit.rs"]
+mod explicit;
+
 fn slot(limits: Value) -> Value {
     let mut value = super::slot(limits);
     value["runner"]

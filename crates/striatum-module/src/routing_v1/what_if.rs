@@ -31,16 +31,6 @@ struct Params {
     head_choices: Option<Value>,
     panel: Option<PanelParams>,
     workloads: Option<BTreeMap<String, String>>,
-    pacing: Option<Pacing>,
-    quota_override: Option<Vec<Value>>,
-    quota_override_at_ms: Option<i64>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum Pacing {
-    Max,
-    Expiry,
 }
 
 /// A dry-run panel. Member values are passed to `route.select_panel`'s own
@@ -106,22 +96,6 @@ pub(super) async fn what_if_with_profile_lookup(
     }
     let mut params: Params = serde_json::from_value(params.clone())
         .map_err(|error| Refusal::invalid_request("params", error.to_string()))?;
-    let now = super::now_ms() as i64;
-    if params
-        .quota_override_at_ms
-        .is_some_and(|at| params.quota_override.is_none() || !(0..=now).contains(&at))
-    {
-        return Err(Refusal::invalid_request(
-            "quota_override_at_ms",
-            "requires quota_override and a Unix millisecond timestamp no later than now",
-        ));
-    }
-    if matches!(params.pacing, Some(Pacing::Max)) && params.quota_override.is_none() {
-        return Err(Refusal::invalid_request(
-            "pacing",
-            "explicit max requires quota_override; otherwise omit pacing for max",
-        ));
-    }
     // A panel-only call may omit the IQ sweep; a supplied sweep is never empty.
     let iqs = params.iqs.take();
     if iqs.as_ref().map_or(params.panel.is_none(), |iqs| {
@@ -217,27 +191,9 @@ pub(super) async fn what_if_with_profile_lookup(
         .transpose()?;
     // Retain repairs in a private account-state copy for the whole sweep.
     // Never publish preview classification or healing into the live state.
-    let mut accounts =
-        crate::account_selection::Sweep::capture(deps.store).map_err(store_refusal)?;
-    accounts.quota_override = params
-        .quota_override
-        .map(|entries| {
-            super::quota_override::QuotaOverride::new(
-                entries,
-                params.quota_override_at_ms.unwrap_or(now),
-                now,
-            )
-            .map(Box::new)
-            .map_err(|error| Refusal::invalid_request("quota_override", error))
-        })
-        .transpose()?;
+    let accounts = crate::account_selection::Sweep::capture(deps.store).map_err(store_refusal)?;
     let mut inputs =
         select::RequestInputs::read_with_config(&deps, live.clone(), operator.clone())?;
-    let pacing_preview = params.pacing.is_some() || accounts.quota_override.is_some();
-    inputs.pacing = match params.pacing {
-        Some(Pacing::Expiry) => striatum_core::subscription::PacingRule::Expiry,
-        _ => Default::default(),
-    };
     inputs.efforts.workloads = params.workloads.unwrap_or_default();
     let concurrency = concurrency::Snapshot::from_snapshot(
         &deps,
@@ -271,18 +227,7 @@ pub(super) async fn what_if_with_profile_lookup(
             effort_diagnostics: Mutex::new(Default::default()),
         };
         let result = select::evaluate(&request, caller, &deps, &view, profile_lookup).await;
-        let mut evidence = view.evidence.into_inner().unwrap();
-        if !pacing_preview {
-            // The unflagged preview keeps its established response shape. Live
-            // decision records retain the pacing inputs under both rules.
-            for candidate in &mut evidence.adequate {
-                if let Some(pricing) = &mut candidate.task_pricing {
-                    pricing.pacing = None;
-                    pricing.weekly_pressure = None;
-                    pricing.short_window_pressure = None;
-                }
-            }
-        }
+        let evidence = view.evidence.into_inner().unwrap();
         let effort_diagnostics = view.effort_diagnostics.into_inner().unwrap();
         let minimum_unverified_count = {
             // The count describes candidates that reached the quality check,

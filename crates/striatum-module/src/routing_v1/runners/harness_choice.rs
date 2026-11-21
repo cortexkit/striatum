@@ -1,7 +1,8 @@
 //! Session task admission is separate from route admission and runner ranking.
 
+use cortexkit_role_routing::errors::{NoRouteReason, Refusal};
 use cortexkit_role_routing::placement::HarnessCapability;
-use cortexkit_role_routing::select::{Requirements, ToolsRequirement};
+use cortexkit_role_routing::select::{Requirements, SelectRequest, ToolsRequirement};
 
 use super::{EffectiveRunner, Registry, RunnerKey, RunnerPolicies};
 
@@ -19,10 +20,51 @@ fn task_needs(requirements: &Requirements) -> Vec<HarnessCapability> {
     if requirements.max_output_tokens.is_some() {
         needs.push(HarnessCapability::OutputCap);
     }
+    for need in explicit_needs(requirements) {
+        if !needs.contains(need) {
+            needs.push(need.clone());
+        }
+    }
     needs
 }
 
+fn explicit_needs(requirements: &Requirements) -> &[HarnessCapability] {
+    requirements
+        .harness_capabilities
+        .as_deref()
+        .unwrap_or_default()
+}
+
 impl Registry {
+    pub(crate) fn task_harness_unavailable(
+        &self,
+        request: &SelectRequest,
+        runners: &[crate::config_policy::RunnerPolicy],
+    ) -> Refusal {
+        let mut refusal = Refusal::no_route(NoRouteReason::HarnessUnavailable, None);
+        if let Some(explicit) = &request.requirements.harness_capabilities {
+            let needs = task_needs(&request.requirements);
+            let mut missing = std::collections::BTreeMap::new();
+            for policy in runners {
+                let Some(runner) = self.get(policy) else {
+                    continue;
+                };
+                let requested = request.harness.as_deref().or(policy.harness.as_deref());
+                for harness in runner.task_harnesses(requested) {
+                    let lacking: Vec<_> = needs
+                        .iter()
+                        .filter(|need| !runner.supports_need(harness, need, explicit))
+                        .collect();
+                    missing.insert(format!("{}/{harness}", policy.module), lacking);
+                }
+            }
+            refusal
+                .detail
+                .insert("missing".into(), serde_json::json!(missing));
+        }
+        refusal
+    }
+
     pub(crate) fn excluded_by_harness(
         &self,
         key: &(impl RunnerKey + ?Sized),
@@ -92,12 +134,19 @@ impl Registry {
                 .collect(),
         };
         let needs = task_needs(requirements);
+        let explicit = explicit_needs(requirements);
         for (entry, policy) in registry.entries.iter_mut().zip(original) {
             let requested = requested.or(policy.harness.as_deref());
             let declaring = entry
                 .wire_declaration
                 .as_ref()
                 .is_some_and(|declaration| declaration.declares_harness_facts());
+            if !declaring && !explicit.is_empty() {
+                // Legacy inference is permissive, but an explicit need requires
+                // affirmative evidence from the named harness.
+                entry.harness_choices = Some(Vec::new());
+                continue;
+            }
             let unbound_legacy = !declaring
                 && requested.is_none()
                 && !entry.harnesses.is_empty()
@@ -110,20 +159,8 @@ impl Registry {
                 // declaring no harnesses also keeps its unnamed wire shape.
                 continue;
             }
-            let mut names = Vec::new();
-            if let Some(requested) = requested {
-                if entry.harnesses.iter().any(|name| name == requested) {
-                    names.push(requested.to_owned());
-                }
-            } else {
-                names.extend(entry.default_harness.iter().cloned());
-                for name in &entry.harnesses {
-                    if !names.contains(name) {
-                        names.push(name.clone());
-                    }
-                }
-            }
-            let candidates = names
+            let candidates = entry
+                .task_harnesses(requested)
                 .into_iter()
                 .filter(|name| {
                     !declaring
@@ -147,11 +184,11 @@ impl Registry {
                         credentials,
                         facts,
                         now_ms,
-                        Some(&harness),
+                        Some(harness),
                     )
                     .entries
                     .remove(0),
-                    harness,
+                    harness: harness.to_owned(),
                 })
                 .collect::<Vec<_>>();
             // The parent retains runner-wide credential metadata for account
@@ -217,10 +254,45 @@ impl Registry {
 }
 
 impl EffectiveRunner {
-    pub(crate) fn hosts_task(&self) -> bool {
-        self.harness_choices
+    fn task_harnesses(&self, requested: Option<&str>) -> Vec<&str> {
+        if let Some(requested) = requested {
+            return self
+                .harnesses
+                .iter()
+                .map(String::as_str)
+                .filter(|name| *name == requested)
+                .collect();
+        }
+        let mut names: Vec<_> = self.default_harness.as_deref().into_iter().collect();
+        for name in &self.harnesses {
+            if !names.contains(&name.as_str()) {
+                names.push(name);
+            }
+        }
+        names
+    }
+
+    fn supports_need(
+        &self,
+        harness: &str,
+        need: &HarnessCapability,
+        explicit: &[HarnessCapability],
+    ) -> bool {
+        let declaring = self
+            .wire_declaration
             .as_ref()
-            .is_none_or(|choices| !choices.is_empty())
+            .filter(|declaration| declaration.declares_harness_facts());
+        declaring.map_or_else(
+            || !explicit.contains(need),
+            |declaration| declaration.harness_supports(harness, need),
+        )
+    }
+
+    pub(crate) fn hosts_task(&self, requirements: &Requirements) -> bool {
+        self.harness_choices.as_ref().map_or_else(
+            || explicit_needs(requirements).is_empty(),
+            |choices| !choices.is_empty(),
+        )
     }
 
     pub(super) fn matches_route(

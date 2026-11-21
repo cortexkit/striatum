@@ -47,6 +47,59 @@ fn split_refuses_unsplit_before_writing_or_creating_history() {
 }
 
 #[test]
+fn accountless_quota_reading_starts_a_separate_moved_watermark() {
+    let scratch = ScratchDir::new("split-credential-watermark");
+    let store = open(&scratch.path().join("store.db"));
+    let at = NOW - QUOTA_PENDING_MS - 1;
+    let entry: striatum_core::quota::ProviderUsage = serde_json::from_value(serde_json::json!({
+        "provider":"claude", "apiProvider":"anthropic", "credentialRef":"oauth:listed-login",
+        "usage":{"primary":{"usedPercent":7.0,"windowMinutes":300}}
+    }))
+    .unwrap();
+    let mut rows =
+        striatum_core::quota_poll::reading_log_rows_for_poll(&entry, "anthropic", &[], at - 1);
+    assert_eq!(rows.len(), 1);
+    let reading = rows.pop().unwrap();
+    let mut legacy = reading.clone();
+    legacy.account_key = "anthropic/".into();
+    legacy.observed_at = at;
+    assert_eq!(store.append_quota_readings(&[legacy.clone()]).unwrap(), 1);
+    assert_eq!(store.move_history_batch(NOW).unwrap(), 1);
+
+    // Even an older sample starts a fresh series under the credential key.
+    assert_eq!(store.append_quota_readings(&[reading.clone()]).unwrap(), 1);
+    assert_eq!(reading.account_key, "anthropic/oauth:listed-login");
+    assert_eq!(store.move_history_batch(NOW).unwrap(), 1);
+    assert_eq!(
+        store
+            .append_quota_readings(&[legacy.clone(), reading.clone()])
+            .unwrap(),
+        0
+    );
+    assert_eq!(store.move_history_batch(NOW).unwrap(), 0);
+    assert_eq!(
+        store.get_quota_readings(&legacy.account_key).unwrap(),
+        vec![legacy.clone()]
+    );
+    assert_eq!(
+        store.get_quota_readings(&reading.account_key).unwrap(),
+        vec![reading.clone()]
+    );
+    store
+        .with_history_reader(|conn| {
+            for row in [&legacy, &reading] {
+                let moved: i64 =
+                    conn.query_row(QUOTA_WATERMARK, [&row.account_key, &row.window_key], |r| {
+                        r.get(0)
+                    })?;
+                assert_eq!(moved, row.observed_at);
+            }
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
 fn history_mover_crash_does_not_drop_or_duplicate_readings_or_advance_watermark() {
     let scratch = ScratchDir::new("split-crash");
     let path = scratch.path().join("state.db");

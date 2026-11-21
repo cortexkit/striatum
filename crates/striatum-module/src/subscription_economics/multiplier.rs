@@ -1,6 +1,7 @@
 //! Astrocyte's latest plan rows, read on the existing quota bus connection.
 use std::{
     collections::{BTreeMap, BTreeSet},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -9,6 +10,8 @@ use serde_json::{json, value::RawValue, Map, Value};
 
 const FALLBACK: Duration = Duration::from_secs(60);
 const BACKSTOP: Duration = Duration::from_secs(15 * 60);
+const BATCH_WINDOW: Duration = Duration::from_millis(20);
+const MAX_BATCH: usize = 64;
 
 pub(super) fn reader_bound(cache: &crate::SharedQuotaCache) -> bool {
     cache.lock().is_ok_and(|cache| {
@@ -57,11 +60,30 @@ impl PollSchedule {
 
 #[derive(Default)]
 pub(super) struct State {
-    entries: BTreeMap<String, Value>,
-    initial: Option<BTreeMap<String, Value>>,
+    entries: BTreeMap<String, Arc<Value>>,
+    initial: Option<BTreeMap<String, Arc<Value>>>,
     warned: BTreeSet<String>,
     pub(super) ready: bool,
     pub(super) generation: u64,
+}
+
+pub(super) enum Update {
+    Put(String, Option<Arc<Value>>),
+    Delete(String),
+    CaughtUp,
+    Reset,
+    Other,
+}
+
+impl From<BucketItem> for Update {
+    fn from(item: BucketItem) -> Self {
+        match item {
+            BucketItem::Put { key, value, .. } => Self::Put(key, decode(&value).map(Arc::new)),
+            BucketItem::Delete { key, .. } => Self::Delete(key),
+            BucketItem::CaughtUp => Self::CaughtUp,
+            _ => Self::Other,
+        }
+    }
 }
 
 fn parse_row(value: &[u8]) -> Option<Value> {
@@ -134,10 +156,15 @@ impl State {
         self.initial = Some(BTreeMap::new());
     }
 
+    #[cfg(test)]
     pub(super) fn apply(&mut self, item: BucketItem) -> bool {
-        match item {
-            BucketItem::Put { key, value, .. } => {
-                let row = decode(&value).or_else(|| {
+        self.apply_update(item.into())
+    }
+
+    pub(super) fn apply_update(&mut self, item: Update) -> bool {
+        let changed = match item {
+            Update::Put(key, row) => {
+                let row = row.or_else(|| {
                     if self.warned.insert(key.clone()) {
                         tracing::warn!(
                             key,
@@ -151,21 +178,27 @@ impl State {
                         .cloned()
                 });
                 if let Some(row) = row {
-                    self.initial
-                        .as_mut()
-                        .unwrap_or(&mut self.entries)
-                        .insert(key, row);
+                    let rows = self.initial.as_mut().unwrap_or(&mut self.entries);
+                    if rows.get(&key) == Some(&row) {
+                        false
+                    } else {
+                        rows.insert(key, row);
+                        true
+                    }
+                } else {
+                    false
                 }
             }
-            BucketItem::Delete { key, .. } => {
+            Update::Delete(key) => {
                 // Forget the old session's backup too, so an invalid later put
                 // cannot resurrect a row explicitly deleted during the snapshot.
-                self.entries.remove(&key);
+                let removed = self.entries.remove(&key).is_some();
                 if let Some(initial) = self.initial.as_mut() {
                     initial.remove(&key);
                 }
+                removed
             }
-            BucketItem::CaughtUp => {
+            Update::CaughtUp => {
                 if let Some(initial) = self.initial.take() {
                     // Only the completed initial state is authoritative: missing
                     // keys were deleted while this reader was away.
@@ -177,18 +210,33 @@ impl State {
                     self.entries.len(),
                     self.entries.keys().collect::<Vec<_>>()
                 ));
+                true
             }
-            _ => return false,
-        }
-        if self.initial.is_some() {
+            Update::Reset => {
+                // The replacement bucket is a new source; its invalid rows must
+                // not recover values from the deleted bucket.
+                self.entries.clear();
+                self.initial = Some(BTreeMap::new());
+                self.warned.clear();
+                self.generation = self.generation.wrapping_add(1);
+                return true;
+            }
+            Update::Other => false,
+        };
+        if !changed || self.initial.is_some() {
             return false;
         }
         self.generation = self.generation.wrapping_add(1);
         true
     }
 
+    pub(super) fn rows(&self) -> Arc<[Arc<Value>]> {
+        self.entries.values().cloned().collect()
+    }
+
+    #[cfg(test)]
     pub(super) fn report(&self) -> Value {
-        json!({"latest": self.entries.values().collect::<Vec<_>>()})
+        json!({"latest": self.entries.values().map(Arc::as_ref).collect::<Vec<_>>()})
     }
 
     pub(super) fn health(&self) -> Value {
@@ -235,6 +283,14 @@ pub(crate) async fn watch(client: &BusClient) {
     }
 }
 
+fn watch_update(item: cortexkit_bus_client::Result<BucketItem>) -> Result<Update, String> {
+    match item {
+        Ok(item) => Ok(item.into()),
+        Err(cortexkit_bus_client::Error::BucketReset { .. }) => Ok(Update::Reset),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
 async fn session(client: &BusClient) -> Result<(), String> {
     let mut changes = client.connection_changes();
     changes.borrow_and_update();
@@ -252,26 +308,54 @@ async fn session(client: &BusClient) -> Result<(), String> {
         .map_err(|_| "multiplier watch bind timeout".to_owned())?
         .map_err(|e| e.to_string())?;
     let mut health = tokio::time::interval(Duration::from_secs(1));
+    let mut batch = Vec::new();
+    let mut deadline = None;
     loop {
         tokio::select! {
             biased;
             changed = changes.changed() => {
                 changed.map_err(|_| "bus credential maintenance stopped".to_owned())?;
-                // A fresh watch starts at LastPerSubject, not the SDK's resumable
-                // revision, so a new binding replaces the entire in-memory map.
+                // A fresh watch starts from the latest value of every key, not
+                // from the SDK's resumable revision, so a new binding replaces
+                // the entire in-memory map.
                 return Ok(());
             }
             _ = health.tick() => {
                 if !connected() { return Err("bus disconnected".into()); }
             }
+            _ = async { tokio::time::sleep_until(deadline.unwrap()).await }, if deadline.is_some() => {
+                publish_batch(std::mem::take(&mut batch)).await;
+                deadline = None;
+            }
             item = watch.next() => {
-                let item = item.map_err(|e| e.to_string())?;
-                if let Ok(mut runtime) = super::cache().lock() {
-                    runtime.bucket_item(item, crate::now_ms() as i64);
+                let update = watch_update(item)?;
+                if matches!(update, Update::Reset) {
+                    // Queued updates belong to the deleted bucket, not its replacement.
+                    batch.clear();
+                    publish_batch(vec![update]).await;
+                    deadline = None;
+                    continue;
+                }
+                batch.push(update);
+                if batch.len() == MAX_BATCH {
+                    publish_batch(std::mem::take(&mut batch)).await;
+                    deadline = None;
+                } else {
+                    // Start a fixed window on the first update. A busy publisher
+                    // can merge work but cannot keep pushing publication back.
+                    deadline.get_or_insert_with(|| tokio::time::Instant::now() + BATCH_WINDOW);
                 }
             }
         }
     }
+}
+
+async fn publish_batch(batch: Vec<Update>) {
+    let work = super::cache()
+        .lock()
+        .ok()
+        .and_then(|mut runtime| runtime.accept_bucket_batch(batch, crate::now_ms() as i64));
+    super::build_and_publish(work).await;
 }
 
 #[cfg(test)]
@@ -284,6 +368,37 @@ mod tests {
             revision: 1,
             value: serde_json::to_vec(&value).unwrap().into(),
         }
+    }
+
+    #[test]
+    fn multiplier_bucket_reset_rebuilds_without_fallback() {
+        let mut runtime = super::super::Runtime::default();
+        let mut schedule = PollSchedule::default();
+        let now = Instant::now();
+        let a = json!({"quota_provider":"a", "plan":null, "multiplier":2.0});
+        let b = json!({"quota_provider":"b", "plan":null, "multiplier":3.0});
+        let b_new = json!({"quota_provider":"b", "plan":null, "multiplier":7.0});
+        runtime.multipliers.begin();
+        for item in [put("A", a), put("B", b), BucketItem::CaughtUp] {
+            runtime.accept_bucket_batch(vec![watch_update(Ok(item)).unwrap()], 0);
+        }
+        assert_eq!(runtime.multipliers.health()["keys"], json!(["A", "B"]));
+        let reset = cortexkit_bus_client::Error::BucketReset {
+            bucket: "multiplier".into(),
+        };
+        runtime.accept_bucket_batch(vec![watch_update(Err(reset)).unwrap()], 0);
+        assert_eq!(*runtime.report.value(), json!({"latest":[]}));
+        assert!(runtime.multipliers.ready);
+        assert!(schedule.due(runtime.multipliers.ready, now));
+        schedule.completed(now);
+        assert_eq!(schedule.interval(), BACKSTOP);
+        for item in [put("B", b_new.clone()), BucketItem::CaughtUp] {
+            runtime.accept_bucket_batch(vec![watch_update(Ok(item)).unwrap()], 0);
+        }
+        assert_eq!(runtime.multipliers.health()["keys"], json!(["B"]));
+        assert_eq!(*runtime.report.value(), json!({"latest":[b_new]}));
+        assert!(runtime.multipliers.ready);
+        assert!(!schedule.due(runtime.multipliers.ready, now + FALLBACK));
     }
 
     #[test]

@@ -86,6 +86,28 @@ fn overlay(windows: &[ProviderUsage], facts: &[ModelFact]) -> ModelRouteStateSna
 }
 
 #[test]
+fn accountless_siblings_keep_model_available_unless_an_explicit_account_groups_them() {
+    let facts = [fact("anthropic", "claude-opus-5-5", 1.0)];
+    let entry = |credential, used| {
+        usage_from_json(serde_json::json!({
+            "provider":"claude", "apiProvider":"anthropic", "credentialRef":credential,
+            "usage":{"primary":{"usedPercent":used,"windowMinutes":300}}
+        }))
+    };
+    let mut rows = [entry("oauth:one", 6.21), entry("oauth:two", 100.0)];
+    let capacity = make_capacity_key("anthropic", "claude-opus-5-5");
+    assert!(overlay(&rows, &facts).by_capacity[&capacity]
+        .quota_exhausted_until
+        .is_none());
+    for row in &mut rows {
+        row.account = Some("the-same-account".into());
+    }
+    assert!(overlay(&rows, &facts).by_capacity[&capacity]
+        .quota_exhausted_until
+        .is_some());
+}
+
+#[test]
 fn degraded_entry_is_skipped() {
     let entry = usage_from_json(serde_json::json!({
         "provider": "grok",

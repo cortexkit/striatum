@@ -1504,7 +1504,7 @@ pub(super) fn serve(
     let salt = tx.salt(now, fresh_salt)?;
     let hash = conversation_hash(&salt, principal, &params.conversation_key);
     let affinity_row = tx.affinity(principal, &hash, provider)?;
-    let fork_parent = fork::resolve(tx, principal, params, provider)?;
+    let mut fork_parent = fork::resolve(tx, principal, params, provider)?;
     if params.fork_of.is_some() && fork_parent.is_none() {
         return Ok(fork_invalid());
     }
@@ -1567,7 +1567,6 @@ pub(super) fn serve(
             classes.allocation_context(provider, &params.model)
         });
     inputs.hold_ok = params.hold_ok;
-    inputs.fork_parent = fork_parent;
     if let Some(parent) = &params.parent_conversation_key {
         let hash = conversation_hash(&salt, principal, parent);
         inputs.parent_account_id = tx.parent_used_account(principal, &hash, provider, now)?;
@@ -1585,21 +1584,22 @@ pub(super) fn serve(
     };
     let blocks = load_blocks(tx, provider)?;
     let bound_pool = request_pool(params.pool.as_deref(), provider, &params.model);
-    let origins: Vec<_> = tx
-        .fence_rechecks()?
-        .into_iter()
-        .filter(|origin| {
-            origin.kind != "account"
-                || blocks.iter().any(|(id, fence)| {
-                    origin.origin_key == json!([id]).to_string()
-                        && fence.applies_to(
-                            &params.model,
-                            policy.family_for_model(&params.model),
-                            bound_pool.as_deref(),
-                        )
-                })
-        })
-        .collect();
+    let mut origins = tx.admission_fence_rechecks(provider)?;
+    let fork_retry = fork_parent
+        .as_mut()
+        .and_then(|parent| fork::apply_blocking_origins(parent, &origins, provider, params, now));
+    inputs.fork_parent = fork_parent;
+    origins.retain(|origin| {
+        origin.kind != "account"
+            || blocks.iter().any(|(id, fence)| {
+                origin.origin_key == json!([id]).to_string()
+                    && fence.applies_to(
+                        &params.model,
+                        policy.family_for_model(&params.model),
+                        bound_pool.as_deref(),
+                    )
+            })
+    });
     // Which probe clocks (the fence_recheck rows that schedule each block's
     // recovery test) apply to this admission was decided from the working
     // state, and neither the admission nor its claim names the rows that
@@ -1724,18 +1724,19 @@ pub(super) fn serve(
         let mut decision =
             striatum_core::accounts::decide_with_context(&request, &state, now, &inputs);
         let Outcome::Admit(admission) = &decision.outcome else {
+            if let (Some(parent), Some(until), Outcome::Hold(hold)) =
+                (&inputs.fork_parent, fork_retry, &decision.outcome)
+            {
+                if until > hold.reset_at_ms {
+                    break fork::hold_after_lost_probe(decision, parent, until, now);
+                }
+            }
             if gate.exhausted(&mut state) {
                 continue;
             }
             break decision;
         };
         let credential = admission.credential_id.clone();
-        if params.fork_of.is_some() {
-            gate.check(
-                tx, ctx, params, principal, &hash, provider, admission, &mut state,
-            );
-            break decision;
-        }
         let applicable: Vec<_> = origins
             .iter()
             .filter(|origin| {
@@ -1799,7 +1800,8 @@ pub(super) fn serve(
             })
             .map(|origin| origin.due_at())
             .max();
-        if established
+        if params.fork_of.is_none()
+            && established
             && state.affinity.as_ref().is_some_and(|affinity| {
                 affinity.account_id == admission.account_id && affinity.credential_id == credential
             })
@@ -1882,6 +1884,9 @@ pub(super) fn serve(
         let claimed = match claimed {
             probe_reservations::ProbeClaim::Store(claimed) => claimed,
             probe_reservations::ProbeClaim::ReservedUntil(until) => {
+                if let Some(parent) = &inputs.fork_parent {
+                    break fork::hold_after_lost_probe(decision, parent, until, now);
+                }
                 reserved_probe = true;
                 // Use the hold that refused this claim, not a second look:
                 // its holder may claim the probe and drop the hold before an
@@ -1913,6 +1918,9 @@ pub(super) fn serve(
                 // misreports missing candidates.
                 let until =
                     lost_probe_retry_at(&applicable, params.model_decision_id.as_deref(), now);
+                if let Some(parent) = &inputs.fork_parent {
+                    break fork::hold_after_lost_probe(decision, parent, until, now);
+                }
                 lost_probe_fences.insert(admission.account_id.clone(), until);
                 inputs.credential_probe_notes.remove(&credential);
                 if let Some(roster) = &mut state.roster {
@@ -1932,7 +1940,7 @@ pub(super) fn serve(
     }
     // An account the class context left out because another selection holds
     // its probe reserved is a lost race as well.
-    if !matches!(decision.outcome, Outcome::Admit(_)) {
+    if params.fork_of.is_none() && !matches!(decision.outcome, Outcome::Admit(_)) {
         if let Some(classes) = &ctx.classes {
             for (account, until) in
                 classes.reserved_probe_accounts(provider, &normalize(&params.model), params)

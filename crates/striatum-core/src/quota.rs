@@ -295,6 +295,12 @@ impl Usage {
 }
 
 impl ProviderUsage {
+    /// Group readings by the producer's explicit account, or by the vault
+    /// credential when the producer supplied no account.
+    pub fn account_identity(&self) -> Option<&str> {
+        self.account.as_deref().or(self.credential_ref.as_deref())
+    }
+
     /// True when this entry carries a usable quota signal (rate windows or reported
     /// spend pools), not a silent-degrade error or an otherwise empty payload.
     pub fn is_healthy(&self) -> bool {
@@ -638,7 +644,7 @@ pub fn merge_quota_overlay_with(
 
         let account_key = (
             join.provider_id.to_string(),
-            entry.account.clone().unwrap_or_default(),
+            entry.account_identity().unwrap_or_default().to_owned(),
         );
         // The provider draws an account's prepaid credits once its plan limit
         // is reached, so a full window on an account that still holds credits

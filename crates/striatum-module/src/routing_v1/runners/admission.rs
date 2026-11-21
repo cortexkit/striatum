@@ -23,6 +23,18 @@ pub(crate) async fn fetch_describe(
     settings: &[crate::config_policy::RunnerPolicy],
     credentials: &crate::SharedBrocaCredentials,
 ) -> Option<Value> {
+    fetch_describe_result(consumer, module, settings, credentials)
+        .await
+        .ok()
+        .flatten()
+}
+
+pub(super) async fn fetch_describe_result(
+    consumer: &SubcConsumer,
+    module: &str,
+    settings: &[crate::config_policy::RunnerPolicy],
+    credentials: &crate::SharedBrocaCredentials,
+) -> Result<Option<Value>, super::enrollment::DescribeError> {
     super::enrollment::describe(
         consumer,
         module,
@@ -36,8 +48,7 @@ pub(crate) async fn fetch_describe(
         credentials,
     )
     .await
-    .ok()
-    .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+    .map(|bytes| serde_json::from_slice(&bytes).ok())
 }
 
 /// Poll unknown tier views before admission. A cold cache cannot establish

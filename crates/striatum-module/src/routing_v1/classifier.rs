@@ -39,11 +39,11 @@ pub(crate) async fn fetch_describe(
     module: &str,
     settings: &[crate::config_policy::RunnerPolicy],
     credentials: &crate::SharedBrocaCredentials,
-) -> Result<Option<Value>, String> {
+) -> Result<Option<Value>, DescribeError> {
     let server = consumer
         .server_describe()
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|_| DescribeError::DaemonExchange)?;
     if !server
         .capabilities
         .iter()
@@ -67,13 +67,29 @@ pub(crate) async fn fetch_describe(
         credentials,
     )
     .await
-    .map_err(|error| error.to_string())?;
-    let value: Value = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    .map_err(DescribeError::Runner)?;
+    let value: Value = serde_json::from_slice(&bytes).map_err(|_| DescribeError::Malformed)?;
     if value.get("result").unwrap_or(&value)["role"] != "classifier/v1" {
         dropped(module, "*", "wrong_describe_role", crate::now_ms() as i64);
         return Ok(None);
     }
     Ok(Some(value))
+}
+
+pub(crate) enum DescribeError {
+    DaemonExchange,
+    Runner(super::runners::enrollment::DescribeError),
+    Malformed,
+}
+
+impl DescribeError {
+    pub(crate) fn needs_catalog_reconnect(&self) -> bool {
+        matches!(
+            self,
+            Self::DaemonExchange
+                | Self::Runner(super::runners::enrollment::DescribeError::TargetChangedNeverSent)
+        )
+    }
 }
 
 #[derive(Default)]

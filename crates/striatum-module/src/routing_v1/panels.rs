@@ -33,6 +33,8 @@ struct StoredPanel {
     request: SelectPanelRequest,
     answer: SelectPanelAnswer,
     history: BTreeSet<String>,
+    #[serde(default)]
+    served_history: BTreeSet<String>,
 }
 
 pub(super) async fn select_panel(
@@ -46,7 +48,11 @@ pub(super) async fn select_panel(
         return replace(request, caller, deps).await;
     }
     super::shapes::settings(params)?;
-    super::shapes::closed(params, "requirements", &["context_window", "modalities"])?;
+    super::shapes::closed(
+        params,
+        "requirements",
+        &["context_window", "modalities", "harness_capabilities"],
+    )?;
     let request = parse_select_panel_request_serving(params, &super::describe::capabilities())?;
     let config = operator_config(deps);
     super::consumers::effective(&config).admit(&request.consumer, caller)?;
@@ -108,6 +114,7 @@ pub(super) async fn select_panel(
             .iter()
             .map(|s| s.answer.route.route_key())
             .collect(),
+        served_history: answer.seats.iter().map(|s| s.answer.route.pin()).collect(),
         answer,
     };
     deps.store
@@ -243,8 +250,17 @@ async fn seat_panel(
     Refusal,
 > {
     let shared = panel_inputs(deps, dry)?;
-    let (panel, _, mut rejected, canonical_ids, catalog) =
-        candidates(request, &[], &[], caller, deps, dry, &shared).await?;
+    let (panel, _, mut rejected, canonical_ids, catalog) = candidates(
+        request,
+        &[],
+        &BTreeSet::new(),
+        &[],
+        caller,
+        deps,
+        dry,
+        &shared,
+    )
+    .await?;
     let mut seats = Vec::new();
     let mut families = HashSet::new();
     let mut models = HashSet::new();
@@ -494,17 +510,6 @@ fn seat_select(
         .and_then(Value::as_str)
         .map(str::to_owned);
     select["pin"] = json!(route.pin());
-    // Panel policy, not the consumer's ordinary single-model quality defaults,
-    // has already ranked and admitted this candidate.
-    select["requirements"] = json!({"iq":0});
-    if let Some(requirements) = &request.requirements {
-        if let Some(window) = requirements.context_window {
-            select["requirements"]["context_window"] = json!(window);
-        }
-        if let Some(modalities) = &requirements.modalities {
-            select["requirements"]["modalities"] = json!(modalities);
-        }
-    }
     Ok((select, route))
 }
 
@@ -650,8 +655,27 @@ async fn replace(
             "slot outside panel policy",
         ));
     }
-    let mut exclude: Vec<_> = state.history.iter().cloned().collect();
-    exclude.extend(request.exclude.clone().unwrap_or_default());
+    // Older panels remember only the base key. Recover exact identities for
+    // standing seats; keep base exclusions for historical seats we cannot recover.
+    if state.served_history.is_empty() {
+        state.served_history.extend(
+            state
+                .answer
+                .seats
+                .iter()
+                .map(|seat| seat.answer.route.pin()),
+        );
+    }
+    let mut legacy_history = state.history.clone();
+    for pin in &state.served_history {
+        if let Some(route) = cortexkit_role_routing::select::RouteRef::parse_pin(pin) {
+            legacy_history.remove(&route.route_key());
+        }
+    }
+    let exclude = legacy_history
+        .into_iter()
+        .chain(request.exclude.clone().unwrap_or_default())
+        .collect::<Vec<_>>();
     let families: Vec<_> = state
         .answer
         .seats
@@ -663,6 +687,7 @@ async fn replace(
     let (panel, package_blocked, mut rejected, _, _) = candidates(
         &state.request,
         &exclude,
+        &state.served_history,
         &families,
         caller,
         deps,
@@ -694,6 +719,7 @@ async fn replace(
             SeatAdmission::Rejected(cause) => rejected.push(cause),
             SeatAdmission::Seated(seat) => {
                 state.history.insert(seat.answer.route.route_key());
+                state.served_history.insert(seat.answer.route.pin());
                 state.answer.seats.retain(|s| s.slot != slot);
                 state.answer.seats.push(seat.clone());
                 state.answer.seats.sort_by_key(|s| s.slot);
@@ -744,6 +770,7 @@ struct CatalogSeats {
 async fn candidates(
     request: &SelectPanelRequest,
     extra_exclude: &[String],
+    served_history: &BTreeSet<String>,
     standing_families: &[String],
     caller: &Caller,
     deps: &Deps<'_>,
@@ -1005,6 +1032,18 @@ async fn candidates(
             let route = fact_to_route(fact);
             match preview.resolve(fact, aliases, workload, false, None) {
                 Ok(choice) => {
+                    if !served_history.is_empty() {
+                        let served = cortexkit_role_routing::select::RouteRef {
+                            provider: fact.provider_id.clone(),
+                            model: fact.model_id.clone(),
+                            variant: choice.variant.clone(),
+                        };
+                        if served_history.contains(&served.pin()) {
+                            rejected
+                                .push(PanelRejectedCandidate::new(&route.route_key, "excluded"));
+                            return false;
+                        }
+                    }
                     choice.apply_scores(fact);
                     if choice.minimum_unverified.is_some()
                         && fact.score_provenance != striatum_core::ScoreProvenance::Unscored

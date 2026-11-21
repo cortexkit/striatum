@@ -494,3 +494,5 @@ pub(crate) fn expect_changes(
         )))
     }
 }
+#[cfg(feature = "test-support")]
+pub use consolidated::{count_recheck_rows, recheck_row_visits};

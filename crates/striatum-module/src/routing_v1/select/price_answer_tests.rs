@@ -196,6 +196,61 @@ async fn estimate_maps_reasoning_and_zero_cache_buckets_without_role_fallbacks()
 }
 
 #[tokio::test]
+async fn settlement_estimate_uses_explicit_reasoning_rates_without_changing_wire_rates() {
+    use striatum_core::billing::{BillingPlane, BillingRate};
+    let (h, route) = configured().await;
+    let params = request(A);
+    let profile = lookup(TokenVector {
+        fresh_input: 100_000.0,
+        output_excluding_reasoning: 400_000.0,
+        reasoning: 500_000.0,
+        ..Default::default()
+    });
+    let mut fact = h
+        .store()
+        .get_facts()
+        .unwrap()
+        .into_iter()
+        .find(|fact| fact_to_route(fact).route_key == A)
+        .unwrap();
+    let mut plane = BillingPlane {
+        provider_id: fact.provider_id.clone(),
+        auth_method: "apikey".into(),
+        kind: "upstream".into(),
+        selection_reason: "reasoning estimate".into(),
+        rates: [
+            ("rate.input".into(), BillingRate::Priced { rate: 4.0 }),
+            ("rate.output".into(), BillingRate::Priced { rate: 20.0 }),
+        ]
+        .into(),
+    };
+    let credentials = h.credentials();
+    let wires = credentials.lock().unwrap().wire_apis.clone();
+    for (reasoning, expected) in [
+        (None, Some(18.4)),
+        (Some(BillingRate::NotBilled), Some(8.4)),
+        (Some(BillingRate::Priced { rate: 10.0 }), Some(13.4)),
+        (Some(BillingRate::Unpriced), None),
+    ] {
+        if let Some(reasoning) = reasoning {
+            plane.rates.insert("rate.reasoning".into(), reasoning);
+        }
+        fact.billing_plane = Some(plane.clone());
+        let catalog = crate::fusiform_catalog::PlaneCatalog::ordinary_test_catalog(&[fact.clone()])
+            .with_wire_apis(&wires);
+        credentials.lock().unwrap().publish_billing_catalog(catalog);
+        let answer = route.select_with_profiles(&params, &profile).await.unwrap();
+        checked(&params, &answer);
+        let price = &answer["price"];
+        assert_eq!(price["rates_per_mtok"], json!({"input":4,"output":20}));
+        assert_eq!(
+            price.get("estimated_task_usd"),
+            expected.map(|e| json!(e)).as_ref()
+        );
+    }
+}
+
+#[tokio::test]
 async fn kit_estimate_facts_become_tokens_not_an_echoed_reserve() {
     let (h, route) = configured().await;
     let mut input = SelectionFacts::new();

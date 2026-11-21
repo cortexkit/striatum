@@ -3,13 +3,15 @@
 
 use crate::{
     account_quota::{
-        parse_rfc3339_ms, AccountEntry, AccountQuotaState, AgeBand, SharedAccountQuota,
+        map_scoped_window, parse_rfc3339_ms, scope_family_for_model, AccountEntry,
+        AccountQuotaState, AgeBand, SharedAccountQuota,
     },
     quota_consumer::QuotaConsumer,
 };
 use serde_json::{json, Value};
 
 pub(crate) mod multiplier;
+mod saved_resets;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     path::Path,
@@ -19,7 +21,7 @@ use striatum_core::{
     model_facts::{make_capacity_key, RoutePricing},
     model_router::ModelRouteStateSnapshot,
     subscription::{
-        MeasuredValue, PacingRule, PlanMeasurements, QuotaAccount, SubscriptionPlan,
+        MeasuredValue, PlanMeasurements, QuotaAccount, QuotaConstraint, SubscriptionPlan,
         SubscriptionPool, DEFAULT_PLAN_FEE_USD,
     },
     ModelFact,
@@ -40,11 +42,14 @@ enum PlanGroup {
 }
 #[derive(Default)]
 struct Runtime {
-    economics: EconomicsCache,
-    inputs: Option<Inputs>,
-    report: Value,
+    economics: Arc<EconomicsCache>,
+    inputs: Option<Arc<Inputs>>,
+    report: ReportInput,
     multipliers: multiplier::State,
     poll: multiplier::PollSchedule,
+    revision: u64,
+    #[cfg(test)]
+    rebuilds: usize,
 }
 
 struct Inputs {
@@ -54,24 +59,105 @@ struct Inputs {
     unpriced_tiers: BTreeSet<String>,
 }
 
+#[derive(Clone)]
+enum ReportInput {
+    Poll(Arc<Value>),
+    Bucket(Arc<[Arc<Value>]>),
+}
+
+impl Default for ReportInput {
+    fn default() -> Self {
+        Self::Poll(Arc::new(Value::Null))
+    }
+}
+
+impl ReportInput {
+    fn value(&self) -> Arc<Value> {
+        match self {
+            Self::Poll(report) => Arc::clone(report),
+            Self::Bucket(rows) => {
+                Arc::new(json!({"latest": rows.iter().map(Arc::as_ref).collect::<Vec<_>>()}))
+            }
+        }
+    }
+}
+
+struct Rebuild {
+    revision: u64,
+    now: i64,
+    inputs: Arc<Inputs>,
+    report: ReportInput,
+}
+
+impl Rebuild {
+    fn build(self) -> (u64, Arc<EconomicsCache>) {
+        let mut economics = build_with_credentials(
+            &self.inputs.state,
+            &self.report.value(),
+            &self.inputs.prices,
+            self.now,
+            &self.inputs.credentials,
+        );
+        economics.unpriced_tiers = self.inputs.unpriced_tiers.clone();
+        (self.revision, Arc::new(economics))
+    }
+}
+
 impl Runtime {
+    fn prepare(&mut self, now: i64) -> Option<Rebuild> {
+        self.revision = self.revision.wrapping_add(1);
+        Some(Rebuild {
+            revision: self.revision,
+            now,
+            inputs: self.inputs.clone()?,
+            report: self.report.clone(),
+        })
+    }
+
+    fn publish(
+        &mut self,
+        (revision, economics): (u64, Arc<EconomicsCache>),
+    ) -> Arc<EconomicsCache> {
+        if self.revision != revision {
+            return economics;
+        }
+        #[cfg(test)]
+        {
+            self.rebuilds += 1;
+        }
+        std::mem::replace(&mut self.economics, economics)
+    }
+
+    fn accept_bucket_batch(&mut self, items: Vec<multiplier::Update>, now: i64) -> Option<Rebuild> {
+        let mut changed = false;
+        for item in items {
+            changed |= self.multipliers.apply_update(item);
+        }
+        if !changed {
+            return None;
+        }
+        self.report = ReportInput::Bucket(self.multipliers.rows());
+        self.prepare(now)
+    }
+
+    #[cfg(test)]
     fn rebuild(&mut self, now: i64) {
-        if let Some(inputs) = &self.inputs {
-            self.economics = build_with_credentials(
-                &inputs.state,
-                &self.report,
-                &inputs.prices,
-                now,
-                &inputs.credentials,
-            );
-            self.economics.unpriced_tiers = inputs.unpriced_tiers.clone();
+        if let Some(work) = self.prepare(now) {
+            self.publish(work.build());
         }
     }
 
+    #[cfg(test)]
     fn bucket_item(&mut self, item: cortexkit_bus_client::BucketItem, now: i64) {
-        if self.multipliers.apply(item) {
-            self.report = self.multipliers.report();
-            self.rebuild(now);
+        self.bucket_batch(vec![item], now);
+    }
+
+    #[cfg(test)]
+    fn bucket_batch(&mut self, items: Vec<cortexkit_bus_client::BucketItem>, now: i64) {
+        if let Some(work) =
+            self.accept_bucket_batch(items.into_iter().map(Into::into).collect(), now)
+        {
+            self.publish(work.build());
         }
     }
 
@@ -81,7 +167,7 @@ impl Runtime {
         if self.multipliers.generation == generation
             && (report["latest"].is_array() || !(reader_bound && self.multipliers.ready))
         {
-            self.report = report;
+            self.report = ReportInput::Poll(Arc::new(report));
         }
     }
 }
@@ -92,9 +178,44 @@ fn cache() -> &'static Mutex<Runtime> {
     CACHE.get_or_init(|| Mutex::new(Runtime::default()))
 }
 
-/// Join by account reference, not provider/tier spelling: Antigravity's quota
+async fn build_and_publish(work: Option<Rebuild>) {
+    let Some(work) = work else { return };
+    let result = crate::stage_timing::spawn_job_blocking(move || {
+        let built = striatum_store::job_timing::sync("subscription_economics", || work.build());
+        // A watch and an inventory poll can finish in either order. Only the
+        // build made from the latest inputs may replace the serving snapshot.
+        let retired = cache()
+            .lock()
+            .ok()
+            .map(|mut runtime| runtime.publish(built));
+        drop(retired);
+    })
+    .await;
+    if let Err(error) = result {
+        if error.is_panic() {
+            std::panic::resume_unwind(error.into_panic());
+        }
+    }
+}
+
+fn price_matches_login(price: &Value, account_id: &str, credential_ref: Option<&str>) -> bool {
+    // An explicit account reference is authoritative even when the price also
+    // names the credential. Astrocyte omits it for key-only logins.
+    match &price["account_ref"] {
+        Value::Null => {
+            credential_ref.is_some_and(|credential| price["credential_ref"] == credential)
+        }
+        account_ref => account_ref == account_id,
+    }
+}
+
+/// Join by login reference, not provider/tier spelling: Antigravity's quota
 /// provider can differ from the prefix in its Astrocyte plan name.
-fn account_plan<'a>(report: &'a Value, account_id: &str) -> Result<Option<&'a Value>, ()> {
+fn account_plan<'a>(
+    report: &'a Value,
+    account_id: &str,
+    credential_ref: Option<&str>,
+) -> Result<Option<&'a Value>, ()> {
     let Some(rows) = report["latest"].as_array() else {
         return Ok(None);
     };
@@ -103,7 +224,7 @@ fn account_plan<'a>(report: &'a Value, account_id: &str) -> Result<Option<&'a Va
             && row["plan_prices"].as_array().is_some_and(|prices| {
                 prices
                     .iter()
-                    .any(|price| price["account_ref"] == account_id)
+                    .any(|price| price_matches_login(price, account_id, credential_ref))
             })
     });
     let matched = matches.next();
@@ -190,12 +311,11 @@ fn price_row<'a>(prices: &'a Value, provider: &str, tier: &str) -> Option<&'a Va
         .find(|row| row["provider_id"] == provider && row["tier"] == tier)
 }
 
-fn astro_fee(row: &Value, account_id: &str, now: i64) -> Option<f64> {
+fn astro_fee(row: &Value, account_id: &str, credential_ref: Option<&str>, now: i64) -> Option<f64> {
     let plan = row["plan"].as_str()?;
-    let plan = row["plan_prices"]
-        .as_array()?
-        .iter()
-        .find(|price| price["account_ref"] == account_id && price["plan"] == plan)?;
+    let plan = row["plan_prices"].as_array()?.iter().find(|price| {
+        price_matches_login(price, account_id, credential_ref) && price["plan"] == plan
+    })?;
     if plan["review_by_ms"]
         .as_i64()
         .is_some_and(|review| review < now)
@@ -221,25 +341,22 @@ fn carries_prepaid_credits(reading: &Value) -> bool {
     })
 }
 
-fn account(reading: &Value, now: i64) -> Option<QuotaAccount> {
+fn account(reading: &Value, now: i64, account_id: &str) -> Option<QuotaAccount> {
     let usage = reading.get("usage")?;
-    let mut windows: Vec<&Value> = ["primary", "secondary", "tertiary"]
+    let windows: Vec<&Value> = ["primary", "secondary", "tertiary"]
         .iter()
         .filter_map(|k| usage.get(*k).filter(|w| w.is_object()))
         .collect();
-    if let Some(extra) = usage["extraRateWindows"].as_array() {
-        windows.extend(extra.iter().filter_map(|w| w.get("window")));
-    }
     // A past reset does not make last-good free. Even a short window with expired
     // usage makes a stale account unknown until a new observation arrives.
-    if reading.get("stale").is_some_and(|stale| !stale.is_null())
-        && windows.iter().any(|window| {
-            window["resetsAt"]
-                .as_str()
-                .and_then(parse_rfc3339_ms)
-                .is_some_and(|reset| reset <= now)
-        })
-    {
+    let stale = reading.get("stale").is_some_and(|stale| !stale.is_null());
+    let expired = |window: &Value| {
+        window["resetsAt"]
+            .as_str()
+            .and_then(parse_rfc3339_ms)
+            .is_some_and(|reset| reset <= now)
+    };
+    if stale && windows.iter().any(|window| expired(window)) {
         return None;
     }
     let weekly = windows.iter().find(|w| {
@@ -275,79 +392,53 @@ fn account(reading: &Value, now: i64) -> Option<QuotaAccount> {
     for w in windows.iter().filter(|w| !std::ptr::eq(**w, *weekly)) {
         if let (Some(use_percent), Some((time, _))) = (used(w), remaining(w)) {
             short_walled |= use_percent >= 100.0;
-            short_windows.push(striatum_core::subscription::QuotaConstraint {
+            short_windows.push(QuotaConstraint {
                 window_minutes: w["windowMinutes"].as_i64().unwrap_or(0),
                 remaining_points: 100.0 - use_percent,
                 remaining_fraction: time,
             });
         }
     }
-    let mut quota = QuotaAccount {
+    let scoped_windows = usage["extraRateWindows"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|extra| {
+            let window = extra.get("window")?;
+            let minutes = window["windowMinutes"].as_i64()?;
+            let scope = map_scoped_window(
+                reading["provider"].as_str()?,
+                extra["id"].as_str(),
+                Some(minutes),
+            )?;
+            if stale && expired(window) {
+                // A stale reset is not fresh headroom, but only this model scope loses it.
+                return Some((scope.family, None));
+            }
+            Some((
+                scope.family,
+                Some(QuotaConstraint {
+                    window_minutes: minutes,
+                    remaining_points: 100.0 - used(window)?,
+                    remaining_fraction: remaining(window)?.0,
+                }),
+            ))
+        })
+        .collect();
+    let saved = saved_resets::decode(&reading["savedResets"], account_id);
+    Some(QuotaAccount {
         weekly_used: used(weekly)?,
         weekly_remaining_fraction: time,
         hours_to_reset: hours,
         short_walled,
         short_windows,
-        banked_resets: reading["savedResets"]["availableCount"]
-            .as_u64()
-            .unwrap_or(0)
-            .min(u32::MAX as u64) as u32,
-        banked_expires_at_ms: reading["savedResets"]["soonestExpiresAt"]
-            .as_str()
-            .and_then(parse_rfc3339_ms)
-            .or_else(|| {
-                reading["savedResets"]["credits"]
-                    .as_array()
-                    .and_then(|credits| {
-                        credits
-                            .iter()
-                            .filter_map(|credit| {
-                                credit["expiresAt"].as_str().and_then(parse_rfc3339_ms)
-                            })
-                            .min()
-                    })
-            }),
-        banked_credit_expiries_ms: reading["savedResets"]["credits"]
-            .as_array()
-            .map(|credits| {
-                credits
-                    .iter()
-                    .filter_map(|credit| credit["expiresAt"].as_str().and_then(parse_rfc3339_ms))
-                    .collect()
-            })
-            .unwrap_or_default(),
+        scoped_windows,
+        banked_resets: saved.count,
+        banked_expires_at_ms: saved.soonest,
+        banked_credit_expiries_ms: saved.credits,
+        banked_kind_expiries_ms: saved.kinds,
         prepaid_credits: carries_prepaid_credits(reading),
-    };
-    if let Some(kinds) = reading["savedResets"].get("kinds") {
-        quota.banked_resets = 0;
-        quota.banked_expires_at_ms = None;
-        quota.banked_credit_expiries_ms.clear();
-        for kind in kinds
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter(|kind| matches!(kind["kind"].as_str(), Some("weekly" | "full")))
-        {
-            let count = kind["availableCount"]
-                .as_u64()
-                .unwrap_or(0)
-                .min(u32::MAX as u64) as u32;
-            quota.banked_resets = quota.banked_resets.saturating_add(count);
-            if let Some(expiry) = kind["soonestExpiresAt"].as_str().and_then(parse_rfc3339_ms) {
-                quota.banked_expires_at_ms = Some(
-                    quota
-                        .banked_expires_at_ms
-                        .map_or(expiry, |soonest| soonest.min(expiry)),
-                );
-                // The aggregate credits have no kind. Expire every credit at its
-                // kind's earliest expiry so none is counted beyond that boundary.
-                quota
-                    .banked_credit_expiries_ms
-                    .extend(std::iter::repeat_n(expiry, count as usize));
-            }
-        }
-    }
-    Some(quota)
+    })
 }
 
 fn build(state: &AccountQuotaState, report: &Value, prices: &Value, now: i64) -> EconomicsCache {
@@ -405,7 +496,8 @@ fn build(state: &AccountQuotaState, report: &Value, prices: &Value, now: i64) ->
         let tier =
             tier.or_else(|| credential_identity.and_then(|identity| identity.plan_tier.as_deref()));
         let tier = tier.map(str::to_owned);
-        let joined = match account_plan(report, &reading.account_id) {
+        let credential_ref = credential_identity.and(entry.credential_ref.as_deref());
+        let joined = match account_plan(report, &reading.account_id, credential_ref) {
             Ok(row) => row,
             Err(()) => {
                 warn_ambiguous_account(&reading.account_id);
@@ -424,7 +516,9 @@ fn build(state: &AccountQuotaState, report: &Value, prices: &Value, now: i64) ->
                     .then(|| decimal(&r["price"], "minor_units"))
                     .flatten()
             })
-            .or_else(|| joined.and_then(|row| astro_fee(row, &reading.account_id, now)))
+            .or_else(|| {
+                joined.and_then(|row| astro_fee(row, &reading.account_id, credential_ref, now))
+            })
             .unwrap_or(DEFAULT_PLAN_FEE_USD);
         out.pools
             .entry(provider.into())
@@ -433,7 +527,7 @@ fn build(state: &AccountQuotaState, report: &Value, prices: &Value, now: i64) ->
                 now_ms: now,
                 ..Default::default()
             });
-        let Some(account) = account(&reading.entry, now) else {
+        let Some(account) = account(&reading.entry, now, &reading.account_id) else {
             continue;
         };
         let group = astro_plan.as_ref().map_or_else(
@@ -593,33 +687,37 @@ pub(crate) async fn refresh(
         striatum_store::job_timing::run("spend_report_refresh", report)
     );
     let reader_bound = multiplier::reader_bound(quota_cache);
-    striatum_store::job_timing::sync("subscription_economics", || {
-        let credential_ids = if let Ok(credentials) = credentials.lock() {
-            credentials.api_key_credentials_by_provider(now as u64)
-        } else {
-            BTreeMap::new()
-        };
-        let Some(snapshot) = state.lock().ok().map(|s| s.clone()) else {
+    let credential_ids = credentials
+        .lock()
+        .ok()
+        .map(|credentials| credentials.api_key_credentials_by_provider(now as u64))
+        .unwrap_or_default();
+    let Some(snapshot) = state.lock().ok().map(|s| s.clone()) else {
+        return;
+    };
+    let inputs = Arc::new(Inputs {
+        state: snapshot,
+        unpriced_tiers: listing
+            .map(|listing| unpriced_tiers(listing, &prices))
+            .unwrap_or_default(),
+        prices,
+        credentials: credential_ids,
+    });
+    let (work, previous_inputs) = {
+        let Ok(mut guard) = cache().lock() else {
             return;
         };
-        if let Ok(mut guard) = cache().lock() {
-            if poll_due {
-                guard.poll.completed(std::time::Instant::now());
-                // A watch update received during the call is newer than the poll's
-                // snapshot. Do not overwrite it when the slower call returns.
-                guard.poll_report(report, generation, reader_bound);
-            }
-            guard.inputs = Some(Inputs {
-                state: snapshot,
-                unpriced_tiers: listing
-                    .map(|listing| unpriced_tiers(listing, &prices))
-                    .unwrap_or_default(),
-                prices,
-                credentials: credential_ids,
-            });
-            guard.rebuild(now);
+        if poll_due {
+            guard.poll.completed(std::time::Instant::now());
+            // A watch update received during the call is newer than the poll's
+            // snapshot. Do not overwrite it when the slower call returns.
+            guard.poll_report(report, generation, reader_bound);
         }
-    });
+        let previous_inputs = guard.inputs.replace(inputs);
+        (guard.prepare(now), previous_inputs)
+    };
+    drop(previous_inputs);
+    build_and_publish(work).await;
 }
 
 fn unpriced_tiers(
@@ -674,37 +772,13 @@ pub(crate) fn overlay(
     facts: &[ModelFact],
     now: i64,
     pricing: &RoutePricing,
-    pacing: PacingRule,
 ) {
-    let pools = cache()
+    let economics = cache()
         .lock()
-        .map(|c| c.economics.pools.clone())
+        .map(|c| Arc::clone(&c.economics))
         .unwrap_or_default();
-    overlay_pools(pools, snapshot, facts, now, pricing, pacing);
-}
-
-pub(crate) fn preview_pools(
-    state: &AccountQuotaState,
-    quota_now: i64,
-    value_now: i64,
-) -> HashMap<String, SubscriptionPool> {
-    let (report, prices, credentials) = cache()
-        .lock()
-        .map(|cache| {
-            let (prices, credentials) = cache.inputs.as_ref().map_or_else(
-                || (Value::Null, BTreeMap::new()),
-                |inputs| (inputs.prices.clone(), inputs.credentials.clone()),
-            );
-            (cache.report.clone(), prices, credentials)
-        })
-        .unwrap_or_default();
-    // Rebuild quota budgets from the override, not from the live economics
-    // cache. Current plan mappings and value evidence are not quota readings.
-    let mut pools = build_with_credentials(state, &report, &prices, quota_now, &credentials).pools;
-    for pool in pools.values_mut() {
-        pool.value_now_ms = Some(value_now);
-    }
-    pools
+    let pools = economics.pools.clone();
+    overlay_pools(pools, snapshot, facts, now, pricing);
 }
 
 #[cfg(test)]
@@ -713,7 +787,17 @@ pub(crate) fn test_account_pools(
     prices: &Value,
     now: i64,
 ) -> HashMap<String, SubscriptionPool> {
-    build(state, &Value::Null, prices, now).pools
+    test_account_pools_with_report(state, &Value::Null, prices, now)
+}
+
+#[cfg(test)]
+pub(crate) fn test_account_pools_with_report(
+    state: &AccountQuotaState,
+    report: &Value,
+    prices: &Value,
+    now: i64,
+) -> HashMap<String, SubscriptionPool> {
+    build(state, report, prices, now).pools
 }
 
 #[cfg(test)]
@@ -721,11 +805,12 @@ pub(crate) fn test_pools(pools: HashMap<String, SubscriptionPool>) -> impl Drop 
     struct Restore(HashMap<String, SubscriptionPool>);
     impl Drop for Restore {
         fn drop(&mut self) {
-            cache().lock().unwrap().economics.pools = std::mem::take(&mut self.0);
+            Arc::make_mut(&mut cache().lock().unwrap().economics).pools =
+                std::mem::take(&mut self.0);
         }
     }
     Restore(std::mem::replace(
-        &mut cache().lock().unwrap().economics.pools,
+        &mut Arc::make_mut(&mut cache().lock().unwrap().economics).pools,
         pools,
     ))
 }
@@ -735,13 +820,12 @@ pub(crate) fn test_pools(pools: HashMap<String, SubscriptionPool>) -> impl Drop 
 /// pool whose provider has no fact here: `set_banked_allowance` compares pools
 /// with each other, so one pool on a reserve read at an earlier refresh would
 /// change whether the others may spend banked resets.
-pub(crate) fn overlay_pools(
+fn overlay_pools(
     mut pools: HashMap<String, SubscriptionPool>,
     snapshot: &mut ModelRouteStateSnapshot,
     facts: &[ModelFact],
     now: i64,
     pricing: &RoutePricing,
-    pacing: PacingRule,
 ) {
     for fact in facts {
         let pool = pools
@@ -757,7 +841,6 @@ pub(crate) fn overlay_pools(
     for (provider, pool) in pools.iter_mut() {
         pool.keep_free_percent = pricing.keep_free_percent(provider);
         pool.banked_as_capacity = pricing.banked_resets_capacity.contains(provider);
-        pool.pacing = pacing;
         let elapsed = (now - pool.now_ms).max(0) as f64 / 3_600_000.0;
         for plan in &mut pool.plans {
             if elapsed > 0.25 {
@@ -784,17 +867,63 @@ pub(crate) fn overlay_pools(
         .into_iter()
         .map(|(key, value)| (key, Arc::new(value)))
         .collect();
+    let mut scoped = HashMap::new();
     for fact in facts {
         let state = snapshot
             .by_capacity
             .entry(make_capacity_key(&fact.provider_id, &fact.model_id))
             .or_default();
-        state.subscription_pool = shared.get(&fact.provider_id).cloned();
+        state.subscription_pool = shared.get(&fact.provider_id).map(|pool| {
+            let Some(scope) = scope_family_for_model(&fact.model_id) else {
+                return pool.clone();
+            };
+            scoped
+                .entry((fact.provider_id.as_str(), scope.family))
+                .or_insert_with(|| pool_for_scope(pool, scope.family))
+                .clone()
+        });
     }
+}
+
+fn pool_for_scope(pool: &Arc<SubscriptionPool>, family: &str) -> Arc<SubscriptionPool> {
+    if !pool
+        .plans
+        .iter()
+        .flat_map(|plan| &plan.accounts)
+        .any(|account| {
+            account
+                .scoped_windows
+                .iter()
+                .any(|(scope, _)| *scope == family)
+        })
+    {
+        return Arc::clone(pool);
+    }
+    // Keep the provider budget shared. Only models that use the same scope
+    // share this narrower projection of its accounts and window pressure.
+    let mut scoped = (**pool).clone();
+    for account in scoped.plans.iter_mut().flat_map(|plan| &mut plan.accounts) {
+        for (scope, window) in std::mem::take(&mut account.scoped_windows) {
+            if scope != family {
+                continue;
+            }
+            match window {
+                Some(window) => {
+                    account.short_walled |= window.remaining_points <= 0.0;
+                    account.short_windows.push(window);
+                }
+                None => account.short_walled = true,
+            }
+        }
+    }
+    Arc::new(scoped)
 }
 
 #[cfg(test)]
 mod tests {
+    fn account(reading: &Value, now: i64) -> Option<QuotaAccount> {
+        super::account(reading, now, reading["account"].as_str().unwrap_or("test"))
+    }
     #[cfg(feature = "heap-measure")]
     #[test]
     #[ignore = "repository subscription-economics heap profile; run alone"]
@@ -804,13 +933,13 @@ mod tests {
         let runtime = operation("subscription_economics_runtime", || {
             let now = 1_800_000_000_000;
             let mut runtime = super::Runtime {
-                inputs: Some(super::Inputs {
+                inputs: Some(Arc::new(super::Inputs {
                     state: v2_state(now),
                     prices: prices(),
                     credentials: Default::default(),
                     unpriced_tiers: Default::default(),
-                }),
-                report: report_v2(),
+                })),
+                report: ReportInput::Poll(Arc::new(report_v2())),
                 ..Default::default()
             };
             runtime.rebuild(now);
@@ -863,12 +992,12 @@ mod tests {
         now: i64,
     ) -> Runtime {
         let mut runtime = Runtime {
-            inputs: Some(Inputs {
+            inputs: Some(Arc::new(Inputs {
                 state,
                 prices: prices(),
                 credentials,
                 unpriced_tiers: BTreeSet::new(),
-            }),
+            })),
             ..Default::default()
         };
         runtime.multipliers.begin();
@@ -914,6 +1043,81 @@ mod tests {
 
     fn kimi_credentials() -> BTreeMap<String, BTreeSet<String>> {
         [(KIMI_PROVIDER.into(), [KIMI_CREDENTIAL.into()].into())].into()
+    }
+
+    #[test]
+    fn multiplier_burst_rebuilds_once_and_identical_rows_do_not_rebuild() {
+        let report = kimi_multiplier_report();
+        let mut runtime = multiplier_runtime(
+            &report,
+            AccountQuotaState::default(),
+            kimi_credentials(),
+            KIMI_NOW,
+        );
+        let builds = runtime.rebuilds;
+        let mut row = report["latest"][0].clone();
+        let unchanged = multiplier_put("opaque-0", &row);
+        row["last_eligible"]["multiplier"] = json!(6.0);
+        let first = multiplier_put("opaque-0", &row);
+        row["last_eligible"]["multiplier"] = json!(7.0);
+        runtime.bucket_batch(
+            vec![unchanged, first, multiplier_put("opaque-0", &row)],
+            KIMI_NOW,
+        );
+        assert_eq!(
+            runtime.rebuilds - builds,
+            1,
+            "one watch burst must publish just one rebuild"
+        );
+        assert_eq!(
+            credential_route_price(
+                runtime.economics.pools.clone(),
+                KIMI_NOW,
+                KIMI_PROVIDER,
+                None
+            )
+            .value_multiplier,
+            7.0
+        );
+        let generation = runtime.multipliers.generation;
+        runtime.bucket_batch(vec![multiplier_put("opaque-0", &row)], KIMI_NOW);
+        assert_eq!(runtime.rebuilds - builds, 1);
+        assert_eq!(runtime.multipliers.generation, generation);
+    }
+
+    #[test]
+    fn multiplier_publication_swaps_complete_pools_and_rejects_late_rebuilds() {
+        let report = kimi_multiplier_report();
+        let mut runtime = multiplier_runtime(
+            &report,
+            AccountQuotaState::default(),
+            kimi_credentials(),
+            KIMI_NOW,
+        );
+        let old = Arc::clone(&runtime.economics);
+        let mut row = report["latest"][0].clone();
+        row["last_eligible"]["multiplier"] = json!(6.0);
+        let late = runtime
+            .accept_bucket_batch(vec![multiplier_put("opaque-0", &row).into()], KIMI_NOW)
+            .unwrap();
+        row["last_eligible"]["multiplier"] = json!(7.0);
+        let latest = runtime
+            .accept_bucket_batch(vec![multiplier_put("opaque-0", &row).into()], KIMI_NOW)
+            .unwrap();
+        assert!(Arc::ptr_eq(&runtime.economics, &old));
+
+        let expected = latest.build();
+        let rebuilt = Arc::clone(&expected.1);
+        assert!(Arc::ptr_eq(&runtime.economics, &old));
+        runtime.publish(expected);
+        runtime.publish(late.build());
+        assert!(Arc::ptr_eq(&runtime.economics, &rebuilt));
+        let price = |snapshot: &EconomicsCache| {
+            credential_route_price(snapshot.pools.clone(), KIMI_NOW, KIMI_PROVIDER, None)
+                .value_multiplier
+        };
+        assert_eq!(price(&old), 4.4);
+        assert_eq!(price(&runtime.economics), 7.0);
     }
 
     fn kimi_report_price(
@@ -1019,8 +1223,12 @@ mod tests {
                 KIMI_NOW,
             );
             assert_eq!(bucket.multipliers.health()["planCount"], 1);
-            let price =
-                credential_route_price(bucket.economics.pools, KIMI_NOW, KIMI_PROVIDER, Some(3.0));
+            let price = credential_route_price(
+                bucket.economics.pools.clone(),
+                KIMI_NOW,
+                KIMI_PROVIDER,
+                Some(3.0),
+            );
             assert_eq!(price.plan_values[0].plan.as_deref(), Some(KIMI_PLAN));
             assert_eq!(price.value_multiplier, 3.0, "malformed {key}");
             assert_eq!(price, kimi_report_price(&malformed, KIMI_NOW, Some(3.0)));
@@ -1056,8 +1264,12 @@ mod tests {
             KIMI_NOW,
         );
         assert_eq!(bucket.multipliers.health()["planCount"], 1);
-        let price =
-            credential_route_price(bucket.economics.pools, KIMI_NOW, KIMI_PROVIDER, Some(3.0));
+        let price = credential_route_price(
+            bucket.economics.pools.clone(),
+            KIMI_NOW,
+            KIMI_PROVIDER,
+            Some(3.0),
+        );
         assert_eq!(price, kimi_report_price(&report, KIMI_NOW, Some(3.0)));
         assert_kimi_last_eligible(&price);
     }
@@ -1191,7 +1403,7 @@ mod tests {
             + 1;
         let mut runtime = multiplier_runtime(&report, v2_state(now), BTreeMap::new(), now);
         let before = runtime.economics.pools.clone();
-        let good = runtime.report.clone();
+        let good = runtime.report.value();
         let index = report["latest"]
             .as_array()
             .unwrap()
@@ -1214,7 +1426,7 @@ mod tests {
                 },
                 now,
             );
-            assert_eq!(runtime.report, good);
+            assert_eq!(runtime.report.value(), good);
             assert_eq!(runtime.economics.pools, before);
         }
         assert_eq!(
@@ -1279,16 +1491,17 @@ mod tests {
     fn multiplier_rebind_replaces_the_map_including_missing_keys_and_empty_buckets() {
         let report = report_v2();
         let mut runtime = multiplier_runtime(&report, v2_state(NOW), BTreeMap::new(), NOW);
-        let before = runtime.report.clone();
+        let before = runtime.report.value();
         runtime.multipliers.begin();
         runtime.bucket_item(multiplier_put("new-opaque-key", &report["latest"][0]), NOW);
         assert_eq!(
-            runtime.report, before,
+            runtime.report.value(),
+            before,
             "a partial snapshot must not remove live rows"
         );
         runtime.bucket_item(cortexkit_bus_client::BucketItem::CaughtUp, NOW);
         let remaining = json!({"latest":[report["latest"][0]]});
-        assert_eq!(runtime.report, remaining);
+        assert_eq!(*runtime.report.value(), remaining);
         let fresh = multiplier_runtime(&remaining, v2_state(NOW), BTreeMap::new(), NOW);
         assert_eq!(runtime.economics.pools, fresh.economics.pools);
         assert_eq!(
@@ -1297,7 +1510,7 @@ mod tests {
         );
         runtime.multipliers.begin();
         runtime.bucket_item(cortexkit_bus_client::BucketItem::CaughtUp, NOW);
-        assert_eq!(runtime.report, json!({"latest":[]}));
+        assert_eq!(*runtime.report.value(), json!({"latest":[]}));
         assert_eq!(runtime.multipliers.health()["planCount"], 0);
     }
 
@@ -1329,9 +1542,9 @@ mod tests {
             },
             NOW,
         );
-        let after_delete = runtime.report.clone();
+        let after_delete = runtime.report.value();
         runtime.poll_report(report, generation, true);
-        assert_eq!(runtime.report, after_delete);
+        assert_eq!(runtime.report.value(), after_delete);
     }
 
     use super::*;
@@ -1401,14 +1614,7 @@ mod tests {
         }))
         .unwrap();
         fact.subscription_multiplier = operator;
-        overlay_pools(
-            pools,
-            &mut snapshot,
-            &[fact.clone()],
-            now,
-            &pricing,
-            PacingRule::Max,
-        );
+        overlay_pools(pools, &mut snapshot, &[fact.clone()], now, &pricing);
         select_model_route(SelectModelRouteInput {
             target_agent: "alfonso".into(),
             target_is_head: true,
@@ -1723,6 +1929,112 @@ mod tests {
     }
 
     #[test]
+    fn scoped_fable_quota_does_not_change_opus_budget_or_pressure() {
+        let facts: Vec<ModelFact> = ["claude-opus-5", "claude-fable-5"]
+            .map(|model| crate::tests::fact("anthropic", model))
+            .into();
+        let pricing = RoutePricing {
+            keep_free_percent: HashMap::from([("anthropic".into(), 10.0)]),
+            ..Default::default()
+        };
+        let quote = |fable_used| {
+            let mut s = state(30.0, None);
+            let entry = &mut s.readings.readings.values_mut().next().unwrap().entry;
+            entry["usage"]["primary"] = json!({"usedPercent":20,"windowMinutes":300,
+                "resetsAt":"2026-10-09T06:00:00Z"});
+            entry["usage"]["extraRateWindows"] = json!([{"id":"Fable", "window":{
+                "usedPercent":fable_used,"windowMinutes":10080,"resetsAt":"2026-10-15T00:00:00Z"}}]);
+            let mut snapshot = ModelRouteStateSnapshot::default();
+            overlay_pools(
+                build(&s, &Value::Null, &Value::Null, NOW).pools,
+                &mut snapshot,
+                &facts,
+                NOW,
+                &pricing,
+            );
+            ["anthropic/claude-opus-5", "anthropic/claude-fable-5"].map(|key| {
+                let pool = snapshot.by_capacity[key]
+                    .subscription_pool
+                    .as_ref()
+                    .unwrap();
+                assert_eq!(
+                    pool.available(10.0, false),
+                    pool.price(1.0, None, 10.0, false).is_some()
+                );
+                pool.price(1.0, None, 10.0, false)
+            })
+        };
+        let [opus_open, fable_open] = quote(99.0);
+        let [opus_full, fable_full] = quote(100.0);
+        assert_eq!(
+            opus_full, opus_open,
+            "a Fable wall must not change Opus economics"
+        );
+        let opus = opus_full.unwrap();
+        let fable = fable_open.unwrap();
+        assert_eq!(opus.available_points, Some(60.0));
+        assert!(fable.plan_pressure > opus.plan_pressure);
+        assert!(fable_full.is_none());
+    }
+
+    #[test]
+    fn saved_reset_decoder_bounds_counts_and_does_not_expand_kind_expiries() {
+        let s = state(95.0, None);
+        let mut entry = s.readings.readings.values().next().unwrap().entry.clone();
+        entry["account"] = json!("banked-reset-regression");
+        let expiry = "2026-12-10T22:00:00Z";
+        for (first, second) in [(10_001, 0), (6_000, 4_001)] {
+            entry["savedResets"] = json!({"kinds":[
+                {"kind":"weekly","availableCount":first,"soonestExpiresAt":expiry},
+                {"kind":"full","availableCount":second,"soonestExpiresAt":expiry}
+            ]});
+            assert_eq!(
+                account(&entry, NOW).unwrap().banked_resets,
+                0,
+                "{first} + {second}"
+            );
+        }
+        entry["savedResets"] = json!({"availableCount":10_001});
+        assert_eq!(account(&entry, NOW).unwrap().banked_resets, 0);
+        let warnings = crate::take_operator_warnings();
+        assert_eq!(
+            warnings
+                .iter()
+                .filter(|warning| warning.contains("banked-reset-regression"))
+                .count(),
+            1,
+            "{warnings:?}"
+        );
+
+        entry["savedResets"] = json!({"kinds":[
+            {"kind":"weekly","availableCount":10_000,"soonestExpiresAt":expiry}
+        ]});
+        let quota = account(&entry, NOW).unwrap();
+        assert_eq!(quota.banked_resets, 10_000);
+        assert!(quota.banked_credit_expiries_ms.is_empty());
+        assert_eq!(
+            quota.banked_kind_expiries_ms,
+            vec![(parse_rfc3339_ms(expiry).unwrap(), 10_000)]
+        );
+        let check_window = |now_ms| {
+            SubscriptionPool {
+                now_ms,
+                banked_as_capacity: true,
+                plans: vec![SubscriptionPlan {
+                    accounts: vec![quota.clone()],
+                    ..fallback_plan()
+                }],
+                ..Default::default()
+            }
+            .price(1.0, None, 0.0, false)
+            .unwrap()
+            .banked_resets_applied
+        };
+        assert_eq!(check_window(NOW), 10_000);
+        assert_eq!(check_window(parse_rfc3339_ms(expiry).unwrap()), 0);
+    }
+
+    #[test]
     fn error_only_restart_keeps_last_good_in_subscription_budget() {
         use crate::account_quota::apply_usage_reply;
         let good = |id: &str, fetched| {
@@ -1796,12 +2108,12 @@ mod tests {
 
     #[test]
     fn v1_reply_parses_but_supplies_no_plan_measurement() {
-        assert!(account_plan(&json!({"latest":[],"series":[]}), "a")
+        assert!(account_plan(&json!({"latest":[],"series":[]}), "a", None)
             .unwrap()
             .is_none());
         let captured = report();
         assert!(captured["latest"].is_array());
-        assert!(account_plan(&captured, "a").unwrap().is_none());
+        assert!(account_plan(&captured, "a", None).unwrap().is_none());
         assert!(captured["latest"]
             .as_array()
             .unwrap()
@@ -1872,8 +2184,8 @@ mod tests {
             "multiplier":99.0, "interval_end_ms":NOW, "observation_day":"2026-10-09"});
         let report = json!({"latest":[row]});
         assert!(measured(&report["latest"][0]).is_none());
-        assert!(account_plan(&report, "acct-10").unwrap().is_none());
-        assert!(astro_fee(&report["latest"][0], "acct-10", NOW).is_none());
+        assert!(account_plan(&report, "acct-10", None).unwrap().is_none());
+        assert!(astro_fee(&report["latest"][0], "acct-10", None, NOW).is_none());
     }
 
     fn v2_state(now: i64) -> AccountQuotaState {
@@ -1989,7 +2301,6 @@ mod tests {
                     &[fact.clone()],
                     now,
                     &pricing,
-                    PacingRule::Max,
                 );
                 let selected = select_model_route(SelectModelRouteInput {
                     target_agent: "mason".into(),
@@ -2043,14 +2354,14 @@ mod tests {
     fn subscription_astro_fee_is_matched_by_plan_and_account() {
         let mut report = report_v2();
         let now = report["latest"][0]["interval_end_ms"].as_i64().unwrap();
-        let pro100 = account_plan(&report, "acct-9").unwrap().unwrap();
-        let pro200 = account_plan(&report, "acct-10").unwrap().unwrap();
-        assert_eq!(astro_fee(pro100, "acct-9", now), Some(100.0));
-        assert_eq!(astro_fee(pro200, "acct-10", now), Some(200.0));
-        assert_eq!(astro_fee(pro100, "acct-10", now), None);
+        let pro100 = account_plan(&report, "acct-9", None).unwrap().unwrap();
+        let pro200 = account_plan(&report, "acct-10", None).unwrap().unwrap();
+        assert_eq!(astro_fee(pro100, "acct-9", None, now), Some(100.0));
+        assert_eq!(astro_fee(pro200, "acct-10", None, now), Some(200.0));
+        assert_eq!(astro_fee(pro100, "acct-10", None, now), None);
         report["latest"].as_array_mut().unwrap().reverse();
-        let pro200 = account_plan(&report, "acct-10").unwrap().unwrap();
-        assert_eq!(astro_fee(pro200, "acct-10", now), Some(200.0));
+        let pro200 = account_plan(&report, "acct-10", None).unwrap().unwrap();
+        assert_eq!(astro_fee(pro200, "acct-10", None, now), Some(200.0));
         let built = build(&v2_state(now), &report, &Value::Null, now);
         assert_eq!(built.pools["openai"].plans[0].fee_usd, 100.0);
         assert_eq!(built.pools["openai"].plans[1].fee_usd, 200.0);
@@ -2063,7 +2374,7 @@ mod tests {
             .find(|r| r["plan"] == "openai/pro_200")
             .unwrap();
         row["plan_prices"][0]["review_by_ms"] = json!(now - 1);
-        assert_eq!(astro_fee(row, "acct-10", now), None);
+        assert_eq!(astro_fee(row, "acct-10", None, now), None);
     }
 
     #[test]
@@ -2079,9 +2390,9 @@ mod tests {
         pro100["plan_prices"].as_array_mut().unwrap().push(json!({
             "account_ref":"acct-10", "plan":"openai/pro_100", "monthly_nanos":100_000_000_000i64
         }));
-        assert!(account_plan(&report, "acct-10").is_err());
+        assert!(account_plan(&report, "acct-10", None).is_err());
         report["latest"].as_array_mut().unwrap().reverse();
-        assert!(account_plan(&report, "acct-10").is_err());
+        assert!(account_plan(&report, "acct-10", None).is_err());
         let mut state = v2_state(now);
         let mut unlisted = state.readings.readings[&("codex".into(), "acct-11".into())].clone();
         unlisted.account_id = "not-listed".into();
@@ -2099,7 +2410,7 @@ mod tests {
             .clone();
         identity.account_id = "not-listed".into();
         roster.identities.push(identity);
-        assert!(account_plan(&report, "not-listed").unwrap().is_none());
+        assert!(account_plan(&report, "not-listed", None).unwrap().is_none());
         let built = build(&state, &report, &Value::Null, now);
         let pool = &built.pools["openai"];
         let unknown = pool.plans.iter().find(|p| p.plan.is_none()).unwrap();
@@ -2287,7 +2598,7 @@ mod tests {
         .unwrap()];
         let mut snapshot = ModelRouteStateSnapshot::default();
 
-        overlay_pools(pools, &mut snapshot, &facts, NOW, &pricing, PacingRule::Max);
+        overlay_pools(pools, &mut snapshot, &facts, NOW, &pricing);
 
         // Under the selection's reserve anthropic has no free headroom, so the
         // nearly spent openai plan may fall back on its banked resets. Judged on
@@ -2325,7 +2636,7 @@ mod tests {
         let expiry = parse_rfc3339_ms("2026-12-10T22:00:00Z").unwrap();
         assert_eq!(quota.banked_resets, 1);
         assert_eq!(quota.banked_expires_at_ms, Some(expiry));
-        assert_eq!(quota.banked_credit_expiries_ms, vec![expiry]);
+        assert_eq!(quota.banked_kind_expiries_ms, vec![(expiry, 1)]);
 
         let mut pools = build(&s, &report(), &prices(), NOW).pools;
         set_banked_allowance(&mut pools, NOW);
@@ -2366,7 +2677,7 @@ mod tests {
         let expiry = parse_rfc3339_ms("2026-12-10T22:00:00Z").unwrap();
         assert_eq!(quota.banked_resets, 2);
         assert_eq!(quota.banked_expires_at_ms, Some(expiry));
-        assert_eq!(quota.banked_credit_expiries_ms, vec![expiry, expiry]);
+        assert_eq!(quota.banked_kind_expiries_ms, vec![(expiry, 2)]);
 
         entry["savedResets"]["kinds"][0] = json!({
             "availableCount": 1, "kind": "weekly", "soonestExpiresAt": "2026-11-01T00:00:00Z"
@@ -2376,8 +2687,8 @@ mod tests {
         assert_eq!(quota.banked_resets, 3);
         assert_eq!(quota.banked_expires_at_ms, Some(weekly_expiry));
         assert_eq!(
-            quota.banked_credit_expiries_ms,
-            vec![weekly_expiry, expiry, expiry]
+            quota.banked_kind_expiries_ms,
+            vec![(weekly_expiry, 1), (expiry, 2)]
         );
     }
 

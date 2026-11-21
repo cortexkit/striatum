@@ -13,14 +13,6 @@ pub const DEFAULT_PLAN_FEE_USD: f64 = 200.0;
 /// the weekly reset; above it, weekly pacing also accounts for expiring quota.
 pub const SHORT_WINDOW_BINDING_SHARE: f64 = 0.25;
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PacingRule {
-    #[default]
-    Max,
-    Expiry,
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct MeasuredValue {
     /// API list value divided by the subscription cost of the quota used.
@@ -54,10 +46,6 @@ pub struct SubscriptionPool {
     /// Count saved windows in pricing only; account admission still uses live quota.
     pub banked_as_capacity: bool,
     pub now_ms: i64,
-    /// Historical quota previews check the age of Astrocyte subscription-value
-    /// measurements against the real clock, not the historical quota clock.
-    pub value_now_ms: Option<i64>,
-    pub pacing: PacingRule,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -78,10 +66,15 @@ pub struct QuotaAccount {
     /// True if any non-weekly live window prevents sending on the account.
     pub short_walled: bool,
     pub short_windows: Vec<QuotaConstraint>,
+    /// A named model scope has its own constraint. `None` means the last known
+    /// reading is past its reset and cannot establish fresh headroom.
+    pub scoped_windows: Vec<(&'static str, Option<QuotaConstraint>)>,
     pub banked_resets: u32,
     pub banked_expires_at_ms: Option<i64>,
     /// Individual expiries, when the producer supplies the saved-credit list.
     pub banked_credit_expiries_ms: Vec<i64>,
+    /// Groups of saved resets sharing their kind's reported earliest expiry.
+    pub banked_kind_expiries_ms: Vec<(i64, u32)>,
     /// The account holds a spendable prepaid-credits balance, which the
     /// provider draws once the plan's limit is reached. Such an account keeps
     /// serving with no weekly headroom, so it never leaves the pool walled.
@@ -105,13 +98,12 @@ pub struct SubscriptionPricing {
     /// The basket's message, or the common output-only reference unit.
     pub price_unit: &'static str,
     pub plan_pressure: f64,
-    pub pacing: PacingRule,
     pub weekly_pressure: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub short_window_pressure: Option<f64>,
     pub keep_free_percent: f64,
     pub available_points: Option<f64>,
-    pub banked_resets_applied: u32,
+    pub banked_resets_applied: u64,
     pub plan_tier: Option<String>,
 }
 
@@ -243,20 +235,7 @@ impl SubscriptionPlan {
         head: bool,
         allow_banked: bool,
         now_ms: i64,
-    ) -> (Option<f64>, f64, u32) {
-        let (points, pressure, banked) =
-            self.budget_with_pacing(keep_free, head, allow_banked, now_ms, PacingRule::Max);
-        (points, pressure.plan, banked)
-    }
-
-    fn budget_with_pacing(
-        &self,
-        keep_free: f64,
-        head: bool,
-        allow_banked: bool,
-        now_ms: i64,
-        pacing: PacingRule,
-    ) -> (Option<f64>, PlanPressure, u32) {
+    ) -> (Option<f64>, PlanPressure, u64) {
         if self.accounts.is_empty() {
             return (None, PlanPressure::neutral(), 0);
         }
@@ -301,11 +280,11 @@ impl SubscriptionPlan {
                 banked_applied = 1;
             }
         }
-        let pressure = PlanPressure::new(pressure, self.short_pressure(pacing));
+        let pressure = PlanPressure::new(pressure, self.short_pressure());
         (Some(points), pressure, banked_applied)
     }
 
-    fn short_pressure(&self, pacing: PacingRule) -> Option<f64> {
+    fn short_pressure(&self) -> Option<f64> {
         let mut short_pools = std::collections::BTreeMap::<i64, (f64, f64, usize)>::new();
         for account in self
             .accounts
@@ -323,54 +302,42 @@ impl SubscriptionPlan {
             .values()
             .filter_map(|(points, time, count)| {
                 let remaining_share = points / (*count as f64 * 100.0);
-                (pacing == PacingRule::Max || remaining_share < SHORT_WINDOW_BINDING_SHARE)
+                (remaining_share < SHORT_WINDOW_BINDING_SHARE)
                     .then(|| plan_pressure(*time, remaining_share))
             })
             .reduce(f64::max)
     }
 
-    #[cfg(test)]
-    fn capacity_pressure(&self, keep_free: f64, head: bool, now_ms: i64) -> (f64, u32) {
-        let (pressure, banked) =
-            self.capacity_pressure_with_pacing(keep_free, head, now_ms, PacingRule::Max);
-        (pressure.plan, banked)
-    }
-
-    fn capacity_pressure_with_pacing(
-        &self,
-        keep_free: f64,
-        head: bool,
-        now_ms: i64,
-        pacing: PacingRule,
-    ) -> (PlanPressure, u32) {
+    fn capacity_pressure(&self, keep_free: f64, head: bool, now_ms: i64) -> (PlanPressure, u64) {
         let margin = if head { 0.0 } else { keep_free };
         let mut points = 0.0;
-        let mut banked = 0;
+        let mut banked = 0_u64;
         let mut time: f64 = 0.0;
         for account in &self.accounts {
             time = time.max(account.weekly_remaining_fraction);
             if !account.short_walled && account.weekly_used < 100.0 {
                 points += (100.0 - account.weekly_used - margin).max(0.0);
             }
-            let listed = account
-                .banked_credit_expiries_ms
-                .len()
-                .min(account.banked_resets as usize);
-            let unlisted = account.banked_resets - listed as u32;
-            let count = account
+            let mut unlisted = account.banked_resets;
+            let mut count = 0_u64;
+            for (expiry, size) in account
                 .banked_credit_expiries_ms
                 .iter()
-                .take(listed)
-                .filter(|expiry| **expiry > now_ms)
-                .count() as u32
-                + if account
-                    .banked_expires_at_ms
-                    .is_none_or(|expiry| expiry > now_ms)
-                {
-                    unlisted
-                } else {
-                    0
-                };
+                .map(|expiry| (*expiry, 1))
+                .chain(account.banked_kind_expiries_ms.iter().copied())
+            {
+                let size = size.min(unlisted);
+                unlisted -= size;
+                if expiry > now_ms {
+                    count += u64::from(size);
+                }
+            }
+            if account
+                .banked_expires_at_ms
+                .is_none_or(|expiry| expiry > now_ms)
+            {
+                count += u64::from(unlisted);
+            }
             banked += count;
             points += count as f64 * (100.0 - margin).max(0.0);
         }
@@ -378,10 +345,7 @@ impl SubscriptionPlan {
         // not spendable live quota and cannot change admission or plan weights.
         let capacity = self.accounts.len() as f64 * 100.0 + banked as f64 * 100.0;
         let weekly = plan_pressure(time, points / capacity.max(100.0));
-        (
-            PlanPressure::new(weekly, self.short_pressure(pacing)),
-            banked,
-        )
+        (PlanPressure::new(weekly, self.short_pressure()), banked)
     }
 
     pub fn has_free_headroom(&self, keep_free: f64, head: bool, now_ms: i64) -> bool {
@@ -467,26 +431,19 @@ impl SubscriptionPool {
         keep_free: f64,
         head: bool,
     ) -> Option<SubscriptionPricing> {
-        let value_now = self.value_now_ms.unwrap_or(self.now_ms);
         let budgets: Vec<_> = self
             .plans
             .iter()
             .enumerate()
             .map(|(index, plan)| {
-                let budget = plan.budget_with_pacing(
+                let budget = plan.budget(
                     keep_free,
                     head,
                     self.banked_for(index, keep_free, head),
                     self.now_ms,
-                    self.pacing,
                 );
                 if self.banked_as_capacity && !plan.accounts.is_empty() {
-                    let (pressure, banked) = plan.capacity_pressure_with_pacing(
-                        keep_free,
-                        head,
-                        self.now_ms,
-                        self.pacing,
-                    );
+                    let (pressure, banked) = plan.capacity_pressure(keep_free, head, self.now_ms);
                     (budget.0, pressure, banked)
                 } else {
                     budget
@@ -499,7 +456,7 @@ impl SubscriptionPool {
             .iter()
             .zip(&budgets)
             .map(|(plan, budget)| {
-                let value = resolve_measurement(operator, plan.measured.as_ref(), value_now);
+                let value = resolve_measurement(operator, plan.measured.as_ref(), self.now_ms);
                 SubscriptionPlanValue {
                     plan_tier: plan.tier.clone(),
                     plan: plan.plan.clone(),
@@ -519,7 +476,7 @@ impl SubscriptionPool {
         let weighted: Vec<_> = plan_values.iter().filter(|p| p.weight > 0.0).collect();
         let (value, source) = if weighted.len() == 1 {
             let index = plan_values.iter().position(|p| p.weight > 0.0).unwrap();
-            resolve_value(operator, self.plans[index].measured.as_ref(), value_now)
+            resolve_value(operator, self.plans[index].measured.as_ref(), self.now_ms)
         } else if !weighted.is_empty() {
             // Capacity-proportional usage pays list/M for each plan, so costs
             // combine arithmetically and the list-to-quota multiplier harmonically.
@@ -531,7 +488,7 @@ impl SubscriptionPool {
                 "spendable-points weighted harmonic mean".into(),
             )
         } else {
-            resolve_value(operator, None, value_now)
+            resolve_value(operator, None, self.now_ms)
         };
         let pricing = |points, pressure: PlanPressure, banked, tier| SubscriptionPricing {
             value_multiplier: value,
@@ -540,7 +497,6 @@ impl SubscriptionPool {
             list_cost_usd: list_usd,
             price_unit: "message",
             plan_pressure: pressure.plan,
-            pacing: self.pacing,
             weekly_pressure: pressure.weekly,
             short_window_pressure: pressure.short_window,
             keep_free_percent: if head { 0.0 } else { keep_free },
@@ -758,9 +714,11 @@ mod tests {
                 hours_to_reset: 84.0,
                 short_walled: false,
                 short_windows: Vec::new(),
+                scoped_windows: Vec::new(),
                 banked_resets: 3,
                 banked_expires_at_ms: Some(10_000),
                 banked_credit_expiries_ms: Vec::new(),
+                banked_kind_expiries_ms: Vec::new(),
                 prepaid_credits: false,
             }],
         }
@@ -775,7 +733,7 @@ mod tests {
         let banked = p.budget(0.0, false, true, 1);
         assert_eq!(ordinary.2, 0);
         assert_eq!(banked.2, 1);
-        assert!(banked.1 < ordinary.1);
+        assert!(banked.1.plan < ordinary.1.plan);
         assert_eq!(p.budget(100.0, false, true, 1).0, Some(0.0));
         assert_eq!(p.budget(0.0, false, true, 10_001).2, 0);
     }
@@ -834,15 +792,27 @@ mod tests {
             remaining_fraction: 0.5,
         });
         let (pressure, banked) = p.capacity_pressure(0.0, false, 1);
-        assert!((pressure - 50.0).abs() < 1e-12);
+        assert!((pressure.plan - 50.0).abs() < 1e-12);
         assert_eq!(banked, 3);
         p.accounts[0].short_windows.clear();
-        assert_eq!(p.capacity_pressure(100.0, false, 1).0, 1_000_000.0);
-        assert!(p.capacity_pressure(20.0, false, 1).0 > p.capacity_pressure(0.0, false, 1).0);
+        assert_eq!(p.capacity_pressure(100.0, false, 1).0.plan, 1_000_000.0);
+        assert!(
+            p.capacity_pressure(20.0, false, 1).0.plan > p.capacity_pressure(0.0, false, 1).0.plan
+        );
         assert_eq!(
             p.capacity_pressure(20.0, true, 1),
             p.capacity_pressure(0.0, false, 1)
         );
+    }
+
+    #[test]
+    fn banked_capacity_counter_keeps_totals_above_u32() {
+        let mut p = plan(95.0);
+        p.accounts[0].banked_resets = 1 << 31;
+        p.accounts[0].banked_expires_at_ms = None;
+        p.accounts.push(p.accounts[0].clone());
+        let (_, banked) = p.capacity_pressure(0.0, false, 1);
+        assert_eq!(banked as u64, 1_u64 << 32);
     }
 
     /// Live on 2026-10-30 after 14:20Z: every Codex account sat at its weekly
@@ -862,8 +832,6 @@ mod tests {
             allow_banked: true,
             banked_as_capacity: false,
             now_ms: 1,
-            value_now_ms: None,
-            pacing: PacingRule::Max,
         };
         assert!(!pool(false).available(5.0, false));
         assert!(pool(true).available(5.0, false));
@@ -920,51 +888,40 @@ mod tests {
     }
 
     #[test]
-    fn expiry_pacing_ignores_an_abundant_short_window() {
-        let mut pool = expiring_pool(100.0);
-        let current = pool.price(1.0, Some(1.0), 5.0, false).unwrap();
-        pool.pacing = PacingRule::Expiry;
-        let preview = pool.price(1.0, Some(1.0), 5.0, false).unwrap();
+    fn expiring_kimi_week_sets_pressure_with_an_abundant_short_window() {
+        let price = expiring_pool(100.0)
+            .price(1.0, Some(1.0), 5.0, false)
+            .unwrap();
 
         let weekly = plan_pressure(2.0 / 168.0, 0.888);
         assert!((weekly - 0.015).abs() < 0.001);
-        assert!((preview.plan_pressure - weekly).abs() < 1e-12);
-        assert_eq!(preview.weekly_pressure, weekly);
-        assert_eq!(preview.short_window_pressure, None);
-        assert_eq!(preview.pacing, PacingRule::Expiry);
-        assert_eq!(current.pacing, PacingRule::Max);
-        assert_eq!(current.weekly_pressure, weekly);
-        assert_eq!(
-            current.plan_pressure,
-            current.short_window_pressure.unwrap()
-        );
-        assert!(current.plan_pressure > preview.plan_pressure);
+        assert!((price.plan_pressure - weekly).abs() < 1e-12);
+        assert_eq!(price.weekly_pressure, weekly);
+        assert_eq!(price.short_window_pressure, None);
     }
 
     #[test]
-    fn expiry_pacing_keeps_a_binding_short_window_under_both_rules() {
-        let mut pool = expiring_pool(20.0);
-        for pacing in [PacingRule::Max, PacingRule::Expiry] {
-            pool.pacing = pacing;
-            let price = pool.price(1.0, Some(1.0), 5.0, false).unwrap();
-            let short = price.short_window_pressure.unwrap();
-            assert_eq!(short, plan_pressure(1.1 / 5.0, 0.2));
-            assert_eq!(price.plan_pressure, short);
-            assert!(price.plan_pressure > price.weekly_pressure);
-        }
+    fn short_window_with_less_than_one_quarter_left_raises_pressure() {
+        let price = expiring_pool(20.0)
+            .price(1.0, Some(1.0), 5.0, false)
+            .unwrap();
+        let short = price.short_window_pressure.unwrap();
+        assert_eq!(short, plan_pressure(1.1 / 5.0, 0.2));
+        assert_eq!(price.plan_pressure, short);
+        assert!(price.plan_pressure > price.weekly_pressure);
     }
 
     #[test]
-    fn expiry_pacing_ignores_a_pool_at_exactly_one_quarter_left() {
-        let mut pool = expiring_pool(25.0);
-        pool.pacing = PacingRule::Expiry;
-        let price = pool.price(1.0, Some(1.0), 5.0, false).unwrap();
+    fn short_window_with_exactly_one_quarter_left_does_not_raise_pressure() {
+        let price = expiring_pool(25.0)
+            .price(1.0, Some(1.0), 5.0, false)
+            .unwrap();
         assert_eq!(price.short_window_pressure, None);
         assert_eq!(price.plan_pressure, price.weekly_pressure);
     }
 
     #[test]
-    fn expiry_pacing_pools_short_windows_before_applying_the_threshold() {
+    fn short_windows_are_pooled_before_applying_the_threshold() {
         let mut pool = expiring_pool(10.0);
         let mut second = pool.plans[0].accounts[0].clone();
         second.short_windows[0].remaining_points = 20.0;
@@ -977,11 +934,14 @@ mod tests {
         pool.plans[0].accounts.push(walled);
         let expected = plan_pressure(1.1 / 5.0, 30.0 / 200.0);
 
-        for pacing in [PacingRule::Max, PacingRule::Expiry] {
-            pool.pacing = pacing;
-            let price = pool.price(1.0, Some(1.0), 5.0, false).unwrap();
-            assert_eq!(price.short_window_pressure, Some(expected));
-            assert_eq!(price.plan_pressure, expected);
-        }
+        let price = pool.price(1.0, Some(1.0), 5.0, false).unwrap();
+        assert_eq!(price.short_window_pressure, Some(expected));
+        assert_eq!(price.plan_pressure, expected);
+
+        // One tight account cannot make the window bind when the pool has room.
+        pool.plans[0].accounts[1].short_windows[0].remaining_points = 60.0;
+        let price = pool.price(1.0, Some(1.0), 5.0, false).unwrap();
+        assert_eq!(price.short_window_pressure, None);
+        assert_eq!(price.plan_pressure, price.weekly_pressure);
     }
 }

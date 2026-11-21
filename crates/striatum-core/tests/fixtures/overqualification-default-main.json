@@ -60,7 +60,6 @@
             "bankedResetsApplied": 0,
             "keepFreePercent": 0.0,
             "listCostUsd": 4.6,
-            "pacing": "max",
             "planPressure": 175.78124999999997,
             "planTier": "scenario",
             "planValues": [
@@ -82,7 +81,6 @@
             "listCostUsd": 4.6,
             "normalizedCost": 424.45866141732273,
             "omittedDimensions": [],
-            "pacing": "max",
             "pressure": 175.78124999999997,
             "priceUnit": "task",
             "profile": {
@@ -176,7 +174,6 @@
             "bankedResetsApplied": 0,
             "keepFreePercent": 0.0,
             "listCostUsd": 4.6,
-            "pacing": "max",
             "planPressure": 175.78124999999997,
             "planTier": "scenario",
             "planValues": [
@@ -198,7 +195,6 @@
             "listCostUsd": 4.6,
             "normalizedCost": 424.45866141732273,
             "omittedDimensions": [],
-            "pacing": "max",
             "pressure": 175.78124999999997,
             "priceUnit": "task",
             "profile": {
@@ -292,7 +288,6 @@
             "bankedResetsApplied": 0,
             "keepFreePercent": 0.0,
             "listCostUsd": 4.6,
-            "pacing": "max",
             "planPressure": 175.78124999999997,
             "planTier": "scenario",
             "planValues": [
@@ -314,7 +309,6 @@
             "listCostUsd": 4.6,
             "normalizedCost": 424.45866141732273,
             "omittedDimensions": [],
-            "pacing": "max",
             "pressure": 175.78124999999997,
             "priceUnit": "task",
             "profile": {
@@ -408,7 +402,6 @@
             "bankedResetsApplied": 0,
             "keepFreePercent": 0.0,
             "listCostUsd": 4.6,
-            "pacing": "max",
             "planPressure": 175.78124999999997,
             "planTier": "scenario",
             "planValues": [
@@ -430,7 +423,6 @@
             "listCostUsd": 4.6,
             "normalizedCost": 424.45866141732273,
             "omittedDimensions": [],
-            "pacing": "max",
             "pressure": 175.78124999999997,
             "priceUnit": "task",
             "profile": {
@@ -524,7 +516,6 @@
             "bankedResetsApplied": 0,
             "keepFreePercent": 0.0,
             "listCostUsd": 4.6,
-            "pacing": "max",
             "planPressure": 175.78124999999997,
             "planTier": "scenario",
             "planValues": [
@@ -546,7 +537,6 @@
             "listCostUsd": 4.6,
             "normalizedCost": 424.45866141732273,
             "omittedDimensions": [],
-            "pacing": "max",
             "pressure": 175.78124999999997,
             "priceUnit": "task",
             "profile": {
@@ -639,7 +629,6 @@
             "bankedResetsApplied": 0,
             "keepFreePercent": 0.0,
             "listCostUsd": 4.6,
-            "pacing": "max",
             "planPressure": 175.78124999999997,
             "planTier": "scenario",
             "planValues": [
@@ -661,7 +650,6 @@
             "listCostUsd": 4.6,
             "normalizedCost": 424.45866141732273,
             "omittedDimensions": [],
-            "pacing": "max",
             "pressure": 175.78124999999997,
             "priceUnit": "task",
             "profile": {
@@ -754,7 +742,6 @@
             "bankedResetsApplied": 0,
             "keepFreePercent": 0.0,
             "listCostUsd": 4.6,
-            "pacing": "max",
             "planPressure": 175.78124999999997,
             "planTier": "scenario",
             "planValues": [
@@ -776,7 +763,6 @@
             "listCostUsd": 4.6,
             "normalizedCost": 424.45866141732273,
             "omittedDimensions": [],
-            "pacing": "max",
             "pressure": 175.78124999999997,
             "priceUnit": "task",
             "profile": {
@@ -868,7 +854,6 @@
             "bankedResetsApplied": 0,
             "keepFreePercent": 0.0,
             "listCostUsd": 4.6,
-            "pacing": "max",
             "planPressure": 175.78124999999997,
             "planTier": "scenario",
             "planValues": [
@@ -890,7 +875,6 @@
             "listCostUsd": 4.6,
             "normalizedCost": 424.45866141732273,
             "omittedDimensions": [],
-            "pacing": "max",
             "pressure": 175.78124999999997,
             "priceUnit": "task",
             "profile": {
@@ -982,7 +966,6 @@
             "bankedResetsApplied": 0,
             "keepFreePercent": 0.0,
             "listCostUsd": 4.6,
-            "pacing": "max",
             "planPressure": 175.78124999999997,
             "planTier": "scenario",
             "planValues": [
@@ -1004,7 +987,6 @@
             "listCostUsd": 4.6,
             "normalizedCost": 424.45866141732273,
             "omittedDimensions": [],
-            "pacing": "max",
             "pressure": 175.78124999999997,
             "priceUnit": "task",
             "profile": {
@@ -1096,7 +1078,6 @@
             "bankedResetsApplied": 0,
             "keepFreePercent": 0.0,
             "listCostUsd": 4.6,
-            "pacing": "max",
             "planPressure": 175.78124999999997,
             "planTier": "scenario",
             "planValues": [
@@ -1118,7 +1099,6 @@
             "listCostUsd": 4.6,
             "normalizedCost": 424.45866141732273,
             "omittedDimensions": [],
-            "pacing": "max",
             "pressure": 175.78124999999997,
             "priceUnit": "task",
             "profile": {
@@ -1212,7 +1192,6 @@
             "bankedResetsApplied": 0,
             "keepFreePercent": 0.0,
             "listCostUsd": 0.24000000000000002,
-            "pacing": "max",
             "planPressure": 175.78124999999997,
             "planTier": "scenario",
             "planValues": [
@@ -1234,7 +1213,6 @@
             "listCostUsd": 0.24000000000000002,
             "normalizedCost": 22.145669291338578,
             "omittedDimensions": [],
-            "pacing": "max",
             "pressure": 175.78124999999997,
             "priceUnit": "task",
             "profile": {
@@ -1328,7 +1306,6 @@
             "bankedResetsApplied": 0,
             "keepFreePercent": 0.0,
             "listCostUsd": 0.24000000000000002,
-            "pacing": "max",
             "planPressure": 175.78124999999997,
             "planTier": "scenario",
             "planValues": [
@@ -1350,7 +1327,6 @@
             "listCostUsd": 0.24000000000000002,
             "normalizedCost": 22.145669291338578,
             "omittedDimensions": [],
-            "pacing": "max",
             "pressure": 175.78124999999997,
             "priceUnit": "task",
             "profile": {
@@ -1444,7 +1420,6 @@
             "bankedResetsApplied": 0,
             "keepFreePercent": 0.0,
             "listCostUsd": 0.24000000000000002,
-            "pacing": "max",
             "planPressure": 175.78124999999997,
             "planTier": "scenario",
             "planValues": [
@@ -1466,7 +1441,6 @@
             "listCostUsd": 0.24000000000000002,
             "normalizedCost": 22.145669291338578,
             "omittedDimensions": [],
-            "pacing": "max",
             "pressure": 175.78124999999997,
             "priceUnit": "task",
             "profile": {
@@ -1560,7 +1534,6 @@
             "bankedResetsApplied": 0,
             "keepFreePercent": 0.0,
             "listCostUsd": 0.24000000000000002,
-            "pacing": "max",
             "planPressure": 175.78124999999997,
             "planTier": "scenario",
             "planValues": [
@@ -1582,7 +1555,6 @@
             "listCostUsd": 0.24000000000000002,
             "normalizedCost": 22.145669291338578,
             "omittedDimensions": [],
-            "pacing": "max",
             "pressure": 175.78124999999997,
             "priceUnit": "task",
             "profile": {
@@ -1676,7 +1648,6 @@
             "bankedResetsApplied": 0,
             "keepFreePercent": 0.0,
             "listCostUsd": 0.24000000000000002,
-            "pacing": "max",
             "planPressure": 175.78124999999997,
             "planTier": "scenario",
             "planValues": [
@@ -1698,7 +1669,6 @@
             "listCostUsd": 0.24000000000000002,
             "normalizedCost": 22.145669291338578,
             "omittedDimensions": [],
-            "pacing": "max",
             "pressure": 175.78124999999997,
             "priceUnit": "task",
             "profile": {
@@ -1791,7 +1761,6 @@
             "bankedResetsApplied": 0,
             "keepFreePercent": 0.0,
             "listCostUsd": 0.24000000000000002,
-            "pacing": "max",
             "planPressure": 175.78124999999997,
             "planTier": "scenario",
             "planValues": [
@@ -1813,7 +1782,6 @@
             "listCostUsd": 0.24000000000000002,
             "normalizedCost": 22.145669291338578,
             "omittedDimensions": [],
-            "pacing": "max",
             "pressure": 175.78124999999997,
             "priceUnit": "task",
             "profile": {
@@ -1906,7 +1874,6 @@
             "bankedResetsApplied": 0,
             "keepFreePercent": 0.0,
             "listCostUsd": 0.24000000000000002,
-            "pacing": "max",
             "planPressure": 175.78124999999997,
             "planTier": "scenario",
             "planValues": [
@@ -1928,7 +1895,6 @@
             "listCostUsd": 0.24000000000000002,
             "normalizedCost": 22.145669291338578,
             "omittedDimensions": [],
-            "pacing": "max",
             "pressure": 175.78124999999997,
             "priceUnit": "task",
             "profile": {
@@ -2020,7 +1986,6 @@
             "bankedResetsApplied": 0,
             "keepFreePercent": 0.0,
             "listCostUsd": 0.24000000000000002,
-            "pacing": "max",
             "planPressure": 175.78124999999997,
             "planTier": "scenario",
             "planValues": [
@@ -2042,7 +2007,6 @@
             "listCostUsd": 0.24000000000000002,
             "normalizedCost": 22.145669291338578,
             "omittedDimensions": [],
-            "pacing": "max",
             "pressure": 175.78124999999997,
             "priceUnit": "task",
             "profile": {
@@ -2134,7 +2098,6 @@
             "bankedResetsApplied": 0,
             "keepFreePercent": 0.0,
             "listCostUsd": 0.24000000000000002,
-            "pacing": "max",
             "planPressure": 175.78124999999997,
             "planTier": "scenario",
             "planValues": [
@@ -2156,7 +2119,6 @@
             "listCostUsd": 0.24000000000000002,
             "normalizedCost": 22.145669291338578,
             "omittedDimensions": [],
-            "pacing": "max",
             "pressure": 175.78124999999997,
             "priceUnit": "task",
             "profile": {
@@ -2248,7 +2210,6 @@
             "bankedResetsApplied": 0,
             "keepFreePercent": 0.0,
             "listCostUsd": 0.24000000000000002,
-            "pacing": "max",
             "planPressure": 175.78124999999997,
             "planTier": "scenario",
             "planValues": [
@@ -2270,7 +2231,6 @@
             "listCostUsd": 0.24000000000000002,
             "normalizedCost": 22.145669291338578,
             "omittedDimensions": [],
-            "pacing": "max",
             "pressure": 175.78124999999997,
             "priceUnit": "task",
             "profile": {

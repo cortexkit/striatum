@@ -333,7 +333,66 @@ fn fixture() -> (ScratchDir, LiveQuota) {
     (scratch, live)
 }
 
+#[tokio::test]
+async fn owed_quota_snapshot_retries_on_idle_ticks_and_regular_snapshots_clear_debt() {
+    let (_scratch, live) = fixture();
+    let start = Instant::now();
+    let mut schedule = SnapshotSchedule::new(start);
+    let mut sequence = SequenceState::default();
+    schedule.set_attached(true, start);
+    let mut source = Source {
+        snapshot: snapshot_body(&body("epoch-z", 1, 10)),
+        ..Default::default()
+    };
+    maintain_inventory(&mut source, &live, &mut schedule, &mut sequence, start).await;
+
+    let bus = bus();
+    let updated = body("epoch-z", 2, 20);
+    source.snapshot = snapshot_body(&updated);
+    source.fetch_error = Some("event_not_found".into());
+    source.snapshot_error = Some("usage unavailable".into());
+    publish(&bus, &mut source, &updated).await;
+    let mut cursor = Cursor::new(&bus, &live).await;
+    cursor.verify_publication = false;
+    consume_one(&mut cursor, &mut source, &live, &mut sequence, SUBJECT)
+        .await
+        .unwrap();
+    assert_eq!(cursor.acks, 1);
+    assert_eq!(source.snapshots, 2);
+    assert_eq!(used(&live), 10.0);
+
+    source.snapshot_error = None;
+    let due = sequence.last_catch_up_attempt.unwrap() + CATCH_UP_SNAPSHOT_EVERY;
+    maintain_inventory(
+        &mut source,
+        &live,
+        &mut schedule,
+        &mut sequence,
+        due - Duration::from_secs(1),
+    )
+    .await;
+    assert_eq!(source.snapshots, 2, "idle retry must respect its deadline");
+    maintain_inventory(&mut source, &live, &mut schedule, &mut sequence, due).await;
+    assert_eq!(
+        source.snapshots, 3,
+        "idle retry did not fetch the owed snapshot"
+    );
+    assert_eq!(used(&live), 20.0);
+    assert!(!sequence.owe_snapshot);
+
+    let regular = schedule.next;
+    sequence.owe_snapshot = true;
+    sequence.last_catch_up_attempt = Some(regular - Duration::from_secs(1));
+    maintain_inventory(&mut source, &live, &mut schedule, &mut sequence, regular).await;
+    assert_eq!(source.snapshots, 4);
+    assert!(
+        !sequence.owe_snapshot,
+        "ordinary publication also pays the debt"
+    );
+}
+
 const KIMI_CREDENTIAL: &str = "apikey:kimi-for-coding";
+const KIMI_SIBLING: &str = "apikey:kimi-for-coding-other";
 
 fn kimi_entry() -> Value {
     serde_json::from_str(
@@ -343,18 +402,25 @@ fn kimi_entry() -> Value {
 }
 
 fn install_credential_roster(live: &LiveQuota) {
+    install_kimi_roster(live, &[KIMI_CREDENTIAL]);
+}
+
+fn install_kimi_roster(live: &LiveQuota, credentials: &[&str]) {
     let listing = cortexkit_claustrum_client::ScopedCredentialListing {
         view: "key-only-kimi".into(),
-        credentials: vec![cortexkit_claustrum_client::ListedCredential {
-            id: KIMI_CREDENTIAL.into(),
-            state: "active".into(),
-            categories: vec!["llm-provider".into()],
-            provider_ids: vec!["kimi-code-plan-global".into()],
-            credential_type: "apikey".into(),
-            auth_method: Some("apikey".into()),
-            plan_tier: Some("pro_500".into()),
-            ..Default::default()
-        }],
+        credentials: credentials
+            .iter()
+            .map(|id| cortexkit_claustrum_client::ListedCredential {
+                id: (*id).into(),
+                state: "active".into(),
+                categories: vec!["llm-provider".into()],
+                provider_ids: vec!["kimi-code-plan-global".into()],
+                credential_type: "apikey".into(),
+                auth_method: Some("apikey".into()),
+                plan_tier: Some("pro_500".into()),
+                ..Default::default()
+            })
+            .collect(),
         ..Default::default()
     };
     account_quota::apply_roster_listing(
@@ -379,20 +445,70 @@ fn stored_rows(live: &LiveQuota) -> Vec<striatum_store::PersistedAccountReading>
 
 #[test]
 fn exact_accountless_kimi_snapshot_stores_the_listed_credential_login() {
-    let (_scratch, live) = fixture();
-    install_credential_roster(&live);
-    store_snapshot(&live, vec![kimi_entry()]);
+    for reverse in [false, true] {
+        let (_scratch, live) = fixture();
+        install_kimi_roster(&live, &[KIMI_CREDENTIAL, KIMI_SIBLING]);
+        let [first, second] = kimi_siblings();
+        let mut entries = vec![first.clone(), second.clone()];
+        if reverse {
+            entries.reverse();
+        }
+        store_snapshot(&live, entries);
 
-    let rows = stored_rows(&live);
-    assert_eq!(rows.len(), 1, "{rows:?}");
-    assert_eq!(rows[0].provider, "kimi-for-coding");
-    assert_eq!(rows[0].account_id, KIMI_CREDENTIAL);
-    assert_eq!(
-        serde_json::from_str::<Value>(&rows[0].entry_json).unwrap(),
-        kimi_entry()
-    );
-    let cached = serde_json::to_value(&live.cache.lock().unwrap().windows).unwrap();
-    assert_eq!(cached[0]["credentialRef"], KIMI_CREDENTIAL);
+        let rows = stored_rows(&live);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        for entry in [&first, &second] {
+            let row = rows
+                .iter()
+                .find(|row| row.account_id == entry["credentialRef"])
+                .unwrap();
+            assert_eq!(row.provider, "kimi-for-coding");
+            assert_eq!(
+                &serde_json::from_str::<Value>(&row.entry_json).unwrap(),
+                entry
+            );
+        }
+        let assert_cached = |sibling_healthy| {
+            let cache = live.cache.lock().unwrap();
+            assert_eq!(cache.windows.len(), 2, "{:#?}", cache.windows);
+            for (credential, healthy) in [(KIMI_CREDENTIAL, true), (KIMI_SIBLING, sibling_healthy)]
+            {
+                let row = cache
+                    .windows
+                    .iter()
+                    .find(|row| row.credential_ref.as_deref() == Some(credential))
+                    .unwrap();
+                assert_eq!(row.is_healthy(), healthy, "{credential}");
+            }
+        };
+        assert_cached(true);
+        let mut unusable = second;
+        unusable["usage"] = Value::Null;
+        unusable["error"] = json!("login rejected");
+        unusable["errorClass"] = json!("credential_unusable");
+        live.store_sample(unusable).unwrap();
+        assert_cached(false);
+    }
+}
+
+fn kimi_siblings() -> [Value; 2] {
+    let first = kimi_entry();
+    let mut second = first.clone();
+    second["credentialRef"] = json!(KIMI_SIBLING);
+    second["usage"]["primary"]["usedPercent"] = json!(100.0);
+    [first, second]
+}
+
+#[test]
+fn accountless_siblings_clear_their_own_snapshot_baselines() {
+    let (_scratch, live) = fixture();
+    install_kimi_roster(&live, &[KIMI_CREDENTIAL, KIMI_SIBLING]);
+    let [first, second] = kimi_siblings();
+    store_snapshot(&live, vec![first.clone(), second.clone()]);
+    for entry in [&first, &second] {
+        assert_eq!(live.covered_by_snapshot(entry).unwrap(), Some(true));
+        assert_eq!(live.covered_by_snapshot(entry).unwrap(), None);
+    }
 }
 
 #[test]

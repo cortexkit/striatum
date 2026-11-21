@@ -625,57 +625,11 @@ pub(crate) fn derive_blocks(
             continue;
         }
         let prior = clocks.remove(&key);
-        if let Some((block, cleared)) = &prior {
-            if block.evidence == origin.evidence {
-                if cleared.is_none() {
-                    loaded.blocks.push(block.clone());
-                }
-                continue;
-            }
-        }
-        let evidence_at = origin.evidence_at;
-        let quota = origin.quota.unwrap_or(false);
-        let deadline = origin.deadline.map(|at| at as i64);
-        if !quota && deadline.is_some_and(|at| at < now) {
-            continue;
-        }
-        let last_claimed_at = prior.as_ref().and_then(|(b, _)| b.last_claimed_at);
-        let mut next = if quota {
-            evidence_at.saturating_add(QUOTA_FENCE_RECHECK_MS)
-        } else {
-            let cap = evidence_at.saturating_add(NON_QUOTA_FENCE_MAX_MS);
-            deadline.unwrap_or(cap).min(cap)
-        };
-        if last_claimed_at.is_some_and(|at| evidence_at < at) {
-            next = next.max(prior.as_ref().unwrap().0.next_recheck_at);
-        }
-        let reset = origin.reset_at.map(|at| at as i64).filter(|at| {
-            quota && *at > evidence_at && last_claimed_at.is_none_or(|claimed| *at > claimed)
-        });
-        loaded.blocks.push(Block {
-            cause: cause(&origin.kind)?,
-            kind: origin.kind,
-            origin_key: origin.origin_key,
-            scope: Scope {
-                provider: origin.provider,
-                account_id: origin.account_id,
-                credential_id: origin.credential_id,
-                model: origin.model,
-                size_class: origin.size_class,
-                principal: origin.principal,
-                admission_id: origin.admission_id,
-            },
-            lifetime: LifetimeClass::from_quota(quota),
-            classified: false,
-            evidence: origin.evidence,
-            evidence_at,
-            next_recheck_at: next,
-            reset_check_at: reset,
-            last_claimed_at,
-            claim_owner: None,
-            claim_generation: 0,
-            cleared_models: Vec::new(),
-        });
+        loaded.blocks.extend(derive_block(
+            origin,
+            prior.as_ref().map(|(block, cleared)| (block, *cleared)),
+            now,
+        )?);
     }
     loaded.blocks.extend(
         clocks
@@ -684,6 +638,61 @@ pub(crate) fn derive_blocks(
             .map(|(block, _)| block),
     );
     Ok(loaded)
+}
+
+pub(crate) fn derive_block(
+    origin: ViewOrigin,
+    prior: Option<(&Block, Option<i64>)>,
+    now: i64,
+) -> rusqlite::Result<Option<Block>> {
+    if let Some((block, cleared)) = prior {
+        if block.evidence == origin.evidence {
+            return Ok(cleared.is_none().then(|| block.clone()));
+        }
+    }
+    let evidence_at = origin.evidence_at;
+    let quota = origin.quota.unwrap_or(false);
+    let deadline = origin.deadline.map(|at| at as i64);
+    if !quota && deadline.is_some_and(|at| at < now) {
+        return Ok(None);
+    }
+    let last_claimed_at = prior.as_ref().and_then(|(b, _)| b.last_claimed_at);
+    let mut next = if quota {
+        evidence_at.saturating_add(QUOTA_FENCE_RECHECK_MS)
+    } else {
+        let cap = evidence_at.saturating_add(NON_QUOTA_FENCE_MAX_MS);
+        deadline.unwrap_or(cap).min(cap)
+    };
+    if last_claimed_at.is_some_and(|at| evidence_at < at) {
+        next = next.max(prior.as_ref().unwrap().0.next_recheck_at);
+    }
+    let reset = origin.reset_at.map(|at| at as i64).filter(|at| {
+        quota && *at > evidence_at && last_claimed_at.is_none_or(|claimed| *at > claimed)
+    });
+    Ok(Some(Block {
+        cause: cause(&origin.kind)?,
+        kind: origin.kind,
+        origin_key: origin.origin_key,
+        scope: Scope {
+            provider: origin.provider,
+            account_id: origin.account_id,
+            credential_id: origin.credential_id,
+            model: origin.model,
+            size_class: origin.size_class,
+            principal: origin.principal,
+            admission_id: origin.admission_id,
+        },
+        lifetime: LifetimeClass::from_quota(quota),
+        classified: false,
+        evidence: origin.evidence,
+        evidence_at,
+        next_recheck_at: next,
+        reset_check_at: reset,
+        last_claimed_at,
+        claim_owner: None,
+        claim_generation: 0,
+        cleared_models: Vec::new(),
+    }))
 }
 
 /// Whether `row` authorizes the test request its clock is on now: the clock
@@ -2229,6 +2238,35 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn admission_projection_preserves_shared_origins_and_recheck_order() {
+        let now = 1_900_000_000_000;
+        let (_scratch, store) = native_fixture::changed_evidence_parity_store(now);
+        let state = store.with_reader_for_test(crate::BlockState::read).unwrap();
+        let full = state.fence_rechecks(now).unwrap();
+        assert!(full.iter().any(|row| row.provider.is_empty()));
+        assert!(full.iter().any(|row| row.kind == "observation"));
+        for provider in ["cpu-provider-0", "cpu-provider-1", "absent"] {
+            let expected: Vec<_> = full
+                .iter()
+                .filter(|row| row.provider == provider || row.provider.is_empty())
+                .cloned()
+                .collect();
+            let scoped = state.admission_fence_rechecks(provider, now).unwrap();
+            // Source-less observations are appended after the scan-ordered sources.
+            let canonical_tail = |mut rows: Vec<FenceRecheck>| {
+                let start = rows.partition_point(|row| row.kind != "observation");
+                rows[start..].sort_by(|left, right| left.origin_key.cmp(&right.origin_key));
+                rows
+            };
+            assert_eq!(
+                canonical_tail(scoped),
+                canonical_tail(expected),
+                "{provider}"
+            );
+        }
+    }
 
     #[test]
     fn expired_admission_probe_cannot_reopen_newer_evidence_or_claim_generation() {

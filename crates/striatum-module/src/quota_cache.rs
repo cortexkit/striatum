@@ -108,7 +108,7 @@ pub(super) fn quota_cache_key(window: &ProviderUsage) -> String {
     format!(
         "{}\0{}",
         window.provider,
-        window.account.as_deref().unwrap_or("")
+        window.account_identity().unwrap_or_default()
     )
 }
 

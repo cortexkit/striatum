@@ -167,6 +167,26 @@ impl AccountCommand<'_> {
         }
     }
 
+    pub(crate) fn admission_fence_rechecks(
+        &self,
+        provider: &str,
+    ) -> RouteStateResult<Vec<FenceRecheck>> {
+        match self.working_blocks()? {
+            Some(blocks) => {
+                let project = || blocks.admission_fence_rechecks(provider, wall_now());
+                #[cfg(test)]
+                let project = || striatum_store::count_recheck_rows(project);
+                project()
+            }
+            None => Ok(self
+                .sql
+                .fence_rechecks()?
+                .into_iter()
+                .filter(|origin| origin.provider.is_empty() || origin.provider == provider)
+                .collect()),
+        }
+    }
+
     pub(crate) fn active_fences(&self, provider: &str) -> RouteStateResult<Vec<AccountFenceRow>> {
         read!(
             self.working_blocks()?,
