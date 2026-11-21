@@ -1,6 +1,7 @@
 //! One effective view of operator runner policy and verified runner facts.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use cortexkit_role_routing::declarations::{RunnerPair, StandingLimits};
 use cortexkit_role_routing::spellings::{AUTH_METHODS, WIRE_APIS};
@@ -71,6 +72,8 @@ pub(crate) struct EffectiveRunner {
     harness_choices: Option<Vec<harness_choice::Candidate>>,
     #[serde(skip)]
     placement_baseline: Option<Box<EffectiveRunner>>,
+    #[serde(skip)]
+    shared_placement_key: bool,
 }
 
 pub(crate) fn can_offer_account(
@@ -135,25 +138,42 @@ pub(crate) struct Registry {
 /// Session selection keeps placements distinct; module-scoped operations keep
 /// reading the first configured entry, as they did before harness placements.
 pub(crate) trait RunnerKey {
-    fn matches(&self, policy: &RunnerPolicy) -> bool;
+    fn matches(&self, runner: &EffectiveRunner) -> bool;
 }
 
 impl RunnerKey for str {
-    fn matches(&self, policy: &RunnerPolicy) -> bool {
-        self == policy.module
+    fn matches(&self, runner: &EffectiveRunner) -> bool {
+        self == runner.policy.module
     }
 }
 
 impl RunnerKey for String {
-    fn matches(&self, policy: &RunnerPolicy) -> bool {
-        self.as_str() == policy.module
+    fn matches(&self, runner: &EffectiveRunner) -> bool {
+        self.as_str() == runner.policy.module
     }
 }
 
 impl RunnerKey for RunnerPolicy {
-    fn matches(&self, policy: &RunnerPolicy) -> bool {
-        self.module == policy.module && self.harness == policy.harness
+    fn matches(&self, runner: &EffectiveRunner) -> bool {
+        self.module == runner.policy.module
+            && self.harness == runner.policy.harness
+            && (!runner.shared_placement_key || self.routes == runner.policy.routes)
     }
+}
+
+fn placement_routes(
+    config: Option<&crate::config_overrides::LiveConfig>,
+    policy: &RunnerPolicy,
+) -> Option<Arc<CompiledSpecs>> {
+    config
+        .and_then(|config| config.runner_routes(policy).cloned())
+        .or_else(|| {
+            // Project intersections are not part of the published user config.
+            policy
+                .routes
+                .as_deref()
+                .map(|routes| Arc::new(placements::compile(routes)))
+        })
 }
 
 pub(crate) struct RunnerPolicies<'a> {
@@ -243,14 +263,17 @@ impl Registry {
         let Some(original) = registry.entries.pop() else {
             return registry;
         };
-        registry.entries = RunnerPolicies::for_consumer(config, consumer)
+        let policies: Vec<_> = RunnerPolicies::for_consumer(config, consumer)
             .enrolled(credentials, now_ms)
             .into_iter()
             .filter(|policy| policy.module == module)
+            .collect();
+        registry.entries = policies
+            .iter()
             .map(|policy| {
                 let mut runner = original.clone();
-                runner.route_policy = config.runner_routes(&policy).cloned();
-                runner.policy.harness = policy.harness;
+                runner.route_policy = placement_routes(Some(config), policy);
+                runner.policy.harness.clone_from(&policy.harness);
                 runner.policy.routes.as_mut().unwrap().retain(|route| {
                     runner
                         .route_policy
@@ -260,6 +283,7 @@ impl Registry {
                 runner
             })
             .collect();
+        registry.keep_distinct_placement_keys(&policies);
         registry
     }
 
@@ -320,6 +344,7 @@ impl Registry {
                 provider_limit_models: BTreeSet::new(),
                 harness_choices: None,
                 placement_baseline: None,
+                shared_placement_key: false,
             }],
         }
     }
@@ -545,15 +570,7 @@ impl Registry {
                     .retain(|model| !statically_reachable_models.contains(model));
                 no_account_models.retain(|model| !statically_reachable_models.contains(model));
                 provider_limit_models.retain(|model| !statically_reachable_models.contains(model));
-                let route_policy = source.config.map_or_else(
-                    || {
-                        policy
-                            .routes
-                            .as_ref()
-                            .map(|routes| std::sync::Arc::new(placements::compile(routes)))
-                    },
-                    |config| config.runner_routes(&policy).cloned(),
-                );
+                let route_policy = placement_routes(source.config, &policy);
                 let routes = facts
                     .iter()
                     .filter(|fact| {
@@ -605,6 +622,7 @@ impl Registry {
                     provider_limit_models,
                     harness_choices: None,
                     placement_baseline: None,
+                    shared_placement_key: false,
                 }
             })
             .collect();
@@ -622,9 +640,21 @@ impl Registry {
     }
 
     pub(crate) fn get(&self, key: &(impl RunnerKey + ?Sized)) -> Option<&EffectiveRunner> {
-        self.entries
-            .iter()
-            .find(|runner| key.matches(&runner.policy))
+        self.entries.iter().find(|runner| key.matches(runner))
+    }
+
+    fn keep_distinct_placement_keys(&mut self, source: &[RunnerPolicy]) {
+        // Inheriting a global harness can resolve a bare project entry and an
+        // explicit entry to the same pair. Keep their configured route lists as
+        // keys even if they currently reach the same models (or none).
+        for (i, (runner, policy)) in self.entries.iter_mut().zip(source).enumerate() {
+            if source.iter().enumerate().any(|(j, other)| {
+                i != j && other.module == policy.module && other.harness == policy.harness
+            }) {
+                runner.shared_placement_key = true;
+                runner.policy.routes.clone_from(&policy.routes);
+            }
+        }
     }
 
     pub(crate) fn runs(

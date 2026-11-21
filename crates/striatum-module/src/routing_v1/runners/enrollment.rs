@@ -100,6 +100,17 @@ pub(super) fn policies_at(
     credentials: &BrocaCredentials,
     now: i64,
 ) -> Vec<RunnerPolicy> {
+    let mut policies = enrolled(settings, credentials);
+    policies.retain(|policy| declaration_available_at(&policy.module, credentials, now));
+    policies
+}
+
+/// An unavailable declaration affects selection, not whether a project may
+/// name a module that the user already enrolled.
+pub(crate) fn enrolled(
+    settings: &[RunnerPolicy],
+    credentials: &BrocaCredentials,
+) -> Vec<RunnerPolicy> {
     let mut policies = settings.to_vec();
     for module in credentials.first_party_runners.keys() {
         if !settings.iter().any(|policy| policy.module == *module) {
@@ -112,7 +123,6 @@ pub(super) fn policies_at(
             });
         }
     }
-    policies.retain(|policy| declaration_available_at(&policy.module, credentials, now));
     policies
 }
 

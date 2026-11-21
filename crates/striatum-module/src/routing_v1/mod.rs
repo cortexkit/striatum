@@ -217,6 +217,17 @@ pub(crate) struct ScopeAuthority {
 }
 
 impl Caller {
+    fn stamped_project(&self) -> Option<&str> {
+        self.scope_authority
+            .as_ref()
+            .and_then(|scope| scope.project_id.as_deref())
+            .or_else(|| {
+                self.scope
+                    .as_ref()
+                    .and_then(|scope| scope.project_id.as_deref())
+            })
+    }
+
     pub(crate) fn for_route(channel: u16, epoch: u32) -> Self {
         Self {
             binding: Some((channel, epoch)),
@@ -270,6 +281,39 @@ impl Caller {
             .strip_prefix("reserved:")
             .filter(|module| !module.is_empty())
     }
+}
+
+async fn scoped_settings(
+    settings: Option<&cortexkit_role_routing::select::SelectSettings>,
+    caller: &Caller,
+    deps: &Deps<'_>,
+    config: &crate::config_overrides::LiveConfig,
+) -> Result<
+    (
+        crate::tier_settings::Layers,
+        Option<cortexkit_role_routing::select::ProjectSettings>,
+    ),
+    Refusal,
+> {
+    let project = caller.stamped_project();
+    if let Some(settings) = settings {
+        settings.check_project_stamp(project)?;
+    }
+    let Some(project) = project else {
+        return Ok((crate::tier_settings::Layers::new(None, None), None));
+    };
+    let enrolled = runners::enrollment::enrolled(
+        &config.v1_runners(),
+        &*deps.broca_credentials.lock().map_err(store_refusal)?,
+    );
+    let (layers, status) =
+        crate::project_settings::layers(project, deps.routing_config_path, &enrolled).await;
+    // Tiers are a caller-visible wire opt-in. Runner placement is operator
+    // policy keyed by the daemon's scope even when the caller omits settings.
+    let tier_status = settings
+        .and_then(|settings| settings.project_id.as_ref())
+        .map(|_| status);
+    Ok((layers, tier_status))
 }
 
 /// Answer one v1 request on its route and send the reply frame.

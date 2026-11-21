@@ -458,30 +458,6 @@ fn family(value: Option<&str>) -> String {
     value.unwrap_or("unknown").to_owned()
 }
 
-async fn settings(
-    request: &SelectPanelRequest,
-    caller: &Caller,
-    deps: &Deps<'_>,
-) -> Result<crate::tier_settings::Layers, Refusal> {
-    if let Some(settings) = &request.settings {
-        settings.check_project_stamp(
-            caller
-                .scope_authority
-                .as_ref()
-                .and_then(|s| s.project_id.as_deref())
-                .or_else(|| caller.scope.as_ref().and_then(|s| s.project_id.as_deref())),
-        )?;
-        if let Some(project) = &settings.project_id {
-            return Ok(
-                crate::project_settings::layers(project, deps.routing_config_path)
-                    .await
-                    .0,
-            );
-        }
-    }
-    Ok(crate::tier_settings::Layers::new(None, None))
-}
-
 enum SeatAdmission<S = PanelSeat> {
     Seated(S),
     Rejected(PanelRejectedCandidate),
@@ -790,12 +766,25 @@ async fn candidates(
     let live = &shared.live_config;
     // Validate the requested project id against the caller's daemon-stamped
     // project before reading candidates, even if the panel will be empty.
-    let layers = settings(request, caller, deps).await?;
+    let (layers, tier_status) =
+        super::scoped_settings(request.settings.as_ref(), caller, deps, config).await?;
+    let project_runners = layers.runners(&request.consumer);
+    let has_project_runners = project_runners.is_some();
+    let empty = crate::tier_settings::Layers::new(None, None);
+    let tier_layers = if tier_status.is_some() {
+        &layers
+    } else {
+        &empty
+    };
     let mut prepared = shared.prepare_for_sweep(deps, dry.map(|dry| dry.accounts))?;
     let aliases = &shared.catalog_targets;
     let consumers = super::consumers::effective(&config);
-    let policy =
+    let mut policy =
         config.consumer_policy(&request.consumer, &Default::default(), &consumers.policies);
+    if let Some(runners) = project_runners {
+        policy.runners = Some(runners);
+        policy.runner = None;
+    }
     let metered = crate::select_policy::priced_per_token(
         &policy,
         crate::select_policy::Consumer::from_id(&request.consumer),
@@ -823,16 +812,31 @@ async fn candidates(
     .map_err(store_refusal)?;
     let registry = {
         let credentials = deps.broca_credentials.lock().map_err(store_refusal)?;
-        super::runners::Registry::build_for_selection(
-            config.as_ref(),
-            &credentials,
-            &prepared.facts,
-            super::now_ms(),
-            request.harness.as_deref(),
-        )
+        if has_project_runners {
+            super::runners::Registry::build_for_task(
+                super::runners::RunnerPolicies::for_consumer(config, &policy),
+                &credentials,
+                &prepared.facts,
+                super::now_ms(),
+                request.harness.as_deref(),
+                &request.seat_request(&[]).requirements,
+            )
+        } else {
+            super::runners::Registry::build_for_selection(
+                config.as_ref(),
+                &credentials,
+                &prepared.facts,
+                super::now_ms(),
+                request.harness.as_deref(),
+            )
+        }
     };
-    let runners: Vec<_> = registry
-        .policies()
+    let entries = if has_project_runners {
+        registry.task_policies()
+    } else {
+        registry.policies()
+    };
+    let runners: Vec<_> = entries
         .into_iter()
         .filter(|r| {
             request
@@ -840,11 +844,21 @@ async fn candidates(
                 .as_ref()
                 .is_none_or(|names| names.contains(&r.module))
                 && policy.runner.as_ref().is_none_or(|name| name == &r.module)
-                && request.harness.as_deref().is_none_or(|h| {
-                    registry
-                        .get(&r.module)
-                        .is_some_and(|r| r.harnesses.iter().any(|name| name == h))
-                })
+                && if has_project_runners {
+                    registry.get(r).is_some_and(|entry| {
+                        super::runners::placements::usable(r, entry.wire_declaration())
+                            && request.harness.as_ref().is_none_or(|harness| {
+                                r.harness.as_ref().is_none_or(|bound| bound == harness)
+                                    && entry.harnesses.contains(harness)
+                            })
+                    })
+                } else {
+                    request.harness.as_ref().is_none_or(|harness| {
+                        registry
+                            .get(&r.module)
+                            .is_some_and(|entry| entry.harnesses.contains(harness))
+                    })
+                }
         })
         .collect();
     let tier_consumer = request
@@ -857,7 +871,7 @@ async fn candidates(
         classes.apply_configured_service_tiers(
             &mut prepared.facts,
             |fact| {
-                layers.resolve(
+                tier_layers.resolve(
                     &config,
                     tier_consumer,
                     &fact.provider_id,
@@ -925,10 +939,13 @@ async fn candidates(
                 "unavailable",
                 "route is not in the request's available_routes",
             ))
-        } else if !runners
-            .iter()
-            .any(|r| registry.runs(&r.module, &route.route_key, &route.capacity_key))
-        {
+        } else if !runners.iter().any(|r| {
+            if has_project_runners {
+                registry.runs(r, &route.route_key, &route.capacity_key)
+            } else {
+                registry.runs(&r.module, &route.route_key, &route.capacity_key)
+            }
+        }) {
             Some((
                 "unavailable",
                 "no eligible requested runner serves this route",

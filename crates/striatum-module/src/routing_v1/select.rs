@@ -269,17 +269,32 @@ pub(super) async fn evaluate_with_inputs(
     shared: &RequestInputs,
     panel_seat: bool,
 ) -> Result<Value, Refusal> {
-    let mut inputs = prepare_selection(params, caller, deps, shared, Some(view)).await?;
+    let request = if panel_seat {
+        let consumers = super::consumers::effective(&shared.operator_config);
+        Some(parse_admitted_request(params, caller, &consumers, true)?)
+    } else {
+        None
+    };
+    let (layers, status) = super::scoped_settings(
+        request
+            .as_ref()
+            .and_then(|request| request.settings.as_ref()),
+        caller,
+        deps,
+        &shared.operator_config,
+    )
+    .await?;
+    let mut inputs = prepare_selection(params, caller, deps, shared, &layers, Some(view)).await?;
     if panel_seat {
-        let (layers, status) = selection_settings(params, &inputs.request, caller, deps).await?;
         let request = inputs.request.clone();
+        let empty = crate::tier_settings::Layers::new(None, None);
         return select_with_tier_fallback(
             params,
             caller,
             deps,
             profile_lookup,
             &request,
-            &layers,
+            if status.is_some() { &layers } else { &empty },
             status,
             true,
             shared,
@@ -350,8 +365,22 @@ async fn select_with_profile_lookup_kind(
     );
     let consumers = super::consumers::effective(&config);
     let request = parse_admitted_request(params, caller, &consumers, false)?;
-    let (settings_layers, project_settings) =
-        selection_settings(params, &request, caller, deps).await?;
+    let (project_layers, project_settings) =
+        super::scoped_settings(request.settings.as_ref(), caller, deps, &config).await?;
+    let legacy_layers;
+    let settings_layers = if project_settings.is_some() {
+        &project_layers
+    } else {
+        legacy_layers = if request.settings.is_none() {
+            crate::tier_settings::Layers::new(
+                params.get("project_root").and_then(Value::as_str),
+                params.get("workspace_root").and_then(Value::as_str),
+            )
+        } else {
+            crate::tier_settings::Layers::new(None, None)
+        };
+        &legacy_layers
+    };
     let mut effective_request = request.clone();
     let mut result = async {
         let owned;
@@ -362,7 +391,8 @@ async fn select_with_profile_lookup_kind(
                 &owned
             }
         };
-        let mut inputs = prepare_selection(params, caller, deps, shared, None).await?;
+        let mut inputs =
+            prepare_selection(params, caller, deps, shared, &project_layers, None).await?;
         effective_request = inputs.request.clone();
         select_with_tier_fallback(
             params,
@@ -370,7 +400,7 @@ async fn select_with_profile_lookup_kind(
             deps,
             profile_lookup,
             &request,
-            &settings_layers,
+            settings_layers,
             project_settings,
             panel_seat,
             shared,
@@ -402,50 +432,6 @@ async fn select_with_profile_lookup_kind(
         }
     }
     result
-}
-
-async fn selection_settings(
-    params: &Value,
-    request: &SelectRequest,
-    caller: &Caller,
-    deps: &Deps<'_>,
-) -> Result<
-    (
-        crate::tier_settings::Layers,
-        Option<cortexkit_role_routing::select::ProjectSettings>,
-    ),
-    Refusal,
-> {
-    Ok(if let Some(settings) = &request.settings {
-        settings.check_project_stamp(
-            caller
-                .scope_authority
-                .as_ref()
-                .and_then(|scope| scope.project_id.as_deref())
-                .or_else(|| {
-                    caller
-                        .scope
-                        .as_ref()
-                        .and_then(|scope| scope.project_id.as_deref())
-                }),
-        )?;
-        match settings.project_id.as_deref() {
-            Some(project) => {
-                let (layers, status) =
-                    crate::project_settings::layers(project, deps.routing_config_path).await;
-                (layers, Some(status))
-            }
-            None => (crate::tier_settings::Layers::new(None, None), None),
-        }
-    } else {
-        (
-            crate::tier_settings::Layers::new(
-                params.get("project_root").and_then(Value::as_str),
-                params.get("workspace_root").and_then(Value::as_str),
-            ),
-            None,
-        )
-    })
 }
 
 async fn select_with_tier_fallback(
@@ -924,6 +910,7 @@ async fn prepare_selection(
     caller: &Caller,
     deps: &Deps<'_>,
     shared: &RequestInputs,
+    project_layers: &crate::tier_settings::Layers,
     evaluation: Option<&Evaluation<'_>>,
 ) -> Result<SelectionInputs, Refusal> {
     let live_config = &shared.live_config;
@@ -951,7 +938,7 @@ async fn prepare_selection(
     // Keep the declared ladder separate from settings policy looked up by
     // consumer name: a settings child belonging to another owner must not
     // inherit it.
-    let consumer_policy = operator_config.consumer_policy(
+    let mut consumer_policy = operator_config.consumer_policy(
         &consumer,
         &crate::config_policy::ConsumerPolicy {
             iq: Some(f64::from(request.requirements.iq)),
@@ -965,6 +952,10 @@ async fn prepare_selection(
         },
         &consumers.policies,
     );
+    if let Some(runners) = project_layers.runners(&consumer) {
+        consumer_policy.runners = Some(runners);
+        consumer_policy.runner = None;
+    }
     // An operator's consumer pin is a hard selection, not a one-route ladder:
     // it bypasses automatic pin-only fences but still uses all pin admission
     // and account checks. Never let a caller's fallback preference replace it.

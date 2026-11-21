@@ -1,4 +1,4 @@
-//! Project tier settings resolved from Entorhinal's machine-local census.
+//! Project routing settings resolved from Entorhinal's machine-local census.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 use tokio::sync::Mutex;
 use tokio::time::{timeout, timeout_at, Instant};
 
-use crate::tier_settings::Layers;
+use crate::{config_policy::RunnerPolicy, tier_settings::Layers};
 
 const REFRESH_MS: u64 = 60_000;
 const MAX_STALE_MS: u64 = 10 * 60_000;
@@ -267,7 +267,17 @@ impl Resolver {
         Ok(canonical)
     }
 
-    pub(crate) async fn layers(&self, project_id: &str, now: u64) -> (Layers, ProjectSettings) {
+    #[cfg(test)]
+    async fn layers(&self, project_id: &str, now: u64) -> (Layers, ProjectSettings) {
+        self.enrolled_layers(project_id, now, &[]).await
+    }
+
+    async fn enrolled_layers(
+        &self,
+        project_id: &str,
+        now: u64,
+        enrolled: &[RunnerPolicy],
+    ) -> (Layers, ProjectSettings) {
         let started = Instant::now();
         let deadline = started + SETTINGS_DEADLINE;
         let mut cache = match timeout_at(deadline, self.cache.lock()).await {
@@ -279,7 +289,12 @@ impl Resolver {
         if cache.last_timeout.is_some_and(|at| at >= started) {
             return self.unresolved(project_id, &ReadError::Timeout);
         }
-        match timeout_at(deadline, self.layers_cached(&mut cache, project_id, now)).await {
+        match timeout_at(
+            deadline,
+            self.layers_cached(&mut cache, project_id, now, enrolled),
+        )
+        .await
+        {
             Ok(Ok((layers, applied))) => {
                 if !cache.registry_unavailable {
                     self.warned_projects.lock().unwrap().remove(project_id);
@@ -314,6 +329,7 @@ impl Resolver {
         cache: &mut Cache,
         project_id: &str,
         now: u64,
+        enrolled: &[RunnerPolicy],
     ) -> Result<(Layers, bool), ReadError> {
         if cache.census.is_some()
             && cache
@@ -352,7 +368,8 @@ impl Resolver {
                 .as_ref()
                 .and_then(|census| census.roots(&canonical))
                 .ok_or_else(|| "project id is absent from census".to_owned())?;
-            Layers::from_roots(&projects, workspace.as_deref()).map_err(ReadError::from)
+            Layers::for_enrolled_runners(&projects, workspace.as_deref(), enrolled)
+                .map_err(ReadError::from)
         }
         .await;
         result
@@ -369,19 +386,29 @@ pub(crate) fn initialize(connection: &Path, bind_root: &Path) {
 }
 
 /// Resolve a settings project id to file layers and `applied`, `none` or
-/// `unresolved`. Select and panel callers validate the trusted project stamp
-/// with `SelectSettings::check_project_stamp` before calling. The config path
+/// `unresolved`. The project id must come from the caller's daemon stamp, not
+/// the request body. The config path
 /// identifies the caller's routing configuration in isolated test harnesses.
-pub(crate) async fn layers(project: &str, _config: &Path) -> (Layers, ProjectSettings) {
+pub(crate) async fn layers(
+    project: &str,
+    _config: &Path,
+    enrolled: &[RunnerPolicy],
+) -> (Layers, ProjectSettings) {
     #[cfg(test)]
     {
         let resolver = test_sources().lock().unwrap().get(_config).cloned();
         if let Some(resolver) = resolver {
-            return resolver.layers(project, crate::now_ms()).await;
+            return resolver
+                .enrolled_layers(project, crate::now_ms(), enrolled)
+                .await;
         }
     }
     match LIVE.get() {
-        Some(resolver) => resolver.layers(project, crate::now_ms()).await,
+        Some(resolver) => {
+            resolver
+                .enrolled_layers(project, crate::now_ms(), enrolled)
+                .await
+        }
         None => (Layers::new(None, None), ProjectSettings::Unresolved),
     }
 }

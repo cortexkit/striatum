@@ -230,11 +230,11 @@ impl Registry {
             );
             *entry = parent;
         }
-        for (entry, policy) in registry.entries.iter_mut().zip(source_policies) {
+        for (entry, policy) in registry.entries.iter_mut().zip(&source_policies) {
             if policy.harness.is_some() {
                 entry.placement_baseline = Self::build_for_harness(
                     RunnerPolicies {
-                        policies: vec![policy],
+                        policies: vec![policy.clone()],
                         config,
                         consumer: None,
                         auto_enroll: false,
@@ -249,6 +249,7 @@ impl Registry {
                 .map(Box::new);
             }
         }
+        registry.keep_distinct_placement_keys(&source_policies);
         registry
     }
 }

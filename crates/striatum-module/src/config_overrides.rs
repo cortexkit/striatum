@@ -886,7 +886,7 @@ fn validate_v1_policy(section: &ModelRoutingSection) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_runner_list(runners: &[RunnerPolicy], path: &str) -> Result<(), String> {
+pub(crate) fn validate_runner_list(runners: &[RunnerPolicy], path: &str) -> Result<(), String> {
     let is_word = |text: &str| !text.is_empty() && !text.chars().any(char::is_whitespace);
     let mut seen = std::collections::HashSet::new();
     for runner in runners {

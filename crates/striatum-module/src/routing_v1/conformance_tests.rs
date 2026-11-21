@@ -54,6 +54,7 @@ mod continuation_tests;
 mod first_party_tests;
 #[path = "media_conformance.rs"]
 mod media_conformance;
+mod project_runner_tests;
 mod warm_credential_tests;
 mod zero_config_tests;
 

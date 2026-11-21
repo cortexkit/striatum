@@ -4,7 +4,28 @@ Striatum picks the model and the account for every model call in the CortexKit f
 
 It runs as the `striatum` module under subc, with binary `ck-striatum` and store at `~/.local/share/cortexkit/striatum/store.db` (or `$XDG_DATA_HOME/cortexkit/striatum/store.db`). Its crates are `striatum-core`, `striatum-store` and `striatum-module`.
 
-Settings live at `$XDG_CONFIG_HOME/cortexkit/striatum.jsonc` (default `~/.config/cortexkit/striatum.jsonc`); project and workspace tier settings use `.cortexkit/striatum.jsonc` under each root. Routing reads only `striatum.jsonc`, with no fallback to older filenames. `--check-config` validates and names the same global file. A file absent on its first read means defaults (or no tier settings). Once a settings file has loaded successfully, moving or deleting it keeps the last good configuration and reports the missing file once until it is restored. Malformed global edits also keep the last good configuration; replace a file with an empty JSON object (`{}`) to intentionally clear its settings.
+User settings live at `$XDG_CONFIG_HOME/cortexkit/striatum.jsonc` (default `~/.config/cortexkit/striatum.jsonc`). Project and workspace settings use `.cortexkit/striatum.jsonc` under each root. Routing reads only `striatum.jsonc`, with no fallback to older filenames. `--check-config` validates and names the user file. Missing or malformed edits to a previously loaded user file retain the last good configuration. A deleted project or workspace file retains its last good tier settings, but its runner overrides stop applying on the next request. Replace a file with an empty JSON object (`{}`) to intentionally clear all of its settings.
+
+A project can choose its own ordered runner list for a consumer and its dotted descendants. Entries can name only runners already enrolled by the user or auto-enrolled as first-party. For example, in a scratch project's `.cortexkit/striatum.jsonc`:
+
+```jsonc
+{
+  "consumers": {
+    "prefrontal.mason": {"runners": [
+      {"module": "thalamus-harness", "harness": "opencode2"},
+      {"module": "thalamus-harness", "harness": "claude-code"},
+      {"module": "thalamus-harness", "harness": "pi"}
+    ]},
+    "prefrontal.sidekick": {"runners": [
+      {"module": "thalamus-harness", "harness": "opencode2"},
+      {"module": "thalamus-harness", "harness": "claude-code"},
+      {"module": "thalamus-harness", "harness": "pi"}
+    ]}
+  }
+}
+```
+
+The daemon-stamped project selects the file. A matching project list replaces the workspace and user lists; otherwise the workspace list can replace the user list. Requests in other projects without their own overrides keep using the user settings. See [the routing spec](docs/specs/model-routing.md#runner-placement) for validation and precedence.
 
 Tracing warnings and errors go to stderr, one event per line, as `LEVEL message key=value`.
 The daemon adds timestamps and the module prefix. The default threshold is `warn`.

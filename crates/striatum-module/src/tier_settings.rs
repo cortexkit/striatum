@@ -7,6 +7,8 @@ use cortexkit_role_routing::service_tier::ServiceTier;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::config_policy::RunnerPolicy;
+
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Tier {
@@ -30,6 +32,73 @@ impl Tier {
 struct Consumer {
     service_tier: Option<Tier>,
     service_tiers: Option<BTreeMap<String, Tier>>,
+    runners: Option<Vec<RunnerChoice>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunnerChoice {
+    module: String,
+    harness: Option<String>,
+    routes: Option<Vec<String>>,
+}
+
+impl RunnerChoice {
+    fn narrow(&self, enrolled: &[RunnerPolicy]) -> Option<RunnerPolicy> {
+        let mut policy = enrolled
+            .iter()
+            .find(|entry| {
+                entry.module == self.module
+                    && (self.harness.is_none()
+                        || entry.harness.is_none()
+                        || entry.harness == self.harness)
+            })?
+            .clone();
+        if self.harness.is_some() {
+            policy.harness.clone_from(&self.harness);
+        }
+        if let Some(routes) = &self.routes {
+            policy.routes = Some(policy.routes.as_ref().map_or_else(
+                || routes.clone(),
+                |allowed| intersect_routes(allowed, routes),
+            ));
+        }
+        Some(policy)
+    }
+
+    fn as_unrestricted_choice(&self) -> RunnerPolicy {
+        RunnerPolicy {
+            module: self.module.clone(),
+            harness: self.harness.clone(),
+            routes: self.routes.clone(),
+            tool_capabilities: Vec::new(),
+            via_vault: false,
+        }
+    }
+}
+
+fn intersect_routes(enrolled: &[String], project: &[String]) -> Vec<String> {
+    // Each positive route spec admits its slash-separated descendants. Two
+    // specs overlap only when one names a descendant of the other.
+    fn includes(prefix: &str, key: &str) -> bool {
+        key == prefix
+            || key
+                .strip_prefix(prefix)
+                .is_some_and(|tail| tail.starts_with('/'))
+    }
+    let mut intersection = Vec::new();
+    for allowed in enrolled {
+        for chosen in project {
+            if includes(allowed, chosen) {
+                intersection.push(chosen.clone());
+            } else if includes(chosen, allowed) {
+                intersection.push(allowed.clone());
+            }
+        }
+    }
+    intersection.sort_unstable();
+    intersection.dedup();
+    intersection
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Deserialize)]
@@ -46,6 +115,43 @@ struct Document {
     providers: BTreeMap<String, Entity>,
 }
 
+impl Document {
+    fn validate_enrollment(&self, path: &Path, enrolled: &[RunnerPolicy]) -> Result<(), String> {
+        for (consumer, entry) in &self.consumers {
+            for (index, runner) in entry.runners.iter().flatten().enumerate() {
+                if !enrolled.iter().any(|entry| entry.module == runner.module) {
+                    return Err(ConfigError {
+                        code: "routing_tier_config_invalid",
+                        path: path.to_owned(),
+                        key: format!("consumers.{consumer}.runners[{index}].module"),
+                        reason: format!("runner {:?} is not enrolled", runner.module),
+                    }
+                    .to_string());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn same_tiers(&self, other: &Self) -> bool {
+        fn tiers(
+            document: &Document,
+        ) -> impl Iterator<Item = (&String, Option<Tier>, &Option<BTreeMap<String, Tier>>)>
+        {
+            document.consumers.iter().filter_map(|(id, entry)| {
+                (entry.service_tier.is_some() || entry.service_tiers.is_some()).then_some((
+                    id,
+                    entry.service_tier,
+                    &entry.service_tiers,
+                ))
+            })
+        }
+        self.models == other.models
+            && self.providers == other.providers
+            && tiers(self).eq(tiers(other))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ConfigError {
     pub code: &'static str,
@@ -58,7 +164,7 @@ impl std::fmt::Display for ConfigError {
     fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             out,
-            "[striatum] {}: ignoring tier settings file {} ({}{}{}); the next level's settings apply",
+            "[striatum] {}: ignoring routing settings file {} ({}{}{}); the next level's settings apply",
             self.code,
             self.path.display(),
             self.key,
@@ -84,7 +190,7 @@ fn parse(path: &Path, raw: &str) -> Result<Document, ConfigError> {
             if !matches!(section.as_str(), "consumers" | "models" | "providers") {
                 return Err(error(
                     section.clone(),
-                    "a workspace or project routing file may hold only consumers, models and providers tier settings".into(),
+                    "a workspace or project routing file may hold only consumers, models and providers settings".into(),
                 ));
             }
             if let Some(entries) = entries.as_object() {
@@ -92,14 +198,26 @@ fn parse(path: &Path, raw: &str) -> Result<Document, ConfigError> {
                     if let Some(entry) = entry.as_object() {
                         for key in entry.keys() {
                             if key != "service_tier"
-                                && !(section == "consumers" && key == "service_tiers")
+                                && !(section == "consumers"
+                                    && matches!(key.as_str(), "service_tiers" | "runners"))
                             {
                                 return Err(error(
                                     format!("{section}.{id}.{key}"),
-                                    "a workspace or project routing file may hold only service_tier (and service_tiers under consumers)".into(),
+                                    "a workspace or project routing file may hold only service_tier (and service_tiers or runners under consumers)".into(),
                                 ));
                             }
                             let field = format!("{section}.{id}.{key}");
+                            if key == "runners" && !entry[key].is_null() {
+                                let runners =
+                                    serde_json::from_value::<Vec<RunnerChoice>>(entry[key].clone())
+                                        .map_err(|err| error(field.clone(), err.to_string()))?;
+                                let policies: Vec<_> = runners
+                                    .iter()
+                                    .map(RunnerChoice::as_unrestricted_choice)
+                                    .collect();
+                                crate::config_overrides::validate_runner_list(&policies, &field)
+                                    .map_err(|reason| error(String::new(), reason))?;
+                            }
                             if key == "service_tier"
                                 && !entry[key].is_null()
                                 && serde_json::from_value::<Tier>(entry[key].clone()).is_err()
@@ -136,52 +254,99 @@ fn parse(path: &Path, raw: &str) -> Result<Document, ConfigError> {
     serde_json::from_value(value).map_err(|err| error(String::new(), err.to_string()))
 }
 
-type Stamp = Option<(SystemTime, u64)>;
-type Cached = (Stamp, Arc<Document>);
-
-struct LastGoodDocument {
-    document: Arc<Document>,
+#[derive(Default)]
+struct DocumentCache {
+    parsed: Option<((SystemTime, u64), Result<Arc<Document>, String>)>,
+    last_good: Option<Arc<Document>>,
     missing_reported: bool,
 }
 
+struct LoadedDocument {
+    document: Arc<Document>,
+    present: bool,
+}
+
+#[cfg(test)]
 fn read_document(path: &Path) -> Result<Option<Arc<Document>>, String> {
-    read_document_with_reporter(path, |error| {
+    Ok(load(path, None)?.map(|loaded| loaded.document))
+}
+
+#[cfg(test)]
+fn read_document_with_reporter(
+    path: &Path,
+    report_rejection: impl FnMut(&str),
+) -> Result<Option<Arc<Document>>, String> {
+    Ok(load_with_reporter(path, None, report_rejection)?.map(|loaded| loaded.document))
+}
+
+fn load(path: &Path, enrolled: Option<&[RunnerPolicy]>) -> Result<Option<LoadedDocument>, String> {
+    load_with_reporter(path, enrolled, |error| {
         eprintln!(
-            "[striatum] routing-config-reload-rejected: {}: {error}; keeping last good config",
+            "[striatum] routing-config-reload-rejected: {}: {error}; keeping last good tier settings",
             path.display()
         );
     })
 }
 
-fn read_document_with_reporter(
+fn load_with_reporter(
     path: &Path,
+    enrolled: Option<&[RunnerPolicy]>,
     mut report_rejection: impl FnMut(&str),
-) -> Result<Option<Arc<Document>>, String> {
-    static CACHE: OnceLock<Mutex<HashMap<PathBuf, LastGoodDocument>>> = OnceLock::new();
-    let mut cache = CACHE.get_or_init(Default::default).lock().unwrap();
+) -> Result<Option<LoadedDocument>, String> {
+    static SCOPED: OnceLock<Mutex<HashMap<PathBuf, DocumentCache>>> = OnceLock::new();
+    static LEGACY: OnceLock<Mutex<HashMap<PathBuf, DocumentCache>>> = OnceLock::new();
+    // A legacy tier lookup has no enrollment snapshot and cannot publish a
+    // last-good document for daemon-stamped requests.
+    let cache = if enrolled.is_some() { &SCOPED } else { &LEGACY };
+    let mut files = cache.get_or_init(Default::default).lock().unwrap();
+    let stamp = std::fs::metadata(path)
+        .ok()
+        .and_then(|meta| Some((meta.modified().ok()?, meta.len())));
+    let found = |cache: &mut DocumentCache, document: Arc<Document>| {
+        if let Some(enrolled) = enrolled {
+            document.validate_enrollment(path, enrolled)?;
+        }
+        cache.last_good = Some(document.clone());
+        cache.missing_reported = false;
+        Ok(Some(LoadedDocument {
+            document,
+            present: true,
+        }))
+    };
+    if let Some(cache) = files.get_mut(path) {
+        if let Some((previous, parsed)) = &cache.parsed {
+            if Some(*previous) == stamp {
+                return found(cache, parsed.clone()?);
+            }
+        }
+    }
     match std::fs::read_to_string(path) {
         Ok(raw) => {
-            let document = Arc::new(parse(path, &raw).map_err(|err| err.to_string())?);
-            cache.insert(
-                path.to_owned(),
-                LastGoodDocument {
-                    document: Arc::clone(&document),
-                    missing_reported: false,
-                },
-            );
-            Ok(Some(document))
+            let parsed = parse(path, &raw)
+                .map(Arc::new)
+                .map_err(|err| err.to_string());
+            let cache = files.entry(path.to_owned()).or_default();
+            cache.parsed = stamp.map(|stamp| (stamp, parsed.clone()));
+            found(cache, parsed?)
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            // An absent optional tier file is harmless only before it has
-            // supplied settings; removal must not withdraw an active policy.
-            let Some(previous) = cache.get_mut(path) else {
+            let Some(cache) = files.get_mut(path) else {
                 return Ok(None);
             };
-            if !previous.missing_reported {
+            cache.parsed = None;
+            let Some(document) = &cache.last_good else {
+                return Ok(None);
+            };
+            if !cache.missing_reported {
                 report_rejection("missing");
-                previous.missing_reported = true;
+                cache.missing_reported = true;
             }
-            Ok(Some(Arc::clone(&previous.document)))
+            // Keep the last good tier settings, but withdraw the runner override:
+            // a stale override would send work to the wrong runner.
+            Ok(Some(LoadedDocument {
+                document: document.clone(),
+                present: false,
+            }))
         }
         Err(err) => Err(ConfigError {
             code: "routing_tier_config_invalid",
@@ -201,28 +366,6 @@ pub(crate) fn without_context(params: &serde_json::Value) -> serde_json::Value {
         }
     }
     params
-}
-
-fn load(path: &Path) -> Arc<Document> {
-    static CACHE: OnceLock<Mutex<HashMap<PathBuf, Cached>>> = OnceLock::new();
-    let mut cache = CACHE.get_or_init(Default::default).lock().unwrap();
-    let stamp = std::fs::metadata(path)
-        .ok()
-        .and_then(|meta| Some((meta.modified().ok()?, meta.len())));
-    if let Some((previous, document)) = cache.get(path) {
-        if stamp.is_some() && previous == &stamp {
-            return document.clone();
-        }
-    }
-    let document = match read_document(path) {
-        Ok(document) => document.unwrap_or_default(),
-        Err(err) => {
-            eprintln!("{err}");
-            Arc::default()
-        }
-    };
-    cache.insert(path.to_owned(), (stamp, document.clone()));
-    document
 }
 
 pub(crate) fn at_level(
@@ -255,36 +398,54 @@ pub(crate) fn at_level(
 }
 
 pub(crate) struct Layers {
-    documents: Vec<Arc<Document>>,
+    documents: Vec<LoadedDocument>,
+    enrolled: Vec<RunnerPolicy>,
 }
 
 impl Layers {
     /// Roots belonging to the same project must agree on its settings document;
     /// folder order is not authority to choose between conflicting documents.
-    pub(crate) fn from_roots(
+    #[cfg(test)]
+    fn from_roots(projects: &[PathBuf], workspace: Option<&Path>) -> Result<(Self, bool), String> {
+        Self::for_enrolled_runners(projects, workspace, &[])
+    }
+
+    pub(crate) fn for_enrolled_runners(
         projects: &[PathBuf],
         workspace: Option<&Path>,
+        enrolled: &[RunnerPolicy],
     ) -> Result<(Self, bool), String> {
-        fn read(root: &Path) -> Result<Option<Arc<Document>>, String> {
+        let read = |root: &Path| {
             let path = crate::config_overrides::config_path_in(&root.join(".cortexkit"));
-            read_document(&path)
-        }
-        let mut project = None;
+            load(&path, Some(enrolled))
+        };
+        let mut project: Option<LoadedDocument> = None;
         for root in projects {
-            if let Some(document) = read(root)? {
-                if project
-                    .as_ref()
-                    .is_some_and(|previous| previous != &document)
-                {
+            if let Some(loaded) = read(root)? {
+                if project.as_ref().is_some_and(|previous| {
+                    if previous.present && loaded.present {
+                        previous.document != loaded.document
+                    } else {
+                        !previous.document.same_tiers(&loaded.document)
+                    }
+                }) {
                     return Err("project routing documents differ".into());
                 }
-                project = Some(document);
+                if loaded.present || project.is_none() {
+                    project = Some(loaded);
+                }
             }
         }
         let workspace = workspace.map(read).transpose()?.flatten();
         let documents: Vec<_> = [project, workspace].into_iter().flatten().collect();
         let applied = !documents.is_empty();
-        Ok((Self { documents }, applied))
+        Ok((
+            Self {
+                documents,
+                enrolled: enrolled.to_vec(),
+            },
+            applied,
+        ))
     }
 
     pub(crate) fn new(project: Option<&str>, workspace: Option<&str>) -> Self {
@@ -292,13 +453,48 @@ impl Layers {
             documents: [project, workspace]
                 .into_iter()
                 .flatten()
-                .map(|root| {
-                    load(&crate::config_overrides::config_path_in(
+                .filter_map(|root| {
+                    let path = crate::config_overrides::config_path_in(
                         &Path::new(root).join(".cortexkit"),
-                    ))
+                    );
+                    match load(&path, None) {
+                        Ok(loaded) => loaded,
+                        Err(err) => {
+                            eprintln!("{err}");
+                            None
+                        }
+                    }
                 })
                 .collect(),
+            enrolled: Vec::new(),
         }
+    }
+
+    pub(crate) fn runners(&self, consumer: &str) -> Option<Vec<RunnerPolicy>> {
+        self.documents
+            .iter()
+            .filter(|layer| layer.present)
+            .find_map(|layer| {
+                let choices = layer
+                    .document
+                    .consumers
+                    .iter()
+                    .filter(|(name, _)| crate::config_policy::consumer_matches(name, consumer))
+                    .filter_map(|(name, entry)| {
+                        Some((
+                            crate::config_policy::consumer_specificity(name),
+                            entry.runners.as_ref()?,
+                        ))
+                    })
+                    .max_by_key(|(specificity, _)| *specificity)?
+                    .1;
+                Some(
+                    choices
+                        .iter()
+                        .filter_map(|choice| choice.narrow(&self.enrolled))
+                        .collect(),
+                )
+            })
     }
 
     pub(crate) fn resolve(
@@ -312,7 +508,8 @@ impl Layers {
         if let Some(pin) = pin {
             return Some(pin);
         }
-        for document in &self.documents {
+        for layer in &self.documents {
+            let document = &layer.document;
             if let Some(tier) = at_level(
                 consumer,
                 provider,
