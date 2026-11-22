@@ -12,6 +12,7 @@ use striatum_store::AccountCommandKind;
 use super::*;
 use crate::account_state::InflightScope;
 
+mod capacity_wait_samples_tests;
 mod fixed_routes_panels_tests;
 mod head_turn_tests;
 mod per_model_tests;

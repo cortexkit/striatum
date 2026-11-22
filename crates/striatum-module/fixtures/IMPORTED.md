@@ -84,6 +84,21 @@ The reader tests send the request bytes unchanged through routing's v1 handler.
 | `thalamus-route-fork-of-v1/hold-answer.json` | `94b1c12960b67c9841db267888af00a66fe847bf9a2911ea0c85c7ff395c54f8` |
 | `thalamus-route-fork-of-v1/SHA256SUMS` | `73031db341c99611a1a92e71b8fea6fdec1bf7ef72fdbcbe9d74b5b731ffe4ac` |
 
+## Thalamus capacity wait
+
+THALAMUS (Agent Runner) supplied the `route.account_for` bodies in the shared
+scratch folder `CortexKit-scratch/shared-routing-capacity-v1/`.
+`thalamus-capacity-wait-v1/` copies the bodies byte for byte, dropping the
+`route.account_for.` prefix from the filenames. The source `SHA256SUMS` has SHA-256
+`730b2a806ef90d1c03c7ca1a64bb9a73a4dc75fe5255bbcea06a4cb3392ab6d6`.
+The OpenCode 2.3.2 run recorded a capacity refusal and the same run re-asking
+after the reset with a fresh admission ID.
+
+| Imported path | SHA-256 |
+| --- | --- |
+| `thalamus-capacity-wait-v1/request.json` | `0ea3b76afb2aecfe170c73fc4c90418ef89aabbc69107d02bb4e4b26c23647da` |
+| `thalamus-capacity-wait-v1/re-ask.json` | `ebb7e14ab2bb4c0b4e48cca501ced65628f51164010f1a038cd89eb0227d796c` |
+
 ## Per-kind and caller-local media grades
 
 `quality-grades-prefix-v1/` copies Fusiform's real-serializer samples byte for
