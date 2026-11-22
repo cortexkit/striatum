@@ -3,9 +3,10 @@
 //! The striatum subc module.
 //!
 //! Lifecycle (mirrors the canonical module handshake, same shape as quota-module):
-//!   1. read `--subc <connection-file>`, HMAC-authenticate as a client to subc;
-//!   2. send `HELLO { manifest }` registering the routing operations, await
-//!      `HELLO_ACK`;
+//!   1. adopt the inherited registration stream, or dial the connection-file
+//!      endpoint on older launches; use the file's key to HMAC-authenticate;
+//!   2. send `HELLO { manifest }` (with any launch nonce only on the legacy
+//!      path), await `HELLO_ACK`, and install the claim minter if adopted;
 //!   3. serve channel-0 control (`route.bind` → ack, `PING` → `PONG`) and
 //!      route-channel data requests (`route.select` → `SelectedModelRoute`).
 //!
@@ -57,6 +58,7 @@ mod quota_bus;
 mod quota_cache;
 mod quota_consumer;
 mod quota_events;
+mod registration_session;
 mod retention;
 mod route_facts;
 mod route_operator;
@@ -90,6 +92,7 @@ mod tests;
 mod tier_settings;
 mod usage_facts;
 mod variant_policy;
+mod vault;
 mod winner_ladder;
 mod work_model_pin;
 
@@ -281,6 +284,7 @@ fn initialize_logging() {
 
 async fn run(
     config: ModuleConfig,
+    registration: Option<Box<dyn subc_client_rs::ModuleStream>>,
     shutdown: &shutdown::Shutdown,
     store: &mut Option<SharedStore>,
 ) -> Result<(), ModuleError> {
@@ -289,7 +293,22 @@ async fn run(
         &std::env::current_dir().map_err(|error| ModuleError::Message(error.to_string()))?,
     );
     runtime_lag::RuntimeLagProbe::default().start("routing runtime");
-    let stream = connect_to_subc(&config.connection_file_path).await?;
+    let registered = registration.is_some();
+    let stream = if let Some(mut stream) = registration {
+        let conn = connection_file::read(&config.connection_file_path).map_err(|error| {
+            ModuleError::Message(format!(
+                "read connection file for registration channel: {error}"
+            ))
+        })?;
+        authenticate_client(&mut stream, &conn, Duration::from_secs(2))
+            .await
+            .map_err(|error| {
+                ModuleError::Message(format!("authenticate registration channel: {error}"))
+            })?;
+        stream
+    } else {
+        Box::new(connect_to_subc(&config.connection_file_path).await?)
+    };
     let (mut read_half, write_half) = tokio::io::split(stream);
     let (tx, rx) = mpsc::channel::<Frame>(EGRESS_BUFFER);
     let writer = tokio::spawn(drain_writer(write_half, rx));
@@ -308,6 +327,7 @@ async fn run(
         &mut read_half,
         tx.clone(),
         &config,
+        registered,
         quota_cache,
         catalog_health,
         shutdown,
@@ -355,6 +375,7 @@ async fn module_loop<R>(
     mut read_half: R,
     writer: mpsc::Sender<Frame>,
     config: &ModuleConfig,
+    registered: bool,
     quota_cache: SharedQuotaCache,
     catalog_health: SharedCatalogHealth,
     shutdown: &shutdown::Shutdown,
@@ -363,8 +384,17 @@ async fn module_loop<R>(
 where
     R: AsyncRead + Unpin + Send,
 {
-    send_hello(&writer, config).await?;
-    let ack = expect_hello_ack(&mut read_half).await?;
+    send_hello(&writer, config, registered).await?;
+    let ack = expect_hello_ack(&mut read_half).await.map_err(|error| {
+        if registered {
+            ModuleError::Message(format!("registration channel HELLO_ACK: {error}"))
+        } else {
+            error
+        }
+    })?;
+    let claims = registered
+        .then(|| registration_session::ClaimSession::install(&writer, ack.negotiated_ver))
+        .transpose()?;
     let daemon_has_config_gate = ack
         .subc_capabilities
         .iter()
@@ -475,6 +505,14 @@ where
             Ok(None) => break Ok(()),
             Err(error) => break Err(error),
         };
+        let frame = if let Some(claims) = &claims {
+            match claims.dispatch(frame) {
+                Some(frame) => frame,
+                None => continue,
+            }
+        } else {
+            frame
+        };
         if settings
             .as_ref()
             .is_some_and(|session| session.dispatch(&frame))
@@ -512,6 +550,7 @@ where
             profiles_started = true;
         }
     };
+    drop(claims);
     drop(settings);
     shutdown.begin();
     let flushed = quota_events::finish_clean_exit(loops, quota_cache, Arc::clone(store))
@@ -549,6 +588,7 @@ where
 async fn send_hello(
     writer: &mpsc::Sender<Frame>,
     config: &ModuleConfig,
+    registered: bool,
 ) -> Result<(), ModuleError> {
     let body = serde_json::to_vec(&ModuleHelloBody {
         manifest: manifest(&config.module_id),
@@ -563,7 +603,11 @@ async fn send_hello(
             MODULE_CONTROL_OP_HEALTH_CHECK.to_owned(),
             CONFIG_REVIEW_OP.to_owned(),
         ]),
-        launch_nonce: hello_launch_nonce()?,
+        launch_nonce: if registered {
+            None
+        } else {
+            hello_launch_nonce()?
+        },
     })
     .map_err(ModuleError::Json)?;
     let frame = Frame::build(FrameType::Hello, control_flags(), 0, 0, HELLO_CORR, body)

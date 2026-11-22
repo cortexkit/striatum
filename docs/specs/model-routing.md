@@ -164,6 +164,26 @@ An unenrolled module or an invalid field (including `tool_capabilities` or `via_
 - The same pass bounds the tables that used to grow without limit: routing/v1 decision bindings with their report and delivery records, admission replay records and route affinity (7 days, and longer while a live admission or continuation names them), `account_continue` (7 days after the run finished or the offer lapsed, never while the run is live), `model_route_speed_samples` (everything in the 7-day observed-speed window, then the newest 20 per route and population, nothing past 30 days), `routing_call_count` (30 idle days, moving the call window's start up with them), `fence_retired_origin` (30 days), `routing_unscored_admissible_models` (the decision window after the last sighting) and `quota_reading_log` (3 days). Every batch takes the writer up front (`BEGIN IMMEDIATE`). `script/compact-store.sh` reclaims the freed pages offline. (`crates/striatum-store/src/retention.rs`)
 
 ## Lifecycle
+
+### Daemon startup
+
+When SUBC supplies a registration channel (`SUBC_REGISTRATION_FD` on Unix, or
+`SUBC_REGISTRATION_PIPE` and the daemon PID on Windows), routing adopts it before
+starting any background work. The connection file still supplies the HMAC key
+and daemon identity, but routing does not dial its endpoint for registration.
+Routing sends `HELLO` without `launch_nonce`, checks `HELLO_ACK`, and installs
+the process's claim minter on that module connection. A named channel that
+cannot be adopted or authenticated fails startup rather than falling back.
+
+Without a handoff, routing still dials the connection-file endpoint, authenticates,
+and sends the legacy `HELLO` with the launch nonce if supplied. On both paths,
+settings and store recovery still gate serving. After adoption, each extra daemon
+connection presents a fresh claim before sending route traffic. Raw quota and
+catalog consumers mint before dialing; SDK consumers authenticate first, then
+mint and present before opening or using a route.
+
+### Routing and refresh
+
 1. Fusiform synchronization decodes served catalog rates as priced, stated-zero, unpriced, or refused; non-USD, negative, and excessive-exponent prices become unknown maximum cost rather than crashing selection. (`crates/striatum-module/src/fusiform_catalog.rs:126-219`)
 2. First-sight models under operator-known providers enter the store as unscored and cannot route until an operator override, curated seed, or AA inference supplies score placement. (`crates/striatum-store/src/lib.rs:830-845`, `crates/striatum-core/src/model_facts.rs:202-204`)
 3. AA maps an exact route key to an index, interpolates the embedded Elo curve, applies a 30 percent floor-gap penalty, inherits EQ from the closest curated neighbor, and uses default speed 100. (`crates/striatum-core/src/aa_infer.rs:21-54`, `crates/striatum-core/src/aa_infer.rs:103-169`)

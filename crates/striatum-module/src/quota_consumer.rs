@@ -18,6 +18,8 @@ use subc_protocol::{Flags, Frame, FrameType, Priority};
 use subc_transport::{authenticate_client, connection_file, read_frame, write_frame};
 use tokio::{io::AsyncWriteExt, net::TcpStream};
 
+use crate::registration_session::{mint_for_connection, present_for_connection};
+
 const QUOTA_MODULE_ID: &str = "insula";
 const USAGE_GET_OP: &str = "usage.get";
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
@@ -147,14 +149,20 @@ impl QuotaConsumer {
             .first()
             .ok_or_else(|| msg("connection file has no endpoints"))?;
         let addr = format!("{}:{}", endpoint.host, endpoint.port);
-        let stream = tokio::time::timeout(SETUP_TIMEOUT, async {
+        let claim = mint_for_connection()
+            .await
+            .map_err(|e| transport(format!("mint quota connection claim: {e}")))?;
+        let (stream, next_corr) = tokio::time::timeout(SETUP_TIMEOUT, async {
             let mut stream = TcpStream::connect(&addr)
                 .await
                 .map_err(|e| msg(format!("connect {addr}: {e}")))?;
             authenticate_client(&mut stream, &conn, Duration::from_secs(2))
                 .await
                 .map_err(|e| msg(format!("authenticate: {e}")))?;
-            Ok::<_, QuotaConsumerError>(stream)
+            let next_corr = present_for_connection(&mut stream, claim)
+                .await
+                .map_err(|e| transport(format!("present quota connection claim: {e}")))?;
+            Ok::<_, QuotaConsumerError>((stream, next_corr))
         })
         .await
         .map_err(|_| msg("timed out setting up quota connection"))??;
@@ -163,7 +171,7 @@ impl QuotaConsumer {
             stream,
             route_channel: 0,
             route_epoch: 0,
-            next_corr: 1,
+            next_corr,
         };
         (consumer.route_channel, consumer.route_epoch) =
             consumer.route_open(project_root, module, kind).await?;

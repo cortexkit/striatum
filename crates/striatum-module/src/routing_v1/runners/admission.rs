@@ -135,10 +135,7 @@ async fn refresh_account_inputs(credentials: &crate::SharedBrocaCredentials) {
                         .lock()
                         .is_ok_and(|credentials| credentials.listing_version().is_none());
                     if needed {
-                        let resolver = cortexkit_claustrum_client::ClaustrumCredentialResolver::new(
-                            path.clone(),
-                            "striatum",
-                        );
+                        let resolver = crate::vault::VaultResolver::new(path.clone(), "striatum");
                         if let Ok(listing) = resolver.list_scoped().await {
                             if let Ok(mut credentials) = credentials.lock() {
                                 credentials.apply_listing(&listing, crate::now_ms());

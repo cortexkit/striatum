@@ -1509,14 +1509,20 @@ impl FusiformCatalogConsumer {
             .first()
             .ok_or_else(|| error("connection file has no endpoints"))?;
         let address = format!("{}:{}", endpoint.host, endpoint.port);
-        let stream = tokio::time::timeout(SETUP_TIMEOUT, async {
+        let claim = crate::registration_session::mint_for_connection()
+            .await
+            .map_err(|reason| error(format!("mint Fusiform connection claim: {reason}")))?;
+        let (stream, next_corr) = tokio::time::timeout(SETUP_TIMEOUT, async {
             let mut stream = TcpStream::connect(&address)
                 .await
                 .map_err(|reason| error(format!("connect {address}: {reason}")))?;
             authenticate_client(&mut stream, &connection, Duration::from_secs(2))
                 .await
                 .map_err(|reason| error(format!("authenticate: {reason}")))?;
-            Ok::<_, FusiformCatalogError>(stream)
+            let next_corr = crate::registration_session::present_for_connection(&mut stream, claim)
+                .await
+                .map_err(|reason| error(format!("present Fusiform connection claim: {reason}")))?;
+            Ok::<_, FusiformCatalogError>((stream, next_corr))
         })
         .await
         .map_err(|_| error("timed out setting up Fusiform connection"))??;
@@ -1525,7 +1531,7 @@ impl FusiformCatalogConsumer {
             stream,
             route_channel: 0,
             route_epoch: 0,
-            next_corr: 1,
+            next_corr,
         };
         (consumer.route_channel, consumer.route_epoch) = consumer.route_open(project_root).await?;
         Ok(consumer)

@@ -223,12 +223,11 @@ pub(super) async fn start(
     .await
     .map_err(|error| ModuleError::Message(format!("restore serving methods: {error}")))?;
     if ACCOUNT_QUOTA.set(Arc::clone(&account_state)).is_ok() {
-        let roster_resolver: Arc<dyn cortexkit_claustrum_client::CredentialResolver> = Arc::new(
-            cortexkit_claustrum_client::ClaustrumCredentialResolver::new(
+        let roster_resolver: Arc<dyn cortexkit_claustrum_client::CredentialResolver> =
+            Arc::new(crate::vault::VaultResolver::new(
                 config.connection_file_path.clone(),
                 DEFAULT_MODULE_ID,
-            ),
-        );
+            ));
         loops.spawn(
             "account roster",
             account_quota::account_quota_loop(

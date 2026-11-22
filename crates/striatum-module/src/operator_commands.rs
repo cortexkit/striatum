@@ -5,8 +5,9 @@ use std::{ffi::OsString, path::PathBuf};
 
 use crate::{
     account_quota, config_convert, config_overrides, print_manifest, quota_consumer::QuotaConsumer,
-    route_transport::run_route_handler_off_async_workers, routing_clock::now_ms, run, shutdown,
-    startup_settings::ModuleConfig, ModuleError, SharedStore, DEFAULT_MODULE_ID,
+    registration_session, route_transport::run_route_handler_off_async_workers,
+    routing_clock::now_ms, run, shutdown, startup_settings::ModuleConfig, ModuleError, SharedStore,
+    DEFAULT_MODULE_ID,
 };
 
 pub(super) async fn async_main(
@@ -29,12 +30,20 @@ pub(super) async fn async_main(
             .map_err(|error| ModuleError::Message(error.to_string()))?;
         return Ok(());
     }
+    let mode = parse_startup_mode(args);
+    let registration = if matches!(mode, Ok(StartupMode::Serve { .. })) {
+        registration_session::adopt()?
+    } else {
+        None
+    };
     // Read the launch nonce before anything else can spawn a process: until
     // this first read, the pipe the daemon handed it over on is inheritable,
     // so a child spawned earlier would receive it. The result is cached for
     // the process; HELLO and the credential route read that cached answer.
-    let _ = subc_os::launch_nonce();
-    let connection_file_path = match parse_startup_mode(args)? {
+    if registration.is_none() {
+        let _ = subc_os::launch_nonce();
+    }
+    let connection_file_path = match mode? {
         StartupMode::PrintManifest => return print_manifest(),
         StartupMode::CheckConfig => {
             let path =
@@ -61,7 +70,7 @@ pub(super) async fn async_main(
         } => connection_file_path,
     };
     let config = ModuleConfig::from_env(connection_file_path)?;
-    let result = run(config, shutdown, store).await;
+    let result = run(config, registration, shutdown, store).await;
     shutdown.begin();
     result
 }
