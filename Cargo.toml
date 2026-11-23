@@ -19,7 +19,7 @@ debug = 1
 strip = false
 
 [workspace.dependencies]
-cortexkit-claustrum-client = "=0.15.0"
+cortexkit-claustrum-client = "=0.16.0"
 subc-protocol = "=0.37.4"
 subc-transport = "=0.18.0"
 subc-client-rs = "=0.41.1"

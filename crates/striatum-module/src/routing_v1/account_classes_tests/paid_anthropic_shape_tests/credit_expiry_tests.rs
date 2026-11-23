@@ -26,27 +26,24 @@ fn install_readings_with_vendors(
     vendors: [Option<&str>; 2],
 ) {
     let mut quota = AccountQuotaState::default();
-    account_quota::apply_roster_listing_with_org_id(
+    account_quota::apply_roster_listing(
         &mut quota,
         &ScopedCredentialListing {
             view: VIEW.into(),
             credentials: KEYS
-                .iter()
-                .map(|id| ListedCredential {
-                    id: (*id).into(),
+                .into_iter()
+                .zip(links)
+                .map(|(id, org)| ListedCredential {
+                    id: id.into(),
                     auth_method: Some("apikey".into()),
                     serves: vec!["anthropic".into()],
+                    org_id: org.map(str::to_owned),
                     ..Default::default()
                 })
                 .collect(),
             ..Default::default()
         },
         NOW as i64,
-        Some(|row: &ListedCredential| {
-            KEYS.iter()
-                .position(|id| *id == row.id)
-                .and_then(|i| links[i])
-        }),
     );
     let rows: Vec<_> = ORGS
         .into_iter()
@@ -273,25 +270,11 @@ async fn learned_vault_org_links_console_credit_without_changing_key_identity() 
     assert_eq!(listing.credentials.len(), 1);
     assert_eq!(listing.credentials[0].id, LINKED_KEY);
     assert_eq!(listing.credentials[0].account_id, None);
+    assert_eq!(listing.credentials[0].org_id.as_deref(), Some(ORG));
     let harness = paid_anthropic_harness_with_listing(listing.clone());
 
     let mut quota = AccountQuotaState::default();
-    let row = if account_quota::LISTED_ORG_ID.is_some() {
-        account_quota::apply_roster_listing(&mut quota, &listing, NOW as i64)
-    } else {
-        // The older SDK drops org_id, so supply the pinned field directly to
-        // apply_roster_listing_with_org_id.
-        let org = reply["result"]["credentials"][0]["org_id"]
-            .as_str()
-            .unwrap();
-        account_quota::apply_roster_listing_with_org_id(
-            &mut quota,
-            &listing,
-            NOW as i64,
-            Some(|row: &ListedCredential| (row.id == LINKED_KEY).then_some(org)),
-        )
-    }
-    .unwrap();
+    let row = account_quota::apply_roster_listing(&mut quota, &listing, NOW as i64).unwrap();
     let persisted: Value = serde_json::from_str(&row.roster_json).unwrap();
     assert_eq!(persisted["listing"]["credentials"][0]["org_id"], ORG);
     assert_eq!(

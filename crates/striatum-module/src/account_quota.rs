@@ -31,8 +31,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use cortexkit_claustrum_client::{
-    CredentialErrorClass, CredentialResolver, CredentialResolverError, ListedCredential,
-    ScopedCredentialListing,
+    CredentialErrorClass, CredentialResolver, CredentialResolverError, ScopedCredentialListing,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -1555,26 +1554,17 @@ fn credential_identities(
     identities
 }
 
-// Leave the join empty until the vault SDK exposes the validated listing member.
-pub(crate) const LISTED_ORG_ID: Option<fn(&ListedCredential) -> Option<&str>> = None;
-
 #[derive(Debug, Clone)]
 pub(crate) struct CredentialOrg {
     pub id: String,
     pub vendors: Vec<String>,
 }
 
-fn credential_orgs<'a>(
-    listing: &'a ScopedCredentialListing,
-    org_id: Option<impl Fn(&'a ListedCredential) -> Option<&'a str>>,
-) -> BTreeMap<String, CredentialOrg> {
-    let Some(org_id) = org_id else {
-        return BTreeMap::new();
-    };
+fn credential_orgs(listing: &ScopedCredentialListing) -> BTreeMap<String, CredentialOrg> {
     let mut orgs = BTreeMap::new();
     for row in &listing.credentials {
         let org = (row.auth_method.as_deref() == Some("apikey"))
-            .then(|| org_id(row).map(|id| (id, &row.serves)))
+            .then(|| row.org_id.as_deref().map(|id| (id, &row.serves)))
             .flatten();
         // Disagreement among repeated records makes only the credit link unknown.
         orgs.entry(&row.id)
@@ -1693,7 +1683,7 @@ pub fn restore_account_state(store: &SqliteRouteStateStore) -> AccountQuotaState
         Ok(Some(row)) => {
             if let Some(listing) = listing::restore_complete_listing(&row) {
                 state.credential_identities = credential_identities(&listing);
-                state.credential_orgs = credential_orgs(&listing, LISTED_ORG_ID);
+                state.credential_orgs = credential_orgs(&listing);
             }
             match serde_json::from_str::<VaultRoster>(&row.roster_json) {
                 Ok(roster) => state.roster = Some(roster),
@@ -1730,27 +1720,15 @@ pub fn apply_roster_listing(
     listing: &ScopedCredentialListing,
     at_ms: i64,
 ) -> Option<PersistedVaultRoster> {
-    apply_roster_listing_with_org_id(state, listing, at_ms, LISTED_ORG_ID)
-}
-
-pub(crate) fn apply_roster_listing_with_org_id<'a>(
-    state: &mut AccountQuotaState,
-    listing: &'a ScopedCredentialListing,
-    at_ms: i64,
-    org_id: Option<impl Fn(&'a ListedCredential) -> Option<&'a str>>,
-) -> Option<PersistedVaultRoster> {
     let roster = build_roster(listing, state.roster.as_ref(), at_ms);
     state.credential_identities = credential_identities(listing);
-    let includes_org_ids = org_id.is_some();
-    state.credential_orgs = credential_orgs(listing, org_id);
+    state.credential_orgs = credential_orgs(listing);
     let row = serde_json::to_value(&roster).ok().map(|mut value| {
         // Quota identities omit API keys without account ids. Persist the
         // full non-secret view too, for admission immediately after restart.
         value["listing"] = listing::encode_with_orgs(listing, &state.credential_orgs);
         value["listing_includes_conditions"] = Value::Bool(true);
-        if includes_org_ids {
-            value["listing_includes_org_ids"] = Value::Bool(true);
-        }
+        value["listing_includes_org_ids"] = Value::Bool(true);
         PersistedVaultRoster {
             view: roster.view.clone(),
             roster_json: value.to_string(),

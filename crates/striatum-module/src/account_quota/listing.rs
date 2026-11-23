@@ -62,7 +62,7 @@ pub(super) fn persisted_view(row: striatum_store::PersistedVaultRoster) -> Optio
     // it did not yet understand. Replace that snapshot on the first live read.
     (roster["listing_includes_conditions"] == true
         && roster["listing"].is_object()
-        && (super::LISTED_ORG_ID.is_none() || roster["listing_includes_org_ids"] == true))
+        && roster["listing_includes_org_ids"] == true)
         .then_some(row.view)
 }
 
@@ -123,10 +123,7 @@ mod tests {
     use super::*;
 
     fn encode(listing: &ScopedCredentialListing) -> Value {
-        encode_with_orgs(
-            listing,
-            &super::super::credential_orgs(listing, super::super::LISTED_ORG_ID),
-        )
+        encode_with_orgs(listing, &super::super::credential_orgs(listing))
     }
 
     #[test]
