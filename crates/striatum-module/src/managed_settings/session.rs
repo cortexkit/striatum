@@ -222,6 +222,14 @@ impl Wire {
             match probe_projects(connection_file).await {
                 Ok(true) => {
                     self.projects.enable(self, &self.settings.path);
+                    if logged_disabled {
+                        // Close the earlier "will retry" line, so the log
+                        // doesn't read as if project settings stayed off.
+                        crate::info_operator(
+                            "[striatum] project settings enabled after a retried capability probe"
+                                .into(),
+                        );
+                    }
                     return;
                 }
                 Ok(false) => {

@@ -395,6 +395,11 @@ async fn slow_consumer_probe_does_not_delay_global_settings_and_recovers_on_retr
     let reasons: Vec<_> = disabled_logs(&logs).collect();
     assert_eq!(reasons.len(), 1, "{logs:?}");
     assert!(reasons[0].contains("server.describe timed out"), "{logs:?}");
+    assert!(
+        logs.iter()
+            .any(|line| line.contains("project settings enabled after a retried capability probe")),
+        "{logs:?}"
+    );
 }
 
 fn disabled_logs(logs: &[String]) -> impl Iterator<Item = &str> {
