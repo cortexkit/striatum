@@ -160,6 +160,7 @@ pub(super) fn effective(conn: &Connection, now: i64) -> rusqlite::Result<Vec<Fen
                 provider: row.get(2)?,
                 account_id: row.get(3)?,
                 credential_id: row.get(4)?,
+                console_credit_micros_at_refusal: None,
                 model: row.get(5)?,
                 size_class: row.get(6)?,
                 principal: row.get(7)?,

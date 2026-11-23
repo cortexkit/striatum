@@ -24,6 +24,8 @@
 //! probe every fifteen minutes. Reset dates only schedule additional checks.
 //! Fresh headroom contradicting the refusal keeps it non-quota instead; later
 //! quota refreshes cannot immediately reopen a credit or entitlement wall.
+//! Linked Console keys hold a billing refusal until the live credit total
+//! increases. Without a linked reading, the usual hourly probe still applies.
 //! Entitlement refusals always keep the timed probe: quota utilization says
 //! nothing about entitlement, so a reading cannot lift or convert that fence.
 
@@ -65,12 +67,10 @@ pub(crate) const QUOTA_HOLD_USED_THRESHOLD: f64 = 99.0;
 
 /// Whether a timed probe may be admitted for a fence of this age.
 ///
-/// A pay-per-token credential (for example an API key out of credit) has no
-/// Insula quota reading: topping its balance up changes no vault listing and
-/// publishes no reading, so without a timed recheck the fence would hold
-/// until the listing changed for an unrelated reason. A subscription's billing
-/// refusal uses its quota reset and fresh headroom readings instead of blind
-/// probes. An entitlement refusal is independent of quota utilization: only a
+/// Topping up a balance changes no vault listing, so billing refusals without a
+/// linked quota reading need a timed recheck. Subscription holds and linked
+/// Console credit fences can instead detect recovery from readings.
+/// An entitlement refusal is independent of quota utilization: only a
 /// real request can discover a provider-side reversal without a listing change
 /// or an operator lift, so it keeps the one-hour probe even with quota readings.
 #[cfg(test)]
@@ -844,6 +844,7 @@ mod tests {
             code: "ENTITLEMENT_ERROR".into(),
             listing_fingerprint: Some("fp".into()),
             observed_at_ms: 1,
+            console_credit_micros_at_refusal: None,
         }
     }
 

@@ -25,6 +25,7 @@ pub struct FenceRecheck {
     pub provider: String,
     pub account_id: Option<String>,
     pub credential_id: Option<String>,
+    pub console_credit_micros_at_refusal: Option<i64>,
     pub model: Option<String>,
     pub size_class: Option<i64>,
     pub principal: Option<String>,
@@ -462,6 +463,7 @@ impl From<&Block> for FenceRecheck {
             provider: block.scope.provider.clone(),
             account_id: block.scope.account_id.clone(),
             credential_id: block.scope.credential_id.clone(),
+            console_credit_micros_at_refusal: None,
             model: block.scope.model.clone(),
             size_class: block.scope.size_class,
             principal: block.scope.principal.clone(),
@@ -3447,6 +3449,7 @@ mod tests {
                         code: "billing_exhausted".into(),
                         listing_fingerprint: None,
                         observed_at_ms: 0,
+                        console_credit_micros_at_refusal: None,
                     },
                 )?;
                 crate::block_storage::write_source(conn, &row)

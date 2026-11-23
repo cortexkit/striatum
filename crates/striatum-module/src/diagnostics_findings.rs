@@ -1236,6 +1236,7 @@ mod tests {
                 code: "signed_out".into(),
                 listing_fingerprint: None,
                 observed_at_ms: NOW,
+                console_credit_micros_at_refusal: None,
             }],
             &Default::default(),
             &[],
@@ -1341,6 +1342,7 @@ mod tests {
             code: code.into(),
             listing_fingerprint: None,
             observed_at_ms: NOW - age_ms,
+            console_credit_micros_at_refusal: None,
         }
     }
 

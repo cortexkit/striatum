@@ -91,7 +91,10 @@ pub(crate) struct AccountMeta {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct CredentialMeta {}
+pub(crate) struct CredentialMeta {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub console_credit_micros_at_refusal: Option<i64>,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -782,7 +785,9 @@ pub(crate) fn credential_source(
     row.observed_at = Some(fence.observed_at_ms);
     row.code = Some(fence.code.clone());
     row.listing_fingerprint = fence.listing_fingerprint.clone();
-    row.meta = Meta::Credential(CredentialMeta {});
+    row.meta = Meta::Credential(CredentialMeta {
+        console_credit_micros_at_refusal: fence.console_credit_micros_at_refusal,
+    });
     Ok(row)
 }
 

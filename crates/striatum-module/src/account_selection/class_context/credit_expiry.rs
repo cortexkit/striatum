@@ -1,12 +1,10 @@
 use std::collections::BTreeMap;
 
-use serde::Deserialize;
 use serde_json::Value;
 use striatum_core::accounts::{CreditExpiry, Roster};
-use striatum_core::quota::SpendBalance;
 
 use super::ClassContext;
-use crate::account_quota::parse_rfc3339_ms;
+use crate::account_quota::console_credit::live_credit;
 
 impl ClassContext {
     pub(in crate::account_selection) fn expiring_org_credits(
@@ -55,16 +53,4 @@ impl ClassContext {
             })
             .collect()
     }
-}
-
-fn live_credit(pool: &Value, now_ms: i64) -> Option<CreditExpiry> {
-    let expires_at_ms = parse_rfc3339_ms(pool.get("expiresAt")?.as_str()?)?;
-    if expires_at_ms <= now_ms {
-        return None;
-    }
-    let remaining = SpendBalance::deserialize(pool.get("remaining")?).ok()?;
-    (!remaining.is_non_positive()).then_some(CreditExpiry {
-        expires_at_ms,
-        remaining,
-    })
 }

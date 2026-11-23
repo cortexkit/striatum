@@ -221,6 +221,7 @@ fn class_memo_revalidates_mutable_restrictions_and_clone_inputs() {
                 provider: fact.provider_id.clone(),
                 account_id: None,
                 credential_id: Some(id.clone()),
+                console_credit_micros_at_refusal: None,
                 model: None,
                 size_class: None,
                 principal: None,

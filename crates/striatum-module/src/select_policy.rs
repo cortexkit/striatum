@@ -889,6 +889,7 @@ mod candidate_tests {
             code: "ENTITLEMENT_ERROR".into(),
             listing_fingerprint: None,
             observed_at_ms: 999,
+            console_credit_micros_at_refusal: None,
         };
         let (candidates, snapshot) = prepare(
             vec![

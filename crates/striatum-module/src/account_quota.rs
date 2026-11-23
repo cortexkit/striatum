@@ -41,6 +41,8 @@ use striatum_store::{
     SqliteRouteStateStore,
 };
 
+pub(crate) mod console_credit;
+
 /// Length of Claude's five-hour general window, as Insula publishes it.
 pub const FIVE_HOUR_MINUTES: i64 = 300;
 /// Length of the seven-day general window and of the Fable scoped window.

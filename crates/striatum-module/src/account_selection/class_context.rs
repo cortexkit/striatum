@@ -1980,12 +1980,32 @@ impl ClassContext {
         account: &str,
         model: &str,
     ) -> bool {
+        if self.console_credit_binds_origin(origin) {
+            return false;
+        }
         if self.origin_recovered(origin, account) {
             return true;
         }
         let owned = self.probe_owner.is_some() && origin.claim_owner == self.probe_owner;
         (self.recheck_at(origin, account, model) <= self.now_ms || owned)
             && (!origin.quota || !self.origin_has_binding_reading(origin, account))
+    }
+
+    pub(super) fn console_credit_binds_origin(
+        &self,
+        origin: &striatum_store::FenceRecheck,
+    ) -> bool {
+        // A linked reading replaces timed probing. Recovery clears the origin
+        // when credit has increased; it does not spend a probe to test the increase.
+        origin.console_credit_micros_at_refusal.is_some()
+            && origin.credential_id.as_deref().is_some_and(|credential| {
+                crate::account_quota::console_credit::live_total_micros(
+                    &self.quota,
+                    credential,
+                    self.now_ms,
+                )
+                .is_some()
+            })
     }
 
     pub(super) fn origin_has_binding_reading(
@@ -2083,6 +2103,9 @@ impl ClassContext {
         account: &str,
         model: &str,
     ) -> i64 {
+        if self.console_credit_binds_origin(origin) {
+            return i64::MIN;
+        }
         let at = self.recheck_at(origin, account, model);
         if origin.quota && at <= self.now_ms {
             self.rechecks

@@ -50,15 +50,30 @@ fn paid_anthropic_harness() -> Arc<Harness> {
     })
 }
 
-fn paid_anthropic_harness_with_listing(mut listing: ScopedCredentialListing) -> Arc<Harness> {
+fn paid_anthropic_harness_with_listing(listing: ScopedCredentialListing) -> Arc<Harness> {
+    paid_anthropic_harness_with_catalog(listing, false)
+}
+
+fn paid_anthropic_harness_with_catalog(
+    mut listing: ScopedCredentialListing,
+    direct_catalog: bool,
+) -> Arc<Harness> {
     let harness = Harness::new("paid-anthropic-shape");
     let mut fact = account_fact("anthropic");
     fact.model_id = MODEL.into();
-    harness.install_facts(&[fact.clone()]);
-    catalog_fact(&harness, &fact);
     let mut subscription = fact.clone();
     subscription.billing_plane.as_mut().unwrap().auth_method = "oauth".into();
     subscription.billing_plane.as_mut().unwrap().kind = "subscription".into();
+    let mut paid_facts = vec![fact];
+    if direct_catalog {
+        let mut direct = account_fact(POOL);
+        direct.model_id = MODEL.into();
+        paid_facts.push(direct);
+    }
+    harness.install_facts(&paid_facts);
+    for fact in &paid_facts {
+        catalog_fact(&harness, fact);
+    }
     let mut rows: Vec<_> = KEYS
         .iter()
         .map(|id| ListedCredential {
@@ -87,7 +102,7 @@ fn paid_anthropic_harness_with_listing(mut listing: ScopedCredentialListing) -> 
     listing.credentials.extend(rows);
     let mut credentials = BrocaCredentials::default();
     credentials.apply_listing(&listing, NOW);
-    credentials.refresh_serving_methods(&Default::default(), &[fact.clone()], NOW as i64, &[]);
+    credentials.refresh_serving_methods(&Default::default(), &paid_facts, NOW as i64, &[]);
     credentials.runner_declarations.insert(
         "broca".into(),
         super::super::runners::parse_declaration(&json!({"runner": {
@@ -104,8 +119,9 @@ fn paid_anthropic_harness_with_listing(mut listing: ScopedCredentialListing) -> 
     credentials
         .wire_apis
         .insert(format!("anthropic/{MODEL}"), "anthropic.messages".into());
+    paid_facts.push(subscription);
     credentials.publish_billing_catalog(
-        crate::fusiform_catalog::PlaneCatalog::ordinary_test_catalog(&[fact, subscription])
+        crate::fusiform_catalog::PlaneCatalog::ordinary_test_catalog(&paid_facts)
             .with_wire_apis(&credentials.wire_apis),
     );
     credentials.publish_plan_prices(&json!({"prices":[]}));

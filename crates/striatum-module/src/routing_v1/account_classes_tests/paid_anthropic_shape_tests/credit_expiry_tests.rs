@@ -86,6 +86,155 @@ fn request(id: &str) -> Value {
     request
 }
 
+async fn refuse_first_key(broca: &super::super::super::conformance_tests::Route) {
+    let admitted = result(
+        broca
+            .call("route.account_for", &single_key_request("spent-key"))
+            .await,
+    );
+    assert_eq!(admitted["account"]["credential_id"], KEYS[0]);
+    let refusal = observe_ok(
+        broca,
+        &json!({"event_id":"spent-credit", "kind":"credential_refused",
+            "admission_id":"spent-key", "provider_code":"billing_exhausted"}),
+    )
+    .await;
+    assert_eq!(
+        refusal["effects"],
+        json!([json!({
+            "credential_id": KEYS[0], "effect": "credential_refused", "provider": POOL
+        })
+        .to_string()])
+    );
+    observe_ok(
+        broca,
+        &json!({"event_id":"spent-key-finished", "kind":"run_finished",
+            "admission_id":"spent-key"}),
+    )
+    .await;
+}
+
+fn credit_fence_harness(direct_catalog: bool) -> Arc<Harness> {
+    paid_anthropic_harness_with_catalog(
+        ScopedCredentialListing {
+            view: VIEW.into(),
+            ..Default::default()
+        },
+        direct_catalog,
+    )
+}
+
+#[tokio::test]
+async fn unchanged_console_credit_does_not_admit_a_billing_probe() {
+    for direct_catalog in [false, true] {
+        let _clock = crate::InjectedClock::set(NOW);
+        let harness = credit_fence_harness(direct_catalog);
+        install_readings(
+            [Some(ORGS[0]), None],
+            [Some(vec![credit(80, 7_200_000)]), None],
+        );
+        let broca = harness.bind(reserved("broca"), None).await;
+        refuse_first_key(&broca).await;
+
+        let _later = crate::InjectedClock::set(NOW + 3_600_001);
+        let held = broca
+            .call("route.account_for", &single_key_request("no-probe"))
+            .await;
+        assert_eq!(held.0, FrameType::Error, "unchanged credit: {}", held.1);
+        assert_eq!(held.1["code"], "account_pool_exhausted");
+        assert!(held.1["detail"]["reset_at_ms"].is_null(), "{}", held.1);
+        let fences = harness.store().credential_entitlement_fences().unwrap();
+        assert_eq!(fences.len(), 1);
+        assert_eq!(fences[0].console_credit_micros_at_refusal, Some(800_000));
+
+        let _expired = crate::InjectedClock::set(NOW + 7_200_000);
+        let held = broca
+            .call("route.account_for", &single_key_request("after-expiry"))
+            .await;
+        assert_eq!(held.0, FrameType::Error, "expired credit: {}", held.1);
+        assert_eq!(held.1["code"], "account_pool_exhausted");
+    }
+}
+
+#[tokio::test]
+async fn new_console_credit_lifts_billing_fence() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let harness = paid_anthropic_harness();
+    let links = [Some(ORGS[0]), None];
+    install_readings(
+        links,
+        [
+            Some(vec![credit(30, 7_200_000), credit(50, 7_200_001)]),
+            None,
+        ],
+    );
+    let broca = harness.bind(reserved("broca"), None).await;
+    refuse_first_key(&broca).await;
+
+    // The total is still $0.80 despite a change to the individual pools.
+    install_readings(links, [Some(vec![credit(80, 7_200_000)]), None]);
+    let still_held = broca
+        .call("route.account_for", &single_key_request("same-total"))
+        .await;
+    assert_eq!(still_held.0, FrameType::Error, "{}", still_held.1);
+
+    install_readings(links, [Some(vec![credit(5000, 7_200_000)]), None]);
+    let admitted = result(
+        broca
+            .call("route.account_for", &single_key_request("new-credit"))
+            .await,
+    );
+    assert_eq!(admitted["account"]["credential_id"], KEYS[0]);
+    assert_ne!(admitted["reason"]["code"], "credential_fence_probe");
+    assert!(harness
+        .store()
+        .credential_entitlement_fences()
+        .unwrap()
+        .iter()
+        .all(|fence| fence.provider_id != POOL || fence.credential_id != KEYS[0]));
+}
+
+#[tokio::test]
+async fn billing_refusal_without_console_credit_reading_keeps_hourly_probe() {
+    for (direct_catalog, link, spend) in [
+        (false, None, Some(vec![credit(80, 7_200_000)])),
+        (true, None, Some(vec![credit(80, 7_200_000)])),
+        (true, Some(ORGS[0]), None),
+    ] {
+        let _clock = crate::InjectedClock::set(NOW);
+        let harness = credit_fence_harness(direct_catalog);
+        install_readings([link, None], [spend, None]);
+        let broca = harness.bind(reserved("broca"), None).await;
+        refuse_first_key(&broca).await;
+
+        let _before = crate::InjectedClock::set(NOW + 3_599_999);
+        let held = broca
+            .call("route.account_for", &single_key_request("before-probe"))
+            .await;
+        assert_eq!(held.0, FrameType::Error, "{}", held.1);
+        let (why, reset_at) = if direct_catalog {
+            ("credential_refused", json!(NOW + 3_600_000))
+        } else {
+            ("pool_backoff", Value::Null)
+        };
+        assert_eq!(
+            held.1["detail"]["exclusions"][0]["reason"], why,
+            "{}",
+            held.1
+        );
+        assert_eq!(held.1["detail"]["reset_at_ms"], reset_at, "{}", held.1);
+
+        let _due = crate::InjectedClock::set(NOW + 3_600_000);
+        let probe = result(
+            broca
+                .call("route.account_for", &single_key_request("probe"))
+                .await,
+        );
+        assert_eq!(probe["account"]["credential_id"], KEYS[0]);
+        assert_eq!(probe["reason"]["code"], "credential_fence_probe");
+    }
+}
+
 #[tokio::test]
 async fn soonest_positive_console_credit_wins_and_is_explained() {
     let _clock = crate::InjectedClock::set(NOW);

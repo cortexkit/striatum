@@ -534,7 +534,25 @@ impl BlockState {
         for block in &mut loaded.blocks {
             self.pending_claim_history(block);
         }
-        Ok(loaded.blocks.iter().map(FenceRecheck::from).collect())
+        Ok(loaded
+            .blocks
+            .iter()
+            .map(|block| self.fence_recheck(block))
+            .collect())
+    }
+
+    fn fence_recheck(&self, block: &Block) -> FenceRecheck {
+        let mut recheck = FenceRecheck::from(block);
+        if block.kind == "credential" {
+            if let Some(StoredBlock {
+                meta: Meta::Credential(meta),
+                ..
+            }) = self.block(&block.kind, &block.origin_key)
+            {
+                recheck.console_credit_micros_at_refusal = meta.console_credit_micros_at_refusal;
+            }
+        }
+        recheck
     }
 
     /// Only the requested provider and provider-less origins can apply during admission.
@@ -575,7 +593,7 @@ impl BlockState {
                     block.cleared_models.clone_from(&row.cleared_models);
                 }
                 self.pending_claim_history(&mut block);
-                rechecks.push(FenceRecheck::from(&block));
+                rechecks.push(self.fence_recheck(&block));
             }
         }
         rechecks.extend(observations);
@@ -1110,7 +1128,7 @@ impl BlockState {
             .clocks(true)
             .into_values()
             .filter(|(_, cleared)| cleared.is_none())
-            .map(|(block, _)| FenceRecheck::from(&block))
+            .map(|(block, _)| self.fence_recheck(&block))
             .collect();
         rows.sort_by(|a, b| (&a.kind, &a.origin_key).cmp(&(&b.kind, &b.origin_key)));
         rows
@@ -1651,7 +1669,7 @@ impl StoredBlock {
         if !self.source_present || self.block.kind != "credential" {
             return None;
         }
-        let Meta::Credential(_) = &self.meta else {
+        let Meta::Credential(meta) = &self.meta else {
             return None;
         };
         Some(
@@ -1661,6 +1679,7 @@ impl StoredBlock {
                 code: self.code.clone()?,
                 listing_fingerprint: self.listing_fingerprint.clone(),
                 observed_at_ms: self.observed_at?,
+                console_credit_micros_at_refusal: meta.console_credit_micros_at_refusal,
             },
         )
     }

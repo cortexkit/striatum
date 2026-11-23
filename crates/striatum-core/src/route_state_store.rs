@@ -284,6 +284,9 @@ pub struct CredentialEntitlementFence {
     /// `None` when routing had no vault listing for the credential at the time.
     pub listing_fingerprint: Option<String>,
     pub observed_at_ms: i64,
+    /// Live Console credit in millionths of a US dollar when billing refused this key.
+    /// `None` means the refusal had no linked Console credit reading.
+    pub console_credit_micros_at_refusal: Option<i64>,
 }
 
 /// The route-local failure-backoff fields before an operator clears them.

@@ -745,6 +745,31 @@ pub(super) fn reconcile_credential_quota_holds(
     let prior_clocks = tx.fence_rechecks()?;
     let mut kept = Vec::new();
     for refusal in refusals {
+        if let Some(at_refusal) = refusal.console_credit_micros_at_refusal {
+            // A balance is not a usage window. A higher total proves new
+            // credit; a missing reading leaves the ordinary probe available.
+            if crate::account_quota::console_credit::live_total_micros(
+                quota,
+                &refusal.credential_id,
+                now,
+            )
+            .is_some_and(|current| current > at_refusal)
+            {
+                *changed = true;
+                if write {
+                    tx.repair(
+                        striatum_store::DryRunRepair::ClearCredential(
+                            refusal.provider_id,
+                            refusal.credential_id,
+                        ),
+                        now,
+                    )?;
+                }
+            } else {
+                kept.push(refusal);
+            }
+            continue;
+        }
         if !crate::credential_fences::is_billing_code(&refusal.code) {
             // Quota utilization cannot establish entitlement. Remove quota
             // blocks left by older reconciliation, but retain the refusal so

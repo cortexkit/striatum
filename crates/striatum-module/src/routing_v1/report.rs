@@ -109,6 +109,16 @@ pub(super) fn report_at(
             )
         })?
     };
+    if let Some((refusal, _)) = &effects.credential_refusal {
+        if crate::credential_fences::is_billing_code(&refusal.code) {
+            effects.console_credit_micros_at_refusal =
+                crate::account_quota::console_credit::live_total_micros(
+                    &quota,
+                    &refusal.credential_id,
+                    now as i64,
+                );
+        }
+    }
     let usage = request
         .usage
         .as_ref()

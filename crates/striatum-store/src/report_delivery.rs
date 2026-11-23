@@ -23,6 +23,7 @@ pub struct V1ReportEffects {
     pub non_quota_route_fence: Option<AccountRouteFence>,
     pub eligibility: Option<AccountEligibilityFact>,
     pub credential_refusal: Option<(CredentialRefusal, Option<String>)>,
+    pub console_credit_micros_at_refusal: Option<i64>,
     pub size_refusal: Option<AccountSizeRefusal>,
     pub non_quota_size_refusal: Option<AccountSizeRefusal>,
     pub lift_credential: Option<(String, String)>,
@@ -515,12 +516,23 @@ impl AccountTx<'_> {
         fingerprint: Option<&str>,
         now: i64,
     ) -> RouteStateResult<()> {
+        self.record_credential_refusal_with_console_credit(refusal, fingerprint, None, now)
+    }
+
+    pub fn record_credential_refusal_with_console_credit(
+        &self,
+        refusal: &CredentialRefusal,
+        fingerprint: Option<&str>,
+        console_credit_micros_at_refusal: Option<i64>,
+        now: i64,
+    ) -> RouteStateResult<()> {
         #[cfg(any(test, feature = "test-support"))]
         let _writer_entry = crate::writer_entry_trace::enter(
             "account_tx::report_delivery::record_credential_refusal",
         );
         let effects = V1ReportEffects {
             credential_refusal: Some((refusal.clone(), fingerprint.map(str::to_owned))),
+            console_credit_micros_at_refusal,
             ..Default::default()
         };
         apply_account_effects(self, &effects, now).map_err(err)
@@ -667,6 +679,13 @@ fn apply_account_effects(
                 observed_at_ms: prior
                     .as_ref()
                     .map_or(now, |row| row.observed_at_ms.max(now)),
+                console_credit_micros_at_refusal: if same_evidence {
+                    prior
+                        .as_ref()
+                        .and_then(|row| row.console_credit_micros_at_refusal)
+                } else {
+                    effects.console_credit_micros_at_refusal
+                },
             };
             crate::block_storage::write_source(
                 conn,

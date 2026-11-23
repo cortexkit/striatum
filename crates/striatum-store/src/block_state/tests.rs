@@ -1262,6 +1262,7 @@ fn a_success_heals_only_its_serving_login_and_evidence_older_than_its_admission(
                     code: "billing_exhausted".into(),
                     listing_fingerprint: None,
                     observed_at_ms: observed_at,
+                    console_credit_micros_at_refusal: None,
                 },
             )?;
             crate::block_storage::write_source(conn, &row)?;
@@ -4623,6 +4624,7 @@ fn a_pool_decision_on_a_state_stale_in_any_one_input_runs_again_on_a_fresh_load(
                             code: "billing_exhausted".into(),
                             listing_fingerprint: Some("l0".into()),
                             observed_at_ms: NOW - 1_000,
+                            console_credit_micros_at_refusal: None,
                         },
                     )
                 });

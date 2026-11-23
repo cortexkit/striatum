@@ -1667,6 +1667,7 @@ pub(crate) mod rows {
             code: row.get(at + 2)?,
             listing_fingerprint: row.get(at + 3)?,
             observed_at_ms: row.get(at + 4)?,
+            console_credit_micros_at_refusal: None,
         })
     }
 }

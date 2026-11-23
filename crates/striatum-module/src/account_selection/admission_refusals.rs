@@ -666,6 +666,8 @@ pub(super) fn empty_roster_refusal(
                 "reason":refusal.code, "reset_at_ms":reset,
                 "message":if reset.is_some() {
                     "This credential is blocked until its quota resets or its next single probe window opens; reset_at_ms says when."
+                } else if refusal.console_credit_micros_at_refusal.is_some() {
+                    "This credential is blocked until its Console credit increases, an operator clears the block, or its vault listing changes."
                 } else {
                     "This credential is blocked with no timed reset: an operator must clear it, or its vault listing must change."
                 }}));

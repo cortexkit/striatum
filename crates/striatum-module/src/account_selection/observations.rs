@@ -439,6 +439,19 @@ fn apply_credential_refused(
     let until = ctx
         .now_ms
         .saturating_add(crate::credential_fences::CREDENTIAL_REFUSED_REPROBE_MS);
+    let code = parsed
+        .provider_code
+        .as_deref()
+        .unwrap_or("credential_refused");
+    let console_credit = crate::credential_fences::is_billing_code(code)
+        .then(|| {
+            crate::account_quota::console_credit::live_total_micros(
+                &classes.quota,
+                credential,
+                ctx.now_ms,
+            )
+        })
+        .flatten();
     for provider in providers {
         // A provider with no catalog rows borrows a vendor's rows through its
         // active API keys. Even if the refused key is now invalid and no longer
@@ -455,29 +468,33 @@ fn apply_credential_refused(
                             .count()
                             == 1
                 }));
-        if pool {
+        // A pool wall is purely timed. Store linked Console billing evidence
+        // as a credential fence so it can wait for a balance increase instead.
+        if pool && console_credit.is_none() {
             tx.pool_wall(
                 &provider,
                 credential,
                 striatum_store::PoolWallKind::Billing,
                 until,
-                parsed
-                    .provider_code
-                    .as_deref()
-                    .unwrap_or("credential_refused"),
+                code,
                 ctx.now_ms,
             )?;
         } else {
-            // Keep the wall independent of quota readings: an empty balance or
-            // a revoked key is not a resettable usage window. The provider's
-            // verbatim code remains in the stored observation.
-            tx.record_credential_refusal(
+            // Unlinked refusals keep their original generic code and timed
+            // recheck. A linked billing wall instead waits for more credit.
+            tx.record_credential_refusal_with_console_credit(
                 &striatum_core::route_state_store::CredentialRefusal {
                     provider_id: provider.clone(),
                     credential_id: credential.into(),
-                    code: "credential_refused".into(),
+                    code: if console_credit.is_some() {
+                        code
+                    } else {
+                        "credential_refused"
+                    }
+                    .into(),
                 },
                 fingerprint.as_deref(),
+                console_credit,
                 ctx.now_ms,
             )?;
         }
