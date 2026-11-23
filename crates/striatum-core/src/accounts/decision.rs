@@ -325,6 +325,13 @@ pub struct RosterNote {
     pub account_ids: Vec<String>,
 }
 
+/// The live credit that gave a cold admission priority over other keys.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CreditExpiry {
+    pub expires_at_ms: EpochMs,
+    pub remaining: crate::quota::SpendBalance,
+}
+
 /// The machine-readable explanation every decision carries.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Explanation {
@@ -332,6 +339,8 @@ pub struct Explanation {
     pub fork_of: Option<ForkNote>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_fence_probe: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credit_expiry: Option<CreditExpiry>,
     pub policy_version: u32,
     pub provider: String,
     pub model: String,

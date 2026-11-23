@@ -66,6 +66,7 @@ pub fn decide_with_context(
     let explanation = Explanation {
         fork_of: None,
         credential_fence_probe: None,
+        credit_expiry: None,
         policy_version: policy.policy_version,
         provider: provider.clone(),
         model: model.clone(),
@@ -1310,8 +1311,22 @@ impl<'a> Allocator<'a> {
                         .then_with(|| a.view.account_id.cmp(&b.view.account_id))
                 })
         });
-        let best = eligible[0];
-        let best_score = best.note.score.unwrap_or(f64::INFINITY);
+        let usual_best = eligible[0];
+        // Among already eligible keys, spend expiring credit first. Taking
+        // the first minimum preserves the usual ranking at equal expiries.
+        let credit_pick = if self.context.credit_expiry_by_credential.is_empty() {
+            None
+        } else {
+            eligible
+                .iter()
+                .filter_map(|&eval| {
+                    let credential = eval.hard.credential_id.as_ref()?;
+                    let credit = self.context.credit_expiry_by_credential.get(credential)?;
+                    Some((eval, credit))
+                })
+                .min_by_key(|(_, credit)| credit.expires_at_ms)
+        };
+        let best = credit_pick.map_or(usual_best, |(eval, _)| eval);
         let mut chosen = (
             best.view,
             best.hard
@@ -1325,6 +1340,8 @@ impl<'a> Allocator<'a> {
             },
         );
         if let Some(requested) = &self.request.requested_account {
+            // Credit order does not change how the explicit request's score is judged.
+            let best_score = usual_best.note.score.unwrap_or(f64::INFINITY);
             let note = self.requested_account(requested, &eligible, best_score);
             if let RequestedAccountNote::Honoured { .. } = note.0 {
                 if let Some(pick) = note.1 {
@@ -1335,6 +1352,9 @@ impl<'a> Allocator<'a> {
         }
         let pin_generation = previous.as_ref().map_or(1, |p| p.pin_generation + 1);
         let (view, credential_id, reason) = chosen;
+        if reason != AdmitReason::RequestedAccount {
+            self.explanation.credit_expiry = credit_pick.map(|(_, credit)| credit.clone());
+        }
         self.admit(
             &view.account_id,
             &credential_id,

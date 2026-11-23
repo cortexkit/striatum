@@ -292,9 +292,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-claustrum-client"
-version = "0.15.0"
+version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e7ef7c4dda929f1c226bcf5c01c84a8ee589292380054c1ce6bdc12236e29059"
+checksum = "02eaeb2788c767054373d7c3b1fa3168bd45a3c36260462673454a0773d4db08"
 dependencies = [
  "base64",
  "serde",
