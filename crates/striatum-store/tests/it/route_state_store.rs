@@ -98,6 +98,7 @@ fn fact(provider: &str, model: &str) -> ModelFact {
         upstream_status: None,
         model_type: None,
         model_kind: None,
+        mode_of: None,
     }
 }
 
@@ -3087,6 +3088,7 @@ fn fusiform_precedence_updates_seed_facts_but_preserves_scores_and_same_field_ov
         upstream_status: None,
         model_type: None,
         model_kind: None,
+        mode_of: None,
         lineage: None,
     };
     store
@@ -3199,6 +3201,7 @@ fn fusiform_catalog_keys_on_provider_and_model_never_bare_model_id() {
         upstream_status: None,
         model_type: None,
         model_kind: None,
+        mode_of: None,
         lineage: None,
     };
     store
@@ -3252,6 +3255,7 @@ fn fusiform_first_sight_rows_are_minted_only_under_operator_known_providers() {
         upstream_status: None,
         model_type: None,
         model_kind: None,
+        mode_of: None,
         lineage: None,
     };
     store
@@ -3315,6 +3319,7 @@ fn withdrawn_model_leaves_the_routable_set_and_is_never_minted_on_first_sight() 
         upstream_status: None,
         model_type: None,
         model_kind: None,
+        mode_of: None,
         lineage: None,
     };
     let routable_before = store.get_facts().unwrap().len();
@@ -3399,6 +3404,7 @@ fn fusiform_apply_treats_a_pair_minted_earlier_in_the_batch_as_stored() {
         upstream_status: None,
         model_type: None,
         model_kind: None,
+        mode_of: None,
         lineage: None,
     };
     let before = store.get_catalog_facts().unwrap().len();
@@ -4323,6 +4329,7 @@ fn complete_catalog_sync_stamps_missing_rows_and_prunes_unpicked_absence() {
         upstream_status: None,
         model_type: None,
         model_kind: None,
+        mode_of: None,
         lineage: None,
     };
     store
@@ -4538,6 +4545,7 @@ fn new_routes_inherit_the_provider_wall_cause_through_the_insert_trigger() {
                 upstream_status: None,
                 model_type: None,
                 model_kind: None,
+                mode_of: None,
                 lineage: None,
             }],
             FusiformCatalogCursor {
@@ -4590,6 +4598,7 @@ fn migration_83_preserves_unknown_classification_and_catalog_refreshes_all_varia
         lineage: initial.family.clone(),
         model_type: model_type.map(str::to_owned),
         model_kind: model_kind.map(str::to_owned),
+        mode_of: None,
     };
     let cursor = FusiformCatalogCursor {
         catalog_version: 1,
@@ -4721,16 +4730,32 @@ fn observed_speed_and_class_vector_match_unsplit_before_the_mover_and_after_rest
 fn migration_100_clears_legacy_defaults_without_removing_explicit_fact_rows() {
     let rig = Rig::new("clear-curated-efforts");
     let descriptor = dev_descriptor("old", rig.db_path());
-    let old = SqliteRouteStateStore::open_at_version_for_test(&descriptor, 99).unwrap();
+    drop(SqliteRouteStateStore::open_at_version_for_test(&descriptor, 99).unwrap());
     let mut pinned = fact("migration-example", "model");
     pinned.variant = Some("high".into());
-    old.upsert_fact(&pinned, FactSource::Override).unwrap();
-    drop(old);
+    let route = striatum_core::fact_to_route(&pinned);
     let sql = rusqlite::Connection::open(rig.db_path()).unwrap();
+    // Write the pre-upgrade row without invoking the current catalog writer.
     sql.execute(
-        "UPDATE model_facts SET prompt_defaults_json = '{\"variant\":\"low\",\"temperature\":0.4}'
-         WHERE provider_id = 'migration-example'",
-        [],
+        "INSERT INTO model_facts (
+             route_key, capacity_key, provider_id, model_id, variant, scores_json,
+             context_window, cost_tier, cost_per_mtok_out, supports_vision, supports_tool_use,
+             prompt_defaults_json, confidence, source, updated_at, family_source
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                   '{\"variant\":\"low\",\"temperature\":0.4}', 'curated', 'override', 1, 'absent')",
+        rusqlite::params![
+            route.route_key,
+            route.capacity_key,
+            pinned.provider_id,
+            pinned.model_id,
+            pinned.variant,
+            serde_json::to_string(&pinned.scores).unwrap(),
+            pinned.context_window,
+            pinned.cost_tier,
+            pinned.cost_per_m_tok_out,
+            pinned.supports_vision,
+            pinned.supports_tool_use,
+        ],
     )
     .unwrap();
     let count = || {

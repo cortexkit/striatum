@@ -39,6 +39,7 @@ pub struct FusiformFactUpdate {
     pub lineage: Option<String>,
     pub model_type: Option<String>,
     pub model_kind: Option<String>,
+    pub mode_of: Option<striatum_core::model_facts::SpeedTwin>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

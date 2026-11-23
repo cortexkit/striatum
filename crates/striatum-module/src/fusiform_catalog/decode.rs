@@ -365,6 +365,7 @@ impl CatalogPage {
             }
         }
         report_unreadable_entries_once(self.catalog_version, &unreadable);
+        super::speed_twins::validate_bases(&mut snapshot.facts);
         Ok(Arc::new(snapshot))
     }
 }

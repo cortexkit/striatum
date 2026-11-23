@@ -328,7 +328,7 @@ const MIGRATION_068: &str = include_str!("../migrations/068_account_demand_by_ac
 const MIGRATION_069: &str = include_str!("../migrations/069_task_workload.sql");
 const MIGRATION_071: &str = include_str!("../migrations/071_service_tiers.sql");
 
-fn route_state_migrations() -> [Migration; 100] {
+fn route_state_migrations() -> [Migration; 101] {
     [
         Migration {
             version: 1,
@@ -726,6 +726,10 @@ fn route_state_migrations() -> [Migration; 100] {
         Migration {
             version: 101,
             statements: include_str!("../migrations/101_bounded_writer_lookups.sql"),
+        },
+        Migration {
+            version: 102,
+            statements: include_str!("../migrations/102_model_mode_of.sql"),
         },
     ]
 }

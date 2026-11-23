@@ -245,6 +245,12 @@ impl Harness {
 
     /// Write `facts` to the catalog and make Broca's billing view serve them.
     pub(super) fn install_facts(&self, facts: &[ModelFact]) {
+        self.install_facts_with(facts, |fact| {
+            self.store.upsert_fact(fact, FactSource::Override).unwrap();
+        });
+    }
+
+    fn install_facts_with(&self, facts: &[ModelFact], persist: impl FnMut(&ModelFact)) {
         // These fixtures exercise selection mechanics with metered candidates.
         // Opt their providers in explicitly; no-file safety tests remove this
         // settings file before requesting the built-in policy.
@@ -256,9 +262,7 @@ impl Harness {
                 }
             }
         });
-        for fact in facts {
-            self.store.upsert_fact(fact, FactSource::Override).unwrap();
-        }
+        facts.iter().for_each(persist);
         *self.broca_credentials.lock().unwrap() =
             Arc::new(Mutex::new(BrocaCredentials::api_test_credentials(facts)));
     }
@@ -660,6 +664,7 @@ pub(super) fn catalog_fact(
         upstream_status: None,
         model_type: None,
         model_kind: None,
+        mode_of: None,
     }
 }
 
@@ -739,13 +744,21 @@ fn account_state(
 /// subscription providers in the routing configuration, accounts in the
 /// allocator.
 pub(super) fn install_catalog(harness: &Harness, catalog: &Catalog) {
+    install_catalog_with(harness, catalog, Harness::install_facts);
+}
+
+fn install_catalog_with(
+    harness: &Harness,
+    catalog: &Catalog,
+    install_facts: impl FnOnce(&Harness, &[ModelFact]),
+) {
     let facts: Vec<ModelFact> = catalog
         .models
         .iter()
         .enumerate()
         .map(|(rank, model)| catalog_fact(model, rank))
         .collect();
-    harness.install_facts(&facts);
+    install_facts(harness, &facts);
     let subscription: Vec<String> = catalog
         .models
         .iter()
@@ -2651,6 +2664,108 @@ pub(super) fn upgrade_harness(harness: Arc<Harness>) -> Arc<Harness> {
     Arc::new(state)
 }
 
+fn seed_097_facts(harness: &Harness, facts: &[ModelFact]) {
+    // Schema 97 keeps route state and history in one file and predates the
+    // catalog columns the current writer requires. Insert the old shape directly.
+    let connection = rusqlite::Connection::open(harness.store_path()).unwrap();
+    harness.install_facts_with(facts, |fact| {
+        assert!(fact.variant.is_none());
+        let route = striatum_core::make_route_key(&fact.provider_id, &fact.model_id, None);
+        connection
+            .execute(
+                "INSERT INTO model_facts (
+                    route_key, capacity_key, provider_id, model_id, scores_json,
+                    context_window, max_output_tokens, cost_tier, cost_per_mtok_out,
+                    supports_vision, supports_tool_use, confidence, source, updated_at, family_source
+                 ) VALUES (?1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'curated', 'override', ?11, 'absent')",
+                rusqlite::params![
+                    route,
+                    fact.provider_id,
+                    fact.model_id,
+                    serde_json::to_string(&fact.scores).unwrap(),
+                    fact.context_window,
+                    fact.max_output_tokens,
+                    fact.cost_tier,
+                    fact.cost_per_m_tok_out,
+                    fact.supports_vision,
+                    fact.supports_tool_use,
+                    crate::now_ms(),
+                ],
+            )
+            .unwrap();
+    });
+}
+
+fn seed_097_completion(harness: &Harness, now: i64) {
+    // Seed the finished admission and its receipts in the combined state/history
+    // store. The stored reply must still replay after history moves to its own file.
+    let connection = rusqlite::Connection::open(harness.store_path()).unwrap();
+    let runner = fixture::RUNNER_ONE.trim_start_matches("reserved:");
+    let principal = format!("reserved:{runner}");
+    assert_eq!(
+        connection
+            .execute(
+                "UPDATE account_admission SET state = 'finished', run_id = 'split-run',
+                started_at = ?2, finished_at = ?2, last_observed_at = ?2
+             WHERE principal = ?1 AND admission_id = 'split-admission' AND state = 'reserved'",
+                rusqlite::params![principal, now],
+            )
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        connection
+            .execute(
+                "UPDATE account_affinity SET lease_valid_until = ?2
+             WHERE principal = ?1 AND pin_id = 'pin-split-admission'",
+                rusqlite::params![principal, now],
+            )
+            .unwrap(),
+        1
+    );
+    for (kind, event, effects) in [
+        (
+            "admission_started",
+            "split-start",
+            json!([{"effect":"admission_started","late":false}]),
+        ),
+        (
+            "run_finished",
+            "split-finish",
+            json!([{"effect":"admission_finished"}, {"effect":"lease_ended","lease_ended":true}]),
+        ),
+    ] {
+        let observation = json!({"kind":kind, "event_id":event, "admission_id":"split-admission",
+            "run_id":"split-run", "caller":{"runner":runner}});
+        let id = format!("aco_{event}");
+        let effects = effects.to_string();
+        connection.execute(
+            "INSERT INTO account_observation (observation_id, principal, runner, event_id, kind,
+                admission_id, bound, observation_json, effects_json, received_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'split-admission', 1, ?6, ?7, ?8)",
+            rusqlite::params![id, principal, runner, event, kind, observation.to_string(), effects, now],
+        ).unwrap();
+        let receipt: (String, bool, String, i64) = connection.query_row(
+            "SELECT observation_id, bound, effects_json, received_at FROM account_observation_event
+             WHERE principal = ?1 AND runner = ?2 AND event_id = ?3",
+            rusqlite::params![principal, runner, event],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).unwrap();
+        assert_eq!(receipt, (id, true, effects, now));
+    }
+    let finished: (String, String, i64, i64, i64, i64) = connection.query_row(
+        "SELECT a.state, a.run_id, a.started_at, a.finished_at, a.last_observed_at, f.lease_valid_until
+         FROM account_admission a JOIN account_affinity f ON a.pin_id = f.pin_id
+         WHERE a.principal = ?1 AND a.admission_id = 'split-admission'",
+        [&principal],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+    ).unwrap();
+    assert_eq!(
+        finished,
+        ("finished".into(), "split-run".into(), now, now, now, now)
+    );
+}
+
 #[tokio::test]
 async fn split_restart_replays_a_completed_admission_before_and_after_moving_history() {
     use striatum_core::{route_state_store::QuotaReadingLogRow, RouteStateStore};
@@ -2661,21 +2776,8 @@ async fn split_restart_replays_a_completed_admission_before_and_after_moving_his
     let request = json!({"provider":fixture::SUBSCRIPTION_PROVIDER,"model":"model-c",
         "conversation_key":"split-conversation","admission_id":"split-admission"});
     let expected = seed_062_admission(&harness, &request, true, now);
-    install_catalog(&harness, &fixture::catalog());
-    let runner = harness.bind(reserved(fixture::RUNNER_ONE), None).await;
-    for (kind, id) in [
-        ("admission_started", "split-start"),
-        ("run_finished", "split-finish"),
-    ] {
-        let answer = runner.call("route.account_observe", &json!({"kind":kind,"event_id":id,"admission_id":"split-admission","run_id":"split-run"})).await;
-        assert_eq!(answer.0, FrameType::Response, "{}", answer.1);
-        assert_eq!(
-            answer.1["result"]["observation"]["bound"], true,
-            "{}",
-            answer.1
-        );
-    }
-    drop(runner);
+    install_catalog_with(&harness, &fixture::catalog(), seed_097_facts);
+    seed_097_completion(&harness, now);
     let mut harness = Arc::try_unwrap(harness).ok().unwrap();
     let descriptor = dev_descriptor(DEFAULT_MODULE_ID, harness.store_path().to_string_lossy());
     let path = harness.store_path();

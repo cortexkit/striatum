@@ -507,6 +507,7 @@ pub(super) fn price_selection_inputs_for_sweep(
     // Borrowed rows are added after the live overlays so they carry the target's
     // current quality data, and before pricing so they get their own plane.
     striatum_core::score_alias::append_alias_rows(facts, sources.catalog_targets);
+    facts.retain(|fact| fact.mode_of.is_none());
     let subscription_plan_providers = if let Ok(credentials) = broca_credentials.lock() {
         credentials.price_facts(facts, sources.live_config.pricing());
         credentials.subscription_plan_providers()
@@ -1344,6 +1345,7 @@ async fn handle_select_panel(
         .map(|credentials| credentials.catalog_targets(&prepared.facts))
         .unwrap_or_default();
     striatum_core::score_alias::append_alias_rows(&mut prepared.facts, &catalog_targets);
+    prepared.facts.retain(|fact| fact.mode_of.is_none());
     if let Ok(credentials) = broca_credentials.lock() {
         credentials.price_facts(&mut prepared.facts, live_config.pricing());
     }

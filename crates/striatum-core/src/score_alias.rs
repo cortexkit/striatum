@@ -128,7 +128,12 @@ pub fn append_alias_rows(facts: &mut Vec<ModelFact>, aliases: &BTreeMap<String, 
             for (index, _) in facts.iter().enumerate().filter(|(_, existing)| {
                 existing.provider_id == *alias && existing.model_id == fact.model_id
             }) {
-                classifications.push((index, fact.model_type.clone(), fact.model_kind.clone()));
+                classifications.push((
+                    index,
+                    fact.model_type.clone(),
+                    fact.model_kind.clone(),
+                    fact.mode_of.clone(),
+                ));
             }
             let owned = facts.iter().any(|existing| {
                 existing.provider_id == *alias
@@ -147,9 +152,10 @@ pub fn append_alias_rows(facts: &mut Vec<ModelFact>, aliases: &BTreeMap<String, 
             borrowed.push(row);
         }
     }
-    for (index, model_type, model_kind) in classifications {
+    for (index, model_type, model_kind, mode_of) in classifications {
         facts[index].model_type = model_type;
         facts[index].model_kind = model_kind;
+        facts[index].mode_of = mode_of;
     }
     facts.extend(borrowed);
 }

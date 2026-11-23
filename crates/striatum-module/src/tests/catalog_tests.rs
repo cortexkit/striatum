@@ -380,6 +380,7 @@ fn panel_canonical_ids_follow_score_alias_rows_to_their_target() {
             upstream_status: None,
             model_type: None,
             model_kind: None,
+            mode_of: None,
             lineage: None,
         };
     store

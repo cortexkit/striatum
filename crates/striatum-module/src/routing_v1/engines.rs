@@ -389,10 +389,31 @@ fn select_request(
         .map(|candidate| format!("{}/{}", candidate.engine.provider, candidate.engine.model))
         .collect();
     let mut excluded = std::collections::BTreeMap::new();
+    let speed_twins: std::collections::HashSet<_> = catalog
+        .iter()
+        .flat_map(|catalog| catalog.speed_twin_ids())
+        .chain(
+            inputs
+                .facts
+                .iter()
+                .filter(|fact| fact.mode_of.is_some())
+                .map(|fact| (fact.provider_id.as_str(), fact.model_id.as_str())),
+        )
+        .collect();
     // Withdrawal applies to media and caller-local engines before ranking.
     // Resolved facts also carry it when a credential uses a different provider
     // name from the catalog's provider name.
     candidates.retain(|candidate| {
+        if speed_twins.contains(&(
+            candidate.engine.provider.as_str(),
+            candidate.engine.model.as_str(),
+        )) {
+            if evaluation.is_some() && candidate.engine.kind == request.kind {
+                let key = format!("{}/{}", candidate.engine.provider, candidate.engine.model);
+                excluded.insert(key, "service tier of another model".to_owned());
+            }
+            return false;
+        }
         let key = format!("{}/{}", candidate.engine.provider, candidate.engine.model);
         let allowed = !catalog
             .as_ref()

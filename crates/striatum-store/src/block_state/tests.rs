@@ -2526,6 +2526,7 @@ fn fact(provider: &str, model: &str) -> striatum_core::model_facts::ModelFact {
         upstream_status: None,
         model_type: None,
         model_kind: None,
+        mode_of: None,
     }
 }
 
@@ -2905,6 +2906,7 @@ fn every_production_block_writer_writes_inside_an_account_command() {
                 upstream_status: None,
                 model_type: None,
                 model_kind: None,
+                mode_of: None,
                 lineage: None,
             }],
             crate::FusiformCatalogCursor {

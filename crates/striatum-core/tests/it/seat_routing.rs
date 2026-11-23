@@ -69,6 +69,7 @@ fn fact(provider: &str, model: &str, family: Option<&str>, elo: f64, cost: f64) 
         upstream_status: None,
         model_type: None,
         model_kind: None,
+        mode_of: None,
     }
 }
 

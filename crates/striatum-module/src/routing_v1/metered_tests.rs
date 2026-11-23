@@ -101,6 +101,7 @@ fn harness_of(route_keys: &[&str], plan_prices: Value) -> Arc<Harness> {
                     upstream_status: None,
                     model_type: None,
                     model_kind: None,
+                    mode_of: None,
                     lineage: None,
                 }],
                 FusiformCatalogCursor {

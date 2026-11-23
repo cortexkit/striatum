@@ -31,7 +31,7 @@ fn refuse(code: &str, message: String) -> Refusal {
 /// Split the model part of a pin into the catalog model id and the reasoning
 /// tier the caller named, if any. A catalog id that itself contains a colon
 /// (for example a model size) is kept whole; only an additional suffix is a tier.
-fn split_model_and_variant<'a>(
+pub(crate) fn split_model_and_variant<'a>(
     provider: &str,
     requested_model: &'a str,
     facts: &[ModelFact],
