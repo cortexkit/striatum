@@ -17,14 +17,18 @@ fn credit(remaining: i64, expires_in_ms: i64) -> Value {
 }
 
 fn install_readings(links: [Option<&str>; 2], spend: [Option<Vec<Value>>; 2]) {
-    install_readings_with_vendors(links, spend, [Some("anthropic"); 2]);
+    let rows = ORGS
+        .into_iter()
+        .zip(spend)
+        .filter_map(|(org, spend)| {
+            Some(json!({"provider": "claude-console", "apiProvider": "anthropic", "account": org,
+                "fetchedAt": rfc3339(NOW as i64), "spend": spend?}))
+        })
+        .collect();
+    install_quota(links, rows);
 }
 
-fn install_readings_with_vendors(
-    links: [Option<&str>; 2],
-    spend: [Option<Vec<Value>>; 2],
-    vendors: [Option<&str>; 2],
-) {
+fn install_quota(links: [Option<&str>; 2], rows: Vec<Value>) {
     let mut quota = AccountQuotaState::default();
     account_quota::apply_roster_listing(
         &mut quota,
@@ -45,18 +49,6 @@ fn install_readings_with_vendors(
         },
         NOW as i64,
     );
-    let rows: Vec<_> = ORGS
-        .into_iter()
-        .zip(spend.into_iter().zip(vendors))
-        .filter_map(|(org, (spend, vendor))| {
-            let mut row = json!({"provider": "claude-console", "account": org,
-                "fetchedAt": rfc3339(NOW as i64), "spend": spend?});
-            if let Some(vendor) = vendor {
-                row["apiProvider"] = json!(vendor);
-            }
-            Some(row)
-        })
-        .collect();
     account_quota::apply_provider_reply(
         &mut quota,
         "claude-console",
@@ -181,25 +173,34 @@ async fn keys_without_live_console_credit_fall_back() {
 }
 
 #[tokio::test]
-async fn console_credit_requires_a_matching_vendor_as_well_as_org() {
+async fn console_credit_links_by_org_without_api_provider() {
+    const CONSOLE_ORGS: [&str; 2] = [
+        "00000000-0000-4000-8000-000000000001",
+        "00000000-0000-4000-8000-000000000002",
+    ];
     let _clock = crate::InjectedClock::set(NOW);
-    for (label, vendor) in [
-        ("different-vendor", Some("openai")),
-        ("missing-vendor", None),
-    ] {
-        let harness = paid_anthropic_harness();
-        install_readings_with_vendors(
-            ORGS.map(Some),
-            [
-                Some(vec![credit(20000, 60_000)]),
-                Some(vec![credit(20000, 120_000)]),
-            ],
-            [vendor, Some("anthropic")],
-        );
-        let broca = harness.bind(reserved("broca"), None).await;
-        let admitted = result(broca.call("route.account_for", &request(label)).await);
-        assert_eq!(admitted["account"]["credential_id"], KEYS[1], "{label}");
-    }
+    let harness = paid_anthropic_harness();
+    let rows = CONSOLE_ORGS
+        .into_iter()
+        .zip([240_000, 120_000])
+        .enumerate()
+        .map(|(index, (org, expires_in_ms))| {
+            json!({
+                "provider": "claude-console",
+                "account": org,
+                "accountInfo": {"orgName": format!("Example Org {}", index + 1)},
+                "credentialRef": format!("cookie:example-{}", index + 1),
+                "source": "vault",
+                "fetchedAt": rfc3339(NOW as i64),
+                "usage": {},
+                "spend": [credit(15833, expires_in_ms)],
+            })
+        })
+        .collect();
+    install_quota(CONSOLE_ORGS.map(Some), rows);
+    let broca = harness.bind(reserved("broca"), None).await;
+    let admitted = result(broca.call("route.account_for", &request("org-only")).await);
+    assert_eq!(admitted["account"]["credential_id"], KEYS[1]);
 }
 
 #[tokio::test]
