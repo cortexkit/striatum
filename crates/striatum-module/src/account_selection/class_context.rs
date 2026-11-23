@@ -1881,12 +1881,11 @@ impl ClassContext {
             .listed_credentials()
             .iter()
             .filter(|row| {
-                params.candidates.as_ref().is_none_or(|candidates| {
-                    candidates.accounts.iter().any(|candidate| {
-                        candidate.credential_id == row.id
-                            && candidate.account_id == self.account_id(row)
-                    })
-                })
+                params.offers_pair(self.account_id(row), &row.id)
+                    && params
+                        .bound_tier
+                        .as_ref()
+                        .is_none_or(|bound| bound.supports(&row.id))
             })
             .filter_map(|row| {
                 self.reserved_probe_retry_at(provider, model, row)

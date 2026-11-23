@@ -431,13 +431,13 @@ fn affinity_retention_grace_preserves_expected_pin_compare_and_set() {
 }
 
 #[test]
-fn affinity_retention_grace_preserves_bound_service_tier_refusal() {
+fn affinity_retention_grace_preserves_generation_when_a_bound_service_tier_moves() {
     let rig = affinity_grace_fixture("grace-tier");
     let ctx = rig.ctx(true, NOW);
     let mut request = admit_params("tier", "grace-conversation", "anthropic-auth");
-    request["candidates"] = json!({"view_digest":"tier-view","accounts":[{"account_id":ACCOUNT_B,"credential_id":"oauth:anthropic-b"}]});
+    request["candidates"] = json!({"view_digest":"tier-view","accounts":[{"account_id":ACCOUNT_B,"credential_id":"oauth:anthropic:ysample"}]});
     let mut params = parse_account_for(&request).unwrap();
-    params.service_tier_bound = true;
+    params.service_tier_chosen = Some(cortexkit_role_routing::service_tier::ServiceTier::Fast);
     let mut roster = roster_for_model(&ctx, "anthropic", Some("claude-opus-5-5"));
     roster
         .roster
@@ -461,11 +461,10 @@ fn affinity_retention_grace_preserves_bound_service_tier_refusal() {
             }
         })
         .unwrap();
-    assert_eq!(reply.code(), Some("account_unservable"));
-    let OpReply::Error { detail, .. } = reply else {
-        unreachable!()
-    };
-    assert_eq!(detail.unwrap(), json!({"reason":"bound_tier_unavailable"}));
+    let reply = result(reply);
+    assert_eq!(reply["service_tier_chosen"], "fast");
+    assert_eq!(reply["account"]["account_id"], ACCOUNT_B);
+    assert_eq!(reply["pin"]["generation"], 8);
 }
 
 #[test]

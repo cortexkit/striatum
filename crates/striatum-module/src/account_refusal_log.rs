@@ -47,6 +47,7 @@ struct Trace {
     exclusions: Option<String>,
     eligible_accounts_not_offered: Option<Value>,
     unservable_candidates: Option<cortexkit_role_routing::errors::AccountUnservableDetail>,
+    pinned_ineligibility: Option<Value>,
 }
 
 thread_local! {
@@ -74,6 +75,14 @@ pub(crate) fn checking(reason: &'static str) {
 pub(crate) fn because<T>(reason: &'static str, reply: T) -> T {
     checking(reason);
     reply
+}
+
+pub(crate) fn pinned_ineligibility(diagnostic: Value) {
+    TRACE.with(|trace| {
+        if let Some(trace) = trace.borrow_mut().as_mut() {
+            trace.pinned_ineligibility = Some(diagnostic);
+        }
+    });
 }
 
 fn exclusions(detail: &Value) -> String {
@@ -232,6 +241,16 @@ pub(crate) fn emit(
             .and_then(|trace| trace.eligible_accounts_not_offered.as_ref())
         {
             fields["eligible_accounts_not_offered"] = detail.clone();
+        }
+        if let Some(diagnostic) = trace
+            .borrow()
+            .as_ref()
+            .and_then(|trace| trace.pinned_ineligibility.as_ref())
+        {
+            fields["pinned_ineligibility"] = diagnostic.clone();
+            // The allocator's exclusion summary uses account IDs; the bound pin
+            // diagnostic names the credential instead.
+            fields["exclusions"] = json!("");
         }
     });
     crate::warn_operator(format!("routing refused an account call: {fields}"));

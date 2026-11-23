@@ -433,7 +433,7 @@ pub(crate) struct AccountForParams {
     #[serde(skip)]
     pub(super) service_tier_chosen: Option<cortexkit_role_routing::service_tier::ServiceTier>,
     #[serde(skip)]
-    pub(super) service_tier_bound: bool,
+    pub(super) bound_tier: Option<BoundTier>,
     /// Routing generated `admission_id` itself (a continuation's reservation),
     /// so no earlier admission can hold it and the writer skips its keyed
     /// existence check.
@@ -517,7 +517,7 @@ impl AccountForParams {
             call: None,
             service_tier: request.service_tier,
             service_tier_chosen: None,
-            service_tier_bound: false,
+            bound_tier: None,
             admission_id_generated: false,
             parent_conversation_key: serde_json::from_value(optional("parent_conversation_key"))
                 .map_err(|e| invalid(e.to_string()))?,
@@ -631,6 +631,14 @@ impl AccountForParams {
 
     pub(super) fn affinity_model(&self) -> &str {
         self.affinity_model.as_deref().unwrap_or(&self.model)
+    }
+
+    pub(super) fn offers_pair(&self, account: &str, credential: &str) -> bool {
+        self.candidates.as_ref().is_none_or(|candidates| {
+            candidates.accounts.iter().any(|candidate| {
+                candidate.account_id == account && candidate.credential_id == credential
+            })
+        })
     }
 
     /// The allocator's request. `import_allowed` is true only when routing
@@ -889,30 +897,40 @@ pub(super) fn prepare_and_admit(
             ),
         ));
     }
-    let (mut roster, route_fenced, class, selection) = match prepare_roster(&parsed, ctx) {
-        Ok(prepared) => prepared,
-        Err(reply) => return Err(reply),
-    };
-    checking("service_tier");
-    // Accounts a route fence or another selection's reserved probe keeps out
-    // for now, and when the first of them returns: a bound tier those
-    // accounts serve waits for them instead of being refused for good.
-    let held_until = route_fenced
-        .values()
-        .copied()
-        .chain(ctx.classes.iter().flat_map(|classes| {
-            classes
-                .reserved_probe_accounts(&provider, &normalize(&parsed.model), &parsed)
-                .into_iter()
-                .map(|(_, until)| until)
-        }))
-        .filter(|until| *until > ctx.now_ms)
-        .min();
-    parsed.service_tier_chosen =
-        match prepare_service_tier(&mut parsed, ctx, &mut roster, class, held_until) {
-            Ok(tier) => tier,
+    let (mut roster, route_fenced, class, selection, bound_tier) =
+        match prepare_roster(&parsed, ctx) {
+            Ok(prepared) => prepared,
             Err(reply) => return Err(reply),
         };
+    checking("service_tier");
+    parsed.bound_tier = bound_tier
+        .filter(|bound| !bound.tier.is_standard())
+        .map(|mut bound| {
+            bound.route_fenced.clone_from(&route_fenced);
+            bound
+        });
+    parsed.service_tier_chosen = if let Some(bound) = &parsed.bound_tier {
+        if !roster
+            .roster
+            .iter()
+            .flat_map(|r| &r.accounts)
+            .any(|account| {
+                account.credentials.iter().any(|credential| {
+                    parsed.offers_pair(&account.account_id, &credential.credential_id)
+                })
+            })
+        {
+            return Err(bound_tier_empty_refusal(
+                &parsed, ctx, principal, &provider, class, &roster,
+            ));
+        }
+        Some(bound.tier)
+    } else {
+        match prepare_service_tier(&mut parsed, ctx, &mut roster, class, None) {
+            Ok(tier) => tier,
+            Err(reply) => return Err(reply),
+        }
+    };
     parsed.continuation_input = Some(continuation::Inputs::prepare(
         &parsed,
         principal,
@@ -999,7 +1017,8 @@ pub(super) fn prepare_and_admit(
     let command_ctx = ctx.command_context();
     let principal = principal.to_owned();
     let finish = finish.take();
-    Ok(crate::account_writer::execute_with_error(
+    let admission_id = parsed.admission_id.clone();
+    let reply = crate::account_writer::execute_with_error(
         ctx.store,
         striatum_store::AccountCommandKind::Admit,
         move |tx| {
@@ -1007,7 +1026,8 @@ pub(super) fn prepare_and_admit(
             // released before the admission decides.
             tx.release_expired(command_ctx.now_ms)?;
             tx.release_expired_continuations(command_ctx.now_ms)?;
-            let reply = serve(
+            let mut pin_diagnostic = None;
+            let reply = serve_with_pin_diagnostic(
                 tx,
                 &command_ctx,
                 &principal,
@@ -1015,11 +1035,31 @@ pub(super) fn prepare_and_admit(
                 &provider,
                 &roster,
                 &request_fingerprint,
+                &mut pin_diagnostic,
             )?;
-            finish_reply(tx, reply, finish.as_ref(), command_ctx.now_ms)
+            Ok((
+                finish_reply(tx, reply, finish.as_ref(), command_ctx.now_ms)?,
+                pin_diagnostic,
+            ))
         },
-    )
-    .unwrap_or_else(admission_error))
+    );
+    Ok(match reply {
+        Ok((reply, Some(mut diagnostic))) => {
+            match &reply {
+                OpReply::Result(result) => {
+                    diagnostic["admission_id"] = json!(admission_id);
+                    diagnostic["new_credential_id"] = result["account"]["credential_id"].clone();
+                    crate::info_operator(format!("routing moved a bound-tier pin: {diagnostic}"));
+                }
+                OpReply::Error { .. } => {
+                    crate::account_refusal_log::pinned_ineligibility(diagnostic)
+                }
+            }
+            reply
+        }
+        Ok((reply, None)) => reply,
+        Err(error) => admission_error(error),
+    })
 }
 
 pub(super) fn finish_reply(
@@ -1082,6 +1122,7 @@ pub(super) fn prepare_roster(
         BTreeMap<String, i64>,
         striatum_core::accounts::AllowedAccountClass,
         Option<striatum_store::V1Decision>,
+        Option<BoundTier>,
     ),
     OpReply,
 > {
@@ -1121,89 +1162,16 @@ pub(super) fn prepare_roster(
         }
         None => roster_for_model(ctx, &provider, Some(&normalize(&parsed.model))),
     };
-    if let Some(id) = parsed.model_decision_id.as_deref() {
-        match ctx.store.decision_service_tier(id) {
-            Ok(Some((tier, allowed))) => {
-                if cortexkit_role_routing::service_tier::ServiceTier::parse(&tier).is_none() {
-                    return Err(unservable_refusal(
-                        cortexkit_role_routing::errors::AccountUnservableReason::StoredStateInvalid,
-                        vec![],
-                        vec![],
-                    ));
-                }
-                // A decision from the older model-selection API has no routing/v1
-                // row naming its runner. The requesting runner will serve the run,
-                // so check that runner's tier support instead.
-                let runner = Some(selection.as_ref().map_or_else(
-                    || normalize(&parsed.caller.runner),
-                    |decision| decision.runner_module.clone(),
-                ));
-                let registry = ctx.classes.as_ref().map(|classes| {
-                    crate::routing_v1::runners::Registry::build(
-                        classes.config.as_ref(),
-                        &classes.credentials,
-                        &classes.facts,
-                        classes.now_ms.max(0) as u64,
-                    )
-                });
-                if let Some(roster) = &mut roster.roster {
-                    for account in &mut roster.accounts {
-                        // The standard tier needs no plan, model or runner
-                        // support, so only the decision's allowed accounts apply.
-                        account.credentials.retain(|credential| {
-                            allowed.contains(&credential.credential_id)
-                                && (tier == "standard"
-                                    || ctx.classes.as_ref().is_some_and(|classes| {
-                                        let fact = classes.facts.iter().find(|fact| {
-                                            fact.provider_id == provider
-                                                && fact.model_id == normalize(&parsed.model)
-                                        });
-                                        let row = classes
-                                            .credentials
-                                            .listed_credentials()
-                                            .iter()
-                                            .find(|row| row.id == credential.credential_id);
-                                        match (fact, row, runner.as_deref()) {
-                                        (Some(fact), Some(row), Some(runner)) => {
-                                            crate::service_tiers::model_offers(
-                                                &classes.credentials,
-                                                fact,
-                                                &tier,
-                                            ) && crate::service_tiers::plan_rate(
-                                                &classes.credentials.plan_prices,
-                                                row,
-                                                &provider,
-                                                &tier,
-                                                false,
-                                            )
-                                            .is_some()
-                                                && (tier == "standard"
-                                                    || registry
-                                                        .as_ref()
-                                                        .and_then(|registry| registry.get(runner))
-                                                        .is_some_and(|runner| {
-                                                            crate::service_tiers::runner_supports(
-                                                                &classes.credentials,
-                                                                runner,
-                                                                fact,
-                                                                row,
-                                                                &tier,
-                                                            )
-                                                        }))
-                                        }
-                                        _ => false,
-                                    }
-                                    }))
-                        });
-                    }
-                    roster
-                        .accounts
-                        .retain(|account| !account.credentials.is_empty());
-                }
-            }
-            Ok(None) => {}
-            Err(error) => return Err(store_error(error)),
+    let bound_tier = BoundTier::read(parsed, ctx, &provider, selection.as_ref())?;
+    if let (Some(bound), Some(roster)) = (&bound_tier, &mut roster.roster) {
+        for account in &mut roster.accounts {
+            account
+                .credentials
+                .retain(|credential| bound.supports(&credential.credential_id));
         }
+        roster
+            .accounts
+            .retain(|account| !account.credentials.is_empty());
     }
     if let Some(classes) = &ctx.classes {
         classes.restrict_size(
@@ -1229,7 +1197,7 @@ pub(super) fn prepare_roster(
             )));
         }
     }
-    Ok((roster, route_fenced, class, selection))
+    Ok((roster, route_fenced, class, selection, bound_tier))
 }
 
 /// Check a cold worker launch without reserving an account or creating affinity.
@@ -1485,6 +1453,29 @@ pub(super) fn serve(
     roster: &RosterBuild,
     request_fingerprint: &str,
 ) -> RouteStateResult<OpReply> {
+    serve_with_pin_diagnostic(
+        tx,
+        ctx,
+        principal,
+        params,
+        provider,
+        roster,
+        request_fingerprint,
+        &mut None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn serve_with_pin_diagnostic(
+    tx: &mut crate::account_state::AccountCommand<'_>,
+    ctx: &CommandContext,
+    principal: &str,
+    params: &AccountForParams,
+    provider: &str,
+    roster: &RosterBuild,
+    request_fingerprint: &str,
+    pin_diagnostic: &mut Option<Value>,
+) -> RouteStateResult<OpReply> {
     if let Some(call) = &params.call {
         call.reset();
     }
@@ -1507,23 +1498,6 @@ pub(super) fn serve(
     let mut fork_parent = fork::resolve(tx, principal, params, provider)?;
     if params.fork_of.is_some() && fork_parent.is_none() {
         return Ok(fork_invalid());
-    }
-    // The tier-filtered roster must still contain the conversation's exact
-    // credential. A healthy sibling cannot replace a bound session's pin.
-    if params.service_tier_bound
-        && affinity_row.as_ref().is_some_and(|affinity| {
-            !roster.roster.as_ref().is_some_and(|roster| {
-                roster.accounts.iter().any(|account| {
-                    account.account_id == affinity.account_id
-                        && account.credentials.iter().any(|credential| {
-                            credential.credential_id == affinity.credential_id
-                                && tier_candidate_matches(params, account, credential)
-                        })
-                })
-            })
-        })
-    {
-        return Ok(bound_service_tier_refusal(params));
     }
     let established = match affinity_row.as_ref() {
         Some(affinity) => tx.pin_has_started(affinity)?,
@@ -1936,6 +1910,39 @@ pub(super) fn serve(
             }
         }
     };
+    let prepared_refusal = if !matches!(decision.outcome, Outcome::Admit(_))
+        || matches!(
+            decision.explanation.affinity,
+            striatum_core::accounts::AffinityNote::Invalidated {
+                reason: striatum_core::accounts::InvalidationReason::IdentityWithdrawn,
+                ..
+            }
+        ) {
+        prepared_bound_refusal(
+            params,
+            ctx.classes.as_ref(),
+            provider,
+            roster.context["priced_per_token"]
+                .as_bool()
+                .unwrap_or(false),
+            now,
+        )
+    } else {
+        None
+    };
+    let prepared_until = prepared_reset(prepared_refusal.as_ref(), now);
+    if let Some(pin) = affinity_row
+        .as_ref()
+        .filter(|_| params.bound_tier.is_some())
+    {
+        *pin_diagnostic = bound_pin_diagnostic(
+            params,
+            pin,
+            &decision,
+            &lost_probe_fences,
+            prepared_refusal.as_ref(),
+        );
+    }
     if gate.refused() {
         return gate.refuse(
             tx, ctx, params, principal, &hash, provider, &decision, roster,
@@ -2101,6 +2108,18 @@ pub(super) fn serve(
             Ok(reply)
         }
         Outcome::Hold(hold) => {
+            // Keep the hold on an existing pin. When there is no pin to keep,
+            // another allowed login may come off its preflight block sooner.
+            if let Some(until) =
+                prepared_until.filter(|until| hold.pin_id.is_empty() && *until < hold.reset_at_ms)
+            {
+                return Ok(lost_probe_refusal(
+                    until,
+                    now,
+                    json!(decision_id),
+                    json!(wire_exclusions(&decision)),
+                ));
+            }
             tx.insert_hold(&AccountHoldRow {
                 decision_id: decision_id.clone(),
                 principal: principal.to_string(),
@@ -2188,6 +2207,16 @@ pub(super) fn serve(
                 &params.model,
                 now,
             );
+            if let Some(until) =
+                prepared_until.filter(|until| reset.is_none_or(|reset| *until < reset))
+            {
+                return Ok(lost_probe_refusal(
+                    until,
+                    now,
+                    json!(decision_id),
+                    json!(wire_exclusions(&decision)),
+                ));
+            }
             let timed = matches!(
                 code,
                 "account_pool_exhausted" | "account_pool_reserve_limited"

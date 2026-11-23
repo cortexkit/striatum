@@ -529,7 +529,7 @@ async fn account_service_tier_legacy_standard_decision_without_v1_row_admits() {
 }
 
 #[tokio::test]
-async fn account_service_tier_legacy_bound_decision_refuses_an_ineligible_pin() {
+async fn account_service_tier_legacy_bound_decision_moves_only_when_a_sibling_supports_it() {
     let _clock = crate::InjectedClock::set(NOW);
     for (failure, hint) in [
         ("plan", true),
@@ -620,6 +620,18 @@ async fn account_service_tier_legacy_bound_decision_refuses_an_ineligible_pin() 
         }
         harness.set_credentials(credentials);
         let refused = runner.call("route.account_for", &request).await;
+        if !matches!(failure, "runner" | "model") {
+            assert_eq!(
+                refused.0,
+                FrameType::Response,
+                "{failure}, hint={hint}: {}",
+                refused.1
+            );
+            assert_eq!(refused.1["result"]["service_tier_chosen"], "fast");
+            assert_eq!(refused.1["result"]["account"]["credential_id"], sibling.id);
+            assert_eq!(refused.1["result"]["pin"]["generation"], 2);
+            continue;
+        }
         assert_eq!(
             refused.0,
             FrameType::Error,

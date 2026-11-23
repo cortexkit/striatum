@@ -8,21 +8,17 @@ pub(super) fn tier_candidate_matches(
     account: &AccountView,
     credential: &CredentialRecord,
 ) -> bool {
-    parsed.candidates.as_ref().is_none_or(|candidates| {
-        candidates.accounts.iter().any(|candidate| {
-            candidate.account_id == account.account_id
-                && candidate.credential_id == credential.credential_id
+    parsed.offers_pair(&account.account_id, &credential.credential_id)
+        && parsed.requested_account.as_ref().is_none_or(|pin| {
+            pin.account_id.as_ref().map_or_else(
+                || {
+                    pin.credential_id
+                        .as_ref()
+                        .is_none_or(|id| *id == credential.credential_id)
+                },
+                |id| *id == account.account_id,
+            )
         })
-    }) && parsed.requested_account.as_ref().is_none_or(|pin| {
-        pin.account_id.as_ref().map_or_else(
-            || {
-                pin.credential_id
-                    .as_ref()
-                    .is_none_or(|id| *id == credential.credential_id)
-            },
-            |id| *id == account.account_id,
-        )
-    })
 }
 
 pub(super) fn service_tier_refusal_detail(
@@ -179,8 +175,7 @@ pub(super) fn prepare_service_tier(
                 vec![],
             )
         })?;
-        parsed.service_tier_bound = !tier.is_standard();
-        if parsed.service_tier_bound
+        if !tier.is_standard()
             && !roster.roster.as_ref().is_some_and(|roster| {
                 roster.accounts.iter().any(|account| {
                     account
@@ -581,14 +576,13 @@ pub(super) fn empty_roster_refusal(
     let rows: Vec<_> = rows
         .into_iter()
         .filter(|row| {
-            params
-                .and_then(|params| params.candidates.as_ref())
-                .is_none_or(|candidates| {
-                    candidates.accounts.iter().any(|candidate| {
-                        candidate.credential_id == row.id
-                            && candidate.account_id == classes.account_id(row)
-                    })
-                })
+            params.is_none_or(|params| {
+                params.offers_pair(classes.account_id(row), &row.id)
+                    && params
+                        .bound_tier
+                        .as_ref()
+                        .is_none_or(|bound| bound.supports(&row.id))
+            })
         })
         .collect();
     if rows.is_empty() {

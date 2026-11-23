@@ -425,6 +425,8 @@ pub(crate) mod admission;
 use admission::*;
 mod admission_refusals;
 use admission_refusals::*;
+mod bound_tier;
+use bound_tier::*;
 pub(crate) mod status;
 use status::*;
 pub(crate) mod observations;

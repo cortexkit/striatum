@@ -216,7 +216,7 @@ pub(crate) fn continue_account_with_call(
         Err(_) => None,
     };
     let prepared = parsed.as_ref().map(|params| {
-        let (mut roster, fenced, class, _) = prepare_roster(params, ctx)?;
+        let (mut roster, fenced, class, _, _) = prepare_roster(params, ctx)?;
         if let (Some(input), Some(classes), Some(roster)) = (&input, &ctx.classes, &mut roster.roster) {
             for account in &mut roster.accounts {
                 account.credentials.retain(|credential| input.compatible(classes, &credential.credential_id));
@@ -332,7 +332,7 @@ pub(crate) fn continue_account_with_call(
             };
             prepare_roster(params, &reset_ctx)
                 .ok()
-                .map(|(roster, _, _, _)| roster)
+                .map(|(roster, _, _, _, _)| roster)
         }
         _ => None,
     };
