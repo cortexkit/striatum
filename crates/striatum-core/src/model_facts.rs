@@ -307,6 +307,36 @@ impl FamilySource {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SpeedTwinMode {
+    Fast,
+    Ultrafast,
+}
+
+impl SpeedTwinMode {
+    pub fn parse(mode: &str) -> Option<Self> {
+        match mode {
+            "fast" => Some(Self::Fast),
+            "ultrafast" => Some(Self::Ultrafast),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Fast => "fast",
+            Self::Ultrafast => "ultrafast",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpeedTwin {
+    pub mode: SpeedTwinMode,
+    pub model_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelFact {
@@ -417,6 +447,9 @@ pub struct ModelFact {
     /// Fusiform's `model.kind`, reserved for specialist consumers such as classifiers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_kind: Option<String>,
+    /// Fusiform's `model.mode_of`: this row names a tier of a same-provider model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode_of: Option<SpeedTwin>,
 }
 
 /// A declared non-chat engine cannot serve LLM work, even if it has chat wire

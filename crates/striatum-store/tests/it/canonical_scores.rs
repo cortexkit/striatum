@@ -72,6 +72,7 @@ fn served(route: &str, canonical_id: Option<&str>) -> FusiformFactUpdate {
         upstream_status: None,
         model_type: None,
         model_kind: None,
+        mode_of: None,
         lineage: None,
     }
 }

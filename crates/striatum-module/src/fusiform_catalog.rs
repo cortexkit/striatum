@@ -468,6 +468,13 @@ impl VideoFacts {
 }
 
 impl CatalogSnapshot {
+    pub(crate) fn speed_twin_ids(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.facts
+            .iter()
+            .filter(|fact| fact.mode_of.is_some())
+            .map(|fact| (fact.provider_id.as_str(), fact.model_id.as_str()))
+    }
+
     pub(crate) fn video_facts(&self, route: &str) -> Option<&VideoFacts> {
         self.video_facts.get(route)
     }
@@ -1215,6 +1222,7 @@ pub(crate) mod allocation_tests;
 mod decode;
 pub(crate) mod efforts;
 mod media_grades;
+mod speed_twins;
 #[cfg(test)]
 pub(crate) use media_grades::{count_calls, inherit_calls};
 
@@ -1354,6 +1362,7 @@ fn decode_catalog_get_legacy(bytes: &[u8]) -> Result<CatalogSnapshot, FusiformCa
         }
     }
     report_unreadable_entries_once(reply.catalog_version, &unreadable);
+    speed_twins::validate_bases(&mut facts);
     Ok(CatalogSnapshot {
         cursor: FusiformCatalogCursor {
             catalog_version: reply.catalog_version,
@@ -1445,6 +1454,7 @@ fn decode_model_entry(
         lineage: model.lineage,
         model_type: model.model_type,
         model_kind: model.model_kind,
+        mode_of: speed_twins::decode(provider_id, model_id, entry),
     };
     Ok((fact, model_rates))
 }

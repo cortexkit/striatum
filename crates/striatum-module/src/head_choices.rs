@@ -158,6 +158,7 @@ pub(crate) fn choices_for_harness_with_effort_detail(
     let mut facts = serving_catalog.facts.clone();
     let aliases = credentials.catalog_targets(&facts);
     striatum_core::score_alias::append_alias_rows(&mut facts, &aliases);
+    facts.retain(|fact| fact.mode_of.is_none());
     config.apply(&mut facts);
     let registry = routing_v1::runners::Registry::build_for_harness(
         config,

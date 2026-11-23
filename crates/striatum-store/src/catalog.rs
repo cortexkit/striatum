@@ -3,6 +3,7 @@
 //! agree on when the stored facts have changed.
 
 use super::*;
+use striatum_core::model_facts::{SpeedTwin, SpeedTwinMode};
 
 /// One catalog row served to read-only consumers. `excluded` stays separate from
 /// the model fact because it describes routing policy state rather than a model
@@ -88,13 +89,15 @@ struct CatalogFingerprintRow {
     model_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     model_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mode_of: Option<SpeedTwin>,
 }
 
 /// BLAKE3 over every routing-read `model_facts` column: route/capacity identity,
 /// provider/model/variant, family, Elo/EQ/speed, context and output limits, price
 /// data, vision/tool capability flags, allowed login methods, published
 /// reasoning efforts, canonical model identity (it decides which score a route
-/// borrows), upstream status, model type and specialist kind, prompt defaults,
+/// borrows), upstream status, model type, specialist kind, speed twins, prompt defaults,
 /// confidence, speed multiplier, and exclusion, plus Fusiform operator grades.
 /// Adding a routing-read column
 /// without extending this row is the defect this hash exists to catch. Query ordering—not insertion ordering—is the
@@ -116,7 +119,7 @@ fn calculate_catalog_fingerprint(connection: &Connection) -> rusqlite::Result<St
                 supports_vision, supports_tool_use, prompt_defaults_json, confidence,
                 speed_multiplier, excluded, fusiform_present, auth_methods_json,
                 reasoning_efforts_json, canonical_id, upstream_status, model_type, model_kind,
-                login_methods_documented
+                login_methods_documented, mode_of_mode, mode_of_model_id
          FROM model_facts
          ORDER BY route_key",
     )?;
@@ -154,6 +157,7 @@ fn calculate_catalog_fingerprint(connection: &Connection) -> rusqlite::Result<St
             upstream_status: row.get(25)?,
             model_type: row.get(26)?,
             model_kind: row.get(27)?,
+            mode_of: row_mode_of(row)?,
         })
     })?;
     let rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -409,7 +413,25 @@ pub(super) fn row_to_fact(row: &Row<'_>) -> rusqlite::Result<ModelFact> {
         upstream_status: row.get::<_, Option<String>>("upstream_status")?,
         model_type: row.get("model_type")?,
         model_kind: row.get("model_kind")?,
+        mode_of: row_mode_of(row)?,
     })
+}
+
+fn row_mode_of(row: &rusqlite::Row<'_>) -> rusqlite::Result<Option<SpeedTwin>> {
+    let mode: Option<String> = row.get("mode_of_mode")?;
+    let model_id: Option<String> = row.get("mode_of_model_id")?;
+    Ok(mode
+        .as_deref()
+        .and_then(SpeedTwinMode::parse)
+        .zip(model_id)
+        .map(|(mode, model_id)| SpeedTwin { mode, model_id }))
+}
+
+fn mode_of_columns(mode_of: Option<&SpeedTwin>) -> (Option<&'static str>, Option<&str>) {
+    match mode_of {
+        Some(twin) => (Some(twin.mode.as_str()), Some(&twin.model_id)),
+        None => (None, None),
+    }
 }
 
 fn bool_to_int(v: Option<bool>) -> Option<i64> {
@@ -1228,8 +1250,8 @@ impl crate::AccountTx<'_> {
                     }
                 }
                 for fact in facts {
-                    if fact.model_id.ends_with("-fast") {
-                        // The request service rejects -fast IDs at admission, so routing must not retain them.
+                    if fact.mode_of.is_none() && fact.model_id.ends_with("-fast") {
+                        // Keep the legacy exclusion for unmarked IDs that the request service rejects.
                         continue;
                     }
                     if fact.provider_id.trim().is_empty() || fact.model_id.trim().is_empty() {
@@ -1257,6 +1279,7 @@ impl crate::AccountTx<'_> {
                     let pair_stored = stored_models
                         .get(&fact.provider_id)
                         .is_some_and(|models| models.contains(&fact.model_id));
+                    let (mode_of_mode, mode_of_model_id) = mode_of_columns(fact.mode_of.as_ref());
                     if !pair_stored {
                         // A model first seen already withdrawn has nothing to route and
                         // nothing for the operator to place; minting it would only add a
@@ -1287,7 +1310,7 @@ impl crate::AccountTx<'_> {
                                cost_per_mtok_out_source, supports_vision_source,
                                supports_tool_use_source, auth_methods_json,
                                reasoning_efforts_json, canonical_id, upstream_status, model_type, model_kind,
-                               login_methods_documented
+                               login_methods_documented, mode_of_mode, mode_of_model_id
                              ) VALUES (
                                ?1, ?1, ?2, ?3, NULL, NULL, ?4, ?5, ?6, ?7,
                                ?8, ?9, ?10, ?11, ?12, ?13, ?14, NULL, 'unknown',
@@ -1295,7 +1318,7 @@ impl crate::AccountTx<'_> {
                                NULL, 0, 'unscored', ?15, NULL, NULL, NULL,
                                'fusiform', ?16, ?17,
                                'fusiform', 'fusiform', 'fusiform', 'fusiform',
-                                'fusiform', 'fusiform', ?18, ?19, ?20, ?21, ?22, ?23, ?24
+                                'fusiform', 'fusiform', ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26
                              )",
                             params![
                                 route_key,
@@ -1322,6 +1345,8 @@ impl crate::AccountTx<'_> {
                                 fact.model_type,
                                 fact.model_kind,
                                 fact.login_methods_documented,
+                                mode_of_mode,
+                                mode_of_model_id,
                             ],
                         )?;
                         stored_models
@@ -1371,7 +1396,8 @@ impl crate::AccountTx<'_> {
                                fusiform_present = ?12, updated_at = ?13,
                                auth_methods_json = ?16, reasoning_efforts_json = ?17,
                                canonical_id = ?18, upstream_status = ?19,
-                               model_type = ?20, model_kind = ?21, login_methods_documented = ?22
+                               model_type = ?20, model_kind = ?21, login_methods_documented = ?22,
+                               mode_of_mode = ?23, mode_of_model_id = ?24
                              WHERE provider_id = ?14 AND model_id = ?15",
                             params![
                                 fact.context_window,
@@ -1396,6 +1422,8 @@ impl crate::AccountTx<'_> {
                                 fact.model_type,
                                 fact.model_kind,
                                 fact.login_methods_documented,
+                                mode_of_mode,
+                                mode_of_model_id,
                             ],
                         )?;
                     }
@@ -1487,13 +1515,14 @@ impl crate::AccountTx<'_> {
                  ).optional()?;
                  let family = lineage.as_ref().unwrap_or(&fact.family);
                  let classification = tx.query_row(
-                     "SELECT model_type, model_kind FROM model_facts
+                     "SELECT model_type, model_kind, mode_of_mode, mode_of_model_id FROM model_facts
                       WHERE provider_id = ?1 AND model_id = ?2 ORDER BY route_key LIMIT 1",
                      params![fact.provider_id, fact.model_id],
-                     |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<String>>(1)?)),
+                     |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<String>>(1)?, row_mode_of(row)?)),
                  ).optional()?;
-                 let (model_type, model_kind) = classification.unwrap_or_else(||
-                     (fact.model_type.clone(), fact.model_kind.clone()));
+                 let (model_type, model_kind, mode_of) = classification.unwrap_or_else(||
+                     (fact.model_type.clone(), fact.model_kind.clone(), fact.mode_of.clone()));
+                 let (mode_of_mode, mode_of_model_id) = mode_of_columns(mode_of.as_ref());
                  // Catalog identity, classifications and login restrictions belong
                  // to the served model. Score edits and new reasoning variants
                  // must retain even an explicitly absent catalog classification.
@@ -1504,7 +1533,7 @@ impl crate::AccountTx<'_> {
                          input_rate, cache_read_rate, cache_write_rate, reasoning_rate,
                          supports_vision, supports_tool_use, prompt_defaults_json, confidence, notes, speed_multiplier,
                           source, updated_at, aa_index, review_by_ms, eq_source, auth_methods_json, login_methods_documented,
-                          canonical_id, upstream_status, model_type, model_kind
+                          canonical_id, upstream_status, model_type, model_kind, mode_of_mode, mode_of_model_id
                          ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,
                            (SELECT auth_methods_json FROM model_facts
                             WHERE provider_id = ?3 AND model_id = ?4 ORDER BY route_key LIMIT 1),
@@ -1514,7 +1543,7 @@ impl crate::AccountTx<'_> {
                             WHERE provider_id = ?3 AND model_id = ?4 ORDER BY route_key LIMIT 1),
                             (SELECT upstream_status FROM model_facts
                              WHERE provider_id = ?3 AND model_id = ?4 ORDER BY route_key LIMIT 1),
-                            ?28, ?29)
+                            ?28, ?29, ?30, ?31)
                       ON CONFLICT(route_key) DO UPDATE SET
                        capacity_key=excluded.capacity_key, provider_id=excluded.provider_id,
                        model_id=excluded.model_id, variant=excluded.variant, family=excluded.family,
@@ -1565,6 +1594,8 @@ impl crate::AccountTx<'_> {
                         eq_source,
                         model_type,
                         model_kind,
+                        mode_of_mode,
+                        mode_of_model_id,
                     ],
                 )?;
                 // A fresh INSERT fires the model_facts insert trigger, which creates
@@ -1692,6 +1723,7 @@ mod tests {
                     upstream_status: None,
                     model_type: None,
                     model_kind: None,
+                    mode_of: None,
                     lineage: None,
                 }],
                 FusiformCatalogCursor {

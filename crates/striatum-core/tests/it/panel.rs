@@ -55,6 +55,7 @@ fn fact(model: &str, elo: f64, family: Option<&str>) -> ModelFact {
         upstream_status: None,
         model_type: None,
         model_kind: None,
+        mode_of: None,
     }
 }
 

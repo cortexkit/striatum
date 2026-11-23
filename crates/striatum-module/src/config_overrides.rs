@@ -2503,6 +2503,7 @@ fn apply_overrides<S: RouteStateStore>(
                 upstream_status: None,
                 model_type: None,
                 model_kind: None,
+                mode_of: None,
             });
         // Score provenance does not distinguish config from route.model_upsert.
         // Preserving absent score fields avoids erasing an upsert placement on restart;
@@ -2622,6 +2623,7 @@ mod tests {
             upstream_status: None,
             model_type: None,
             model_kind: None,
+            mode_of: None,
         };
         let ov = ModelFactOverride {
             vision: Some(true),

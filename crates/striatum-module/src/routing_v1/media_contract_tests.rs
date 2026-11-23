@@ -219,6 +219,37 @@ async fn speech_prices_unicode_scalars_before_utf8_bytes_and_keeps_the_byte_fall
 }
 
 #[tokio::test]
+async fn speed_twin_is_not_a_media_candidate_even_when_pinned() {
+    super::super::super::describe::with_candidate_capabilities(
+        &["select_kind", "select_media"],
+        async {
+            let h = setup(vec![engine("base", false), engine("highspeed", false)]);
+            let row = |price| json!({"existence":"present", "model.type":"transcription",
+                "quality.grade.transcription":80,
+                "rate.input_audio.per_second":{"state":"priced","currency":"USD","units":price,"exponent":0,"per":1}});
+            let mut models = json!({"media-vendor/base":row(10), "media-vendor/highspeed":row(1)});
+            catalog(&h, models.clone());
+            ranking::measure(&h, "base", 0.8);
+            ranking::measure(&h, "highspeed", 0.9);
+            let route = h.bind(reserved("colliculus"), None).await;
+            let mut params = request();
+            params["requirements"]["iq"] = json!(40);
+            assert_eq!(select(&route, &params).await["engine"]["model"], "highspeed");
+
+            models["media-vendor/highspeed"]["model.mode_of"] = json!({"mode":"fast", "model_id":"base"});
+            catalog(&h, models);
+            assert_eq!(select(&route, &params).await["engine"]["model"], "base");
+            params["pin"] = json!("media-vendor/highspeed");
+            let (ty, refusal) = route.call("route.select", &params).await;
+            assert_eq!(ty, FrameType::Error, "{refusal}");
+            assert_eq!(refusal["code"], "pin_unavailable");
+            assert_eq!(refusal["detail"]["reason"], "not_available");
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn quantity_free_media_compares_matching_unit_rates_without_inventing_an_estimate() {
     super::super::super::describe::with_candidate_capabilities(
         &["select_kind", "select_media"],

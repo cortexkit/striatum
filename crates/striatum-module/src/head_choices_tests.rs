@@ -171,7 +171,7 @@ fn fixture() -> (Arc<Harness>, BrocaCredentials) {
     (harness, credentials)
 }
 
-fn broca_live_catalog_fixture() -> Arc<Harness> {
+fn broca_live_catalog_fixture(mark_speed_twin: bool) -> Arc<Harness> {
     let input: Value = serde_json::from_str(include_str!(
         "../fixtures/head-choices-broca-live-inputs-20261114.json"
     ))
@@ -218,6 +218,19 @@ fn broca_live_catalog_fixture() -> Arc<Harness> {
         "quality_scores": {"graded_by":"operator", "graded_at_ms":1794404263000_i64},
         "models": input["catalog_models"]
     });
+    if mark_speed_twin {
+        let served: Value = serde_json::from_str(include_str!(
+            "../fixtures/service-tier-v1/kimi-served-payloads.json"
+        ))
+        .unwrap();
+        let base = "kimi-code-plan-global/k3.1-pro";
+        catalog["models"][base]["rate.output.mode.fast"] = served
+            ["catalog.get — speed twin k3.1-pro plain"]["response"]["models"][base]
+            ["rate.output.mode.fast"]
+            .clone();
+        catalog["models"]["kimi-code-plan-global/k3.1-pro-highspeed"]["model.mode_of"] =
+            json!({"mode":"fast", "model_id":"k3.1-pro"});
+    }
     // The captured November 14 catalog has no graded efforts. Supply the
     // matching facts so the client picker test vectors still contain the
     // defaults that previously came from routing's store.
@@ -308,7 +321,21 @@ fn broca_live_catalog_fixture() -> Arc<Harness> {
         "../fixtures/service-tier-v1/fusiform-served-payloads.json"
     ))
     .unwrap();
-    credentials.publish_plan_prices(&served["plan.prices — every curated row"]["response"]);
+    let mut plan_prices = served["plan.prices — every curated row"]["response"].clone();
+    if mark_speed_twin {
+        // The captured Allegro plan predates fast-tier pricing. Give the
+        // picker a plan that already admits fast so only the twin is hidden.
+        let allegro = plan_prices["prices"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|row| row["provider_id"] == "kimi-code-plan-global" && row["tier"] == "allegro")
+            .unwrap();
+        allegro["service_tiers"] = json!({"state":"established", "tiers":[{
+            "tier":"fast", "included_usage_rate":{"units":25, "exponent":1}
+        }]});
+    }
+    credentials.publish_plan_prices(&plan_prices);
     credentials.runner_declarations.insert(
         "broca".into(),
         super::runners::parse_declaration(&input["runner_declaration"])
@@ -369,6 +396,23 @@ fn ids(reply: &Value) -> Vec<String> {
             )
         })
         .collect()
+}
+
+#[tokio::test]
+async fn broca_head_choices_lists_speed_twin_only_as_base_fast_tier() {
+    let harness = broca_live_catalog_fixture(true);
+    let reply = query(&harness, "broca").await;
+    assert!(
+        !ids(&reply).contains(&"kimi-code-plan-global/k3.1-pro-highspeed".into()),
+        "the speed twin appeared as a separate picker model"
+    );
+    let base = reply["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["provider"] == "kimi-code-plan-global" && row["model"] == "k3.1-pro")
+        .expect("Broca should list the base model");
+    assert_eq!(base["service_tiers"], json!(["fast", "standard"]));
 }
 
 #[tokio::test]
@@ -1071,7 +1115,7 @@ async fn serving_bytes_match_tagged_vectors() {
         ]);
     });
     let route = harness.bind(reserved("occipital"), None).await;
-    let live_harness = broca_live_catalog_fixture();
+    let live_harness = broca_live_catalog_fixture(false);
     let live_route = live_harness.bind(reserved("occipital"), None).await;
     let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../test-vectors/route-head-choices-v1");

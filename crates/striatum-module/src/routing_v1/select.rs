@@ -52,6 +52,7 @@ mod eligible_routes_tests;
 mod price_answer;
 #[cfg(test)]
 mod price_answer_tests;
+mod speed_twin_pin;
 mod tier_catalog;
 
 /// The members a v1 select may carry.
@@ -444,7 +445,7 @@ async fn select_with_tier_fallback(
         project_settings,
         ..Default::default()
     };
-    let Some(requested) = request.service_tier else {
+    let Some(requested) = inputs.twin_pin_tier.or(request.service_tier) else {
         return select_at_tier(
             params,
             caller,
@@ -788,6 +789,8 @@ fn count_input_build(config: &std::sync::Arc<config_overrides::LiveConfig>, stag
 /// Every tier attempt clones it before applying tier or sticky-account filters.
 struct SelectionInputs {
     request: SelectRequest,
+    slot_pin: Option<String>,
+    twin_pin_tier: Option<cortexkit_role_routing::service_tier::ServiceTier>,
     workload: Option<effort_preview::Workload>,
     consumer_pinned: bool,
     now: f64,
@@ -965,6 +968,16 @@ async fn prepare_selection(
         ));
         request.pin_fallback = None;
     }
+    let mut slot_pin = request
+        .pin_slot
+        .as_deref()
+        .and_then(|slot| operator_config.select_slot_pin(slot));
+    let twin_pin_tier = speed_twin_pin::resolve(
+        &mut request,
+        &mut slot_pin,
+        &shared.facts,
+        &shared.catalog_targets,
+    )?;
     let priced_per_token = select_policy::priced_per_token(&consumer_policy, legacy_consumer);
     let crate::PreparedSelectionInputs {
         catalog_snapshot,
@@ -1166,6 +1179,8 @@ async fn prepare_selection(
     count_input_build(&shared.operator_config, 1);
     Ok(SelectionInputs {
         request,
+        slot_pin,
+        twin_pin_tier,
         workload,
         consumer_pinned,
         now,
@@ -1708,15 +1723,10 @@ async fn select_at_tier_attempt(
         .collect();
     let ledger_pin = request
         .pin
-        .clone()
-        .or_else(|| {
-            request
-                .pin_slot
-                .as_deref()
-                .and_then(|slot| operator_config.select_slot_pin(slot))
-        })
+        .as_deref()
+        .or(inputs.slot_pin.as_deref())
         .filter(|_| request.pin_fallback != Some(PinFallback::Route))
-        .map(|pin| crate::select_concurrency::pin_capacity(&pin, &facts));
+        .map(|pin| crate::select_concurrency::pin_capacity(pin, &facts));
     let concurrency = crate::select_concurrency::capture_with_snapshot(
         deps.store,
         priced.classes.as_ref(),
@@ -1791,6 +1801,8 @@ async fn select_at_tier_attempt(
             selection.score_candidates_evaluated(&usable, false, None, None, Some(&mut evidence));
     }
 
+    // Project pins are tried inside a tier attempt, after request pin fallback.
+    // Only request-level pins can set the tier before attempts begin.
     let project_pin = request
         .settings
         .as_ref()
@@ -1835,12 +1847,7 @@ async fn select_at_tier_attempt(
             || (request.pin.is_none() && request.pin_slot.is_some())
             || request.pin_origin == Some(PinOrigin::User)
             || request_pin_is_keep_free_exempt(request.pin.as_deref(), &consumer_policy);
-        let mut request_pin = request.pin.clone().or_else(|| {
-            request
-                .pin_slot
-                .as_deref()
-                .and_then(|slot| operator_config.select_slot_pin(slot))
-        });
+        let mut request_pin = request.pin.clone().or_else(|| inputs.slot_pin.clone());
         let mut pin_reason = None;
         if request.pin_slot.is_some() && request_pin.is_none() {
             if request.pin_fallback == Some(PinFallback::Route) {

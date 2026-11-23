@@ -143,6 +143,95 @@ fn select_sol(tier: &str) -> Value {
     request
 }
 
+#[tokio::test]
+async fn speed_twin_pin_matches_base_pin_with_explicit_tier() {
+    let _clock = crate::InjectedClock::set(NOW);
+    const TWIN: &str = "openai/gpt-6.1-sol-highspeed";
+    for (runner_offers_fast, chosen) in [(true, "fast"), (false, "standard")] {
+        let (harness, mut credentials) = setup(&["pro_200"], true, false);
+        if !runner_offers_fast {
+            credentials.runner_service_tiers.clear();
+        }
+        let mut catalog = served()["catalog.get — provider default endpoint"]["response"].clone();
+        catalog["models"][TWIN] = json!({
+            "existence":"present", "model.mode_of":{"mode":"fast", "model_id":MODEL}
+        });
+        let snapshot = crate::fusiform_catalog::decode_catalog_get(catalog.to_string()).unwrap();
+        let (facts, cursor) = snapshot.parts();
+        harness
+            .store()
+            .apply_fusiform_catalog(facts, cursor)
+            .unwrap();
+        harness.set_credentials(credentials);
+        let route = harness.bind(reserved("tier-owner"), None).await;
+
+        let mut twin_request = select_sol("fast");
+        twin_request["pin"] = json!(TWIN);
+        twin_request.as_object_mut().unwrap().remove("service_tier");
+        let twin = route.call("route.select", &twin_request).await;
+        let base = route.call("route.select", &select_sol("fast")).await;
+        for (ty, reply) in [&twin, &base] {
+            assert_eq!(*ty, FrameType::Response, "{reply}");
+            let answer = &reply["result"];
+            assert_eq!(answer["route"], json!({"provider":"openai", "model":MODEL}));
+            assert_eq!(answer["service_tier_chosen"], chosen);
+            assert_eq!(answer["pin_outcome"], "pinned");
+            let id = answer["decision_id"].as_str().unwrap();
+            assert_eq!(
+                harness.store().decision_service_tier(id).unwrap(),
+                Some((chosen.into(), vec!["oauth:0".into()]))
+            );
+        }
+        let explanation = |reply: &Value| {
+            let id = reply["result"]["decision_id"].as_str().unwrap();
+            let decision = harness.store().get_decision_by_id(id).unwrap().unwrap();
+            serde_json::from_str::<Value>(&decision.explanation_json.unwrap()).unwrap()
+        };
+        assert_eq!(explanation(&twin.1), explanation(&base.1));
+        let fallback = stored_tier_fallback(&harness, &twin.1);
+        assert_eq!(fallback, stored_tier_fallback(&harness, &base.1));
+        if runner_offers_fast {
+            assert!(fallback.is_null());
+        } else {
+            assert_eq!(fallback["requested"], "fast");
+            assert_eq!(fallback["chosen"], "standard");
+            assert_eq!(sol_tier_rejections(&fallback)[0]["check"], "runner");
+        }
+
+        twin_request["service_tier"] = json!("standard");
+        let (ty, refusal) = route.call("route.select", &twin_request).await;
+        assert_eq!(ty, FrameType::Error, "{refusal}");
+        assert_eq!(refusal["code"], "invalid_request");
+        let message = refusal["message"].as_str().unwrap();
+        assert!(
+            message.contains(TWIN) && message.contains("fast") && message.contains("standard"),
+            "{refusal}"
+        );
+
+        harness.edit_config(|config| {
+            config["consumers"]["spec_designer"]["pin"] = json!({"model":TWIN});
+            config["consumers"]["mason"]["pin"] = json!({"model":TWIN});
+        });
+        for (request, pin_outcome) in [
+            (
+                json!({"consumer":"mason", "requirements":{"iq":30}, "pin_slot":"spec_designer"}),
+                json!("pinned"),
+            ),
+            (
+                json!({"consumer":"mason", "requirements":{"iq":30}}),
+                Value::Null,
+            ),
+        ] {
+            let (ty, reply) = route.call("route.select", &request).await;
+            assert_eq!(ty, FrameType::Response, "{reply}");
+            let answer = &reply["result"];
+            assert_eq!(answer["route"], base.1["result"]["route"]);
+            assert_eq!(answer["service_tier_chosen"], chosen);
+            assert_eq!(answer["pin_outcome"], pin_outcome);
+        }
+    }
+}
+
 fn account_request(id: &str, tier: Option<&str>) -> Value {
     let mut request = json!({
         "provider":"openai", "model":MODEL, "conversation_key":id, "admission_id":id,

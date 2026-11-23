@@ -925,6 +925,9 @@ pub fn admit_routes_with_availability(
     let mut rejected = Vec::new();
 
     for fact in facts {
+        if fact.mode_of.is_some() {
+            continue;
+        }
         let route = fact_to_route(fact);
         // Operator withdrawal is a hard wall, before scores or availability:
         // neither a high grade nor an explicit pin can make it routable.
@@ -3602,6 +3605,7 @@ mod abundance_tests {
             upstream_status: None,
             model_type: None,
             model_kind: None,
+            mode_of: None,
         }
     }
 
