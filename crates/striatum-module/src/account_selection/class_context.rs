@@ -3,6 +3,8 @@
 
 use super::*;
 
+mod credit_expiry;
+
 #[derive(Default)]
 pub(crate) struct LoginConditions {
     reasons: BTreeSet<String>,

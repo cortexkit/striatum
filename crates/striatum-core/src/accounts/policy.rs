@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use super::{EpochMs, PoolKey};
+use super::{CreditExpiry, EpochMs, PoolKey};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -49,6 +49,8 @@ pub struct AllocationContext {
     pub parent_account_id: Option<String>,
     pub credits: BTreeMap<String, CreditReading>,
     pub spend: BTreeMap<String, SpendReading>,
+    /// Credit expiry priority keyed by credential, separate from quota and eligibility.
+    pub credit_expiry_by_credential: BTreeMap<String, CreditExpiry>,
 }
 
 /// A granted parent resolved by the router under the requesting principal.

@@ -97,7 +97,7 @@ impl AccountCaller<'_> {
     fn admission_key(&self, id: &str) -> String {
         self.session.map_or_else(
             || id.to_owned(),
-            |scope| serde_json::to_string(&(&scope.reference, id)).unwrap(),
+            |scope| scoped_admission_key(&scope.reference, id),
         )
     }
 
@@ -119,6 +119,24 @@ impl AccountCaller<'_> {
                 )
             },
         )
+    }
+}
+
+fn scoped_admission_key(reference: &str, id: &str) -> String {
+    serde_json::to_string(&(reference, id)).unwrap()
+}
+
+/// The v1 row's principal carries the scope, whereas the allocator includes
+/// it in the admission key. Reconstruct that key for the stored explanation.
+pub(super) fn allocator_admission_key(
+    row: &striatum_store::V1SelectionAdmission,
+) -> Option<std::borrow::Cow<'_, str>> {
+    match row.principal.strip_prefix("session:") {
+        Some(scope) => {
+            let (_, reference) = serde_json::from_str::<(String, String)>(scope).ok()?;
+            Some(scoped_admission_key(&reference, &row.admission_id).into())
+        }
+        None => Some(row.admission_id.as_str().into()),
     }
 }
 

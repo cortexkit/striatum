@@ -124,13 +124,24 @@ pub(super) fn explain(params: &Value, caller: &Caller, deps: &Deps<'_>) -> Resul
         .auth
         .as_ref()
         .and_then(|auth| auth.credential_id.clone());
-    if let Some(admission) = deps
+    let mut credit_expiry = None;
+    if let Some(recorded) = deps
         .store
         .v1_selection_admission(&selection.decision_id)
         .map_err(store_refusal)?
     {
         let admission: cortexkit_role_routing::account::AccountForAnswer =
-            serde_json::from_str(&admission).map_err(store_refusal)?;
+            serde_json::from_str(&recorded.answer_json).map_err(store_refusal)?;
+        if admission.account.method == "apikey" {
+            if let Some(key) = super::accounts::allocator_admission_key(&recorded) {
+                credit_expiry = deps
+                    .store
+                    .v1_bound_account_decision(&selection.decision_id, &admission.pin.id, &key)
+                    .map_err(store_refusal)?
+                    .and_then(|decision| serde_json::from_str::<Value>(&decision).ok())
+                    .and_then(|decision| decision["explanation"].get("credit_expiry").cloned());
+            }
+        }
         serving.account_id = Some(admission.account.account_id);
         serving.credential_id = Some(admission.account.credential_id);
     }
@@ -143,6 +154,9 @@ pub(super) fn explain(params: &Value, caller: &Caller, deps: &Deps<'_>) -> Resul
         explain::ReasonCode::parse("selected"),
     );
     let mut answer = serde_json::to_value(answer).map_err(store_refusal)?;
+    if let Some(credit_expiry) = credit_expiry {
+        answer["credit_expiry"] = credit_expiry;
+    }
     if let Some(decision) = deps
         .store
         .get_decision_by_id(&request.decision_id)

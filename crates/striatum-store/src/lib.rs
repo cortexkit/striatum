@@ -128,7 +128,7 @@ pub use retention::{
     AffinityRetentionBatch, AffinityRetentionKey, AffinityRetentionPlan, AffinityRetentionPosition,
     V1DecisionRetentionBatch,
 };
-pub use routing_v1::{V1Decision, V1Recorded};
+pub use routing_v1::{V1Decision, V1Recorded, V1SelectionAdmission};
 pub use task_usage::{ClosedTaskUsage, ProviderTokenReporting, TaskTokenTotals};
 
 #[cfg(any(test, feature = "test-support"))]

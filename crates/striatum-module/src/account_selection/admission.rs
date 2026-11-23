@@ -439,6 +439,8 @@ pub(crate) struct AccountForParams {
     /// existence check.
     #[serde(skip)]
     pub(super) admission_id_generated: bool,
+    #[serde(skip)]
+    prefer_expiring_org_credit: bool,
     #[serde(default)]
     pub(super) parent_conversation_key: Option<String>,
     #[serde(default)]
@@ -519,6 +521,7 @@ impl AccountForParams {
             service_tier_chosen: None,
             service_tier_bound: false,
             admission_id_generated: false,
+            prefer_expiring_org_credit: true,
             parent_conversation_key: serde_json::from_value(optional("parent_conversation_key"))
                 .map_err(|e| invalid(e.to_string()))?,
             hold_ok: serde_json::from_value(optional("hold_ok"))
@@ -1567,6 +1570,11 @@ pub(super) fn serve(
             classes.allocation_context(provider, &params.model)
         });
     inputs.hold_ok = params.hold_ok;
+    if params.prefer_expiring_org_credit {
+        if let (Some(classes), Some(roster)) = (&ctx.classes, &roster.roster) {
+            inputs.credit_expiry_by_credential = classes.expiring_org_credits(roster);
+        }
+    }
     if let Some(parent) = &params.parent_conversation_key {
         let hash = conversation_hash(&salt, principal, parent);
         inputs.parent_account_id = tx.parent_used_account(principal, &hash, provider, now)?;

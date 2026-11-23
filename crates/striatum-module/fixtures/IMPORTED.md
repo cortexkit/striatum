@@ -160,3 +160,12 @@ helpers and an invented `example-router` module in scratch state. The capture
 README identifies the exchange for each frame, and `SHA256SUMS` was verified
 before import. The tests use the frames without rewriting their module or project
 IDs.
+
+## Claustrum scoped credential listing
+
+`claustrum-list-scoped-v2/list-scoped-v2.json` copies the vault's
+`credential.list_scoped` vectors byte for byte from Claustrum commit
+`d85f4a01`, as supplied under `.cortexkit/internal-docs/contract-ref/`.
+The `learned_org` case includes a top-level `org_id` on an Anthropic API key
+with no account identity. SHA-256:
+`4ff7e45c2839f71873c1ca12ffe5ea3e15d35897e3610bb884a26a6f0329b691`.

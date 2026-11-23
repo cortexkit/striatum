@@ -1,4 +1,5 @@
 use super::*;
+mod credit_expiry_tests;
 mod unservable_tests;
 
 const MODEL: &str = "claude-haiku-5-5";
@@ -43,6 +44,13 @@ async fn select_ledger_paid_pool_uses_the_admissions_pool_provider_count() {
 }
 
 fn paid_anthropic_harness() -> Arc<Harness> {
+    paid_anthropic_harness_with_listing(ScopedCredentialListing {
+        view: "paid-anthropic-vault".into(),
+        ..Default::default()
+    })
+}
+
+fn paid_anthropic_harness_with_listing(mut listing: ScopedCredentialListing) -> Arc<Harness> {
     let harness = Harness::new("paid-anthropic-shape");
     let mut fact = account_fact("anthropic");
     fact.model_id = MODEL.into();
@@ -76,15 +84,9 @@ fn paid_anthropic_harness() -> Arc<Harness> {
         auth_method: Some("oauth".into()),
         ..Default::default()
     });
+    listing.credentials.extend(rows);
     let mut credentials = BrocaCredentials::default();
-    credentials.apply_listing(
-        &ScopedCredentialListing {
-            view: "paid-anthropic-vault".into(),
-            credentials: rows,
-            ..Default::default()
-        },
-        NOW,
-    );
+    credentials.apply_listing(&listing, NOW);
     credentials.refresh_serving_methods(&Default::default(), &[fact.clone()], NOW as i64, &[]);
     credentials.runner_declarations.insert(
         "broca".into(),

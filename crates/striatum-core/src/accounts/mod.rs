@@ -29,8 +29,8 @@ mod policy_tests;
 pub use decide::{decide, decide_with_context};
 pub use decision::{
     AccountNote, Admission, AdmitReason, AffinityNote, AffinityOutcome, AgeBand, ApplicableWindow,
-    Decision, ExclusionReason, ExclusionTier, Explanation, Hold, HoldBasis, ImportNote,
-    InvalidationReason, Outcome, OverrideNote, PreviousPin, Refusal, RefusalCode,
+    CreditExpiry, Decision, ExclusionReason, ExclusionTier, Explanation, Hold, HoldBasis,
+    ImportNote, InvalidationReason, Outcome, OverrideNote, PreviousPin, Refusal, RefusalCode,
     RequestedAccountIgnored, RequestedAccountNote, RosterNote, ScopedListState, WindowWeight,
 };
 pub use policy::{

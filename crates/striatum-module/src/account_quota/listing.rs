@@ -2,31 +2,25 @@
 
 use cortexkit_claustrum_client::{decode_list_scoped_reply, ScopedCredentialListing};
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 
-pub(super) fn restore_credential_identities(
+pub(super) fn restore_complete_listing(
     row: &striatum_store::PersistedVaultRoster,
-) -> std::collections::BTreeMap<String, super::CredentialIdentity> {
-    let Ok(roster) = serde_json::from_str::<Value>(&row.roster_json) else {
-        return Default::default();
-    };
-    let Some(listing) = roster.get("listing") else {
-        return Default::default();
-    };
-    match decode_list_scoped_reply(json!({"result": listing})) {
-        Ok(listing)
-            if listing.view == row.view
-                && listing.undecodable_credentials.is_empty()
-                && listing.undecodable_grants.is_empty() =>
-        {
-            super::credential_identities(&listing)
-        }
-        _ => Default::default(),
-    }
+) -> Option<ScopedCredentialListing> {
+    let roster = serde_json::from_str::<Value>(&row.roster_json).ok()?;
+    let listing = decode_list_scoped_reply(json!({"result": roster.get("listing")?})).ok()?;
+    (listing.view == row.view
+        && listing.undecodable_credentials.is_empty()
+        && listing.undecodable_grants.is_empty())
+    .then_some(listing)
 }
 
 // The client listing types do not implement serde. Keep the published wire shape
 // so restoration uses the client's row validation rather than a second decoder.
-pub(super) fn encode(listing: &ScopedCredentialListing) -> Value {
+pub(super) fn encode_with_orgs(
+    listing: &ScopedCredentialListing,
+    orgs: &BTreeMap<String, super::CredentialOrg>,
+) -> Value {
     json!({
         "view": listing.view,
         "credentials": listing.credentials.iter().map(|row| {
@@ -41,6 +35,9 @@ pub(super) fn encode(listing: &ScopedCredentialListing) -> Value {
             });
             if let Some(condition) = &row.condition {
                 value["condition"] = condition_json(condition);
+            }
+            if let Some(org) = orgs.get(&row.id) {
+                value["org_id"] = json!(org.id);
             }
             value
         }).collect::<Vec<_>>(),
@@ -61,9 +58,11 @@ pub(crate) fn condition_json(
 
 pub(super) fn persisted_view(row: striatum_store::PersistedVaultRoster) -> Option<String> {
     let roster: Value = serde_json::from_str(&row.roster_json).ok()?;
-    // An older router may have saved this digest without its conditions. Let
-    // the first live read replace that snapshot, even when its digest matches.
-    (roster["listing_includes_conditions"] == true && roster["listing"].is_object())
+    // An older router may have saved the same view without listing metadata
+    // it did not yet understand. Replace that snapshot on the first live read.
+    (roster["listing_includes_conditions"] == true
+        && roster["listing"].is_object()
+        && (super::LISTED_ORG_ID.is_none() || roster["listing_includes_org_ids"] == true))
         .then_some(row.view)
 }
 
@@ -122,6 +121,13 @@ pub(crate) fn restore_credential_listing(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn encode(listing: &ScopedCredentialListing) -> Value {
+        encode_with_orgs(
+            listing,
+            &super::super::credential_orgs(listing, super::super::LISTED_ORG_ID),
+        )
+    }
 
     #[test]
     fn login_condition_producer_replies_decode_and_preserve_the_condition() {

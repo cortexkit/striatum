@@ -19,6 +19,11 @@ const AFFINITY_READ_SQL: &str = "SELECT decision_id FROM routing_v1_affinity
     AND ended_at_ms IS NULL ORDER BY updated_at_ms DESC, (principal=?6) DESC, (consumer=?7) DESC, rowid DESC LIMIT 1";
 const ADMISSION_READ_SQL: &str = "SELECT body_json, answer_json FROM routing_v1_admission
     WHERE principal IN (?1, ?3) AND admission_id = ?2";
+const BOUND_ACCOUNT_DECISION_SQL: &str = "SELECT d.decision_json
+    FROM account_admission AS a
+    LEFT JOIN account_decision AS d ON d.decision_id = a.decision_id
+    WHERE a.model_decision_id = ?1 AND a.pin_id = ?2 AND a.admission_id = ?3
+    LIMIT 2";
 
 /// What a v1 decision is bound to.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,6 +48,12 @@ pub struct V1Decision {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct V1Recorded {
     pub body_json: String,
+    pub answer_json: String,
+}
+
+pub struct V1SelectionAdmission {
+    pub principal: String,
+    pub admission_id: String,
     pub answer_json: String,
 }
 
@@ -202,17 +213,51 @@ impl SqliteRouteStateStore {
 
     /// Latest admitted serving identity under a selection. Continuation offers
     /// carry previous_decision_id instead and do not move this binding.
-    pub fn v1_selection_admission(&self, decision_id: &str) -> RouteStateResult<Option<String>> {
+    pub fn v1_selection_admission(
+        &self,
+        decision_id: &str,
+    ) -> RouteStateResult<Option<V1SelectionAdmission>> {
         self.store
             .with_conn(|c: &Connection| {
                 c.query_row(
-                    "SELECT answer_json FROM routing_v1_admission
+                    "SELECT principal, admission_id, answer_json FROM routing_v1_admission
                  WHERE json_extract(body_json, '$.decision_id') = ?1
                  ORDER BY created_at_ms DESC, rowid DESC LIMIT 1",
                     params![decision_id],
-                    |row| row.get(0),
+                    |row| {
+                        Ok(V1SelectionAdmission {
+                            principal: row.get(0)?,
+                            admission_id: row.get(1)?,
+                            answer_json: row.get(2)?,
+                        })
+                    },
                 )
                 .optional()
+            })
+            .map_err(err)
+    }
+
+    /// Explain a particular v1 admission, not another use of the same model
+    /// decision or pin. Ambiguous matches do not establish provenance.
+    pub fn v1_bound_account_decision(
+        &self,
+        model_decision_id: &str,
+        pin_id: &str,
+        admission_id: &str,
+    ) -> RouteStateResult<Option<String>> {
+        self.store
+            .with_conn(|c: &Connection| {
+                let mut stmt = c.prepare_cached(BOUND_ACCOUNT_DECISION_SQL)?;
+                let mut rows = stmt.query(params![model_decision_id, pin_id, admission_id])?;
+                let Some(row) = rows.next()? else {
+                    return Ok(None);
+                };
+                let decision = row.get(0)?;
+                Ok(if rows.next()?.is_none() {
+                    decision
+                } else {
+                    None
+                })
             })
             .map_err(err)
     }
@@ -499,6 +544,39 @@ mod tests {
                 })
                 .unwrap();
         }
+    }
+
+    #[test]
+    fn bound_account_explanation_uses_indexed_admission_and_decision_lookups() {
+        let store = store("bound-explain-plan");
+        store
+            .store
+            .with_conn(|c| {
+                let mut stmt =
+                    c.prepare(&format!("EXPLAIN QUERY PLAN {BOUND_ACCOUNT_DECISION_SQL}"))?;
+                let plan: Vec<String> = stmt
+                    .query_map(params!["selection", "pin", "admission"], |row| row.get(3))?
+                    .collect::<rusqlite::Result<_>>()?;
+                assert!(
+                    plan.iter().any(|line| {
+                        line.contains("SEARCH a USING INDEX")
+                            && (line.contains("account_admission_model_decision")
+                                || line.contains("account_admission_by_pin"))
+                    }),
+                    "{plan:?}"
+                );
+                assert!(
+                    plan.iter().any(|line| line
+                        .contains("SEARCH d USING INDEX sqlite_autoindex_account_decision_1")),
+                    "{plan:?}"
+                );
+                assert!(
+                    !plan.iter().any(|line| line.starts_with("SCAN ")),
+                    "{plan:?}"
+                );
+                Ok(())
+            })
+            .unwrap();
     }
 
     #[test]
