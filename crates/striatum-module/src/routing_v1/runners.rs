@@ -18,6 +18,7 @@ mod admission;
 mod describe_cache;
 pub(crate) mod enrollment;
 mod harness_choice;
+pub(crate) use harness_choice::TaskRunnerDiagnostics;
 mod harness_facts;
 #[cfg(test)]
 mod harness_facts_tests;

@@ -245,9 +245,9 @@ async fn declared_placement_module_narrows_settings_and_caller_filters() {
         h.edit_config(|config| {
             config["consumers"]["basal.task"]["runner"] = json!(fixture::RUNNER_ONE)
         });
-        no_route(
+        on_runner(
             &owner.call("route.select", &select("basal.task")).await,
-            "harness_unavailable",
+            "broca",
         );
         h.edit_config(|config| {
             config["consumers"]

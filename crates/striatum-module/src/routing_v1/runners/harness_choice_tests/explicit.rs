@@ -5,6 +5,93 @@ use striatum_core::{FactSource, RouteStateStore};
 use subc_protocol::FrameType;
 
 #[tokio::test]
+async fn harness_refusal_names_unregistered_runner_without_explicit_needs() {
+    let (harness, route) = configured().await;
+    setup(&harness, json!([{"module":"pending","harness":"primary"}]));
+    let reply = route.call("route.select", &request(json!({"iq":0}))).await;
+    refused(reply.clone(), "harness_unavailable");
+    let detail = &reply.1["detail"];
+    assert!(detail.get("missing").is_none(), "{detail}");
+    assert_eq!(
+        detail["runners"],
+        json!([
+            {"module":"pending", "harness":"primary", "reason":"not_registered"}
+        ])
+    );
+}
+
+#[tokio::test]
+async fn harness_refusal_names_declared_but_stopped_harness() {
+    let (harness, route) = configured().await;
+    setup(&harness, json!([{"module":"runner","harness":"primary"}]));
+    install(
+        &harness,
+        "runner",
+        &slot(json!({"primary":{"starts_sessions":false}})),
+    );
+    let reply = route.call("route.select", &request(json!({"iq":0}))).await;
+    refused(reply.clone(), "harness_unavailable");
+    let detail = &reply.1["detail"];
+    assert!(detail.get("missing").is_none(), "{detail}");
+    assert_eq!(
+        detail["runners"],
+        json!([
+            {"module":"runner", "harness":"primary", "reason":"harness_stopped"}
+        ])
+    );
+}
+
+#[tokio::test]
+async fn harness_refusal_names_undeclared_and_unregistered_entries_in_policy_order() {
+    let (harness, route) = configured().await;
+    setup(
+        &harness,
+        json!([
+            {"module":"runner"}, {"module":"pending"}
+        ]),
+    );
+    install(&harness, "runner", &slot(json!({})));
+    let mut params = request(json!({"iq":0, "harness_capabilities":[]}));
+    params["harness"] = json!("unhosted");
+    let reply = route.call("route.select", &params).await;
+    refused(reply.clone(), "harness_unavailable");
+    let detail = &reply.1["detail"];
+    assert_eq!(detail["missing"], json!({}));
+    assert_eq!(
+        detail["runners"],
+        json!([
+            {"module":"runner", "harness":"unhosted", "reason":"harness_not_declared",
+             "declared":["primary", "secondary", "inherited"]},
+            {"module":"pending", "harness":"unhosted", "reason":"not_registered"}
+        ])
+    );
+}
+
+#[tokio::test]
+async fn harness_refusal_names_capability_gap_with_legacy_missing_unchanged() {
+    let (harness, route) = configured().await;
+    setup(&harness, json!([{"module":"runner"}]));
+    install(
+        &harness,
+        "runner",
+        &slot(json!({"primary":{"capabilities":["one_off"]}})),
+    );
+    let mut params = request(json!({"iq":0, "tools":"none", "harness_capabilities":["plans"]}));
+    params["harness"] = json!("primary");
+    let reply = route.call("route.select", &params).await;
+    refused(reply.clone(), "harness_unavailable");
+    let detail = &reply.1["detail"];
+    assert_eq!(detail["missing"], json!({"runner/primary":["plans"]}));
+    assert_eq!(
+        detail["runners"],
+        json!([
+            {"module":"runner", "harness":"primary", "reason":"capabilities_missing",
+             "missing":{"runner/primary":["plans"]}}
+        ])
+    );
+}
+
+#[tokio::test]
 async fn explicit_harness_needs_union_with_inferred_needs_on_one_pair() {
     describe::with_candidate_capabilities(&[GROUP], async {
         let (harness, route) = configured().await;
@@ -82,6 +169,17 @@ async fn explicit_harness_needs_report_each_pairs_missing_names() {
             names.sort();
             assert_eq!(names, expected, "{pair}: {detail}");
         }
+        assert_eq!(
+            detail["runners"],
+            json!([
+                {"module":"runner", "reason":"capabilities_missing", "missing":{
+                    "runner/primary":["fork_answer"],
+                    "runner/secondary":["output_cap", "fork_answer"],
+                    "runner/inherited":["fork_answer"]
+                }},
+                {"module":"other", "reason":"excluded_by_policy", "filter":"request_runners"}
+            ])
+        );
 
         install(
             &harness,

@@ -143,6 +143,141 @@ async fn request_runner_filter_cannot_add_an_enrolled_runner_left_out_of_the_pro
     assert_agent(&answer, "claude-code");
 }
 
+fn mason_declared_on_broca() -> Arc<Harness> {
+    let harness = fixture_with_runners(&HARNESSES);
+    super::install_head_snapshot(&harness);
+    super::super::consumers::replace_catalog(&json!([{
+        "module_id":"prefrontal", "nonce_verified":true,
+        "role_declarations":{"routing/v1":{"consumers":[{
+            "name":MASON, "iq":70, "eq":0, "placement":{"module":"broca"},
+            "priority":"worker", "tools":"required", "workload":"code"
+        }]}}
+    }]));
+    let full = [
+        "plans",
+        "fork_answer",
+        "submit_tool",
+        "final_text",
+        "output_cap",
+        "one_off",
+    ];
+    let declaration = super::super::runners::parse_declaration(&json!({"runner":{
+        "pairs":[{"wire_api":"anthropic.messages", "auth_method":"apikey"}],
+        "harnesses":["opencode2", "pi", "claude-code"],
+        "default_harness":"opencode2", "starts_sessions":true,
+        "harness_limits":{
+            "opencode2":{"capabilities":full}, "claude-code":{"capabilities":full},
+            "pi":{"capabilities":&full[..4]}
+        }
+    }}))
+    .unwrap()
+    .unwrap();
+    harness
+        .credentials()
+        .lock()
+        .unwrap()
+        .runner_declarations
+        .insert(AGENT.into(), declaration);
+    harness.edit_config(|config| {
+        config["runners"] = json!([
+            {"module":"broca","via_vault":true}, {"module":AGENT,"via_vault":true}
+        ]);
+        config["consumers"][MASON] = json!({"below_bar":"refuse"});
+    });
+    harness
+}
+
+fn mason_request() -> Value {
+    json!({"consumer":MASON, "requirements":{"harness_capabilities":[]}})
+}
+
+#[tokio::test]
+async fn declared_mason_placement_falls_back_when_project_list_is_disjoint() {
+    let harness = mason_declared_on_broca();
+    let project = "mason-disjoint";
+    let daemon = harness.project_daemon().await;
+    daemon.set(project, runner_layer(MASON, json!(HARNESSES.map(agent))));
+    let caller = harness.bind(reserved("prefrontal"), Some(project)).await;
+    crate::logging::take_operator_warnings();
+    for _ in 0..2 {
+        assert_eq!(
+            result(caller.call("route.select", &mason_request()).await)["runner"]["module"],
+            "broca"
+        );
+    }
+    let warnings = crate::logging::take_operator_warnings();
+    let warnings: Vec<_> = warnings
+        .iter()
+        .filter(|warning| warning.contains(MASON))
+        .collect();
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    for token in [project, "broca", AGENT, "opencode2", "claude-code", "pi"] {
+        assert!(warnings[0].contains(token), "{}", warnings[0]);
+    }
+}
+
+#[tokio::test]
+async fn declared_mason_placement_keeps_partial_overlap_and_honors_caller_filter() {
+    let harness = mason_declared_on_broca();
+    let project = "mason-partial";
+    let daemon = harness.project_daemon().await;
+    daemon.set(
+        project,
+        runner_layer(MASON, json!([agent("opencode2"), {"module":"broca"}])),
+    );
+    let caller = harness.bind(reserved("prefrontal"), Some(project)).await;
+    let mut params = mason_request();
+    assert_eq!(
+        result(caller.call("route.select", &params).await)["runner"]["module"],
+        "broca"
+    );
+    params["runners"] = json!([AGENT]);
+    let (frame, reply) = caller.call("route.select", &params).await;
+    assert_eq!(frame, FrameType::Error, "{reply}");
+    assert_eq!(reply["code"], "no_route", "{reply}");
+    assert_eq!(
+        reply["detail"],
+        json!({
+            "reason":"harness_unavailable", "missing":{},
+            "runners":[
+                {"module":AGENT, "harness":"opencode2", "reason":"excluded_by_policy",
+                 "filter":"declared_placement", "declared_module":"broca"},
+                {"module":"broca", "reason":"excluded_by_policy", "filter":"request_runners"}
+            ]
+        })
+    );
+}
+
+#[tokio::test]
+async fn declared_mason_placement_never_widens_global_enrollment() {
+    let harness = mason_declared_on_broca();
+    let project = "mason-unenrolled";
+    harness.edit_config(|config| {
+        config["runners"] = json!([{"module":AGENT,"via_vault":true}]);
+    });
+    let daemon = harness.project_daemon().await;
+    daemon.set(project, runner_layer(MASON, json!(HARNESSES.map(agent))));
+    let caller = harness.bind(reserved("prefrontal"), Some(project)).await;
+    crate::logging::take_operator_warnings();
+    let (frame, reply) = caller.call("route.select", &mason_request()).await;
+    assert_eq!(frame, FrameType::Error, "{reply}");
+    assert_eq!(reply["code"], "no_route", "{reply}");
+    assert_eq!(
+        reply["detail"],
+        json!({
+            "reason":"harness_unavailable", "missing":{},
+            "runners":HARNESSES.map(|harness| json!({
+                "module":AGENT, "harness":harness, "reason":"excluded_by_policy",
+                "filter":"global_enrollment", "declared_module":"broca"
+            }))
+        })
+    );
+    assert!(crate::logging::take_operator_warnings()
+        .iter()
+        .any(|line| line.contains(project)
+            && line.contains("declared runner is not globally enrolled")));
+}
+
 #[tokio::test]
 async fn project_runner_change_refreshes_only_the_notified_project() {
     let harness = fixture_with_runners(&HARNESSES);

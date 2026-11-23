@@ -6,6 +6,10 @@ use cortexkit_role_routing::select::{Requirements, SelectRequest, ToolsRequireme
 
 use super::{EffectiveRunner, Registry, RunnerKey, RunnerPolicies};
 
+#[path = "task_refusal.rs"]
+mod task_refusal;
+pub(crate) use task_refusal::TaskRunnerDiagnostics;
+
 #[derive(Clone, Debug)]
 pub(super) struct Candidate {
     harness: String,

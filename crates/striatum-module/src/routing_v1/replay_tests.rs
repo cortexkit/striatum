@@ -264,7 +264,7 @@ pub(super) fn assert_or_record_with_fingerprint(
         project_additive_shape_members(&mut observed);
         project_additive_shape_members(&mut expected);
         if file == "availability" {
-            apply_availability_difference(&mut expected);
+            apply_availability_difference(&mut expected, false);
         }
         if let Some(frames) = native_frames {
             frames.restore_after_wire_projection(&mut observed, &mut expected);
@@ -277,6 +277,7 @@ pub(super) fn assert_or_record_with_fingerprint(
             project_additive_pricing_members(&mut expected);
         }
         if file == "availability" {
+            apply_availability_difference(&mut expected, true);
             for state in ["after_select", "state"] {
                 let rows = observed["cases"][7]["launches"][2][state]["model_route_decisions"]
                     .as_array()
@@ -338,9 +339,10 @@ fn apply_fence_lifetime_difference(value: &mut Value) {
     }
 }
 
-/// Keep the historical availability observations intact while declaring each
-/// corrected public refusal and its persisted decision effects by row.
-fn apply_availability_difference(expected: &mut Value) {
+/// Apply the historical wire corrections before replacing the state frames.
+/// Add runner diagnostics afterward: those members are new on both the wire
+/// and the persisted refusal, so neither of the historical recordings has them.
+fn apply_availability_difference(expected: &mut Value, add_runner_diagnostics: bool) {
     let differences: Value = serde_json::from_str(include_str!(
         "../../fixtures/replay/availability-difference.json"
     ))
@@ -353,7 +355,25 @@ fn apply_availability_difference(expected: &mut Value) {
             .find(|case| case["name"] == difference["row"])
             .unwrap();
         for patch in difference["changes"].as_array().unwrap() {
-            let value = case.pointer_mut(patch["path"].as_str().unwrap()).unwrap();
+            let path = patch["path"].as_str().unwrap();
+            if add_runner_diagnostics {
+                let Some(runners) = difference.get("runner_diagnostics") else {
+                    continue;
+                };
+                if let Some(parent) = path.strip_suffix("/detail/reason") {
+                    let detail = case
+                        .pointer_mut(&format!("{parent}/detail"))
+                        .and_then(Value::as_object_mut)
+                        .unwrap();
+                    assert_eq!(detail["reason"], "harness_unavailable", "{path}");
+                    assert!(
+                        detail.insert("runners".into(), runners.clone()).is_none(),
+                        "{path}"
+                    );
+                }
+                continue;
+            }
+            let value = case.pointer_mut(path).unwrap();
             if patch["op"] == "append" {
                 let rows = value.as_array_mut().unwrap();
                 assert_eq!(rows.len(), patch["before"].as_u64().unwrap() as usize);

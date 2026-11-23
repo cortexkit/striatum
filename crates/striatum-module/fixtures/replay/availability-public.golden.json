@@ -856,7 +856,19 @@
           "reply": {
             "code": "no_route",
             "detail": {
-              "reason": "harness_unavailable"
+              "reason": "harness_unavailable",
+              "runners": [
+                {
+                  "filter": "request_runners",
+                  "module": "runner-one",
+                  "reason": "excluded_by_policy"
+                },
+                {
+                  "filter": "request_runners",
+                  "module": "runner-two",
+                  "reason": "excluded_by_policy"
+                }
+              ]
             },
             "message": "no route meets the request: harness_unavailable"
           }
@@ -877,7 +889,19 @@
           "reply": {
             "code": "no_route",
             "detail": {
-              "reason": "harness_unavailable"
+              "reason": "harness_unavailable",
+              "runners": [
+                {
+                  "filter": "request_runners",
+                  "module": "runner-one",
+                  "reason": "excluded_by_policy"
+                },
+                {
+                  "filter": "request_runners",
+                  "module": "runner-two",
+                  "reason": "excluded_by_policy"
+                }
+              ]
             },
             "message": "no route meets the request: harness_unavailable"
           }
@@ -900,7 +924,19 @@
           "reply": {
             "code": "no_route",
             "detail": {
-              "reason": "harness_unavailable"
+              "reason": "harness_unavailable",
+              "runners": [
+                {
+                  "filter": "request_runners",
+                  "module": "runner-one",
+                  "reason": "excluded_by_policy"
+                },
+                {
+                  "filter": "request_runners",
+                  "module": "runner-two",
+                  "reason": "excluded_by_policy"
+                }
+              ]
             },
             "message": "no route meets the request: harness_unavailable"
           }

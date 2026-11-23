@@ -795,6 +795,7 @@ struct SelectionInputs {
     snapshot: ModelRouteStateSnapshot,
     priced: crate::select::PricedSelection,
     registry: super::runners::Registry,
+    runner_diagnostics: super::runners::TaskRunnerDiagnostics,
     runners: Vec<RunnerPolicy>,
     consumer_policy: crate::config_policy::ConsumerPolicy,
     priced_per_token: bool,
@@ -946,14 +947,11 @@ async fn prepare_selection(
         },
         &consumers.policies,
     );
-    if let Some(runners) = project_layers.runners(
+    let project_candidates = project_layers.runner_candidates(
         &consumer,
         operator_config,
         consumer_policy.runners.as_deref(),
-    ) {
-        consumer_policy.runners = Some(runners);
-        consumer_policy.runner = None;
-    }
+    );
     // An operator's consumer pin is a hard selection, not a one-route ladder:
     // it bypasses automatic pin-only fences but still uses all pin admission
     // and account checks. Never let a caller's fallback preference replace it.
@@ -1004,20 +1002,39 @@ async fn prepare_selection(
         .clone()
         .unwrap_or_default();
     let classifier = consumer == "classifier";
+    let credentials = deps.broca_credentials.lock();
     let placement = if declared_placement.is_some() {
-        let credentials = deps.broca_credentials.lock().map_err(store_refusal)?;
+        let credentials = credentials.as_ref().map_err(store_refusal)?;
         super::consumers::declared::placement_module(
             declared_placement.as_ref(),
             caller,
             request.runners.as_deref(),
             |module| credentials.runner_declarations.contains_key(module),
-        )?
+        )
     } else {
-        None
+        Ok(None)
     };
-    let registry = deps
-        .broca_credentials
-        .lock()
+    let global = operator_config.v1_runners();
+    let enrolled = credentials.as_ref().map_or_else(
+        |_| global.clone(),
+        |credentials| super::runners::enrollment::enrolled(&global, credentials),
+    );
+    let runner_diagnostics = super::runners::TaskRunnerDiagnostics::prepare(
+        &consumer,
+        caller.stamped_project(),
+        placement.as_ref().ok().and_then(|module| module.as_deref()),
+        &mut consumer_policy,
+        project_candidates,
+        &enrolled,
+    );
+    let placement = placement.map_err(|refusal| {
+        if refusal.detail.get("reason").and_then(Value::as_str) == Some("harness_unavailable") {
+            runner_diagnostics.attach(refusal, &request, &Default::default(), "declared_placement")
+        } else {
+            refusal
+        }
+    })?;
+    let registry = credentials
         .map(|credentials| {
             if classifier {
                 return caller
@@ -1045,6 +1062,14 @@ async fn prepare_selection(
             )
         })
         .unwrap_or_default();
+    let unavailable = |runners: &[RunnerPolicy], filter| {
+        runner_diagnostics.attach(
+            registry.task_harness_unavailable(&request, runners),
+            &request,
+            &registry,
+            filter,
+        )
+    };
     let runners: Vec<RunnerPolicy> = registry
         .task_policies()
         .into_iter()
@@ -1057,13 +1082,13 @@ async fn prepare_selection(
         .collect();
     if runners.is_empty() {
         return Err(if let Some(harness) = &request.harness {
-            let mut refusal = registry.task_harness_unavailable(&request, &runners);
+            let mut refusal = unavailable(&runners, "session_start");
             refusal.message = format!("no session-starting runner declares harness {harness}");
             refusal
         } else if request.requirements.harness_capabilities.is_some()
             || (consumer_policy.runners.is_some() && consumer_policy.runner.is_none())
         {
-            registry.task_harness_unavailable(&request, &runners)
+            unavailable(&runners, "session_start")
         } else {
             Refusal::no_route(NoRouteReason::NoAvailableModel, None)
         });
@@ -1077,7 +1102,7 @@ async fn prepare_selection(
         })
         .collect();
     if runners.is_empty() {
-        return Err(registry.task_harness_unavailable(&request, &runners));
+        return Err(unavailable(&runners, "settings_harness"));
     }
     // Declarations narrow the configured placements before any caller filters.
     let runners: Vec<RunnerPolicy> = runners
@@ -1089,7 +1114,7 @@ async fn prepare_selection(
         })
         .collect();
     if runners.is_empty() && placement.is_some() {
-        return Err(registry.task_harness_unavailable(&request, &runners));
+        return Err(unavailable(&runners, "declared_placement"));
     }
     let runners: Vec<RunnerPolicy> = runners
         .into_iter()
@@ -1112,7 +1137,7 @@ async fn prepare_selection(
         })
         .collect();
     if runners.is_empty() {
-        let mut refusal = registry.task_harness_unavailable(&request, &runners);
+        let mut refusal = unavailable(&runners, "request_harness");
         if let Some(harness) = &request.harness {
             refusal.message = format!("no session-starting runner declares harness {harness}");
         }
@@ -1124,7 +1149,7 @@ async fn prepare_selection(
             .is_some_and(|runner| runner.hosts_task(&request.requirements))
     };
     if !runners.iter().any(&hosts_task) {
-        return Err(registry.task_harness_unavailable(&request, &runners));
+        return Err(unavailable(&runners, "task_admission"));
     }
     let runners: Vec<RunnerPolicy> = runners
         .into_iter()
@@ -1148,6 +1173,7 @@ async fn prepare_selection(
         snapshot,
         priced,
         registry,
+        runner_diagnostics,
         runners,
         consumer_policy,
         priced_per_token,
@@ -2073,7 +2099,12 @@ async fn select_at_tier_attempt(
         Err(select_policy::OrderFailure::Score(no_route)) => {
             if selection.harness_exclusions_emptied_routes(&harness_excluded, &statically_available)
             {
-                return Err(Refusal::no_route(NoRouteReason::HarnessUnavailable, None));
+                return Err(inputs.runner_diagnostics.attach(
+                    Refusal::no_route(NoRouteReason::HarnessUnavailable, None),
+                    request,
+                    registry,
+                    "harness_routes",
+                ));
             }
             if evaluation.is_none() {
                 selection.record_refusal(&no_route, &priced.provenance);

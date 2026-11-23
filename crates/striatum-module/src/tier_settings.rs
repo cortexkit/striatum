@@ -42,6 +42,16 @@ pub(crate) struct RunnerChoice {
 }
 
 impl RunnerChoice {
+    fn policy(&self) -> RunnerPolicy {
+        RunnerPolicy {
+            module: self.module.clone(),
+            harness: self.harness.clone(),
+            routes: self.routes.clone(),
+            tool_capabilities: Vec::new(),
+            via_vault: false,
+        }
+    }
+
     fn narrow(&self, enrolled: &[RunnerPolicy], user: &[RunnerPolicy]) -> Option<RunnerPolicy> {
         let mut policy = enrolled
             .iter()
@@ -164,6 +174,21 @@ impl Layers {
         global: &crate::config_overrides::LiveConfig,
         user_runners: Option<&[RunnerPolicy]>,
     ) -> Option<Vec<RunnerPolicy>> {
+        self.runner_candidates(consumer, global, user_runners)
+            .map(|candidates| {
+                candidates
+                    .into_iter()
+                    .filter_map(|(policy, allowed)| allowed.then_some(policy))
+                    .collect()
+            })
+    }
+
+    pub(crate) fn runner_candidates(
+        &self,
+        consumer: &str,
+        global: &crate::config_overrides::LiveConfig,
+        user_runners: Option<&[RunnerPolicy]>,
+    ) -> Option<Vec<(RunnerPolicy, bool)>> {
         use crate::config_policy::{consumer_matches, consumer_specificity};
         let enrolled = self.enrolled.as_deref()?;
         let (name, choices) = self
@@ -179,7 +204,11 @@ impl Layers {
         Some(
             choices
                 .iter()
-                .filter_map(|choice| choice.narrow(enrolled, user_runners.unwrap_or_default()))
+                .map(|choice| {
+                    choice
+                        .narrow(enrolled, user_runners.unwrap_or_default())
+                        .map_or_else(|| (choice.policy(), false), |policy| (policy, true))
+                })
                 .collect(),
         )
     }

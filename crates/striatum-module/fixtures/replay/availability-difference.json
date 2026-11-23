@@ -1078,6 +1078,18 @@
   {
     "row": "unsupported-runner",
     "reason": "Contract §16.3 requires harness_unavailable when the caller's runners remove the last allowed placement.",
+    "runner_diagnostics": [
+      {
+        "filter": "request_runners",
+        "module": "runner-one",
+        "reason": "excluded_by_policy"
+      },
+      {
+        "filter": "request_runners",
+        "module": "runner-two",
+        "reason": "excluded_by_policy"
+      }
+    ],
     "changes": [
       {
         "op": "replace",
