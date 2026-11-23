@@ -108,6 +108,7 @@ fn record_signed_out(
             code: code.into(),
         },
         fingerprint.as_deref(),
+        None,
         (request.exhausted.observed_at_ms as i64).min(ctx.now_ms),
     )?;
     tx.insert_observation(&AccountObservationRow {

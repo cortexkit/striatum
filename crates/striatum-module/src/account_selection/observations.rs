@@ -482,7 +482,7 @@ fn apply_credential_refused(
         } else {
             // Unlinked refusals keep their original generic code and timed
             // recheck. A linked billing wall instead waits for more credit.
-            tx.record_credential_refusal_with_console_credit(
+            tx.record_credential_refusal(
                 &striatum_core::route_state_store::CredentialRefusal {
                     provider_id: provider.clone(),
                     credential_id: credential.into(),

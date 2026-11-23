@@ -841,7 +841,7 @@ impl crate::AccountTx<'_> {
             return Ok(());
         }
         self.command_scope(|tx| {
-            tx.record_credential_refusal(refusal, listing_fingerprint, observed_at_ms)
+            tx.record_credential_refusal(refusal, listing_fingerprint, None, observed_at_ms)
         })
     }
 

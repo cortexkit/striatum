@@ -512,15 +512,6 @@ impl AccountTx<'_> {
     /// Record a credential refusal in the same transaction as its observation.
     pub fn record_credential_refusal(
         &self,
-        refusal: &striatum_core::route_state_store::CredentialRefusal,
-        fingerprint: Option<&str>,
-        now: i64,
-    ) -> RouteStateResult<()> {
-        self.record_credential_refusal_with_console_credit(refusal, fingerprint, None, now)
-    }
-
-    pub fn record_credential_refusal_with_console_credit(
-        &self,
         refusal: &CredentialRefusal,
         fingerprint: Option<&str>,
         console_credit_micros_at_refusal: Option<i64>,

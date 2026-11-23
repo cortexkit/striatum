@@ -2002,6 +2002,7 @@ impl RoutingSubject for KitSubject {
                             .into(),
                         },
                         fingerprint.as_deref(),
+                        None,
                         at,
                     )?;
                 }
