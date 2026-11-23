@@ -220,6 +220,136 @@ async fn console_credit_links_by_org_without_api_provider() {
     assert_eq!(admitted["account"]["credential_id"], KEYS[1]);
 }
 
+const RESTORED_KEYS: [&str; 2] = ["apikey:anthropic:example-a", "apikey:anthropic:example-b"];
+const RESTORED_VIEW: &str = "example-routing-listing";
+
+fn caller_bearing_admission_after_restore(org_ids: [Option<&str>; 2]) -> (Value, String) {
+    use crate::account_selection::{ClassContext, Ctx, OpReply, ACCOUNT_FOR_OP};
+    use std::sync::Mutex;
+
+    let _clock = crate::InjectedClock::set(NOW);
+    let harness = paid_anthropic_harness();
+    let store = harness.store();
+    let listing = ScopedCredentialListing {
+        view: RESTORED_VIEW.into(),
+        credentials: RESTORED_KEYS
+            .into_iter()
+            .zip(org_ids)
+            .map(|(key, org)| ListedCredential {
+                id: key.into(),
+                org_id: org.map(str::to_owned),
+                state: "active".into(),
+                categories: vec!["llm-provider".into()],
+                provider_ids: vec![POOL.into()],
+                serves: vec!["anthropic".into()],
+                credential_type: "apikey".into(),
+                auth_method: Some("apikey".into()),
+                ..Default::default()
+            })
+            .collect(),
+        ..Default::default()
+    };
+    let mut previous = AccountQuotaState::default();
+    let row = account_quota::apply_roster_listing(&mut previous, &listing, NOW as i64).unwrap();
+    crate::account_writer::put_account_vault_roster(store, &row).unwrap();
+    let readings = CONSOLE_ORGS
+        .into_iter()
+        .zip([300_000, 120_000])
+        .enumerate()
+        .map(|(index, (org, expires_in_ms))| {
+            let mut pool = credit(1_234, expires_in_ms);
+            pool["basis"] = json!("reported");
+            console_reading(
+                org,
+                &format!("cookie:platform.example:org-{index}"),
+                vec![pool],
+            )
+        })
+        .collect::<Vec<_>>();
+    let (rows, completeness) = account_quota::apply_usage_reply(
+        &mut previous,
+        &serde_json::to_vec(&json!({"result": readings})).unwrap(),
+        NOW as i64,
+    )
+    .unwrap();
+    store.put_account_quota_poll(&rows, &completeness).unwrap();
+
+    let accounts = Arc::new(Mutex::new(account_quota::restore_account_state(store)));
+    let credentials = harness.credentials();
+    account_quota::restore_credential_listing(store, &mut credentials.lock().unwrap());
+    let config = harness.operator_config();
+    let policy = config.allocator_policy(POOL);
+    let ctx = Ctx {
+        store,
+        accounts: Some(&accounts),
+        flags: config.account_flags(),
+        policy: &policy,
+        now_ms: NOW as i64,
+        classes: Some(
+            ClassContext::load(store, &credentials, config, Some(&accounts), NOW as i64).unwrap(),
+        ),
+    };
+    let body = serde_json::to_vec(&json!({"method": ACCOUNT_FOR_OP, "params": {
+        "provider": POOL, "model": MODEL, "mode": "admit",
+        "caller": {"runner": "broca"},
+        "conversation_key": "example-first-conversation", "admission_id": "example-first-admit",
+        "candidates": {"view_digest": "example-runner-listing", "accounts":
+            RESTORED_KEYS.map(|key| json!({"account_id": key, "credential_id": key}))},
+    }}))
+    .unwrap();
+    assert!(!crate::routing_v1::claims(&body));
+    let admitted = match crate::account_selection::handle_with_call(
+        ACCOUNT_FOR_OP,
+        &body,
+        "reserved:broca",
+        &ctx,
+        None,
+    ) {
+        OpReply::Result(value) => value,
+        OpReply::Error { code, message, .. } => panic!("{code}: {message}"),
+    };
+    let stored = store
+        .account_decision(admitted["reason"]["decision_id"].as_str().unwrap())
+        .unwrap()
+        .unwrap();
+    (admitted, stored.decision_json)
+}
+
+#[test]
+fn caller_bearing_admission_spends_earliest_restored_console_credit() {
+    let (admitted, stored) = caller_bearing_admission_after_restore(CONSOLE_ORGS.map(Some));
+    let decision: Value = serde_json::from_str(&stored).unwrap();
+    assert_eq!(
+        decision["explanation"]["roster"]["view_digest"],
+        RESTORED_VIEW
+    );
+    let accounts = decision["explanation"]["accounts"].as_array().unwrap();
+    assert_eq!(accounts.len(), RESTORED_KEYS.len());
+    for account in accounts {
+        assert_eq!(account["exclusions"], json!([{"reason": "quota_missing"}]));
+    }
+    assert_eq!(admitted["account"]["credential_id"], RESTORED_KEYS[1]);
+    assert_eq!(
+        decision["explanation"]["credit_expiry"],
+        json!({
+            "expires_at_ms": NOW + 120_000,
+            "remaining": {"minor": 1_234, "exponent": 2, "unit": "USD"},
+        })
+    );
+}
+
+#[test]
+fn caller_bearing_admission_without_org_links_keeps_its_decision() {
+    let (admitted, stored) = caller_bearing_admission_after_restore([None; 2]);
+    assert_eq!(admitted["account"]["credential_id"], RESTORED_KEYS[0]);
+    // This digest was captured from the legacy handler before it applied organization credit.
+    assert_eq!(
+        format!("{:x}", Sha256::digest(&stored)),
+        "abc42fa1bce8d98ade5a6b81771512b247a79b6aab1e5844b331800a216fbb41",
+        "{stored}"
+    );
+}
+
 #[tokio::test]
 async fn console_credit_is_unknown_when_current_readings_share_an_org() {
     let _clock = crate::InjectedClock::set(NOW);
