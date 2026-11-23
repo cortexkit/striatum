@@ -13,6 +13,7 @@ use super::{
 };
 use crate::broca_credentials::BrocaCredentials;
 mod finish_rollback_tests;
+mod follow_up_tests;
 mod unservable_tests;
 
 const NOW: u64 = 1_800_000_000_000;
