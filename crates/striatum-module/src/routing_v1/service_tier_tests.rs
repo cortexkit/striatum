@@ -1055,6 +1055,47 @@ async fn service_tier_pinned_variant_follow_up_steps_down_without_changing_model
 }
 
 #[tokio::test]
+async fn stamped_select_inherits_daemon_project_tier_without_project_id() {
+    use crate::managed_settings::test_daemon::ID;
+    const CONSUMER: &str = "prefrontal.sidekick";
+
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, _) = setup(&["pro_500"], true, true);
+    harness.edit_config(|config| {
+        config["consumers"][CONSUMER] = json!({"owner":"tier-owner","mode":"demand"});
+    });
+    let daemon = harness.project_daemon().await;
+    daemon.set(
+        ID,
+        json!({"consumers":{
+            CONSUMER:{"service_tier":"fast"},
+            "tier-override":{"service_tier":"ultrafast"}
+        }}),
+    );
+    let route = harness.bind(reserved("tier-owner"), Some(ID)).await;
+    for (consumer, settings, expected) in [
+        ("prefrontal.sidekick.review", None, "fast"),
+        (CONSUMER, None, "fast"),
+        (CONSUMER, Some(json!({})), "fast"),
+        (
+            CONSUMER,
+            Some(json!({"tier_consumer":"tier-override"})),
+            "ultrafast",
+        ),
+    ] {
+        let mut body = json!({"consumer":consumer,"requirements":{"iq":30}});
+        if let Some(settings) = settings {
+            body["settings"] = settings;
+        }
+        let reply = route.call("route.select", &body).await;
+        assert_eq!(reply.0, FrameType::Response, "{body}: {}", reply.1);
+        let result = &reply.1["result"];
+        assert_eq!(result["service_tier_chosen"], expected, "{body}: {result}");
+        assert!(result.get("project_settings").is_none(), "{result}");
+    }
+}
+
+#[tokio::test]
 async fn daemon_service_tier_view_wins_over_project_file_and_updates_on_change() {
     use crate::managed_settings::test_daemon::ID;
     let _clock = crate::InjectedClock::set(NOW);
@@ -1144,6 +1185,36 @@ async fn service_tier_refused_pin_records_its_real_reason_once() {
         assert_eq!(explanation["refusal"]["code"], "pin_unavailable");
         assert_eq!(explanation["pin"], pin);
     }
+}
+
+#[tokio::test]
+async fn stamped_legacy_panel_inherits_daemon_project_tier() {
+    use crate::managed_settings::test_daemon::ID;
+
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, _) = setup(&["pro_500"], true, true);
+    harness.edit_config(|config| {
+        config["panels"]["audit"] = json!({"top_k":1,"by":"iq"});
+    });
+    let daemon = harness.project_daemon().await;
+    daemon.set(
+        ID,
+        json!({"consumers":{"prefrontal-core.athena":{"service_tier":"fast"}}}),
+    );
+    let excluded: Vec<_> = harness
+        .store()
+        .get_facts()
+        .unwrap()
+        .iter()
+        .filter(|fact| fact.provider_id != "openai" || fact.model_id != MODEL)
+        .map(|fact| striatum_core::fact_to_route(fact).route_key)
+        .collect();
+    let route = harness.bind(reserved("tier-owner"), Some(ID)).await;
+    let reply = route.call("route.select_panel", &json!({"taskId":"tier-panel","substrate":"broca","panelSpec":{"class":"AUDIT","diversity":"family"},"excludeRouteKeys":excluded})).await;
+    assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
+    let members = reply.1["result"]["members"].as_array().unwrap();
+    assert_eq!(members.len(), 1, "{}", reply.1);
+    assert_eq!(members[0]["promptParams"]["service_tier_chosen"], "fast");
 }
 
 #[tokio::test]
@@ -1560,6 +1631,43 @@ async fn daemon_settings_tier_consumer_precedence_and_request_cap() {
         .await;
     assert_eq!(reply.1["code"], "invalid_request");
     assert_eq!(reply.1["detail"]["field"], "service_tier");
+}
+
+#[tokio::test]
+async fn stamped_panel_inherits_daemon_project_tier_without_project_id() {
+    use crate::managed_settings::test_daemon::ID;
+    use cortexkit_role_routing::panel::{
+        check_panel_answer, parse_select_panel_request_serving, SelectPanelAnswer,
+    };
+
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, _) = setup(&["pro_500"], true, true);
+    harness.edit_config(|config| config["panels"]["audit"] = json!({"top_k":1,"by":"iq"}));
+    let daemon = harness.project_daemon().await;
+    daemon.set(ID, json!({"consumers":{"mason":{"service_tier":"fast"}}}));
+    let route = harness.bind(reserved("tier-owner"), Some(ID)).await;
+    for settings in [None, Some(json!({}))] {
+        let mut body = json!({"class":"audit","consumer":"mason.review","available_routes":[format!("openai/{MODEL}")]});
+        if let Some(settings) = settings {
+            body["settings"] = settings;
+        }
+        let reply = route.call("route.select_panel", &body).await;
+        assert_eq!(reply.0, FrameType::Response, "{body}: {}", reply.1);
+        let answer: SelectPanelAnswer = serde_json::from_value(reply.1["result"].clone()).unwrap();
+        assert_eq!(answer.seats.len(), 1, "{body}: {}", reply.1);
+        assert_eq!(
+            answer.seats[0].answer.service_tier_chosen.as_deref(),
+            Some("fast"),
+            "{body}: {}",
+            reply.1
+        );
+        assert!(answer.seats[0].answer.project_settings.is_none());
+        check_panel_answer(
+            &parse_select_panel_request_serving(&body, super::describe::CAPABILITIES).unwrap(),
+            &answer,
+        )
+        .unwrap();
+    }
 }
 
 #[tokio::test]

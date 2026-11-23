@@ -766,7 +766,7 @@ async fn candidates(
     let live = &shared.live_config;
     // Validate the requested project id against the caller's daemon-stamped
     // project before reading candidates, even if the panel will be empty.
-    let (layers, tier_status) = super::scoped_settings(
+    let (layers, _) = super::scoped_settings(
         request.settings.as_ref(),
         caller,
         deps,
@@ -774,12 +774,6 @@ async fn candidates(
         Some(&shared.project_views),
     )
     .await?;
-    let empty = crate::tier_settings::Layers::default();
-    let tier_layers = if tier_status.is_some() {
-        &layers
-    } else {
-        &empty
-    };
     let mut prepared = shared.prepare_for_sweep(deps, dry.map(|dry| dry.accounts))?;
     let aliases = &shared.catalog_targets;
     let consumers = super::consumers::effective(&config);
@@ -877,7 +871,7 @@ async fn candidates(
         classes.apply_configured_service_tiers(
             &mut prepared.facts,
             |fact| {
-                tier_layers.resolve(
+                layers.resolve(
                     &config,
                     tier_consumer,
                     &fact.provider_id,

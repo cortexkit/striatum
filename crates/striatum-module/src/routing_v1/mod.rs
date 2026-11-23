@@ -217,7 +217,7 @@ pub(crate) struct ScopeAuthority {
 }
 
 impl Caller {
-    fn stamped_project(&self) -> Option<&str> {
+    pub(crate) fn stamped_project(&self) -> Option<&str> {
         self.scope_authority
             .as_ref()
             .and_then(|scope| scope.project_id.as_deref())
@@ -301,8 +301,10 @@ async fn scoped_settings(
     if let Some(settings) = settings {
         settings.check_project_stamp(stamped_project)?;
     }
-    let tier_project = settings.and_then(|settings| settings.project_id.as_deref());
-    let Some(project) = stamped_project.or(tier_project) else {
+    let requested_project = settings.and_then(|settings| settings.project_id.as_deref());
+    // The stamp supplies the default tier view; only an explicit lookup
+    // gets a project_settings status in the reply.
+    let Some(project) = stamped_project.or(requested_project) else {
         return Ok((crate::tier_settings::Layers::default(), None));
     };
     let view = match request_views {
@@ -312,7 +314,7 @@ async fn scoped_settings(
     let Some(view) = view else {
         return Ok((
             crate::tier_settings::Layers::default(),
-            tier_project.map(|_| ProjectSettings::Unresolved),
+            requested_project.map(|_| ProjectSettings::Unresolved),
         ));
     };
     // The wire contract lets an unscoped caller opt into tier settings, but
@@ -333,7 +335,7 @@ async fn scoped_settings(
     } else {
         ProjectSettings::None
     };
-    Ok((layers, tier_project.map(|_| status)))
+    Ok((layers, requested_project.map(|_| status)))
 }
 
 /// Answer one v1 request on its route and send the reply frame.

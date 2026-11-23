@@ -1374,7 +1374,14 @@ async fn handle_select_panel(
             )
         })
         .unwrap_or_default();
-    let tier_settings = crate::tier_settings::Layers::default();
+    let caller = routing_v1::Caller::for_route(channel, epoch);
+    let tier_settings = match caller.stamped_project() {
+        Some(project) => crate::managed_settings::project_view(routing_config_path, project)
+            .await
+            .map(|view| crate::tier_settings::Layers::new(view.consumers.clone(), None))
+            .unwrap_or_default(),
+        None => crate::tier_settings::Layers::default(),
+    };
     let tiers = classes.apply_configured_service_tiers(
         &mut prepared.facts,
         |fact| {

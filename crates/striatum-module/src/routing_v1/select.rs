@@ -288,14 +288,13 @@ pub(super) async fn evaluate_with_inputs(
     let mut inputs = prepare_selection(params, caller, deps, shared, &layers, Some(view)).await?;
     if panel_seat {
         let request = inputs.request.clone();
-        let empty = crate::tier_settings::Layers::default();
         return select_with_tier_fallback(
             params,
             caller,
             deps,
             profile_lookup,
             &request,
-            if status.is_some() { &layers } else { &empty },
+            &layers,
             status,
             true,
             shared,
@@ -374,12 +373,6 @@ async fn select_with_profile_lookup_kind(
         shared.map(|inputs| &inputs.project_views),
     )
     .await?;
-    let global_layers = crate::tier_settings::Layers::default();
-    let settings_layers = if project_settings.is_some() {
-        &project_layers
-    } else {
-        &global_layers
-    };
     let mut effective_request = request.clone();
     let mut result = async {
         let owned;
@@ -399,7 +392,7 @@ async fn select_with_profile_lookup_kind(
             deps,
             profile_lookup,
             &request,
-            settings_layers,
+            &project_layers,
             project_settings,
             panel_seat,
             shared,
