@@ -296,48 +296,68 @@ fn project_review_accepts_scoped_tiers_and_an_unenrolled_runner() {
 }
 
 #[tokio::test]
-async fn project_capability_is_discovered_from_hello_or_describe_and_logs_disabled_once() {
+async fn hello_ack_enables_project_settings_without_a_probe() {
     use super::test_daemon::{Advertise, Daemon, ID};
-    for (advertise, enabled, describes) in [
-        (Advertise::Hello, true, 0),
-        (Advertise::Describe, true, 1),
-        (Advertise::Neither, false, 1),
-        (Advertise::Refused, false, 1),
-        (Advertise::Failed, false, 1),
+    let dir = ScratchDir::new("project-capability-hello");
+    let path = dir.join("routing.jsonc");
+    let (daemon, _connection) = Daemon::connect(&path, json!({}), Advertise::Hello).await;
+    daemon.set(
+        ID,
+        json!({"consumers":{"prefrontal.sidekick":{"service_tier":"fast"}}}),
+    );
+    for _ in 0..2 {
+        assert!(project_view(&path, ID).await.is_some());
+    }
+    assert_eq!(daemon.gets(ID), 1);
+    assert_eq!(daemon.module_describes(), 0);
+    assert_eq!(daemon.consumer_connections(), 0);
+}
+
+#[tokio::test]
+async fn consumer_probe_without_a_capability_or_valid_reply_leaves_project_views_off() {
+    use super::test_daemon::{Advertise, Daemon, ID};
+    for (advertise, reason) in [
+        (
+            Advertise::Neither,
+            "daemon did not advertise project settings",
+        ),
+        (Advertise::Refused, "consumer capability probe failed"),
+        (Advertise::Failed, "consumer capability probe failed"),
     ] {
         crate::logging::take_operator_infos();
         let dir = ScratchDir::new("project-capability");
         let path = dir.join("routing.jsonc");
         let (daemon, _connection) = Daemon::connect(&path, json!({}), advertise).await;
-        daemon.set(
-            ID,
-            json!({"consumers":{"prefrontal.sidekick":{"service_tier":"fast"}}}),
-        );
-        for _ in 0..2 {
-            assert_eq!(project_view(&path, ID).await.is_some(), enabled);
-        }
-        assert_eq!(daemon.gets(ID), usize::from(enabled));
-        assert_eq!(daemon.describes(), describes);
-        let startup = crate::logging::take_operator_infos();
-        assert_eq!(
-            startup
-                .iter()
-                .filter(|line| line.contains("project settings disabled:"))
-                .count(),
-            usize::from(!enabled),
-            "{startup:?}"
-        );
+        let mut logs = Vec::new();
+        wait_for_probe(|| {
+            logs.extend(crate::logging::take_operator_infos());
+            disabled_logs(&logs).next().is_some()
+        })
+        .await;
+        assert!(project_view(&path, ID).await.is_none());
+        assert_eq!(daemon.gets(ID), 0);
+        assert_eq!(daemon.describes(), 1);
+        assert_eq!(daemon.module_describes(), 0);
+        let reasons: Vec<_> = disabled_logs(&logs).collect();
+        assert_eq!(reasons.len(), 1, "{logs:?}");
+        assert!(reasons[0].contains(reason), "{logs:?}");
     }
 }
 
 #[tokio::test]
-async fn slow_server_describe_does_not_delay_global_settings_readiness() {
+async fn slow_consumer_probe_does_not_delay_global_settings_and_recovers_on_retry() {
     use super::test_daemon::{Advertise, Daemon, ID};
+    use crate::tier_settings::Tier;
     crate::logging::take_operator_infos();
     let dir = ScratchDir::new("slow-project-capability");
     let path = dir.join("routing.jsonc");
-    let user = json!({"consumers":{"prefrontal.sidekick":{"service_tier":"fast"}}});
+    let user = json!({"consumers":{"prefrontal.sidekick":{"service_tier":"standard"}}});
     let (daemon, _connection) = Daemon::connect(&path, user, Advertise::Slow).await;
+    daemon.set(
+        ID,
+        json!({"consumers":{"prefrontal.sidekick":{"service_tier":"fast"}}}),
+    );
+    wait_for_probe(|| daemon.describes() == 1).await;
     let startup = crate::logging::take_operator_infos();
     assert!(
         startup
@@ -345,31 +365,51 @@ async fn slow_server_describe_does_not_delay_global_settings_readiness() {
             .any(|line| line.contains("routing settings are ready")),
         "{startup:?}"
     );
-    assert!(
-        !startup
-            .iter()
-            .any(|line| line.contains("project settings disabled:")),
-        "{startup:?}"
-    );
-    assert_eq!(daemon.describes(), 1);
+    assert!(disabled_logs(&startup).next().is_none(), "{startup:?}");
     assert_eq!(
         config_overrides::live_config(&path).service_tier("prefrontal.sidekick", "openai", "model"),
-        Some(crate::tier_settings::Tier::Fast.value())
+        Some(Tier::Standard.value())
     );
 
-    tokio::time::pause();
-    tokio::time::advance(std::time::Duration::from_secs(1)).await;
-    tokio::task::yield_now().await;
+    wait_for_probe(|| daemon.describes() == 2).await;
     assert!(project_view(&path, ID).await.is_none());
     assert_eq!(daemon.gets(ID), 0);
-    let logs = crate::logging::take_operator_infos();
+    daemon.advertise_on_consumer();
+    let view = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let Some(view) = project_view(&path, ID).await {
+                break view;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("project settings did not become available after retry");
     assert_eq!(
-        logs.iter()
-            .filter(|line| line.contains("project settings disabled:"))
-            .count(),
-        1,
-        "{logs:?}"
+        view.consumers["prefrontal.sidekick"].service_tier,
+        Some(Tier::Fast)
     );
+    assert_eq!(daemon.describes(), 3);
+    assert_eq!(daemon.module_describes(), 0);
+    let logs = crate::logging::take_operator_infos();
+    let reasons: Vec<_> = disabled_logs(&logs).collect();
+    assert_eq!(reasons.len(), 1, "{logs:?}");
+    assert!(reasons[0].contains("server.describe timed out"), "{logs:?}");
+}
+
+fn disabled_logs(logs: &[String]) -> impl Iterator<Item = &str> {
+    logs.iter()
+        .filter_map(|line| line.strip_prefix("[striatum] project settings disabled: "))
+}
+
+async fn wait_for_probe(mut condition: impl FnMut() -> bool) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !condition() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("consumer capability probe did not make progress");
 }
 
 #[tokio::test]

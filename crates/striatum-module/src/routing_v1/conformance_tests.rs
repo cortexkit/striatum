@@ -214,10 +214,18 @@ impl Harness {
     }
 
     pub(crate) async fn project_daemon(&self) -> crate::managed_settings::test_daemon::Daemon {
-        use crate::managed_settings::test_daemon::{Advertise, Daemon};
+        self.project_daemon_advertising(crate::managed_settings::test_daemon::Advertise::Hello)
+            .await
+    }
+
+    pub(super) async fn project_daemon_advertising(
+        &self,
+        advertise: crate::managed_settings::test_daemon::Advertise,
+    ) -> crate::managed_settings::test_daemon::Daemon {
+        use crate::managed_settings::test_daemon::Daemon;
         let user = self.config.lock().unwrap().clone();
         let (daemon, connection) =
-            Daemon::connect(&self.config_path_for_test(), user, Advertise::Hello).await;
+            Daemon::connect(&self.config_path_for_test(), user, advertise).await;
         *self.settings_connection.lock().unwrap() = Some(connection);
         daemon
     }

@@ -443,6 +443,7 @@ where
         Some(managed_settings::Session::start(
             &config.module_id,
             config_path,
+            &config.connection_file_path,
             ack.negotiated_ver,
             &writer,
             ack.subc_capabilities

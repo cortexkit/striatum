@@ -1096,6 +1096,45 @@ async fn stamped_select_inherits_daemon_project_tier_without_project_id() {
 }
 
 #[tokio::test]
+async fn stamped_select_inherits_project_tier_advertised_only_to_consumers() {
+    use crate::managed_settings::test_daemon::{Advertise, ID};
+    use std::time::Duration;
+
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, _) = setup(&["pro_500"], true, true);
+    harness.edit_config(|config| {
+        config["consumers"]["prefrontal.sidekick"] =
+            json!({"owner":"tier-owner","mode":"demand","service_tier":"standard"});
+    });
+    let daemon = harness
+        .project_daemon_advertising(Advertise::Describe)
+        .await;
+    daemon.set(
+        ID,
+        json!({"consumers":{"prefrontal.sidekick":{"service_tier":"fast"}}}),
+    );
+    let route = harness.bind(reserved("tier-owner"), Some(ID)).await;
+    let request = json!({"consumer":"prefrontal.sidekick.review","requirements":{"iq":30}});
+    let result = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let reply = route.call("route.select", &request).await;
+            assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
+            let result = reply.1["result"].clone();
+            if daemon.module_describes() > 0 || daemon.gets(ID) > 0 {
+                break result;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("project discovery did not finish");
+    assert_eq!(result["service_tier_chosen"], "fast", "{result}");
+    assert_eq!(daemon.module_describes(), 0);
+    assert_eq!(daemon.describes(), 1);
+    assert_eq!(daemon.gets(ID), 1);
+}
+
+#[tokio::test]
 async fn daemon_service_tier_view_wins_over_project_file_and_updates_on_change() {
     use crate::managed_settings::test_daemon::ID;
     let _clock = crate::InjectedClock::set(NOW);

@@ -10,12 +10,18 @@ use subc_protocol::config::{
     ConfigGetRequest, ConfigLayer, ConfigLayerSnapshot, ConfigStatus, ConfigView,
     CONFIG_APPLIED_OP, CONFIG_DECLARE_OP, CONFIG_GET_OP,
 };
+use subc_transport::{authenticate_server, read_frame, write_frame};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, watch};
+use tokio::task::{JoinHandle, JoinSet};
 
 use super::{Session, PROJECTS_CAPABILITY};
 use crate::{Frame, FrameType, DEFAULT_MODULE_ID, PROTOCOL_VERSION};
 
 pub(crate) const ID: &str = "pj-active";
+const KEY: [u8; 32] = [7; 32];
+const DAEMON_ID: [u8; 16] = [0; 16];
+const DAEMON_VERSION: &str = "0.50.32";
 
 #[derive(Default)]
 struct State {
@@ -25,6 +31,9 @@ struct State {
     report_bytes: Vec<Vec<u8>>,
     global_gets: usize,
     describes: usize,
+    module_describes: usize,
+    consumer_connections: usize,
+    advertise: Advertise,
 }
 
 enum Reply {
@@ -43,17 +52,20 @@ pub(crate) struct Daemon {
     replied: watch::Receiver<usize>,
 }
 
-pub(crate) struct Connection(tokio::task::JoinHandle<()>);
+pub(crate) struct Connection(JoinHandle<()>, JoinHandle<()>);
 
 impl Drop for Connection {
     fn drop(&mut self) {
         self.0.abort();
+        self.1.abort();
     }
 }
 
+#[derive(Clone, Copy, Default)]
 pub(crate) enum Advertise {
     Hello,
     Describe,
+    #[default]
     Neither,
     Refused,
     Failed,
@@ -77,11 +89,16 @@ impl Daemon {
     ) -> (Self, Connection) {
         let (tx, mut rx) = mpsc::channel(16);
         let (hints, mut pushes) = mpsc::unbounded_channel();
-        let state = Arc::new(Mutex::new(State::default()));
+        let state = Arc::new(Mutex::new(State {
+            advertise,
+            ..State::default()
+        }));
+        let (connection_file, consumers) = serve_consumers(path, Arc::clone(&state)).await;
         let (replied_tx, replied) = watch::channel(0);
         let mut session = Session::start(
             module_id,
             path,
+            &connection_file,
             PROTOCOL_VERSION,
             &tx,
             matches!(advertise, Advertise::Hello),
@@ -105,21 +122,12 @@ impl Daemon {
                         match value["op"].as_str().unwrap() {
                             CONFIG_DECLARE_OP => response(&request, kind, ConfigDeclareReply::new()),
                             "server.describe" => {
-                                state.describes += 1;
-                                let capabilities = match advertise {
-                                    Advertise::Describe => vec![PROJECTS_CAPABILITY],
-                                    Advertise::Refused => {
-                                        assert!(session.dispatch(&response(&request, FrameType::Error, crate::ErrorBody::new("unknown_op", "no describe operation"))));
-                                        continue;
-                                    }
-                                    Advertise::Failed => {
-                                        assert!(session.dispatch(&response(&request, kind, json!({"op":"unexpected"}))));
-                                        continue;
-                                    }
-                                    Advertise::Slow => continue,
-                                    _ => vec![],
-                                };
-                                response(&request, kind, json!({"op":"server.describe", "capabilities":capabilities}))
+                                assert_eq!((request.header.ty, request.header.channel), (FrameType::Request, 0));
+                                state.module_describes += 1;
+                                response(&request, FrameType::Error, crate::ErrorBody::new(
+                                    "unsupported_control_frame",
+                                    "module-originated channel-0 REQUEST is not supported",
+                                ))
                             }
                             CONFIG_GET_OP => {
                                 let get: ConfigGetRequest = serde_json::from_value(value).unwrap();
@@ -173,7 +181,7 @@ impl Daemon {
             .unwrap()
             .unwrap()
             .unwrap();
-        (daemon, Connection(connection))
+        (daemon, Connection(connection, consumers))
     }
 
     pub(crate) fn set(&self, project: &str, layer: Value) {
@@ -238,6 +246,18 @@ impl Daemon {
         self.state.lock().unwrap().describes
     }
 
+    pub(crate) fn module_describes(&self) -> usize {
+        self.state.lock().unwrap().module_describes
+    }
+
+    pub(crate) fn consumer_connections(&self) -> usize {
+        self.state.lock().unwrap().consumer_connections
+    }
+
+    pub(crate) fn advertise_on_consumer(&self) {
+        self.state.lock().unwrap().advertise = Advertise::Describe;
+    }
+
     pub(crate) fn global_gets(&self) -> usize {
         self.state.lock().unwrap().global_gets
     }
@@ -278,6 +298,92 @@ impl Daemon {
             .unwrap()
             .unwrap();
     }
+}
+
+async fn serve_consumers(
+    path: &Path,
+    state: Arc<Mutex<State>>,
+) -> (std::path::PathBuf, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let connection = path.with_extension("connection.json");
+    std::fs::write(&connection, serde_json::to_vec(&json!({
+        "schema":1,"endpoints":[{"host":"127.0.0.1","port":listener.local_addr().unwrap().port()}],
+        "key":KEY,"daemon_id":DAEMON_ID,"pid":std::process::id(),"daemon_ver":DAEMON_VERSION,
+    })).unwrap()).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&connection, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let task = tokio::spawn(async move {
+        let mut peers = JoinSet::new();
+        loop {
+            tokio::select! {
+                accepted = listener.accept() => {
+                    let (stream, _) = accepted.unwrap();
+                    state.lock().unwrap().consumer_connections += 1;
+                    peers.spawn(serve_consumer(stream, Arc::clone(&state)));
+                }
+                done = peers.join_next(), if !peers.is_empty() => done.unwrap().unwrap(),
+            }
+        }
+    });
+    (connection, task)
+}
+
+async fn serve_consumer(mut stream: TcpStream, state: Arc<Mutex<State>>) {
+    authenticate_server(
+        &mut stream,
+        &KEY,
+        &DAEMON_ID,
+        DAEMON_VERSION,
+        Duration::from_secs(2),
+    )
+    .await
+    .unwrap();
+    let request = read_frame(&mut stream).await.unwrap().unwrap();
+    assert_eq!(
+        (
+            request.header.ty,
+            request.header.channel,
+            request.header.epoch
+        ),
+        (FrameType::Request, 0, 0)
+    );
+    let body: Value = serde_json::from_slice(&request.body).unwrap();
+    assert_eq!(body["op"], "server.describe");
+    let advertise = {
+        let mut state = state.lock().unwrap();
+        state.describes += 1;
+        state.advertise
+    };
+    let capabilities = match advertise {
+        Advertise::Describe => json!([PROJECTS_CAPABILITY]),
+        Advertise::Failed => json!("not an array"),
+        Advertise::Slow => {
+            assert!(read_frame(&mut stream).await.unwrap().is_none());
+            return;
+        }
+        Advertise::Refused => {
+            let reply = response(
+                &request,
+                FrameType::Error,
+                crate::ErrorBody::new("unavailable", "describe unavailable"),
+            );
+            write_frame(&mut stream, &reply).await.unwrap();
+            return;
+        }
+        _ => json!([]),
+    };
+    let reply = response(
+        &request,
+        FrameType::Response,
+        json!({
+            "op":"server.describe", "protocol_ver":PROTOCOL_VERSION, "subc_ops":[],
+            "capabilities":capabilities, "connected_clients":1,
+        }),
+    );
+    write_frame(&mut stream, &reply).await.unwrap();
 }
 
 pub(crate) fn active(effective: Value, project: Option<&str>) -> ConfigView {

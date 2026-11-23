@@ -119,19 +119,6 @@ impl Rig {
         declare
     }
 
-    async fn describe_without_project_settings(&mut self) {
-        let describe = self.request("server.describe").await;
-        self.send(
-            FrameType::Response,
-            describe.header.corr,
-            json!({
-                "op":"server.describe", "protocol_ver": self.ver, "subc_ops":[],
-                "capabilities":[], "connected_clients":1
-            }),
-        )
-        .await;
-    }
-
     fn assert_review_advertised(&self) {
         assert_eq!(
             self.hello_control_ops,
@@ -291,7 +278,6 @@ async fn capable_daemon_gets_a_declaration_without_a_startup_flag() {
         vector!("config_declare_reply"),
     )
     .await;
-    rig.describe_without_project_settings().await;
     rig.request("config.get").await;
     rig.ping().await;
     assert_settings_source(
@@ -310,14 +296,13 @@ async fn unanswered_initial_get_recovers_without_a_settings_change() {
         vector!("config_declare_reply"),
     )
     .await;
-    rig.describe_without_project_settings().await;
     let first = rig.request("config.get").await;
     rig.ping().await;
     rig.bind().await;
     assert_eq!(rig.explain_missing().await["code"], "routing_not_ready");
 
     let second = request_after_timeout(&mut rig, &first, "config.get").await;
-    serve_approved_view(&mut rig, &second, false).await;
+    serve_approved_view(&mut rig, &second).await;
     rig.finish().await;
 }
 
@@ -327,7 +312,7 @@ async fn timed_out_declaration_probes_and_applies_an_approved_view() {
     let declare = rig.declare().await;
     rig.bind().await;
     let probe = request_after_timeout(&mut rig, &declare, "config.get").await;
-    serve_approved_view(&mut rig, &probe, true).await;
+    serve_approved_view(&mut rig, &probe).await;
     rig.finish().await;
 }
 
@@ -343,7 +328,6 @@ async fn timed_out_declaration_stays_push_driven_if_probe_is_gated() {
         vector!("config_get_error_gated"),
     )
     .await;
-    rig.describe_without_project_settings().await;
     assert_eq!(rig.explain_missing().await["code"], "routing_not_ready");
     assert!(
         timeout(Duration::from_secs(3), rig.peer.peek(&mut [0]))
@@ -390,9 +374,8 @@ async fn timed_out_declaration_is_resent_if_probe_requires_declaration() {
         vector!("config_declare_reply"),
     )
     .await;
-    rig.describe_without_project_settings().await;
     let get = rig.request("config.get").await;
-    serve_approved_view(&mut rig, &get, false).await;
+    serve_approved_view(&mut rig, &get).await;
     rig.finish().await;
 }
 
@@ -407,7 +390,7 @@ async fn request_after_timeout(rig: &mut Rig, unanswered: &Frame, op: &str) -> F
     next
 }
 
-async fn serve_approved_view(rig: &mut Rig, get: &Frame, discovering: bool) {
+async fn serve_approved_view(rig: &mut Rig, get: &Frame) {
     rig.send(
         FrameType::Response,
         get.header.corr,
@@ -424,9 +407,6 @@ async fn serve_approved_view(rig: &mut Rig, get: &Frame, discovering: bool) {
         }),
     )
     .await;
-    if discovering {
-        rig.describe_without_project_settings().await;
-    }
     assert_serves_approved_view(rig).await;
 }
 
@@ -549,7 +529,6 @@ async fn module_delivery_vectors_drive_review_wait_ack_and_nack() {
         vector!("config_declare_reply"),
     )
     .await;
-    rig.describe_without_project_settings().await;
     let get = rig.request("config.get").await;
     rig.send(
         FrameType::Error,

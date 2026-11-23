@@ -11,6 +11,7 @@ use subc_client_rs::config::{
     ConfigGetRequest, ConfigReviewRequest, ConfigStatus, ConfigView, CONFIG_APPLIED_OP,
     CONFIG_CHANGED_OP, CONFIG_DECLARE_OP, CONFIG_GET_OP, CONFIG_REVIEW_OP,
 };
+use subc_client_rs::{ConsumerOptions, SubcConsumer};
 use tokio::sync::{mpsc, oneshot, Notify};
 use tokio::task::JoinHandle;
 
@@ -20,7 +21,7 @@ use crate::{control_flags, send, ErrorBody, Frame, FrameType, ModuleError};
 pub(crate) const WAITING: &str = "waiting for the daemon's settings view";
 // The locked SDK predates the exported name for this daemon capability.
 pub(crate) const PROJECTS_CAPABILITY: &str = "config.settings.projects/v1";
-const SERVER_DESCRIBE: &str = "server.describe";
+const PROJECT_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 const CALL_TIMEOUT: Duration = Duration::from_secs(10);
 const RETRY_INITIAL: Duration = Duration::from_secs(1);
 const RETRY_MAX: Duration = Duration::from_secs(60);
@@ -48,6 +49,7 @@ impl Session {
     pub(crate) fn start(
         module_id: &str,
         path: &Path,
+        connection_file: &Path,
         negotiated_ver: u8,
         writer: &mpsc::Sender<Frame>,
         projects_advertised: bool,
@@ -74,6 +76,7 @@ impl Session {
             report: None,
         };
         crate::info_operator(format!("[striatum] {WAITING}"));
+        let connection_file = connection_file.to_owned();
         let task = tokio::spawn(async move {
             enum InitialGet {
                 Fetch,
@@ -128,7 +131,7 @@ impl Session {
             // Older daemons advertise the project protocol in server.describe
             // only. That probe must not delay serving the global settings view.
             tokio::join!(biased;
-                wire.discover_projects(projects_advertised),
+                wire.discover_projects(projects_advertised, &connection_file),
                 async {
                     match initial_get {
                         InitialGet::Fetch => driver.refresh().await,
@@ -208,27 +211,33 @@ pub(super) struct Wire {
 }
 
 impl Wire {
-    async fn discover_projects(self: &Arc<Self>, advertised: bool) {
-        let enabled = advertised
-            || self
-                .call(
-                    SERVER_DESCRIBE,
-                    &serde_json::json!({"op": SERVER_DESCRIBE}),
-                    Duration::from_secs(1),
-                )
-                .await
-                .is_ok_and(|reply| {
-                    reply["capabilities"].as_array().is_some_and(|values| {
-                        values.iter().any(|value| value == PROJECTS_CAPABILITY)
-                    })
-                });
-        if enabled {
+    async fn discover_projects(self: &Arc<Self>, advertised: bool, connection_file: &Path) {
+        if advertised {
             self.projects.enable(self, &self.settings.path);
-        } else {
-            crate::info_operator(
-                "[striatum] project settings disabled: daemon did not advertise project settings"
-                    .into(),
-            );
+            return;
+        }
+        let mut retry = RetryDelay::new();
+        let mut logged_disabled = false;
+        loop {
+            match probe_projects(connection_file).await {
+                Ok(true) => {
+                    self.projects.enable(self, &self.settings.path);
+                    return;
+                }
+                Ok(false) => {
+                    if !logged_disabled {
+                        crate::info_operator("[striatum] project settings disabled: daemon did not advertise project settings".into());
+                    }
+                    return;
+                }
+                Err(error) => {
+                    if !logged_disabled {
+                        crate::info_operator(format!("[striatum] project settings disabled: consumer capability probe failed ({error}); will retry"));
+                        logged_disabled = true;
+                    }
+                    retry.wait().await;
+                }
+            }
         }
     }
 
@@ -257,6 +266,26 @@ impl Wire {
         )?;
         send(&self.writer, reply).await
     }
+}
+
+async fn probe_projects(connection_file: &Path) -> Result<bool, String> {
+    // The module connection rejects server.describe, and the runner refresh
+    // consumer only starts after global settings are ready.
+    tokio::time::timeout(PROJECT_PROBE_TIMEOUT, async {
+        let consumer = SubcConsumer::connect(connection_file, ConsumerOptions::default())
+            .await
+            .map_err(|error| error.to_string())?;
+        let describe = consumer
+            .server_describe()
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(describe
+            .capabilities
+            .iter()
+            .any(|cap| cap == PROJECTS_CAPABILITY))
+    })
+    .await
+    .map_err(|_| "server.describe timed out".to_owned())?
 }
 
 struct Driver {
