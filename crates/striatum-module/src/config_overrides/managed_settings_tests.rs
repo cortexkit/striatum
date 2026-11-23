@@ -214,6 +214,60 @@ fn walk_schema(
     if let Some(child) = node.get("items") {
         walk_schema(child, &format!("{path}/*"), visit);
     }
+    if let Some(child) = node
+        .get("additionalProperties")
+        .filter(|node| node.is_object())
+    {
+        walk_schema(child, &format!("{path}/additionalProperties"), visit);
+    }
+}
+
+#[test]
+fn schema_names_the_routing_module() {
+    let schema: serde_json::Value = serde_json::from_str(&super::routing_config_schema()).unwrap();
+    assert_eq!(schema["title"], "Routing");
+}
+
+#[test]
+fn schema_labels_every_settings_property() {
+    use serde_json::Value;
+
+    fn assert_title(node: &Value, path: &str) {
+        assert!(
+            node["title"].as_str().is_some_and(|title| {
+                !title.trim().is_empty() && title.chars().count() <= 60 && !title.contains('_')
+            }),
+            "{path} needs a human title, got {}",
+            node["title"]
+        );
+    }
+
+    fn describes_object(node: &Value) -> bool {
+        node["type"] == "object" || node["properties"].is_object()
+    }
+
+    let schema: Value = serde_json::from_str(&super::routing_config_schema()).unwrap();
+    for (owner, node) in std::iter::once(("Root", &schema)).chain(
+        schema["$defs"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(name, node)| (name.as_str(), node)),
+    ) {
+        walk_schema(node, "", &mut |node, path| {
+            for (key, child) in node["properties"].as_object().into_iter().flatten() {
+                assert_title(child, &format!("{owner}{path}/{key}"));
+            }
+            let additional = &node["additionalProperties"];
+            let referenced = additional["$ref"]
+                .as_str()
+                .and_then(|reference| reference.strip_prefix('#'))
+                .and_then(|pointer| schema.pointer(pointer));
+            if describes_object(additional) || referenced.is_some_and(describes_object) {
+                assert_title(additional, &format!("{owner}{path}/additionalProperties"));
+            }
+        });
+    }
 }
 
 #[test]

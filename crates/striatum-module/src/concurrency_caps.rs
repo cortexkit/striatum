@@ -52,9 +52,11 @@ impl CapLimit {
 #[serde(deny_unknown_fields)]
 pub(crate) struct CapOverride {
     /// Maximum simultaneous requests, as a whole number of at least 1, or `none` to remove the cap.
+    #[schemars(title = "Maximum simultaneous requests")]
     pub(crate) limit: CapLimit,
     /// Count requests per account, or separately for each model on the account. Omit to inherit the less specific setting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(title = "How to group requests for the limit")]
     pub(crate) scope: Option<CapScope>,
 }
 
@@ -62,6 +64,7 @@ pub(crate) struct CapOverride {
 #[serde(deny_unknown_fields)]
 pub(crate) struct ModelCapOverride {
     /// Maximum simultaneous requests on this model, as a whole number of at least 1, or `none` to remove the cap.
+    #[schemars(title = "Maximum simultaneous requests")]
     pub(crate) limit: CapLimit,
 }
 
@@ -69,14 +72,19 @@ pub(crate) struct ModelCapOverride {
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct CapSettings {
     /// Enforce the limits. When disabled, counts are visible but requests are not blocked by these limits.
+    #[schemars(title = "Enforce request limits")]
     pub(crate) enforcement_enabled: bool,
     /// Limits by provider ID.
+    #[schemars(title = "Limits by provider")]
     pub(crate) providers: BTreeMap<String, CapOverride>,
     /// Limits by provider/plan.
+    #[schemars(title = "Limits by plan")]
     pub(crate) plans: BTreeMap<String, CapOverride>,
     /// Limits by provider/model.
+    #[schemars(title = "Limits by model")]
     pub(crate) models: BTreeMap<String, ModelCapOverride>,
     /// Limits by provider/account.
+    #[schemars(title = "Limits by account")]
     pub(crate) accounts: BTreeMap<String, CapOverride>,
 }
 

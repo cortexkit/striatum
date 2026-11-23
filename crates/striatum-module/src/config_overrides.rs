@@ -1355,41 +1355,53 @@ fn prompt_cache_providers_cache() -> &'static Mutex<HashMap<PathBuf, PromptCache
 
 #[derive(Debug, Deserialize, Serialize, Clone, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[schemars(title = "Routing")]
 struct RoutingConfigFile {
     /// Scheduling priority by consumer name. The most specific dotted name wins.
     #[serde(default)]
+    #[schemars(title = "Consumer priorities")]
     consumer_priorities: BTreeMap<String, crate::config_policy::PriorityClass>,
     /// Limits on the number of requests running at once.
     #[serde(default)]
+    #[schemars(title = "Concurrent request limits")]
     concurrency: crate::concurrency_caps::CapSettings,
     #[serde(flatten)]
     model_routing: ModelRoutingSection,
     /// Routing and account settings by provider ID.
     #[serde(default)]
+    #[schemars(title = "Providers")]
     providers: BTreeMap<String, ProviderPolicy>,
     /// Routing preferences by consumer name.
     #[serde(default)]
+    #[schemars(title = "Consumers")]
     consumers: BTreeMap<String, ConsumerPolicy>,
     /// Modules that can run models, in order of preference.
     #[serde(default)]
+    #[schemars(title = "Preferred runners")]
     runners: Vec<RunnerPolicy>,
     /// Full caller identities allowed to mark a model choice as made by the user. An empty list allows nobody.
     #[serde(default = "default_pin_origin_callers")]
+    #[schemars(title = "Callers allowed to mark user choices")]
     pin_origin_callers: Vec<String>,
     /// Names of operator-facing agents allowed to use reserved subscription quota. Case is ignored.
     #[serde(default)]
+    #[schemars(title = "Agents allowed to use reserved quota")]
     head_agents: Vec<String>,
     /// Additional quota pools that apply only to models with a matching name prefix.
     #[serde(default)]
+    #[schemars(title = "Additional model quota pools")]
     quota_model_pools: Vec<QuotaModelPoolConfig>,
     /// Settings for refreshing the model catalog.
     #[serde(default)]
+    #[schemars(title = "Model catalog refresh")]
     catalog: CatalogSection,
     /// How long to keep routing and account history, and how much scoring detail to keep.
     #[serde(default)]
+    #[schemars(title = "Routing history retention")]
     retention: RetentionSection,
     /// Default account selection and spending rules, unless a provider overrides them.
     #[serde(default)]
+    #[schemars(title = "Default account settings")]
     accounts: crate::config_policy::ProviderAccountsPolicy,
 }
 
@@ -1642,6 +1654,7 @@ struct CatalogSection {
     /// Time between model catalog refreshes, in milliseconds. Must be at least 1.
     #[serde(default)]
     #[schemars(range(min = 1))]
+    #[schemars(title = "Refresh interval (milliseconds)")]
     poll_ms: Option<u64>,
 }
 
@@ -1655,26 +1668,32 @@ struct RetentionSection {
     /// Days to keep account selections after their last activity. Minimum 7 days.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(with = "Option<u64>", range(min = 7))]
+    #[schemars(title = "Account selections (days)")]
     account_selection_days: Option<serde_json::Value>,
     /// Days to keep reports from model runners. Minimum 1 day.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(with = "Option<u64>", range(min = 1))]
+    #[schemars(title = "Runner reports (days)")]
     account_observation_days: Option<serde_json::Value>,
     /// Days to keep the summary of each routing decision. Minimum 1 day.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(with = "Option<u64>", range(min = 1))]
+    #[schemars(title = "Routing decision summaries (days)")]
     model_route_decisions_days: Option<serde_json::Value>,
     /// Days to keep full scores and quota details for each routing decision. Minimum 1 day.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(with = "Option<u64>", range(min = 1))]
+    #[schemars(title = "Full routing decision details (days)")]
     model_route_decisions_full_detail_days: Option<serde_json::Value>,
     /// Keep full scoring details for one decision in this many until its summary expires. Set to 0 to keep no long-term samples.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(with = "Option<u64>")]
+    #[schemars(title = "Long-term detail sampling (one in N)")]
     model_route_decisions_full_detail_sample_one_in: Option<serde_json::Value>,
     /// Days to keep usage records for individual requests. Minimum 7 days.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(with = "Option<u64>", range(min = 7))]
+    #[schemars(title = "Request usage records (days)")]
     model_route_usage_days: Option<serde_json::Value>,
 }
 
@@ -1682,8 +1701,10 @@ struct RetentionSection {
 #[serde(deny_unknown_fields)]
 struct QuotaModelPoolConfig {
     /// Beginning of the model name that this quota rule matches.
+    #[schemars(title = "Model name prefix")]
     model_prefix: String,
     /// Name of the additional quota pool used by matching models.
+    #[schemars(title = "Additional quota pool")]
     pool: String,
 }
 
@@ -1699,6 +1720,7 @@ struct ModelRoutingSection {
     exclude: ExcludeGroups,
     /// How many models to choose and how to rank them for each panel type.
     #[serde(default)]
+    #[schemars(title = "Model selection for panels")]
     panels: PanelPolicies,
     #[serde(skip)]
     pins: Pins,
@@ -1707,20 +1729,25 @@ struct ModelRoutingSection {
     subscription: Vec<String>,
     /// Override catalog values or routing rules by provider/model or provider/model/variant.
     #[serde(default)]
+    #[schemars(title = "Model overrides")]
     models: HashMap<String, ModelFactOverride>,
     /// Set how quickly the reasoning quality target rises as a request asks for more. Use a number greater than 0.
     #[serde(default)]
     #[schemars(transform = positive_number)]
+    #[schemars(title = "How quickly the reasoning target rises")]
     demand_exponent: Option<f64>,
     /// How much to discourage using a stronger model than a request needs.
     #[serde(default)]
+    #[schemars(title = "Penalty for using stronger models")]
     overqualification: OverqualificationSection,
     /// Minimum fit for choosing a fallback model when none meets the quality target. Use a score from 0 to 1.
     #[serde(default)]
+    #[schemars(title = "Minimum fit for a fallback model")]
     min_best_effort_adequacy: Option<f64>,
     /// Number of failed sends in a row before temporarily avoiding a route. Must be at least 1.
     #[serde(default)]
     #[schemars(range(min = 1))]
+    #[schemars(title = "Failures before a route is avoided")]
     consecutive_terminal_failure_threshold: Option<u32>,
     /// Providers that do not expose prompt-cache reads or writes. Gather seats
     /// avoid these providers when a cache-capable adequate route exists.
@@ -1728,6 +1755,7 @@ struct ModelRoutingSection {
     providers_without_prompt_cache: Vec<String>,
     /// Divide estimated subscription costs by these provider-specific numbers. Use numbers greater than 0; a provider's own setting takes precedence.
     #[serde(default, skip_serializing)]
+    #[schemars(title = "Subscription cost divisors")]
     subscription_multipliers: HashMap<String, f64>,
     /// Percent of each weekly account window reserved from delegated workers;
     /// long-lived head agents may spend that reserved share.
@@ -1773,15 +1801,19 @@ impl Default for ModelRoutingSection {
 struct OverqualificationSection {
     /// Add a fixed-scale penalty (`additive`) or multiply the estimated cost (`cost_scaled`).
     #[serde(default)]
+    #[schemars(title = "Penalty method")]
     mode: OverqualificationMode,
     /// How far the model's reasoning score may exceed the target before adding a penalty. In additive mode only; use 0 or more. If omitted in additive mode, uses 40.
     #[schemars(range(min = 0))]
+    #[schemars(title = "Extra reasoning score allowed without penalty")]
     threshold: Option<f64>,
     /// Extra reasoning score needed to double the penalty. In additive mode only; use a number greater than 0. If omitted in additive mode, uses 10.
     #[schemars(transform = positive_number)]
+    #[schemars(title = "Extra reasoning score to double the penalty")]
     doubling: Option<f64>,
     /// Starting penalty before it grows with excess reasoning quality. In additive mode only; use 0 or more. If omitted in additive mode, uses 0.05.
     #[schemars(range(min = 0))]
+    #[schemars(title = "Starting penalty")]
     base: Option<f64>,
 }
 
@@ -1825,25 +1857,33 @@ impl OverqualificationSection {
 struct ModelFactOverride {
     /// Override the model's reasoning score. Use a number greater than 0, or omit to use the catalog score.
     #[schemars(transform = positive_number)]
+    #[schemars(title = "Reasoning score override")]
     elo: Option<f64>,
     /// Override the model's collaboration score. Use a number greater than 0, or omit to use the catalog score.
     #[schemars(transform = positive_number)]
+    #[schemars(title = "Collaboration score override")]
     eq: Option<f64>,
     /// Override generation speed in output tokens per second, from 0 upward. Omit to use measured or catalog speed.
     #[schemars(range(min = 0))]
+    #[schemars(title = "Generation speed (tokens per second)")]
     output_tokens_per_second: Option<f64>,
     /// Override cost in US dollars per million output tokens, from 0 upward.
     #[schemars(range(min = 0))]
+    #[schemars(title = "Price per million output tokens (USD)")]
     cost_per_mtok_out: Option<f64>,
     /// Override the context window in tokens. Use a number greater than 0, or omit to use the catalog size.
     #[schemars(transform = positive_number)]
+    #[schemars(title = "Context window (tokens)")]
     context_window_tokens: Option<f64>,
     /// Override whether the model can read images. Omit to use catalog support.
+    #[schemars(title = "Image support")]
     vision: Option<bool>,
     /// Multiply the speed used to compare this model with others. Use a number greater than 0 and up to 2.
     #[schemars(range(max = 2), transform = positive_number)]
+    #[schemars(title = "Speed comparison multiplier")]
     speed_multiplier: Option<f64>,
     /// This setting is ignored. Set the subscription cost multiplier on the provider instead.
+    #[schemars(title = "Subscription cost divisor (ignored)")]
     subscription_multiplier: Option<f64>,
     #[serde(flatten)]
     rules: crate::config_policy::EntityPolicy,

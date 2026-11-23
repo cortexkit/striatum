@@ -5,6 +5,7 @@
       "properties": {
         "model": {
           "description": "Model this floor applies to. Omit to apply it to every model using the pool.",
+          "title": "Model covered by this minimum",
           "type": "string",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -14,6 +15,7 @@
         },
         "pool": {
           "description": "Name of the quota pool. Provide a pool name, a window length, or both.",
+          "title": "Quota pool",
           "type": "string",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -24,6 +26,7 @@
         "remaining_percent": {
           "description": "Minimum quota that must remain in the pool, from 0 to 100 percent.",
           "format": "double",
+          "title": "Minimum remaining quota (%)",
           "type": "number",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -35,6 +38,7 @@
           "description": "Length of the quota window in minutes. Provide a window length, a pool name, or both.",
           "format": "uint32",
           "minimum": 0,
+          "title": "Quota window (minutes)",
           "type": "integer",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -56,6 +60,7 @@
           "description": "Maximum simultaneous requests, as a whole number of at least 1, or `none` to remove the cap.",
           "minimum": 1,
           "pattern": "^none$",
+          "title": "Maximum simultaneous requests",
           "type": [
             "integer",
             "string"
@@ -72,6 +77,7 @@
             "account",
             "account_model"
           ],
+          "title": "How to group requests for the limit",
           "type": "string",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -103,6 +109,7 @@
               "x-ck-required": false
             }
           },
+          "title": "Limits by account",
           "type": "object",
           "unevaluatedProperties": false,
           "x-ck-apply": "live",
@@ -113,6 +120,7 @@
         "enforcement_enabled": {
           "default": false,
           "description": "Enforce the limits. When disabled, counts are visible but requests are not blocked by these limits.",
+          "title": "Enforce request limits",
           "type": "boolean",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -133,6 +141,7 @@
               "x-ck-required": false
             }
           },
+          "title": "Limits by model",
           "type": "object",
           "unevaluatedProperties": false,
           "x-ck-apply": "live",
@@ -154,6 +163,7 @@
               "x-ck-required": false
             }
           },
+          "title": "Limits by plan",
           "type": "object",
           "unevaluatedProperties": false,
           "x-ck-apply": "live",
@@ -175,6 +185,7 @@
               "x-ck-required": false
             }
           },
+          "title": "Limits by provider",
           "type": "object",
           "unevaluatedProperties": false,
           "x-ck-apply": "live",
@@ -194,6 +205,7 @@
           "description": "Time between model catalog refreshes, in milliseconds. Must be at least 1.",
           "format": "uint64",
           "minimum": 1,
+          "title": "Refresh interval (milliseconds)",
           "type": "integer",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -213,6 +225,7 @@
             "best_effort",
             "refuse"
           ],
+          "title": "When no model meets the quality target",
           "type": "string",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -224,6 +237,7 @@
           "description": "Minimum context capacity in tokens.",
           "format": "uint64",
           "minimum": 0,
+          "title": "Minimum context (tokens)",
           "type": "integer",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -234,6 +248,7 @@
         "eq": {
           "description": "Minimum collaboration quality requested, from 0 to 100.",
           "format": "double",
+          "title": "Minimum collaboration quality",
           "type": "number",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -244,6 +259,7 @@
         "iq": {
           "description": "Minimum reasoning quality requested, from 0 to 100.",
           "format": "double",
+          "title": "Minimum reasoning quality",
           "type": "number",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -262,6 +278,7 @@
             ],
             "x-ck-required": false
           },
+          "title": "Model preference order",
           "type": "array",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -273,6 +290,7 @@
           "description": "Minimum output capacity in tokens.",
           "format": "uint64",
           "minimum": 0,
+          "title": "Minimum output capacity (tokens)",
           "type": "integer",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -286,6 +304,7 @@
             "demand",
             "ladder"
           ],
+          "title": "Model selection method",
           "type": "string",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -295,6 +314,7 @@
         },
         "owner": {
           "description": "Module responsible for this consumer. Omit to use the consumer's declared owner.",
+          "title": "Responsible module",
           "type": "string",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -304,6 +324,7 @@
         },
         "pay_per_token": {
           "description": "Limit this consumer to routes priced per token.",
+          "title": "Only use pay-per-token routes",
           "type": "boolean",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -314,6 +335,7 @@
         "pin": {
           "$ref": "#/$defs/SynthesizerPin",
           "description": "Prefer a specific model and optional variant for this consumer.",
+          "title": "Preferred model",
           "x-ck-apply": "live",
           "x-ck-layers": [
             "user"
@@ -334,6 +356,7 @@
               "x-ck-required": false
             }
           },
+          "title": "Model preferences by project",
           "type": "object",
           "unevaluatedProperties": false,
           "x-ck-apply": "live",
@@ -343,6 +366,7 @@
         },
         "runner": {
           "description": "Name of the preferred module that runs this consumer's models.",
+          "title": "Preferred runner",
           "type": "string",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -363,6 +387,7 @@
             ],
             "x-ck-required": false
           },
+          "title": "Runner list override",
           "type": "array",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -379,6 +404,7 @@
             "fast",
             "ultrafast"
           ],
+          "title": "Service speed",
           "type": "string",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -408,6 +434,7 @@
               "x-ck-required": false
             }
           },
+          "title": "Service speeds by provider or model",
           "type": "object",
           "unevaluatedProperties": false,
           "x-ck-apply": "live",
@@ -429,6 +456,7 @@
             ],
             "x-ck-required": false
           },
+          "title": "Required tool capabilities",
           "type": "array",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -438,6 +466,7 @@
         },
         "workload": {
           "description": "Name of the workload this consumer serves. Omit when it does not declare a workload.",
+          "title": "Workload name",
           "type": "string",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -460,6 +489,7 @@
       "properties": {
         "harness": {
           "description": "Restrict this entry to one of the runner's named execution environments.",
+          "title": "Execution environment",
           "type": "string",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -472,6 +502,7 @@
         "module": {
           "description": "Name of the module that runs the selected model.",
           "pattern": "^\\S+$",
+          "title": "Runner module",
           "type": "string",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -494,6 +525,7 @@
             ],
             "x-ck-required": false
           },
+          "title": "Allowed routes",
           "type": "array",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -515,6 +547,7 @@
             ],
             "x-ck-required": false
           },
+          "title": "Available tool capabilities",
           "type": "array",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -524,6 +557,7 @@
         "via_vault": {
           "default": false,
           "description": "Require an available account credential before choosing this runner.",
+          "title": "Require an account credential",
           "type": "boolean",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -558,6 +592,7 @@
             ],
             "x-ck-required": false
           },
+          "title": "Minimum quotas by pool",
           "type": "array",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -567,6 +602,7 @@
         "hold_when_reset_within": {
           "description": "Wait for an account only if its quota resets within this time. Use seconds (`s`), minutes (`m`), or hours (`h`). Omit to use the request's wait limit.",
           "pattern": "^\\+?[0-9]+[smh]$",
+          "title": "Longest time to wait for a quota reset",
           "type": "string",
           "x-ck-apply": "live",
           "x-ck-kind": "duration",
@@ -579,6 +615,7 @@
           "default": "3600s",
           "description": "Longest time a request may wait for an account. Use seconds (`s`), minutes (`m`), or hours (`h`).",
           "pattern": "^\\+?[0-9]+[smh]$",
+          "title": "Maximum wait for an account",
           "type": "string",
           "x-ck-apply": "live",
           "x-ck-kind": "duration",
@@ -589,6 +626,7 @@
         "metered_fallback": {
           "default": false,
           "description": "Allow this provider to use a pay-per-token account when its subscription accounts are unavailable.",
+          "title": "Allow pay-per-token fallback",
           "type": "boolean",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -607,6 +645,7 @@
             ],
             "x-ck-required": false
           },
+          "title": "Preferred account order",
           "type": "array",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -616,6 +655,7 @@
         "ordered": {
           "default": "main-first",
           "description": "For ordered selection, try main accounts first (`main-first`) or fallback accounts first (`fallback-first`).",
+          "title": "Main or fallback accounts first",
           "type": "string",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -625,6 +665,7 @@
         "paid_credits": {
           "default": true,
           "description": "Allow calls to draw on the account's paid credits.",
+          "title": "Allow paid credits",
           "type": "boolean",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -634,6 +675,7 @@
         "soft_quota_remaining_percent": {
           "description": "Prefer accounts with at least this percentage of quota remaining, from 0 to 100.",
           "format": "double",
+          "title": "Preferred remaining quota (%)",
           "type": "number",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -644,6 +686,7 @@
         "spend_budget_reset_at_ms": {
           "description": "Scheduled spending-limit reset as milliseconds since the Unix epoch. Omit for no scheduled reset.",
           "format": "int64",
+          "title": "Spending limit reset (Unix milliseconds)",
           "type": "integer",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -654,6 +697,7 @@
         "spend_budget_usd": {
           "description": "Maximum account spending in US dollars. Use a positive amount or omit for no spending limit.",
           "format": "double",
+          "title": "Spending limit (USD)",
           "type": "number",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -664,6 +708,7 @@
         "strategy": {
           "default": "sticky",
           "description": "How to choose among available accounts: `sticky`, `round_robin`, `hybrid`, or `ordered`.",
+          "title": "Account selection strategy",
           "type": "string",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -674,6 +719,7 @@
           "default": "900s",
           "description": "Wait this long before retrying an account whose reset time is unknown. Use seconds (`s`), minutes (`m`), or hours (`h`).",
           "pattern": "^\\+?[0-9]+[smh]$",
+          "title": "Retry delay when reset time is unknown",
           "type": "string",
           "x-ck-apply": "live",
           "x-ck-kind": "duration",
@@ -692,6 +738,7 @@
           "description": "Maximum simultaneous requests on this model, as a whole number of at least 1, or `none` to remove the cap.",
           "minimum": 1,
           "pattern": "^none$",
+          "title": "Maximum simultaneous requests",
           "type": [
             "integer",
             "string"
@@ -717,6 +764,7 @@
           "description": "Override the context window in tokens. Use a number greater than 0, or omit to use the catalog size.",
           "exclusiveMinimum": 0,
           "format": "double",
+          "title": "Context window (tokens)",
           "type": "number",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -728,6 +776,7 @@
           "description": "Override cost in US dollars per million output tokens, from 0 upward.",
           "format": "double",
           "minimum": 0,
+          "title": "Price per million output tokens (USD)",
           "type": "number",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -739,6 +788,7 @@
           "description": "Override the model's reasoning score. Use a number greater than 0, or omit to use the catalog score.",
           "exclusiveMinimum": 0,
           "format": "double",
+          "title": "Reasoning score override",
           "type": "number",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -750,6 +800,7 @@
           "description": "Override the model's collaboration score. Use a number greater than 0, or omit to use the catalog score.",
           "exclusiveMinimum": 0,
           "format": "double",
+          "title": "Collaboration score override",
           "type": "number",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -768,6 +819,7 @@
             ],
             "x-ck-required": false
           },
+          "title": "Blocked consumers",
           "type": "array",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -786,6 +838,7 @@
             ],
             "x-ck-required": false
           },
+          "title": "Allowed consumers",
           "type": "array",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -797,6 +850,7 @@
           "description": "Override generation speed in output tokens per second, from 0 upward. Omit to use measured or catalog speed.",
           "format": "double",
           "minimum": 0,
+          "title": "Generation speed (tokens per second)",
           "type": "number",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -806,6 +860,7 @@
         },
         "pin_only": {
           "description": "Require an explicitly named model instead of choosing it automatically. Omit to follow the provider or billing policy.",
+          "title": "Require an explicitly named model",
           "type": "boolean",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -824,6 +879,7 @@
             ],
             "x-ck-required": false
           },
+          "title": "Consumers that must name a model",
           "type": "array",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -838,6 +894,7 @@
             "fast",
             "ultrafast"
           ],
+          "title": "Service speed",
           "type": "string",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -850,6 +907,7 @@
           "exclusiveMinimum": 0,
           "format": "double",
           "maximum": 2,
+          "title": "Speed comparison multiplier",
           "type": "number",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -859,6 +917,7 @@
         },
         "subscription": {
           "description": "Treat this provider or model as a flat-rate subscription. Omit to use the account's billing information.",
+          "title": "Treat as a flat-rate subscription",
           "type": "boolean",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -869,6 +928,7 @@
         "subscription_multiplier": {
           "description": "This setting is ignored. Set the subscription cost multiplier on the provider instead.",
           "format": "double",
+          "title": "Subscription cost divisor (ignored)",
           "type": "number",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -878,6 +938,7 @@
         },
         "vision": {
           "description": "Override whether the model can read images. Omit to use catalog support.",
+          "title": "Image support",
           "type": "boolean",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -897,6 +958,7 @@
           "description": "Starting penalty before it grows with excess reasoning quality. In additive mode only; use 0 or more. If omitted in additive mode, uses 0.05.",
           "format": "double",
           "minimum": 0,
+          "title": "Starting penalty",
           "type": "number",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -908,6 +970,7 @@
           "description": "Extra reasoning score needed to double the penalty. In additive mode only; use a number greater than 0. If omitted in additive mode, uses 10.",
           "exclusiveMinimum": 0,
           "format": "double",
+          "title": "Extra reasoning score to double the penalty",
           "type": "number",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -922,6 +985,7 @@
             "additive",
             "cost_scaled"
           ],
+          "title": "Penalty method",
           "type": "string",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -932,6 +996,7 @@
           "description": "How far the model's reasoning score may exceed the target before adding a penalty. In additive mode only; use 0 or more. If omitted in additive mode, uses 40.",
           "format": "double",
           "minimum": 0,
+          "title": "Extra reasoning score allowed without penalty",
           "type": "number",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -949,6 +1014,7 @@
         "audit": {
           "$ref": "#/$defs/PanelPolicy",
           "description": "Model selection for audit panels. Omit to use the built-in audit policy.",
+          "title": "Audit panel",
           "x-ck-apply": "live",
           "x-ck-layers": [
             "user"
@@ -958,6 +1024,7 @@
         "design_review": {
           "$ref": "#/$defs/PanelPolicy",
           "description": "Model selection for design review panels. Omit to use the built-in design review policy.",
+          "title": "Design review panel",
           "x-ck-apply": "live",
           "x-ck-layers": [
             "user"
@@ -967,6 +1034,7 @@
         "diagnose": {
           "$ref": "#/$defs/PanelPolicy",
           "description": "Model selection for diagnosis panels. Omit to use the built-in diagnosis policy.",
+          "title": "Diagnosis panel",
           "x-ck-apply": "live",
           "x-ck-layers": [
             "user"
@@ -976,6 +1044,7 @@
         "evaluate": {
           "$ref": "#/$defs/PanelPolicy",
           "description": "Model selection for evaluation panels. Omit to use the built-in evaluation policy.",
+          "title": "Evaluation panel",
           "x-ck-apply": "live",
           "x-ck-layers": [
             "user"
@@ -985,6 +1054,7 @@
         "explain": {
           "$ref": "#/$defs/PanelPolicy",
           "description": "Model selection for explanation panels. Omit to use the built-in explanation policy.",
+          "title": "Explanation panel",
           "x-ck-apply": "live",
           "x-ck-layers": [
             "user"
@@ -994,6 +1064,7 @@
         "lab": {
           "$ref": "#/$defs/PanelPolicy",
           "description": "Model selection for lab panels. Omit to use the built-in lab policy.",
+          "title": "Lab panel",
           "x-ck-apply": "live",
           "x-ck-layers": [
             "user"
@@ -1003,6 +1074,7 @@
         "spec": {
           "$ref": "#/$defs/PanelPolicy",
           "description": "Model selection for specification panels. Omit to use the built-in specification policy.",
+          "title": "Specification panel",
           "x-ck-apply": "live",
           "x-ck-layers": [
             "user"
@@ -1023,6 +1095,7 @@
             "eq",
             "cost"
           ],
+          "title": "Ranking for leading models",
           "type": "string",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -1036,6 +1109,7 @@
           "format": "uint8",
           "maximum": 7,
           "minimum": 0,
+          "title": "Number of additional models",
           "type": "integer",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -1050,6 +1124,7 @@
             "eq",
             "cost"
           ],
+          "title": "Selection of additional models",
           "type": "string",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -1062,6 +1137,7 @@
           "format": "uint8",
           "maximum": 100,
           "minimum": 0,
+          "title": "Minimum panel quality score",
           "type": "integer",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -1074,6 +1150,7 @@
           "format": "uint8",
           "maximum": 8,
           "minimum": 1,
+          "title": "Number of leading models",
           "type": "integer",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -1095,6 +1172,7 @@
         "pin": {
           "default": "",
           "description": "Prefer this model in the project, as provider/model or provider/model:variant. Leave empty for ordinary selection.",
+          "title": "Preferred model",
           "type": "string",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -1120,6 +1198,7 @@
             ],
             "x-ck-required": false
           },
+          "title": "Minimum quotas by pool",
           "type": "array",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -1130,6 +1209,7 @@
         "hold_when_reset_within": {
           "description": "Wait for an account only if its quota resets within this time. Use seconds (`s`), minutes (`m`), or hours (`h`). Omit to use the request's wait limit.",
           "pattern": "^\\+?[0-9]+[smh]$",
+          "title": "Longest time to wait for a quota reset",
           "type": "string",
           "x-ck-apply": "live",
           "x-ck-kind": "duration",
@@ -1141,6 +1221,7 @@
         "max_hold": {
           "description": "Longest time a request may wait for an account. Use seconds (`s`), minutes (`m`), or hours (`h`).",
           "pattern": "^\\+?[0-9]+[smh]$",
+          "title": "Maximum wait for an account",
           "type": "string",
           "x-ck-apply": "live",
           "x-ck-kind": "duration",
@@ -1152,6 +1233,7 @@
         "metered_fallback": {
           "default": false,
           "description": "Allow this provider to use a pay-per-token account when its subscription accounts are unavailable.",
+          "title": "Allow pay-per-token fallback",
           "type": "boolean",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -1169,6 +1251,7 @@
             ],
             "x-ck-required": false
           },
+          "title": "Preferred account order",
           "type": "array",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -1178,6 +1261,7 @@
         },
         "ordered": {
           "description": "For ordered selection, try main accounts first (`main-first`) or fallback accounts first (`fallback-first`).",
+          "title": "Main or fallback accounts first",
           "type": "string",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -1187,6 +1271,7 @@
         },
         "paid_credits": {
           "description": "Allow calls to draw on the account's paid credits.",
+          "title": "Allow paid credits",
           "type": "boolean",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -1197,6 +1282,7 @@
         "soft_quota_remaining_percent": {
           "description": "Prefer accounts with at least this percentage of quota remaining, from 0 to 100.",
           "format": "double",
+          "title": "Preferred remaining quota (%)",
           "type": "number",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -1207,6 +1293,7 @@
         "spend_budget_reset_at_ms": {
           "description": "Scheduled spending-limit reset as milliseconds since the Unix epoch. Omit for no scheduled reset.",
           "format": "int64",
+          "title": "Spending limit reset (Unix milliseconds)",
           "type": "integer",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -1217,6 +1304,7 @@
         "spend_budget_usd": {
           "description": "Maximum account spending in US dollars. Use a positive amount or omit for no spending limit.",
           "format": "double",
+          "title": "Spending limit (USD)",
           "type": "number",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -1226,6 +1314,7 @@
         },
         "strategy": {
           "description": "How to choose among available accounts: `sticky`, `round_robin`, `hybrid`, or `ordered`.",
+          "title": "Account selection strategy",
           "type": "string",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -1236,6 +1325,7 @@
         "unknown_reset_retry": {
           "description": "Wait this long before retrying an account whose reset time is unknown. Use seconds (`s`), minutes (`m`), or hours (`h`).",
           "pattern": "^\\+?[0-9]+[smh]$",
+          "title": "Retry delay when reset time is unknown",
           "type": "string",
           "x-ck-apply": "live",
           "x-ck-kind": "duration",
@@ -1257,6 +1347,7 @@
             "metered_fallback": false
           },
           "description": "Account selection and spending rules that override the global account settings for this provider.",
+          "title": "Account settings override",
           "x-ck-apply": "live",
           "x-ck-layers": [
             "user"
@@ -1269,6 +1360,7 @@
             "emergency",
             "capacity"
           ],
+          "title": "When to count saved quota resets",
           "type": "string",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -1279,6 +1371,7 @@
           "default": 0.0,
           "description": "Reserve this percentage of weekly quota for operator-facing sessions, from 0 to 100.",
           "format": "double",
+          "title": "Weekly quota reserved for operators (%)",
           "type": "number",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -1296,6 +1389,7 @@
             ],
             "x-ck-required": false
           },
+          "title": "Allowed models",
           "type": "array",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -1314,6 +1408,7 @@
             ],
             "x-ck-required": false
           },
+          "title": "Blocked consumers",
           "type": "array",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -1332,6 +1427,7 @@
             ],
             "x-ck-required": false
           },
+          "title": "Allowed consumers",
           "type": "array",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -1341,6 +1437,7 @@
         },
         "pin_only": {
           "description": "Require an explicitly named model instead of choosing it automatically. Omit to follow the provider or billing policy.",
+          "title": "Require an explicitly named model",
           "type": "boolean",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -1359,6 +1456,7 @@
             ],
             "x-ck-required": false
           },
+          "title": "Consumers that must name a model",
           "type": "array",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -1369,6 +1467,7 @@
         "prompt_cache": {
           "default": true,
           "description": "Allow this provider to use cached prompts when available.",
+          "title": "Allow prompt caching",
           "type": "boolean",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -1382,6 +1481,7 @@
             "fast",
             "ultrafast"
           ],
+          "title": "Service speed",
           "type": "string",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -1391,6 +1491,7 @@
         },
         "subscription": {
           "description": "Treat this provider or model as a flat-rate subscription. Omit to use the account's billing information.",
+          "title": "Treat as a flat-rate subscription",
           "type": "boolean",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -1401,6 +1502,7 @@
         "subscription_multiplier": {
           "description": "Divide the estimated cost of using a subscription by this number. Use a number greater than 0.",
           "format": "double",
+          "title": "Subscription cost divisor",
           "type": "number",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -1417,6 +1519,7 @@
       "properties": {
         "model_prefix": {
           "description": "Beginning of the model name that this quota rule matches.",
+          "title": "Model name prefix",
           "type": "string",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -1426,6 +1529,7 @@
         },
         "pool": {
           "description": "Name of the additional quota pool used by matching models.",
+          "title": "Additional quota pool",
           "type": "string",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -1449,6 +1553,7 @@
           "description": "Days to keep reports from model runners. Minimum 1 day.",
           "format": "uint64",
           "minimum": 1,
+          "title": "Runner reports (days)",
           "type": "integer",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -1460,6 +1565,7 @@
           "description": "Days to keep account selections after their last activity. Minimum 7 days.",
           "format": "uint64",
           "minimum": 7,
+          "title": "Account selections (days)",
           "type": "integer",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -1471,6 +1577,7 @@
           "description": "Days to keep the summary of each routing decision. Minimum 1 day.",
           "format": "uint64",
           "minimum": 1,
+          "title": "Routing decision summaries (days)",
           "type": "integer",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -1482,6 +1589,7 @@
           "description": "Days to keep full scores and quota details for each routing decision. Minimum 1 day.",
           "format": "uint64",
           "minimum": 1,
+          "title": "Full routing decision details (days)",
           "type": "integer",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -1493,6 +1601,7 @@
           "description": "Keep full scoring details for one decision in this many until its summary expires. Set to 0 to keep no long-term samples.",
           "format": "uint64",
           "minimum": 0,
+          "title": "Long-term detail sampling (one in N)",
           "type": "integer",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -1504,6 +1613,7 @@
           "description": "Days to keep usage records for individual requests. Minimum 7 days.",
           "format": "uint64",
           "minimum": 7,
+          "title": "Request usage records (days)",
           "type": "integer",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -1520,6 +1630,7 @@
       "properties": {
         "harness": {
           "description": "Restrict this entry to one of the runner's named execution environments.",
+          "title": "Execution environment",
           "type": "string",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -1530,6 +1641,7 @@
         "module": {
           "description": "Name of the module that runs the selected model.",
           "pattern": "^\\S+$",
+          "title": "Runner module",
           "type": "string",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -1548,6 +1660,7 @@
             ],
             "x-ck-required": false
           },
+          "title": "Allowed routes",
           "type": "array",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -1567,6 +1680,7 @@
             ],
             "x-ck-required": false
           },
+          "title": "Available tool capabilities",
           "type": "array",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -1576,6 +1690,7 @@
         "via_vault": {
           "default": false,
           "description": "Require an available account credential before choosing this runner.",
+          "title": "Require an account credential",
           "type": "boolean",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -1595,6 +1710,7 @@
         "model": {
           "description": "Route to pin, written as provider/model.",
           "pattern": "^[^/\\s]+/[^\\s]+$",
+          "title": "Pinned model",
           "type": "string",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -1605,6 +1721,7 @@
         "variant": {
           "description": "Optional named model variant. Omit to use the model's usual variant.",
           "pattern": "\\S",
+          "title": "Model variant",
           "type": "string",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -1629,6 +1746,7 @@
         "metered_fallback": false
       },
       "description": "Default account selection and spending rules, unless a provider overrides them.",
+      "title": "Default account settings",
       "x-ck-apply": "live",
       "x-ck-layers": [
         "user"
@@ -1638,6 +1756,7 @@
       "$ref": "#/$defs/CatalogSection",
       "default": {},
       "description": "Settings for refreshing the model catalog.",
+      "title": "Model catalog refresh",
       "x-ck-apply": "live",
       "x-ck-layers": [
         "user"
@@ -1653,6 +1772,7 @@
         "providers": {}
       },
       "description": "Limits on the number of requests running at once.",
+      "title": "Concurrent request limits",
       "x-ck-apply": "live",
       "x-ck-layers": [
         "user"
@@ -1663,6 +1783,7 @@
       "description": "Number of failed sends in a row before temporarily avoiding a route. Must be at least 1.",
       "format": "uint32",
       "minimum": 1,
+      "title": "Failures before a route is avoided",
       "type": "integer",
       "x-ck-apply": "live",
       "x-ck-layers": [
@@ -1689,6 +1810,7 @@
           "x-ck-required": false
         }
       },
+      "title": "Consumer priorities",
       "type": "object",
       "unevaluatedProperties": false,
       "x-ck-apply": "live",
@@ -1712,6 +1834,7 @@
           "x-ck-required": false
         }
       },
+      "title": "Consumers",
       "type": "object",
       "unevaluatedProperties": false,
       "x-ck-apply": "live",
@@ -1726,6 +1849,7 @@
       "description": "Set how quickly the reasoning quality target rises as a request asks for more. Use a number greater than 0.",
       "exclusiveMinimum": 0,
       "format": "double",
+      "title": "How quickly the reasoning target rises",
       "type": "number",
       "x-ck-apply": "live",
       "x-ck-layers": [
@@ -1744,6 +1868,7 @@
         ],
         "x-ck-required": false
       },
+      "title": "Agents allowed to use reserved quota",
       "type": "array",
       "x-ck-apply": "live",
       "x-ck-layers": [
@@ -1754,6 +1879,7 @@
       "default": 0.6,
       "description": "Minimum fit for choosing a fallback model when none meets the quality target. Use a score from 0 to 1.",
       "format": "double",
+      "title": "Minimum fit for a fallback model",
       "type": "number",
       "x-ck-apply": "live",
       "x-ck-layers": [
@@ -1774,6 +1900,7 @@
           "x-ck-required": false
         }
       },
+      "title": "Model overrides",
       "type": "object",
       "unevaluatedProperties": false,
       "x-ck-apply": "live",
@@ -1787,6 +1914,7 @@
         "mode": "additive"
       },
       "description": "How much to discourage using a stronger model than a request needs.",
+      "title": "Penalty for using stronger models",
       "x-ck-apply": "live",
       "x-ck-layers": [
         "user"
@@ -1796,6 +1924,7 @@
       "$ref": "#/$defs/PanelPolicies",
       "default": {},
       "description": "How many models to choose and how to rank them for each panel type.",
+      "title": "Model selection for panels",
       "x-ck-apply": "live",
       "x-ck-layers": [
         "user"
@@ -1816,6 +1945,7 @@
         ],
         "x-ck-required": false
       },
+      "title": "Callers allowed to mark user choices",
       "type": "array",
       "x-ck-apply": "live",
       "x-ck-layers": [
@@ -1836,6 +1966,7 @@
           "x-ck-required": false
         }
       },
+      "title": "Providers",
       "type": "object",
       "unevaluatedProperties": false,
       "x-ck-apply": "live",
@@ -1855,6 +1986,7 @@
         ],
         "x-ck-required": false
       },
+      "title": "Additional model quota pools",
       "type": "array",
       "x-ck-apply": "live",
       "x-ck-layers": [
@@ -1865,6 +1997,7 @@
       "$ref": "#/$defs/RetentionSection",
       "default": {},
       "description": "How long to keep routing and account history, and how much scoring detail to keep.",
+      "title": "Routing history retention",
       "x-ck-apply": "live",
       "x-ck-layers": [
         "user"
@@ -1882,6 +2015,7 @@
         ],
         "x-ck-required": false
       },
+      "title": "Preferred runners",
       "type": "array",
       "x-ck-apply": "live",
       "x-ck-layers": [
@@ -1903,6 +2037,7 @@
           "x-ck-required": false
         }
       },
+      "title": "Subscription cost divisors",
       "type": "object",
       "unevaluatedProperties": false,
       "writeOnly": true,
@@ -1912,7 +2047,7 @@
       ]
     }
   },
-  "title": "RoutingConfigFile",
+  "title": "Routing",
   "type": "object",
   "unevaluatedProperties": false
 }
