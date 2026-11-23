@@ -30,21 +30,25 @@ impl ClassContext {
             .flat_map(|account| &account.credentials)
             .filter_map(|credential| {
                 let id = &credential.credential_id;
-                let org = self.quota.credential_orgs.get(id)?;
-                let readings = self.reading_index().accounts.get(&org.id)?;
-                let credit = readings
+                let org_id = self.quota.credential_orgs.get(id)?;
+                let readings = self.reading_index().accounts.get(org_id)?;
+                // The vault learns the org ID from the provider for this exact key.
+                // A reading must report that org itself, not just be indexed under it.
+                let mut matching =
+                    readings
+                        .iter()
+                        .map(|record| &record.reading.entry)
+                        .filter(|entry| {
+                            entry.get("account").and_then(Value::as_str) == Some(org_id.as_str())
+                        });
+                let reading = matching.next()?;
+                if matching.next().is_some() {
+                    return None;
+                }
+                let credit = reading
+                    .get("spend")?
+                    .as_array()?
                     .iter()
-                    .filter_map(|record| {
-                        let reading = &record.reading;
-                        let vendor = reading.routing_provider()?;
-                        if reading.entry.get("account")?.as_str()? != org.id
-                            || !org.vendors.iter().any(|served| served == vendor)
-                        {
-                            return None;
-                        }
-                        reading.entry.get("spend")?.as_array()
-                    })
-                    .flatten()
                     .filter_map(|pool| live_credit(pool, self.now_ms))
                     .min_by_key(|credit| credit.expires_at_ms)?;
                 Some((id.clone(), credit))

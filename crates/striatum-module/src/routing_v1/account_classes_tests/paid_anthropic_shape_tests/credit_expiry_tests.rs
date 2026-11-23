@@ -5,6 +5,10 @@ use sha2::{Digest, Sha256};
 
 const VIEW: &str = "paid-anthropic-vault";
 const ORGS: [&str; 2] = ["org-first", "org-second"];
+const CONSOLE_ORGS: [&str; 2] = [
+    "00000000-0000-4000-8000-000000000001",
+    "00000000-0000-4000-8000-000000000002",
+];
 
 fn credit(remaining: i64, expires_in_ms: i64) -> Value {
     json!({
@@ -16,19 +20,34 @@ fn credit(remaining: i64, expires_in_ms: i64) -> Value {
     })
 }
 
+fn console_reading(org: &str, credential_ref: &str, spend: Vec<Value>) -> Value {
+    json!({
+        "provider": "claude-console",
+        "account": org,
+        "accountInfo": {"orgName": "Example Org"},
+        "credentialRef": credential_ref,
+        "source": "vault",
+        "fetchedAt": rfc3339(NOW as i64),
+        "usage": {},
+        "spend": spend,
+    })
+}
+
 fn install_readings(links: [Option<&str>; 2], spend: [Option<Vec<Value>>; 2]) {
     let rows = ORGS
         .into_iter()
         .zip(spend)
         .filter_map(|(org, spend)| {
-            Some(json!({"provider": "claude-console", "apiProvider": "anthropic", "account": org,
-                "fetchedAt": rfc3339(NOW as i64), "spend": spend?}))
+            Some(
+                json!({"provider": "claude-console", "apiProvider": "anthropic", "account": org,
+                "fetchedAt": rfc3339(NOW as i64), "spend": spend?}),
+            )
         })
         .collect();
-    install_quota(links, rows);
+    install_quota(links, &[("claude-console", rows)]);
 }
 
-fn install_quota(links: [Option<&str>; 2], rows: Vec<Value>) {
+fn install_quota(links: [Option<&str>; 2], readings: &[(&str, Vec<Value>)]) {
     let mut quota = AccountQuotaState::default();
     account_quota::apply_roster_listing(
         &mut quota,
@@ -49,13 +68,15 @@ fn install_quota(links: [Option<&str>; 2], rows: Vec<Value>) {
         },
         NOW as i64,
     );
-    account_quota::apply_provider_reply(
-        &mut quota,
-        "claude-console",
-        &serde_json::to_vec(&json!({"result":rows})).unwrap(),
-        NOW as i64,
-    )
-    .unwrap();
+    for (provider, rows) in readings {
+        account_quota::apply_provider_reply(
+            &mut quota,
+            provider,
+            &serde_json::to_vec(&json!({"result":rows})).unwrap(),
+            NOW as i64,
+        )
+        .unwrap();
+    }
     *crate::ACCOUNT_QUOTA.get().unwrap().lock().unwrap() = quota;
 }
 
@@ -174,33 +195,61 @@ async fn keys_without_live_console_credit_fall_back() {
 
 #[tokio::test]
 async fn console_credit_links_by_org_without_api_provider() {
-    const CONSOLE_ORGS: [&str; 2] = [
-        "00000000-0000-4000-8000-000000000001",
-        "00000000-0000-4000-8000-000000000002",
-    ];
     let _clock = crate::InjectedClock::set(NOW);
     let harness = paid_anthropic_harness();
-    let rows = CONSOLE_ORGS
-        .into_iter()
-        .zip([240_000, 120_000])
-        .enumerate()
-        .map(|(index, (org, expires_in_ms))| {
-            json!({
-                "provider": "claude-console",
-                "account": org,
-                "accountInfo": {"orgName": format!("Example Org {}", index + 1)},
-                "credentialRef": format!("cookie:example-{}", index + 1),
-                "source": "vault",
-                "fetchedAt": rfc3339(NOW as i64),
-                "usage": {},
-                "spend": [credit(15833, expires_in_ms)],
-            })
-        })
-        .collect();
-    install_quota(CONSOLE_ORGS.map(Some), rows);
+    install_quota(
+        CONSOLE_ORGS.map(Some),
+        &[(
+            "claude-console",
+            vec![
+                console_reading(
+                    CONSOLE_ORGS[0],
+                    "cookie:example-1",
+                    vec![credit(15833, 240_000)],
+                ),
+                console_reading(
+                    CONSOLE_ORGS[1],
+                    "cookie:example-2",
+                    vec![credit(15833, 120_000)],
+                ),
+            ],
+        )],
+    );
     let broca = harness.bind(reserved("broca"), None).await;
     let admitted = result(broca.call("route.account_for", &request("org-only")).await);
     assert_eq!(admitted["account"]["credential_id"], KEYS[1]);
+}
+
+#[tokio::test]
+async fn console_credit_is_unknown_when_current_readings_share_an_org() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let harness = paid_anthropic_harness();
+    let org = CONSOLE_ORGS[1];
+    // Polls keep one reading per provider and account. Use two providers so
+    // both readings remain current, even though one offers no spend credit.
+    let mut other = console_reading(org, "cookie:example-2", vec![]);
+    other["provider"] = json!("other-spend-feed");
+    install_quota(
+        CONSOLE_ORGS.map(Some),
+        &[
+            (
+                "claude-console",
+                vec![console_reading(
+                    org,
+                    "cookie:example-1",
+                    vec![credit(15833, 120_000)],
+                )],
+            ),
+            ("other-spend-feed", vec![other]),
+        ],
+    );
+    let broca = harness.bind(reserved("broca"), None).await;
+    let admitted = result(
+        broca
+            .call("route.account_for", &request("ambiguous-org"))
+            .await,
+    );
+    assert_eq!(admitted["account"]["credential_id"], KEYS[0]);
 }
 
 #[tokio::test]

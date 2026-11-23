@@ -1490,7 +1490,7 @@ pub struct AccountQuotaState {
     pub credential_identities: BTreeMap<String, CredentialIdentity>,
     /// Provider organization links from the same listing as `roster`. An
     /// organization is not an account identity and never replaces one.
-    pub(crate) credential_orgs: BTreeMap<String, CredentialOrg>,
+    pub(crate) credential_orgs: BTreeMap<String, String>,
     pub roster_poll: RosterPoll,
     pub last_insula_error: Option<String>,
     /// Readings restored from the store at boot.
@@ -1554,18 +1554,13 @@ fn credential_identities(
     identities
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct CredentialOrg {
-    pub id: String,
-    pub vendors: Vec<String>,
-}
-
-fn credential_orgs(listing: &ScopedCredentialListing) -> BTreeMap<String, CredentialOrg> {
+fn credential_orgs(listing: &ScopedCredentialListing) -> BTreeMap<String, String> {
     let mut orgs = BTreeMap::new();
     for row in &listing.credentials {
-        let org = (row.auth_method.as_deref() == Some("apikey"))
-            .then(|| row.org_id.as_deref().map(|id| (id, &row.serves)))
-            .flatten();
+        let org = row
+            .org_id
+            .as_deref()
+            .filter(|_| row.auth_method.as_deref() == Some("apikey"));
         // Disagreement among repeated records makes only the credit link unknown.
         orgs.entry(&row.id)
             .and_modify(|previous| {
@@ -1576,16 +1571,7 @@ fn credential_orgs(listing: &ScopedCredentialListing) -> BTreeMap<String, Creden
             .or_insert(org);
     }
     orgs.into_iter()
-        .filter_map(|(credential, org)| {
-            let (id, vendors) = org?;
-            Some((
-                credential.clone(),
-                CredentialOrg {
-                    id: id.to_owned(),
-                    vendors: vendors.clone(),
-                },
-            ))
-        })
+        .filter_map(|(credential, org)| Some((credential.clone(), org?.to_owned())))
         .collect()
 }
 

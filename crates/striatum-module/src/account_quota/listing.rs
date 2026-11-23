@@ -19,7 +19,7 @@ pub(super) fn restore_complete_listing(
 // so restoration uses the client's row validation rather than a second decoder.
 pub(super) fn encode_with_orgs(
     listing: &ScopedCredentialListing,
-    orgs: &BTreeMap<String, super::CredentialOrg>,
+    orgs: &BTreeMap<String, String>,
 ) -> Value {
     json!({
         "view": listing.view,
@@ -36,8 +36,8 @@ pub(super) fn encode_with_orgs(
             if let Some(condition) = &row.condition {
                 value["condition"] = condition_json(condition);
             }
-            if let Some(org) = orgs.get(&row.id) {
-                value["org_id"] = json!(org.id);
+            if let Some(org_id) = orgs.get(&row.id) {
+                value["org_id"] = json!(org_id);
             }
             value
         }).collect::<Vec<_>>(),
