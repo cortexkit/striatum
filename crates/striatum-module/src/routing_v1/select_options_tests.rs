@@ -300,21 +300,18 @@ async fn prompt_cache_preference_reaches_the_adequate_scorer_only() {
 
 #[tokio::test]
 async fn settings_results_are_answered_and_pass_the_contract_answer_check() {
-    use crate::project_settings::tests::{census, root, write, Fake, ID};
+    use crate::managed_settings::test_daemon::ID;
     use cortexkit_role_routing::select::{
         check_answer, parse_select_request_serving, SelectAnswer,
     };
     for status in ["applied", "none", "unresolved"] {
         let (harness, route) = configured().await;
-        let project = root();
-        if status == "applied" {
-            write(&project, "{}");
+        let daemon = harness.project_daemon().await;
+        match status {
+            "applied" => daemon.set(ID, json!({})),
+            "none" => daemon.no_overrides(ID),
+            _ => daemon.refuse(ID),
         }
-        let source = Fake::new(census(&[project], None));
-        source
-            .fail
-            .store(status == "unresolved", std::sync::atomic::Ordering::Relaxed);
-        harness.settings_source(source);
         let request = select_body(json!({"settings":{"project_id":ID}}));
         let result = route.call("route.select", &request).await;
         assert_eq!(result.0, FrameType::Response, "{}", result.1);
@@ -338,8 +335,6 @@ async fn settings_results_are_answered_and_pass_the_contract_answer_check() {
 async fn empty_settings_is_global_only_and_a_mismatched_stamp_is_named() {
     use super::conformance_tests::reserved;
     let (harness, _route) = configured().await;
-    let project = crate::project_settings::tests::root();
-    crate::project_settings::tests::write(&project, "broken");
     harness.edit_config(|config| {
         config["consumers"][fixture::SUMMARY]["projects"]["project-a"] = json!({"pin":MODEL_A});
     });

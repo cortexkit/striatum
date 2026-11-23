@@ -353,18 +353,22 @@
         "runners": {
           "description": "Replace the global runner list for this consumer and its dotted subgroups. An empty list disables all runners.",
           "items": {
-            "$ref": "#/$defs/RunnerPolicy",
+            "$ref": "#/$defs/ConsumerRunnerPolicy",
             "description": "One module that can run the selected model.",
             "x-ck-apply": "live",
             "x-ck-layers": [
-              "user"
+              "user",
+              "workspace",
+              "project"
             ],
             "x-ck-required": false
           },
           "type": "array",
           "x-ck-apply": "live",
           "x-ck-layers": [
-            "user"
+            "user",
+            "workspace",
+            "project"
           ],
           "x-ck-required": false
         },
@@ -378,7 +382,9 @@
           "type": "string",
           "x-ck-apply": "live",
           "x-ck-layers": [
-            "user"
+            "user",
+            "workspace",
+            "project"
           ],
           "x-ck-required": false
         },
@@ -395,7 +401,9 @@
               "type": "string",
               "x-ck-apply": "live",
               "x-ck-layers": [
-                "user"
+                "user",
+                "workspace",
+                "project"
               ],
               "x-ck-required": false
             }
@@ -404,7 +412,9 @@
           "unevaluatedProperties": false,
           "x-ck-apply": "live",
           "x-ck-layers": [
-            "user"
+            "user",
+            "workspace",
+            "project"
           ],
           "x-ck-required": false
         },
@@ -437,7 +447,100 @@
         }
       },
       "type": "object",
-      "unevaluatedProperties": false
+      "unevaluatedProperties": false,
+      "x-ck-layers": [
+        "user",
+        "workspace",
+        "project"
+      ]
+    },
+    "ConsumerRunnerPolicy": {
+      "additionalProperties": false,
+      "description": "A runner module `routing/v1` answers with (`runners[]`).\nListed in preference order: the first listed runner that can serve the\nanswered route is named.",
+      "properties": {
+        "harness": {
+          "description": "Restrict this entry to one of the runner's named execution environments.",
+          "type": "string",
+          "x-ck-apply": "live",
+          "x-ck-layers": [
+            "user",
+            "workspace",
+            "project"
+          ],
+          "x-ck-required": false
+        },
+        "module": {
+          "description": "Name of the module that runs the selected model.",
+          "pattern": "^\\S+$",
+          "type": "string",
+          "x-ck-apply": "live",
+          "x-ck-layers": [
+            "user",
+            "workspace",
+            "project"
+          ],
+          "x-ck-required": true
+        },
+        "routes": {
+          "description": "Routes this runner may use, as provider, provider/model, or provider/model/variant. Omit to allow every route the runner supports.",
+          "items": {
+            "description": "One route or group of routes, as provider, provider/model, or provider/model/variant.",
+            "type": "string",
+            "x-ck-apply": "live",
+            "x-ck-layers": [
+              "user",
+              "workspace",
+              "project"
+            ],
+            "x-ck-required": false
+          },
+          "type": "array",
+          "x-ck-apply": "live",
+          "x-ck-layers": [
+            "user",
+            "workspace",
+            "project"
+          ],
+          "x-ck-required": false
+        },
+        "tool_capabilities": {
+          "default": [],
+          "description": "Tools this runner can provide, named by capability tags such as `code.read/v1`.",
+          "items": {
+            "description": "One tool capability tag.",
+            "type": "string",
+            "x-ck-apply": "live",
+            "x-ck-layers": [
+              "user"
+            ],
+            "x-ck-required": false
+          },
+          "type": "array",
+          "x-ck-apply": "live",
+          "x-ck-layers": [
+            "user"
+          ]
+        },
+        "via_vault": {
+          "default": false,
+          "description": "Require an available account credential before choosing this runner.",
+          "type": "boolean",
+          "x-ck-apply": "live",
+          "x-ck-layers": [
+            "user"
+          ]
+        }
+      },
+      "required": [
+        "module"
+      ],
+      "type": "object",
+      "unevaluatedProperties": false,
+      "x-ck-layers": [
+        "user",
+        "workspace",
+        "project"
+      ]
     },
     "DefaultAccountsPolicy": {
       "additionalProperties": false,
@@ -1602,7 +1705,9 @@
           "description": "Routing preferences for this consumer.",
           "x-ck-apply": "live",
           "x-ck-layers": [
-            "user"
+            "user",
+            "workspace",
+            "project"
           ],
           "x-ck-required": false
         }
@@ -1611,7 +1716,9 @@
       "unevaluatedProperties": false,
       "x-ck-apply": "live",
       "x-ck-layers": [
-        "user"
+        "user",
+        "workspace",
+        "project"
       ]
     },
     "demand_exponent": {

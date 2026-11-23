@@ -250,3 +250,405 @@ fn delivered_effective_settings_match_the_file_and_ignore_later_edits() {
     assert!(managed.config_apply(&bad).is_err());
     assert!(Arc::ptr_eq(&applied, &config_overrides::live_config(&path)));
 }
+
+#[test]
+fn project_review_accepts_scoped_tiers_and_an_unenrolled_runner() {
+    let mut workspace = ConfigLayerSnapshot::file(
+        "striatum",
+        ConfigLayer::Workspace,
+        "/isolated/workspace/striatum.jsonc",
+        Some(br#"{"consumers":{"prefrontal.sidekick":{"service_tier":"fast"}}}"#.to_vec()),
+    );
+    workspace.project_id = Some("pj-review".into());
+    workspace.workspace_id = Some("workspace".into());
+    let mut project = ConfigLayerSnapshot::file(
+        "striatum", ConfigLayer::Project, "/isolated/project/striatum.jsonc",
+        Some(br#"{"consumers":{"prefrontal.sidekick":{"runners":[{"module":"not-enrolled","harness":"opencode2","routes":["openai"]}],"service_tiers":{"openai":"ultrafast"}}}}"#.to_vec()),
+    );
+    project.project_id = workspace.project_id.clone();
+    let mut user = snapshot("{}");
+    user.project_id = project.project_id.clone();
+    let reply = review(
+        &review_schema(),
+        "striatum",
+        ConfigReviewRequest::new(0, vec![user, workspace, project], None),
+    );
+    assert!(reply.refusals.is_empty(), "{:?}", reply.refusals);
+    for (path, layer) in [
+        (
+            "/consumers/prefrontal.sidekick/service_tier",
+            Layer::Workspace,
+        ),
+        ("/consumers/prefrontal.sidekick/runners", Layer::Project),
+        (
+            "/consumers/prefrontal.sidekick/service_tiers/openai",
+            Layer::Project,
+        ),
+    ] {
+        let field = reply
+            .fields
+            .iter()
+            .find(|field| field.path == path)
+            .unwrap();
+        assert_eq!(field.project_id.as_deref(), Some("pj-review"));
+        assert_eq!(field.new_source, layer);
+    }
+}
+
+#[tokio::test]
+async fn project_capability_is_discovered_from_hello_or_describe_and_logs_disabled_once() {
+    use super::test_daemon::{Advertise, Daemon, ID};
+    for (advertise, enabled, describes) in [
+        (Advertise::Hello, true, 0),
+        (Advertise::Describe, true, 1),
+        (Advertise::Neither, false, 1),
+        (Advertise::Refused, false, 1),
+        (Advertise::Failed, false, 1),
+    ] {
+        crate::logging::take_operator_infos();
+        let dir = ScratchDir::new("project-capability");
+        let path = dir.join("routing.jsonc");
+        let (daemon, _connection) = Daemon::connect(&path, json!({}), advertise).await;
+        daemon.set(
+            ID,
+            json!({"consumers":{"prefrontal.sidekick":{"service_tier":"fast"}}}),
+        );
+        for _ in 0..2 {
+            assert_eq!(project_view(&path, ID).await.is_some(), enabled);
+        }
+        assert_eq!(daemon.gets(ID), usize::from(enabled));
+        assert_eq!(daemon.describes(), describes);
+        let startup = crate::logging::take_operator_infos();
+        assert_eq!(
+            startup
+                .iter()
+                .filter(|line| line.contains("project settings disabled:"))
+                .count(),
+            usize::from(!enabled),
+            "{startup:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn slow_server_describe_does_not_delay_global_settings_readiness() {
+    use super::test_daemon::{Advertise, Daemon, ID};
+    crate::logging::take_operator_infos();
+    let dir = ScratchDir::new("slow-project-capability");
+    let path = dir.join("routing.jsonc");
+    let user = json!({"consumers":{"prefrontal.sidekick":{"service_tier":"fast"}}});
+    let (daemon, _connection) = Daemon::connect(&path, user, Advertise::Slow).await;
+    let startup = crate::logging::take_operator_infos();
+    assert!(
+        startup
+            .iter()
+            .any(|line| line.contains("routing settings are ready")),
+        "{startup:?}"
+    );
+    assert!(
+        !startup
+            .iter()
+            .any(|line| line.contains("project settings disabled:")),
+        "{startup:?}"
+    );
+    assert_eq!(daemon.describes(), 1);
+    assert_eq!(
+        config_overrides::live_config(&path).service_tier("prefrontal.sidekick", "openai", "model"),
+        Some(crate::tier_settings::Tier::Fast.value())
+    );
+
+    tokio::time::pause();
+    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    tokio::task::yield_now().await;
+    assert!(project_view(&path, ID).await.is_none());
+    assert_eq!(daemon.gets(ID), 0);
+    let logs = crate::logging::take_operator_infos();
+    assert_eq!(
+        logs.iter()
+            .filter(|line| line.contains("project settings disabled:"))
+            .count(),
+        1,
+        "{logs:?}"
+    );
+}
+
+#[tokio::test]
+async fn project_delivery_reports_attempt_scope_and_nack_keeps_only_that_projects_view() {
+    use super::test_daemon::{self, Advertise, Daemon, ID};
+    use crate::tier_settings::Tier;
+    use subc_protocol::config::{ConfigApplyResult, ConfigGetReply};
+
+    let dir = ScratchDir::new("project-delivery");
+    let path = dir.join("routing.jsonc");
+    let user = json!({"consumers":{"prefrontal.sidekick":{"service_tier":"standard"}}});
+    let (daemon, _connection) = Daemon::connect(&path, user.clone(), Advertise::Hello).await;
+    let layer = |tier| json!({"consumers":{"prefrontal.sidekick":{"service_tier":tier}}});
+    let delivery = |generation, attempt, tier| {
+        let mut view = test_daemon::project_view(&user, ID, &layer(tier));
+        view.generation = generation;
+        view.attempt = Some(attempt);
+        view.status = ConfigStatus::Pending;
+        ConfigGetReply::new(None, Some(view))
+    };
+    async fn tier(path: &Path, project: &str) -> Tier {
+        project_view(path, project).await.unwrap().consumers["prefrontal.sidekick"]
+            .service_tier
+            .unwrap()
+    }
+    daemon.deliver(ID, delivery(3, 5, "fast"));
+    daemon.set("other", layer("ultrafast"));
+    daemon.no_overrides("plain");
+    assert_eq!(tier(&path, ID).await, Tier::Fast);
+    assert_eq!(tier(&path, "other").await, Tier::Ultrafast);
+    assert!(!project_view(&path, "plain").await.unwrap().applied);
+    let reports = daemon.reports();
+    assert_eq!(
+        reports.len(),
+        1,
+        "unstamped and unscoped views carry no attempt"
+    );
+    assert_eq!(reports[0].project_id.as_deref(), Some(ID));
+    assert_eq!(
+        (
+            reports[0].generation,
+            reports[0].attempt,
+            reports[0].result.clone()
+        ),
+        (3, 5, ConfigApplyResult::Ack)
+    );
+
+    daemon.deliver(ID, delivery(4, 6, "not-a-tier"));
+    daemon.changed(ID).await;
+    assert_eq!(tier(&path, ID).await, Tier::Fast);
+    assert_eq!(tier(&path, "other").await, Tier::Ultrafast);
+    assert_eq!(daemon.gets("other"), 1);
+    let reports = daemon.reports();
+    assert_eq!(reports.len(), 2);
+    assert_eq!(reports[1].project_id.as_deref(), Some(ID));
+    assert_eq!(
+        (
+            reports[1].generation,
+            reports[1].attempt,
+            reports[1].result.clone()
+        ),
+        (4, 6, ConfigApplyResult::Nack)
+    );
+    assert!(!reports[1].reasons.is_empty());
+    assert_eq!(
+        config_overrides::live_config(&path).service_tier("prefrontal.sidekick", "openai", "model"),
+        Some(Tier::Standard.value())
+    );
+}
+
+#[tokio::test]
+async fn global_settings_notice_refetches_only_the_global_view() {
+    use super::test_daemon::{Advertise, Daemon};
+    let dir = ScratchDir::new("project-global-notice");
+    let path = dir.join("routing.jsonc");
+    let (daemon, _connection) = Daemon::connect(&path, json!({}), Advertise::Hello).await;
+    for project in ["one", "two"] {
+        daemon.no_overrides(project);
+        assert!(project_view(&path, project).await.is_some());
+    }
+    daemon.no_overrides("not-requested");
+    daemon.global_changed().await;
+    assert_eq!(daemon.global_gets(), 2);
+    assert_eq!(daemon.gets("one"), 1);
+    assert_eq!(daemon.gets("two"), 1);
+    assert_eq!(daemon.gets("not-requested"), 0);
+}
+
+macro_rules! captured_project_frame {
+    ($file:literal) => {
+        include_bytes!(concat!("../../fixtures/subc-project-views-v1/", $file))
+    };
+}
+
+const CAPTURED_PROJECT: &str = "sample-project";
+const CAPTURED_MODULE: &str = "example-router";
+
+#[test]
+fn project_wire_capture_checksums_and_scoped_review_reply_are_pinned() {
+    use sha2::{Digest, Sha256};
+    use subc_protocol::config::ConfigDeclareRequest;
+    let sum = |bytes: &[u8]| format!("{:x}", Sha256::digest(bytes));
+    let files: [(&str, &[u8]); 9] = [
+        ("README.md", captured_project_frame!("README.md")),
+        (
+            "config-applied-project.stamped.json",
+            captured_project_frame!("config-applied-project.stamped.json"),
+        ),
+        (
+            "config-changed-project.stamped.json",
+            captured_project_frame!("config-changed-project.stamped.json"),
+        ),
+        (
+            "config-changed-project.unstamped.json",
+            captured_project_frame!("config-changed-project.unstamped.json"),
+        ),
+        (
+            "config-declare.json",
+            captured_project_frame!("config-declare.json"),
+        ),
+        (
+            "config-get-project-reply.stamped.json",
+            captured_project_frame!("config-get-project-reply.stamped.json"),
+        ),
+        (
+            "config-get-project-reply.unstamped.json",
+            captured_project_frame!("config-get-project-reply.unstamped.json"),
+        ),
+        (
+            "config-get-unknown-project.json",
+            captured_project_frame!("config-get-unknown-project.json"),
+        ),
+        (
+            "config-review-project.stamped.json",
+            captured_project_frame!("config-review-project.stamped.json"),
+        ),
+    ];
+    let sums = std::str::from_utf8(captured_project_frame!("SHA256SUMS")).unwrap();
+    assert_eq!(sums.lines().count(), files.len());
+    for (name, bytes) in files {
+        assert!(
+            sums.lines()
+                .any(|line| line == format!("{}  {name}", sum(bytes))),
+            "{name}"
+        );
+    }
+    let declare: ConfigDeclareRequest =
+        serde_json::from_slice(captured_project_frame!("config-declare.json")).unwrap();
+    let schema = Schema::new(declare.schema).unwrap();
+    let fixture: Value = serde_json::from_slice(captured_project_frame!(
+        "config-review-project.stamped.json"
+    ))
+    .unwrap();
+    let request: ConfigReviewRequest = serde_json::from_value(fixture["request"].clone()).unwrap();
+    assert_eq!(
+        request.layers[0].project_id.as_deref(),
+        Some(CAPTURED_PROJECT)
+    );
+    assert_eq!(
+        serde_json::to_value(review(&schema, CAPTURED_MODULE, request)).unwrap(),
+        fixture["reply"]
+    );
+}
+
+#[tokio::test]
+async fn real_project_get_and_change_frames_drive_the_cache_and_exact_ack() {
+    use super::test_daemon::{Advertise, Daemon};
+    let dir = ScratchDir::new("captured-project-views");
+    let path = dir.join("routing.jsonc");
+    let (daemon, _connection) =
+        Daemon::connect_as(CAPTURED_MODULE, &path, json!({}), Advertise::Hello).await;
+    daemon.captured_reply(
+        CAPTURED_PROJECT,
+        FrameType::Response,
+        captured_project_frame!("config-get-project-reply.unstamped.json"),
+    );
+    let view = project_view(&path, CAPTURED_PROJECT).await.unwrap();
+    assert!(view.applied);
+    // The example module's integer setting is not a routing override.
+    assert!(view.consumers.is_empty());
+    assert!(view.ignored_policy);
+    daemon
+        .captured_change(captured_project_frame!(
+            "config-changed-project.unstamped.json"
+        ))
+        .await;
+    assert!(project_view(&path, CAPTURED_PROJECT).await.unwrap().applied);
+    assert_eq!(daemon.gets(CAPTURED_PROJECT), 2);
+    assert!(daemon.report_bytes().is_empty());
+
+    let unknown = "unknown-sample-project";
+    daemon.captured_reply(
+        unknown,
+        FrameType::Error,
+        captured_project_frame!("config-get-unknown-project.json"),
+    );
+    assert!(!project_view(&path, unknown).await.unwrap().applied);
+    assert_eq!(daemon.gets(unknown), 1);
+
+    daemon.captured_reply(
+        CAPTURED_PROJECT,
+        FrameType::Response,
+        captured_project_frame!("config-get-project-reply.stamped.json"),
+    );
+    daemon
+        .captured_change(captured_project_frame!(
+            "config-changed-project.stamped.json"
+        ))
+        .await;
+    assert!(project_view(&path, CAPTURED_PROJECT).await.unwrap().applied);
+    assert_eq!(daemon.gets(CAPTURED_PROJECT), 3);
+    assert_eq!(daemon.gets(unknown), 1);
+    assert_eq!(
+        daemon.report_bytes(),
+        vec![captured_project_frame!("config-applied-project.stamped.json").to_vec()]
+    );
+}
+
+#[tokio::test]
+async fn failed_project_refresh_keeps_cached_runners_and_tiers_until_a_successful_retry() {
+    use super::test_daemon::{Advertise, Daemon, ID};
+    use crate::tier_settings::{Layers, Tier};
+    use std::time::Duration;
+
+    let dir = ScratchDir::new("project-refresh-failure");
+    let path = dir.join("routing.jsonc");
+    let consumer = "prefrontal.sidekick";
+    let user = json!({
+        "runners": [{"module":"project-runner"}],
+        "consumers": {consumer: {"service_tier":"standard"}}
+    });
+    let (daemon, _connection) = Daemon::connect(&path, user, Advertise::Hello).await;
+    let config = config_overrides::live_config(&path);
+    let layer = |tier, harness| {
+        json!({"consumers":{consumer:{
+            "service_tier":tier, "runners":[{"module":"project-runner","harness":harness}]
+        }}})
+    };
+    let assert_settings =
+        |view: Option<Arc<crate::project_settings::Overrides>>, tier: Tier, harness: &str| {
+            let layers = view.map_or_else(Layers::default, |view| {
+                Layers::new(view.consumers.clone(), Some(config.v1_runners()))
+            });
+            let selected_tier = layers.resolve(&config, consumer, "openai", "model", None);
+            let runners = layers.runners(consumer, &config, None);
+            let chosen_harness = runners
+                .as_ref()
+                .and_then(|runners| runners.first()?.harness.as_deref());
+            assert_eq!(
+                (selected_tier, chosen_harness),
+                (Some(tier.value()), Some(harness))
+            );
+        };
+
+    daemon.set(ID, layer("fast", "old-harness"));
+    assert_settings(project_view(&path, ID).await, Tier::Fast, "old-harness");
+    tokio::time::pause();
+
+    daemon.refuse(ID);
+    daemon.changed(ID).await;
+    assert_settings(project_view(&path, ID).await, Tier::Fast, "old-harness");
+    assert_eq!(daemon.gets(ID), 2);
+
+    daemon.delay(ID);
+    tokio::time::advance(Duration::from_secs(2)).await;
+    // One lookup retries while the other arrives before the daemon answers.
+    let (first, concurrent) = tokio::join!(project_view(&path, ID), project_view(&path, ID));
+    assert_settings(first, Tier::Fast, "old-harness");
+    assert_settings(concurrent, Tier::Fast, "old-harness");
+    assert_eq!(daemon.gets(ID), 3);
+
+    daemon.set(ID, layer("ultrafast", "new-harness"));
+    assert_settings(project_view(&path, ID).await, Tier::Fast, "old-harness");
+    assert_eq!(daemon.gets(ID), 3);
+    tokio::time::advance(Duration::from_secs(2)).await;
+    assert_settings(
+        project_view(&path, ID).await,
+        Tier::Ultrafast,
+        "new-harness",
+    );
+    assert_eq!(daemon.gets(ID), 4);
+}

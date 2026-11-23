@@ -80,6 +80,7 @@ pub(super) struct Harness {
     next_channel: AtomicU16,
     selection_profiles: Arc<Mutex<striatum_core::model_router::RouteTaskProfiles>>,
     subscription_pools: Mutex<Option<Box<dyn Send + Sync>>>,
+    settings_connection: Mutex<Option<crate::managed_settings::test_daemon::Connection>>,
 }
 
 impl Drop for Harness {
@@ -166,6 +167,7 @@ impl Harness {
             next_channel: AtomicU16::new(100),
             selection_profiles: Default::default(),
             subscription_pools: Default::default(),
+            settings_connection: Default::default(),
             dir,
         });
         harness.edit_config(|config| {
@@ -211,8 +213,13 @@ impl Harness {
         .unwrap();
     }
 
-    pub(crate) fn settings_source(&self, source: Arc<dyn crate::project_settings::Source>) {
-        crate::project_settings::set_test_source(&self.config_path.lock().unwrap(), source);
+    pub(crate) async fn project_daemon(&self) -> crate::managed_settings::test_daemon::Daemon {
+        use crate::managed_settings::test_daemon::{Advertise, Daemon};
+        let user = self.config.lock().unwrap().clone();
+        let (daemon, connection) =
+            Daemon::connect(&self.config_path_for_test(), user, Advertise::Hello).await;
+        *self.settings_connection.lock().unwrap() = Some(connection);
+        daemon
     }
 
     /// Change the routing configuration and publish it as a new file.

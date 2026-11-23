@@ -1,4 +1,6 @@
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -12,10 +14,13 @@ use subc_client_rs::config::{
 use tokio::sync::{mpsc, oneshot, Notify};
 use tokio::task::JoinHandle;
 
-use super::Settings;
+use super::{projects::Projects, Settings};
 use crate::{control_flags, send, ErrorBody, Frame, FrameType, ModuleError};
 
 pub(crate) const WAITING: &str = "waiting for the daemon's settings view";
+// The locked SDK predates the exported name for this daemon capability.
+pub(crate) const PROJECTS_CAPABILITY: &str = "config.settings.projects/v1";
+const SERVER_DESCRIBE: &str = "server.describe";
 const CALL_TIMEOUT: Duration = Duration::from_secs(10);
 const RETRY_INITIAL: Duration = Duration::from_secs(1);
 const RETRY_MAX: Duration = Duration::from_secs(60);
@@ -45,6 +50,7 @@ impl Session {
         path: &Path,
         negotiated_ver: u8,
         writer: &mpsc::Sender<Frame>,
+        projects_advertised: bool,
     ) -> Result<Self, ModuleError> {
         let settings = Settings {
             module_id: module_id.into(),
@@ -55,13 +61,14 @@ impl Session {
             settings: Arc::new(settings),
             ver: negotiated_ver,
             writer: writer.clone(),
-            pending: Mutex::new(None),
+            pending: Mutex::new(HashMap::new()),
+            next_corr: AtomicU64::new(crate::HELLO_CORR + 1),
+            projects: Projects::default(),
             changed: Notify::new(),
         });
         let (ready_tx, ready) = oneshot::channel();
         let mut driver = Driver {
             wire: Arc::clone(&wire),
-            next_corr: crate::HELLO_CORR + 1,
             ready: Some(ready_tx),
             has_view: false,
             report: None,
@@ -103,6 +110,7 @@ impl Session {
                             "[striatum] settings source: file (daemon refused config.declare)"
                                 .into(),
                         );
+                        crate::info_operator("[striatum] project settings disabled: managed settings are unavailable".into());
                         let result = load_files(&driver.wire.settings.path).await;
                         driver.finish_wait(result);
                         return;
@@ -116,15 +124,23 @@ impl Session {
             crate::info_operator(
                 "[striatum] settings source: managed (daemon advertised config.gate)".into(),
             );
-            match initial_get {
-                InitialGet::Fetch => driver.refresh().await,
-                InitialGet::Probed(reply) => driver.apply_reply(reply).await,
-                InitialGet::WaitForChange => {}
-            }
-            loop {
-                driver.wire.changed.notified().await;
-                driver.refresh().await;
-            }
+            let wire = Arc::clone(&driver.wire);
+            // Older daemons advertise the project protocol in server.describe
+            // only. That probe must not delay serving the global settings view.
+            tokio::join!(biased;
+                wire.discover_projects(projects_advertised),
+                async {
+                    match initial_get {
+                        InitialGet::Fetch => driver.refresh().await,
+                        InitialGet::Probed(reply) => driver.apply_reply(reply).await,
+                        InitialGet::WaitForChange => {}
+                    }
+                    loop {
+                        driver.wire.changed.notified().await;
+                        driver.refresh().await;
+                    }
+                },
+            );
         });
         Ok(Self { wire, ready, task })
     }
@@ -137,20 +153,18 @@ impl Session {
         }
         match frame.header.ty {
             FrameType::Response | FrameType::Error => {
-                let mut pending = self.wire.pending.lock().unwrap();
-                if pending
-                    .as_ref()
-                    .is_some_and(|(corr, _)| *corr == frame.header.corr)
+                if let Some(response) = self.wire.pending.lock().unwrap().remove(&frame.header.corr)
                 {
-                    let (_, response) = pending.take().unwrap();
                     let _ = response.send(frame.clone());
                     return true;
                 }
             }
             FrameType::Push if has_op(frame, CONFIG_CHANGED_OP) => {
                 match serde_json::from_slice::<ConfigChanged>(&frame.body) {
-                    Ok(hint) if hint.project_id.is_none() => self.wire.changed.notify_one(),
-                    Ok(_) => {}
+                    Ok(hint) => match hint.project_id {
+                        Some(project) => self.wire.projects.refresh_cached(&self.wire, &project),
+                        None => self.wire.changed.notify_one(),
+                    },
                     Err(error) => tracing::warn!(%error, "ignoring malformed config.changed"),
                 }
                 return true;
@@ -183,15 +197,41 @@ impl Drop for Session {
     }
 }
 
-struct Wire {
+pub(super) struct Wire {
     settings: Arc<Settings>,
     ver: u8,
     writer: mpsc::Sender<Frame>,
-    pending: Mutex<Option<(u64, oneshot::Sender<Frame>)>>,
+    pending: Mutex<HashMap<u64, oneshot::Sender<Frame>>>,
+    next_corr: AtomicU64,
+    pub(super) projects: Projects,
     changed: Notify,
 }
 
 impl Wire {
+    async fn discover_projects(self: &Arc<Self>, advertised: bool) {
+        let enabled = advertised
+            || self
+                .call(
+                    SERVER_DESCRIBE,
+                    &serde_json::json!({"op": SERVER_DESCRIBE}),
+                    Duration::from_secs(1),
+                )
+                .await
+                .is_ok_and(|reply| {
+                    reply["capabilities"].as_array().is_some_and(|values| {
+                        values.iter().any(|value| value == PROJECTS_CAPABILITY)
+                    })
+                });
+        if enabled {
+            self.projects.enable(self, &self.settings.path);
+        } else {
+            crate::info_operator(
+                "[striatum] project settings disabled: daemon did not advertise project settings"
+                    .into(),
+            );
+        }
+    }
+
     async fn review(&self, frame: Frame) -> Result<(), ModuleError> {
         let (kind, body) = match serde_json::from_slice::<ConfigReviewRequest>(&frame.body) {
             Ok(request) => {
@@ -221,7 +261,6 @@ impl Wire {
 
 struct Driver {
     wire: Arc<Wire>,
-    next_corr: u64,
     ready: Option<oneshot::Sender<Result<(), ModuleError>>>,
     has_view: bool,
     report: Option<ConfigAppliedRequest>,
@@ -315,22 +354,21 @@ impl Driver {
     }
 
     async fn apply_and_report(&mut self, view: ConfigView, attempt: u64) {
-        let generation = view.generation;
-        let (result, reasons) = match self.apply(view).await {
-            Ok(()) => (ConfigApplyResult::Ack, vec![]),
-            Err(reasons) => (ConfigApplyResult::Nack, reasons),
-        };
-        self.report = Some(ConfigAppliedRequest::new(
-            generation, attempt, result, reasons,
-        ));
+        let result = self.apply(view.clone()).await;
+        self.report = Some(applied_request(&view, attempt, &result));
         self.send_report().await;
     }
 
     async fn apply(&mut self, view: ConfigView) -> Result<(), Vec<String>> {
         let settings = Arc::clone(&self.wire.settings);
-        tokio::task::spawn_blocking(move || settings.config_apply(&view))
+        let view = Arc::new(view);
+        let delivered = Arc::clone(&view);
+        tokio::task::spawn_blocking(move || settings.config_apply(&delivered))
             .await
             .map_err(|error| vec![format!("config.apply: {error}")])??;
+        self.wire
+            .projects
+            .set_global(&self.wire, &self.wire.settings.path, view);
         self.has_view = true;
         self.finish_wait(Ok(()));
         Ok(())
@@ -354,22 +392,62 @@ impl Driver {
     }
 
     async fn call(&mut self, op: &str, body: &impl Serialize) -> Result<Value, ConfigError> {
-        let corr = self.next_corr;
-        self.next_corr = corr.checked_add(1).ok_or(ConfigError::ConnectionClosed)?;
+        self.wire.call(op, body, CALL_TIMEOUT).await
+    }
+}
+
+pub(super) fn applied_request<T>(
+    view: &ConfigView,
+    attempt: u64,
+    outcome: &Result<T, Vec<String>>,
+) -> ConfigAppliedRequest {
+    let (result, reasons) = match outcome {
+        Ok(_) => (ConfigApplyResult::Ack, vec![]),
+        Err(reasons) => (ConfigApplyResult::Nack, reasons.clone()),
+    };
+    let mut report = ConfigAppliedRequest::new(view.generation, attempt, result, reasons);
+    report.project_id.clone_from(&view.project_id);
+    report
+}
+
+impl Wire {
+    pub(super) fn module_id(&self) -> &str {
+        &self.settings.module_id
+    }
+
+    pub(super) async fn call(
+        &self,
+        op: &str,
+        body: &impl Serialize,
+        timeout: Duration,
+    ) -> Result<Value, ConfigError> {
+        let corr = self
+            .next_corr
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |corr| {
+                corr.checked_add(1)
+            })
+            .map_err(|_| ConfigError::ConnectionClosed)?;
         let body =
             serde_json::to_vec(body).map_err(|error| ConfigError::Protocol(error.to_string()))?;
-        let request = control_frame(self.wire.ver, FrameType::Request, corr, body)
+        let request = control_frame(self.ver, FrameType::Request, corr, body)
             .map_err(|error| ConfigError::Protocol(error.to_string()))?;
         let (tx, rx) = oneshot::channel();
-        *self.wire.pending.lock().unwrap() = Some((corr, tx));
-        let reply = tokio::time::timeout(CALL_TIMEOUT, async {
-            send(&self.wire.writer, request)
+        self.pending.lock().unwrap().insert(corr, tx);
+        // An abandoned request must release its correlation slot too.
+        struct Pending<'a>(&'a Wire, u64);
+        impl Drop for Pending<'_> {
+            fn drop(&mut self) {
+                self.0.pending.lock().unwrap().remove(&self.1);
+            }
+        }
+        let _pending = Pending(self, corr);
+        let reply = tokio::time::timeout(timeout, async {
+            send(&self.writer, request)
                 .await
                 .map_err(|_| ConfigError::ConnectionClosed)?;
             rx.await.map_err(|_| ConfigError::ConnectionClosed)
         })
         .await;
-        self.wire.pending.lock().unwrap().take();
         let reply = reply.map_err(|_| ConfigError::Timeout)??;
         if reply.header.ty == FrameType::Error {
             let error = serde_json::from_slice(&reply.body)

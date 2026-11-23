@@ -17,8 +17,6 @@ folders are routing-produced samples; these are frozen consumer inputs.
 | `test-vectors/broca-head-selection-v2/before/role.describe.json` | `a60bf6a845d06480de6c01bf2555e9b51972e1e43f5547873268df7669ee3d14` |
 | `test-vectors/broca-head-selection-v2/before-routed/role.describe.json` | `8488a915fe0bb8a8ac828d9969a475728e7a8554ddee704802b600e698789f86` |
 | `test-vectors/broca-head-selection-v2/after/role.describe.json` | `d6f2aaeb1a8b7421a11170f5fda7cd186d602e7fdc28bdf572cab3355984a52a` |
-| `test-vectors/project-resolve-v1/enumerate.json` | `89afedb88fa4ddec219f4932df22f26ca8395022c5c1dd399e3e50c9d50b94dd` |
-| `test-vectors/project-resolve-v1/resolve-project-id.json` | `4af3d3d6dd6b279146da2e50dd48dd507674f2806f6ac35e8f04b380bc5e901e` |
 | `test-vectors/diagnostics-findings-v1/request-empty.json` | `85e09268d9303b5e1863c341c3577ea77ecbea4d46eaafc7419c513109b41680` |
 | `test-vectors/diagnostics-findings-v1/request-window.json` | `01e32754c10783ceb1f1b9f2a61a0376888e772106de75b139d863bc55130042` |
 | `test-vectors/diagnostics-findings-v1/request-max-window.json` | `f5b7c7eadac60e9eb0d41a9235ac95d53c21e095a384cec521a653c5cbb8f43e` |
@@ -152,3 +150,13 @@ source `SHA256SUMS`; the tests use those body digests as the transport headers.
 | `thalamus-bus-route-fact-v1/typed-success.json` | `bdb59cf0af248f2f669554ae1741e06bfd8f9b25db5c6d4ee8830161cc46b63e` |
 | `thalamus-bus-route-fact-v2/mixed-headers.json` | `389e3b7dde17afc7995b98729ca2ac01d2a833b21f245faca63cd76bea0c4009` |
 | `thalamus-bus-route-fact-v2/all-headers-dropped.json` | `880027a45706c78c2c9fafdab55c19c90e9672b93b304f0d5f96aa9a8a995ecb` |
+
+## SUBC project settings views
+
+`subc-project-views-v1/` preserves the byte-for-byte capture from a real
+`ck-subc` built from commit `f55cc24e5062e46cb790dabcaf7430b82bbc4b93` on Linux.
+The rig used the daemon's `crates/subc-client-rs/tests/real_daemon/project_config.rs`
+helpers and an invented `example-router` module in scratch state. The capture
+README identifies the exchange for each frame, and `SHA256SUMS` was verified
+before import. The tests use the frames without rewriting their module or project
+IDs.

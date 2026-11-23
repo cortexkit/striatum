@@ -1,8 +1,7 @@
 use super::{install_catalog, install_panel_families, reserved, Harness};
-use crate::project_settings::tests::{census, write, Fake, ID};
+use crate::managed_settings::test_daemon::ID;
 use cortexkit_role_routing_conformance::fixture;
 use serde_json::{json, Value};
-use std::path::Path;
 use std::sync::{Arc, Mutex};
 use subc_protocol::FrameType;
 
@@ -45,11 +44,8 @@ fn fixture_with_runners(hosted: &[&str]) -> Arc<Harness> {
     harness
 }
 
-fn project_file(project: &Path, consumer: &str, runners: Value) {
-    write(
-        project,
-        &json!({"consumers":{consumer:{"runners":runners}}}).to_string(),
-    );
+fn runner_layer(consumer: &str, runners: Value) -> Value {
+    json!({"consumers":{consumer:{"runners":runners}}})
 }
 
 fn agent(harness: &str) -> Value {
@@ -78,19 +74,9 @@ fn result(reply: (FrameType, Value)) -> Value {
 async fn mason_uses_project_harness_order_and_other_scopes_keep_broca() {
     for (index, expected) in HARNESSES.into_iter().enumerate() {
         let harness = fixture_with_runners(&HARNESSES[index..]);
-        let scratch = cortexkit_test_support::ScratchDir::new("project-runner-order");
-        let project = scratch.join("project");
-        project_file(&project, MASON, json!(HARNESSES.map(agent)));
-        let mut registry = census(&[project], None);
-        let mut other = registry["result"]["projects"][0].clone();
-        other["projectId"] = json!("pj-other");
-        other["roots"] = json!([]);
-        other["rootRecords"] = json!([]);
-        registry["result"]["projects"]
-            .as_array_mut()
-            .unwrap()
-            .push(other);
-        harness.settings_source(Fake::new(registry));
+        let daemon = harness.project_daemon().await;
+        daemon.set(ID, runner_layer(MASON, json!(HARNESSES.map(agent))));
+        daemon.no_overrides("pj-other");
         let caller = harness.bind(reserved(fixture::CONSUMER), Some(ID)).await;
         let params = request(MASON);
         let reply = caller.call("route.select", &params).await;
@@ -118,45 +104,33 @@ async fn mason_uses_project_harness_order_and_other_scopes_keep_broca() {
 }
 
 #[tokio::test]
-async fn project_parent_runner_list_beats_more_specific_user_setting() {
+async fn more_specific_user_runner_list_beats_project_parent() {
     let harness = fixture_with_runners(&HARNESSES);
     harness.edit_config(|config| {
         config["consumers"]["prefrontal.sidekick.review"]["runners"] = json!([{"module":"broca"}]);
     });
-    let scratch = cortexkit_test_support::ScratchDir::new("project-runner-sidekick");
-    let project = scratch.join("project");
-    let workspace = scratch.join("workspace");
-    project_file(
-        &workspace,
-        "prefrontal.sidekick.review",
-        json!([agent("pi")]),
+    let daemon = harness.project_daemon().await;
+    daemon.set(
+        ID,
+        runner_layer("prefrontal.sidekick", json!([agent("claude-code")])),
     );
-    project_file(
-        &project,
-        "prefrontal.sidekick",
-        json!([agent("claude-code")]),
-    );
-    harness.settings_source(Fake::new(census(&[project], Some(&workspace))));
     let caller = harness.bind(reserved(fixture::CONSUMER), Some(ID)).await;
     let answer = result(
         caller
             .call("route.select", &request("prefrontal.sidekick.review"))
             .await,
     );
-    assert_agent(&answer, "claude-code");
+    assert_eq!(answer["runner"]["module"], "broca", "{answer}");
 }
 
 #[tokio::test]
 async fn request_runner_filter_cannot_add_an_enrolled_runner_left_out_of_the_project() {
     let harness = fixture_with_runners(&HARNESSES);
-    let scratch = cortexkit_test_support::ScratchDir::new("project-runner-filter");
-    let project = scratch.join("project");
-    project_file(
-        &project,
-        MASON,
-        json!([agent("opencode2"), agent("claude-code")]),
+    let daemon = harness.project_daemon().await;
+    daemon.set(
+        ID,
+        runner_layer(MASON, json!([agent("opencode2"), agent("claude-code")])),
     );
-    harness.settings_source(Fake::new(census(&[project], None)));
     let caller = harness.bind(reserved(fixture::CONSUMER), Some(ID)).await;
     let mut params = request(MASON);
     params["runners"] = json!(["broca"]);
@@ -170,28 +144,34 @@ async fn request_runner_filter_cannot_add_an_enrolled_runner_left_out_of_the_pro
 }
 
 #[tokio::test]
-async fn project_runner_edit_and_removal_apply_on_the_next_request() {
+async fn project_runner_change_refreshes_only_the_notified_project() {
     let harness = fixture_with_runners(&HARNESSES);
-    let scratch = cortexkit_test_support::ScratchDir::new("project-runner-reload");
-    let project = scratch.join("project");
-    let workspace = scratch.join("workspace");
-    project_file(&workspace, MASON, json!([agent("pi")]));
-    harness.settings_source(Fake::new(census(&[project.clone()], Some(&workspace))));
+    let daemon = harness.project_daemon().await;
+    daemon.set(ID, runner_layer(MASON, json!([agent("opencode2")])));
+    daemon.set("pj-other", runner_layer(MASON, json!([agent("pi")])));
     let caller = harness.bind(reserved(fixture::CONSUMER), Some(ID)).await;
+    let other = harness
+        .bind(reserved(fixture::CONSUMER), Some("pj-other"))
+        .await;
     let params = request(MASON);
-    project_file(&project, MASON, json!([agent("opencode2")]));
-    assert_agent(
-        &result(caller.call("route.select", &params).await),
-        "opencode2",
-    );
-    project_file(&project, MASON, json!([agent("claude-code")]));
+    for _ in 0..2 {
+        assert_agent(
+            &result(caller.call("route.select", &params).await),
+            "opencode2",
+        );
+        assert_agent(&result(other.call("route.select", &params).await), "pi");
+    }
+    assert_eq!((daemon.gets(ID), daemon.gets("pj-other")), (1, 1));
+    daemon.set(ID, runner_layer(MASON, json!([agent("claude-code")])));
+    daemon.changed(ID).await;
     assert_agent(
         &result(caller.call("route.select", &params).await),
         "claude-code",
     );
-    std::fs::remove_file(project.join(".cortexkit/striatum.jsonc")).unwrap();
-    assert_agent(&result(caller.call("route.select", &params).await), "pi");
-    std::fs::remove_file(workspace.join(".cortexkit/striatum.jsonc")).unwrap();
+    assert_agent(&result(other.call("route.select", &params).await), "pi");
+    assert_eq!((daemon.gets(ID), daemon.gets("pj-other")), (2, 1));
+    daemon.no_overrides(ID);
+    daemon.changed(ID).await;
     assert_eq!(
         result(caller.call("route.select", &params).await)["runner"]["module"],
         "broca"
@@ -201,10 +181,8 @@ async fn project_runner_edit_and_removal_apply_on_the_next_request() {
 #[tokio::test]
 async fn panel_seat_follows_project_runners_in_live_and_estimate_paths() {
     let harness = fixture_with_runners(&HARNESSES);
-    let scratch = cortexkit_test_support::ScratchDir::new("project-runner-panel");
-    let project = scratch.join("project");
-    project_file(&project, MASON, json!([agent("claude-code")]));
-    harness.settings_source(Fake::new(census(&[project], None)));
+    let daemon = harness.project_daemon().await;
+    daemon.set(ID, runner_layer(MASON, json!([agent("claude-code")])));
     let caller = harness.bind(reserved(fixture::CONSUMER), Some(ID)).await;
     for estimate in [false, true] {
         let answer = result(caller.call("route.select_panel", &json!({
@@ -244,54 +222,70 @@ impl tracing::Subscriber for WarningLog {
     fn exit(&self, _: &tracing::span::Id) {}
 }
 
-async fn invalid_project_runner_entry(entry: Value, reason: &str) {
+#[tokio::test]
+async fn unenrolled_runner_is_skipped_and_the_rest_applies() {
     let harness = fixture_with_runners(&HARNESSES);
-    let scratch = cortexkit_test_support::ScratchDir::new("invalid-project-runner");
-    let project = scratch.join("project");
-    let workspace = scratch.join("workspace");
-    project_file(&workspace, MASON, json!([agent("pi")]));
-    write(
-        &project,
-        &json!({"consumers":{
-            MASON:{"runners":[agent("opencode2")]},
-            "unrelated": {"runners":[entry]}
-        }})
-        .to_string(),
+    let daemon = harness.project_daemon().await;
+    daemon.set(
+        ID,
+        json!({"consumers":{
+            MASON:{"runners":[{"module":"not-enrolled"}, agent("opencode2")]},
+            "prefrontal.sidekick":{"runners":[agent("pi")]}
+        }}),
     );
-    harness.settings_source(Fake::new(census(&[project], Some(&workspace))));
     let caller = harness.bind(reserved(fixture::CONSUMER), Some(ID)).await;
     let mut params = request(MASON);
     params["settings"] = json!({"project_id":ID});
+    let answer = result(caller.call("route.select", &params).await);
+    assert_agent(&answer, "opencode2");
+    assert_eq!(answer["project_settings"], "applied");
+    assert_agent(
+        &result(
+            caller
+                .call("route.select", &request("prefrontal.sidekick"))
+                .await,
+        ),
+        "pi",
+    );
+}
+
+#[tokio::test]
+async fn daemon_project_ignores_user_only_fields_and_warns_once_per_unknown_name() {
+    let harness = fixture_with_runners(&HARNESSES);
+    harness.edit_config(|config| {
+        config["consumers"]
+            .as_object_mut()
+            .unwrap()
+            .remove("sidekick");
+    });
+    let daemon = harness.project_daemon().await;
+    daemon.set(ID, json!({
+        "runners": [{"module":"not-enrolled"}],
+        "consumers": {
+            MASON: {"pin":{"model":"anthropic/model-b"}, "runners":[{"module":AGENT,"harness":"opencode2","via_vault":true}]},
+            "sidekick":{"service_tier":"fast"},
+            "prefrontal.mason.child":{"service_tier":"fast"},
+            "prefrontal.sidekick.review":{},
+        }
+    }));
+    let caller = harness.bind(reserved(fixture::CONSUMER), Some(ID)).await;
+    let mut params = request(MASON);
+    params.as_object_mut().unwrap().remove("pin");
     let warnings = WarningLog::default();
     let _subscriber = tracing::subscriber::set_default(warnings.clone());
     for _ in 0..2 {
-        // Dispatch on this thread so the test subscriber sees handler warnings.
         let frame = caller.request_frame("route.select", &params);
-        let answer = result(harness.finish_dispatched(frame).await);
-        assert_eq!(answer["runner"]["module"], "broca", "{answer}");
-        assert_eq!(answer["project_settings"], "unresolved", "{answer}");
+        assert_agent(&result(harness.finish_dispatched(frame).await), "opencode2");
     }
     let log = warnings.0.lock().unwrap().join("\n");
+    assert_eq!(log.matches("ignored user-only fields").count(), 1, "{log}");
     assert_eq!(
-        log.matches("project settings unresolved").count(),
+        log.matches("unknown consumer in project routing settings")
+            .count(),
         1,
         "{log}"
     );
-    assert!(log.contains(reason), "expected {reason:?} in {log}");
-}
-
-#[tokio::test]
-async fn unenrolled_runner_rejects_the_whole_project_once() {
-    invalid_project_runner_entry(json!({"module":"not-enrolled"}), "is not enrolled").await;
-}
-
-#[tokio::test]
-async fn project_runner_rejects_via_vault_as_an_unknown_field() {
-    invalid_project_runner_entry(
-        json!({"module":AGENT,"via_vault":true}),
-        "unknown field `via_vault`",
-    )
-    .await;
+    assert!(log.contains("\"sidekick\""), "{log}");
 }
 
 #[tokio::test]
@@ -304,18 +298,18 @@ async fn project_routes_and_harnesses_cannot_widen_a_global_entry() {
             {"module":AGENT,"harness":"pi","routes":[MODEL]}
         ]);
     });
-    let scratch = cortexkit_test_support::ScratchDir::new("narrow-project-runner");
-    let project = scratch.join("project");
-    project_file(
-        &project,
-        MASON,
-        json!([
-            agent("opencode2"),
-            {"module":AGENT,"harness":"claude-code","routes":[MODEL]},
-            {"module":AGENT,"harness":"pi","routes":["anthropic"]}
-        ]),
+    let daemon = harness.project_daemon().await;
+    daemon.set(
+        ID,
+        runner_layer(
+            MASON,
+            json!([
+                agent("opencode2"),
+                {"module":AGENT,"harness":"claude-code","routes":[MODEL]},
+                {"module":AGENT,"harness":"pi","routes":["anthropic"]}
+            ]),
+        ),
     );
-    harness.settings_source(Fake::new(census(&[project.clone()], None)));
     let caller = harness.bind(reserved(fixture::CONSUMER), Some(ID)).await;
     assert_agent(
         &result(caller.call("route.select", &request(MASON)).await),
@@ -329,14 +323,16 @@ async fn project_routes_and_harnesses_cannot_widen_a_global_entry() {
     );
     // The bare entry inherits claude-code too, but its route restrictions
     // cannot hide a later entry for the same resolved pair.
-    project_file(
-        &project,
-        MASON,
-        json!([
-            {"module":AGENT,"routes":[MODEL]},
-            agent("claude-code")
-        ]),
+    daemon.set(
+        ID,
+        runner_layer(
+            MASON,
+            json!([
+                {"module":AGENT,"routes":[MODEL]}, agent("claude-code")
+            ]),
+        ),
     );
+    daemon.changed(ID).await;
     assert_agent(
         &result(caller.call("route.select", &excluded).await),
         "claude-code",
@@ -358,13 +354,131 @@ async fn project_may_choose_an_auto_enrolled_first_party_runner() {
         &mut harness.credentials().lock().unwrap(),
         crate::now_ms() as i64,
     );
-    let scratch = cortexkit_test_support::ScratchDir::new("auto-project-runner");
-    let project = scratch.join("project");
-    project_file(&project, MASON, json!([agent("pi")]));
-    harness.settings_source(Fake::new(census(&[project], None)));
+    let daemon = harness.project_daemon().await;
+    daemon.set(ID, runner_layer(MASON, json!([agent("pi")])));
     let caller = harness.bind(reserved(fixture::CONSUMER), Some(ID)).await;
     assert_agent(
         &result(caller.call("route.select", &request(MASON)).await),
         "pi",
     );
+}
+
+#[tokio::test]
+async fn slow_or_refused_project_get_uses_user_settings_and_retries_after_change() {
+    let harness = fixture_with_runners(&HARNESSES);
+    let daemon = harness.project_daemon().await;
+    daemon.delay("slow");
+    daemon.refuse("refused");
+    let warnings = WarningLog::default();
+    let _subscriber = tracing::subscriber::set_default(warnings.clone());
+    for project in ["slow", "refused"] {
+        let caller = harness
+            .bind(reserved(fixture::CONSUMER), Some(project))
+            .await;
+        let mut params = request(MASON);
+        params["settings"] = json!({"project_id":project});
+        for _ in 0..2 {
+            let answer = result(
+                harness
+                    .finish_dispatched(caller.request_frame("route.select", &params))
+                    .await,
+            );
+            assert_eq!(answer["runner"]["module"], "broca", "{answer}");
+            assert_eq!(answer["project_settings"], "unresolved");
+        }
+        assert_eq!(daemon.gets(project), 1);
+        daemon.set(project, runner_layer(MASON, json!([agent("pi")])));
+        daemon.changed(project).await;
+        assert_agent(&result(caller.call("route.select", &params).await), "pi");
+        assert_eq!(daemon.gets(project), 2);
+    }
+    let log = warnings.0.lock().unwrap().join("\n");
+    assert_eq!(
+        log.matches("project settings unresolved").count(),
+        2,
+        "{log}"
+    );
+    assert!(log.contains("layer_forbidden"), "{log}");
+}
+
+#[tokio::test]
+async fn unknown_project_is_a_no_layer_result_and_can_be_retried() {
+    let harness = fixture_with_runners(&HARNESSES);
+    let daemon = harness.project_daemon().await;
+    let caller = harness.bind(reserved(fixture::CONSUMER), Some(ID)).await;
+    let mut params = request(MASON);
+    params["settings"] = json!({"project_id":ID});
+    let warnings = WarningLog::default();
+    let _subscriber = tracing::subscriber::set_default(warnings.clone());
+    for _ in 0..2 {
+        let answer = result(
+            harness
+                .finish_dispatched(caller.request_frame("route.select", &params))
+                .await,
+        );
+        assert_eq!(answer["runner"]["module"], "broca", "{answer}");
+        assert_eq!(answer["project_settings"], "none", "{answer}");
+    }
+    assert_eq!(daemon.gets(ID), 1);
+    let log = warnings.0.lock().unwrap().join("\n");
+    assert_eq!(
+        log.matches("unknown_project: using user routing settings")
+            .count(),
+        1,
+        "{log}"
+    );
+    assert!(!log.contains("project settings unresolved"), "{log}");
+    daemon.set(ID, runner_layer(MASON, json!([agent("pi")])));
+    daemon.changed(ID).await;
+    assert_agent(&result(caller.call("route.select", &params).await), "pi");
+}
+
+#[tokio::test]
+async fn empty_project_child_preserves_user_runner_pin_and_exclusions() {
+    let harness = fixture_with_runners(&HARNESSES);
+    let parent = "prefrontal.sidekick";
+    let child = "prefrontal.sidekick.explore";
+    harness.edit_config(|config| {
+        config["consumers"][parent]["runners"] = json!([agent("pi")]);
+        config["consumers"][parent]["pin"] = json!({"model":MODEL});
+        config["consumers"][parent]["service_tier"] = json!("fast");
+        config["models"]["anthropic/model-b"]["not_for"] = json!([parent]);
+    });
+    let daemon = harness.project_daemon().await;
+    daemon.set(ID, json!({"consumers":{child:{}}}));
+    let route = harness.bind(reserved(fixture::CONSUMER), Some(ID)).await;
+    let mut params = request(child);
+    params.as_object_mut().unwrap().remove("pin");
+    params["settings"] = json!({"project_id":ID});
+    let answer = result(route.call("route.select", &params).await);
+    assert_agent(&answer, "pi");
+    assert_eq!(
+        answer["route"],
+        json!({"provider":"anthropic", "model":"model-a"})
+    );
+    assert!(
+        answer["explanation"]
+            .as_str()
+            .unwrap()
+            .contains("consumer's operator pin"),
+        "{answer}"
+    );
+    assert_eq!(answer["project_settings"], "applied");
+    let scoped = crate::managed_settings::project_view(&harness.config_path_for_test(), ID)
+        .await
+        .unwrap();
+    let layers = crate::tier_settings::Layers::new(scoped.consumers.clone(), None);
+    assert_eq!(
+        layers.resolve(
+            &harness.operator_config(),
+            child,
+            "anthropic",
+            "model-a",
+            None
+        ),
+        Some(crate::tier_settings::Tier::Fast.value())
+    );
+    params["pin"] = json!("anthropic/model-b");
+    let refused = route.call("route.select", &params).await;
+    assert_eq!(refused.1["detail"]["reason"], "excluded", "{refused:?}");
 }

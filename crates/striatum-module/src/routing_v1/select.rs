@@ -282,12 +282,13 @@ pub(super) async fn evaluate_with_inputs(
         caller,
         deps,
         &shared.operator_config,
+        Some(&shared.project_views),
     )
     .await?;
     let mut inputs = prepare_selection(params, caller, deps, shared, &layers, Some(view)).await?;
     if panel_seat {
         let request = inputs.request.clone();
-        let empty = crate::tier_settings::Layers::new(None, None);
+        let empty = crate::tier_settings::Layers::default();
         return select_with_tier_fallback(
             params,
             caller,
@@ -311,7 +312,7 @@ pub(super) async fn evaluate_with_inputs(
         None,
         None,
         &mut TierTrace::default(),
-        &crate::tier_settings::Layers::new(None, None),
+        &crate::tier_settings::Layers::default(),
         panel_seat,
         Some(view),
         shared,
@@ -365,21 +366,19 @@ async fn select_with_profile_lookup_kind(
     );
     let consumers = super::consumers::effective(&config);
     let request = parse_admitted_request(params, caller, &consumers, false)?;
-    let (project_layers, project_settings) =
-        super::scoped_settings(request.settings.as_ref(), caller, deps, &config).await?;
-    let legacy_layers;
+    let (project_layers, project_settings) = super::scoped_settings(
+        request.settings.as_ref(),
+        caller,
+        deps,
+        &config,
+        shared.map(|inputs| &inputs.project_views),
+    )
+    .await?;
+    let global_layers = crate::tier_settings::Layers::default();
     let settings_layers = if project_settings.is_some() {
         &project_layers
     } else {
-        legacy_layers = if request.settings.is_none() {
-            crate::tier_settings::Layers::new(
-                params.get("project_root").and_then(Value::as_str),
-                params.get("workspace_root").and_then(Value::as_str),
-            )
-        } else {
-            crate::tier_settings::Layers::new(None, None)
-        };
-        &legacy_layers
+        &global_layers
     };
     let mut effective_request = request.clone();
     let mut result = async {
@@ -630,6 +629,7 @@ fn record_pinned_refusal(
 pub(super) struct RequestInputs {
     pub(super) live_config: std::sync::Arc<config_overrides::LiveConfig>,
     pub(super) operator_config: std::sync::Arc<config_overrides::LiveConfig>,
+    pub(super) project_views: crate::managed_settings::RequestViews,
     pub(super) catalog_snapshot: std::sync::Arc<striatum_store::CatalogFactsSnapshot>,
     pub(super) efforts: effort_preview::Efforts,
     facts: Vec<ModelFact>,
@@ -675,6 +675,7 @@ impl RequestInputs {
         Ok(Self {
             live_config,
             operator_config,
+            project_views: Default::default(),
             efforts: effort_preview::Efforts {
                 models: catalog_snapshot.efforts.clone(),
                 workloads: Default::default(),
@@ -952,7 +953,11 @@ async fn prepare_selection(
         },
         &consumers.policies,
     );
-    if let Some(runners) = project_layers.runners(&consumer) {
+    if let Some(runners) = project_layers.runners(
+        &consumer,
+        operator_config,
+        consumer_policy.runners.as_deref(),
+    ) {
         consumer_policy.runners = Some(runners);
         consumer_policy.runner = None;
     }

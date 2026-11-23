@@ -243,6 +243,30 @@ fn schema_pins_field_metadata_and_omission() {
                 assert_eq!(node["unevaluatedProperties"], false, "{owner}{path}");
             }
             assert!(!node["additionalProperties"].is_object(), "{owner}{path}");
+            let project_layers = matches!(
+                (owner, path),
+                ("Root", "/consumers" | "/consumers/*")
+                    | (
+                        "ConsumerPolicy",
+                        "" | "/runners"
+                            | "/runners/*"
+                            | "/service_tier"
+                            | "/service_tiers"
+                            | "/service_tiers/*"
+                    )
+                    | (
+                        "ConsumerRunnerPolicy",
+                        "" | "/module" | "/harness" | "/routes" | "/routes/*"
+                    )
+            );
+            if project_layers || !path.is_empty() {
+                let expected = if project_layers {
+                    json!(["user", "workspace", "project"])
+                } else {
+                    json!(["user"])
+                };
+                assert_eq!(node["x-ck-layers"], expected, "{owner}{path}");
+            }
             if path.is_empty() {
                 return;
             }
@@ -251,7 +275,6 @@ fn schema_pins_field_metadata_and_omission() {
                 "{owner}{path}"
             );
             assert_eq!(node["x-ck-apply"], "live", "{owner}{path}");
-            assert_eq!(node["x-ck-layers"], json!(["user"]), "{owner}{path}");
             match node.get("default") {
                 Some(default) => {
                     fn contains_null(v: &Value) -> bool {
@@ -280,6 +303,7 @@ fn schema_pins_field_metadata_and_omission() {
         ("CapOverride", "/scope"),
         ("CapSettings", "/accounts/* /models/* /plans/* /providers/*"),
         ("ConsumerPolicy", "/below_bar /context_tokens /eq /iq /ladder /ladder/* /max_output_tokens /mode /owner /pay_per_token /pin /projects/* /runner /runners /runners/* /service_tier /service_tiers /service_tiers/* /tool_capabilities /tool_capabilities/* /workload"),
+        ("ConsumerRunnerPolicy", "/harness /routes /routes/* /tool_capabilities/*"),
         ("DefaultAccountsPolicy", "/floors/* /hold_when_reset_within /order/* /soft_quota_remaining_percent /spend_budget_reset_at_ms /spend_budget_usd"),
         ("ModelFactOverride", "/context_window_tokens /cost_per_mtok_out /elo /eq /not_for /not_for/* /only_for /only_for/* /output_tokens_per_second /pin_only /pin_only_for /pin_only_for/* /service_tier /speed_multiplier /subscription /subscription_multiplier /vision"),
         ("OverqualificationSection", "/base /doubling /threshold"),

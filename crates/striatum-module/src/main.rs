@@ -288,10 +288,6 @@ async fn run(
     shutdown: &shutdown::Shutdown,
     store: &mut Option<SharedStore>,
 ) -> Result<(), ModuleError> {
-    project_settings::initialize(
-        &config.connection_file_path,
-        &std::env::current_dir().map_err(|error| ModuleError::Message(error.to_string()))?,
-    );
     runtime_lag::RuntimeLagProbe::default().start("routing runtime");
     let registered = registration.is_some();
     let stream = if let Some(mut stream) = registration {
@@ -402,6 +398,9 @@ where
     let config_path = &config.config_path;
     if !daemon_has_config_gate {
         info_operator(
+            "[striatum] project settings disabled: managed settings are unavailable".into(),
+        );
+        info_operator(
             "[striatum] settings source: file (daemon did not advertise config.gate)".into(),
         );
         check_config_at(config_path)?;
@@ -446,6 +445,9 @@ where
             config_path,
             ack.negotiated_ver,
             &writer,
+            ack.subc_capabilities
+                .iter()
+                .any(|capability| capability == managed_settings::PROJECTS_CAPABILITY),
         )?)
     } else {
         None

@@ -1,9 +1,14 @@
 //! Routing's settings hooks and the channel-0 session that drives them.
 
+mod projects;
 mod session;
 #[cfg(test)]
+#[path = "managed_settings/test_daemon/tests.rs"]
+pub(crate) mod test_daemon;
+#[cfg(test)]
 mod tests;
-pub(super) use session::{Session, WAITING};
+pub(super) use projects::{project_view, RequestViews};
+pub(super) use session::{Session, PROJECTS_CAPABILITY, WAITING};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
@@ -109,41 +114,64 @@ fn review_layers(
     module_id: &str,
     request: ConfigReviewRequest,
 ) -> Result<Vec<FieldChange>, ConfigReviewRefusal> {
-    fn invalid_document(reason: impl Into<String>) -> ConfigReviewRefusal {
-        ConfigReviewRefusal::new("value_invalid", vec![String::new()], vec![reason.into()])
-    }
     let mut layers = Vec::new();
     let mut raw_user = None;
+    let project = request
+        .layers
+        .iter()
+        .find_map(|layer| layer.project_id.clone());
+    let invalid_document = |reason: String| {
+        let mut refusal =
+            ConfigReviewRefusal::new("value_invalid", vec![String::new()], vec![reason]);
+        refusal.project_id.clone_from(&project);
+        refusal
+    };
     for snapshot in request.layers {
-        if snapshot.module_id != module_id
-            || snapshot.layer.known_layer() != Some(Layer::User)
-            || snapshot.project_id.is_some()
-            || snapshot.workspace_id.is_some()
-        {
-            return Err(ConfigReviewRefusal::new(
-                "layer_forbidden",
-                vec![String::new()],
-                vec!["routing only accepts a global user layer".into()],
-            ));
-        }
+        let layer = snapshot
+            .layer
+            .known_layer()
+            .filter(|layer| {
+                let scope = snapshot.project_id.as_deref();
+                snapshot.module_id == module_id
+                    && scope == project.as_deref()
+                    && match layer {
+                        Layer::User => snapshot.workspace_id.is_none(),
+                        Layer::Workspace => scope.is_some() && snapshot.workspace_id.is_some(),
+                        Layer::Project => scope.is_some(),
+                        _ => false,
+                    }
+            })
+            .ok_or_else(|| {
+                let mut refusal = ConfigReviewRefusal::new(
+                    "layer_forbidden",
+                    vec![String::new()],
+                    vec!["routing settings snapshots disagree on module or project scope".into()],
+                );
+                refusal.project_id.clone_from(&project);
+                refusal
+            })?;
         if let Some(bytes) = snapshot.bytes {
             let document =
                 String::from_utf8(bytes).map_err(|error| invalid_document(error.to_string()))?;
             let json = subc_jsonc::jsonc_to_json(&document).map_err(invalid_document)?;
             let value =
                 serde_json::from_str(&json).map_err(|error| invalid_document(error.to_string()))?;
-            layers.push(LayerValue::new(Layer::User, value));
-            raw_user = Some(document);
+            layers.push(LayerValue::new(layer, value));
+            if layer == Layer::User {
+                raw_user = Some(document);
+            }
         }
     }
     let tuple = schema
-        .review_tuple(&layers, &ValidationContext::new(module_id, None))
+        .review_tuple(&layers, &ValidationContext::new(module_id, project.clone()))
         .map_err(|error| {
-            ConfigReviewRefusal::new(
+            let mut refusal = ConfigReviewRefusal::new(
                 "value_invalid",
                 vec![error.path.clone()],
                 vec![error.to_string()],
-            )
+            );
+            refusal.project_id.clone_from(&project);
+            refusal
         })?;
     let old = request.base.as_ref();
     // Use the SDK's field boundaries, including arrays that are replaced as a
@@ -170,11 +198,17 @@ fn review_layers(
                 RecordedValue::new(after.cloned().unwrap_or(Value::Null)),
                 ApplyKind::Live,
             );
+            field.project_id.clone_from(&project);
             field.old_source = old_source;
             field.new_source = new_source;
             Some(field)
         })
         .collect();
+    // Runtime restrictions and enrollment are evaluated against the global
+    // configuration. A project list cannot add enrollment or invalidate it.
+    if project.is_some() {
+        return Ok(fields);
+    }
     let effective = serde_json::to_string(&tuple.effective)
         .map_err(|error| invalid_document(error.to_string()))?;
     // Test both forms: the original text can contain repeated keys that do

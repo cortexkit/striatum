@@ -375,6 +375,22 @@ pub(crate) fn effective(config: &LiveConfig) -> Registry {
         .effective(config)
 }
 
+pub(crate) fn is_declared_or_builtin(name: &str) -> bool {
+    crate::select_policy::Consumer::from_id(name).is_some()
+        || crate::config_policy::is_slot(name)
+        || CATALOG
+            .get_or_init(Default::default)
+            .read()
+            .unwrap()
+            .modules
+            .values()
+            .any(|declared| {
+                declared
+                    .keys()
+                    .any(|declared| crate::config_policy::consumer_matches(declared, name))
+            })
+}
+
 /// Capabilities come from verified daemon catalog entries, independently of
 /// whether the module declares routing consumers.
 pub(crate) fn provides_agent_host(module: &str) -> bool {

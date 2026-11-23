@@ -288,6 +288,7 @@ async fn scoped_settings(
     caller: &Caller,
     deps: &Deps<'_>,
     config: &crate::config_overrides::LiveConfig,
+    request_views: Option<&crate::managed_settings::RequestViews>,
 ) -> Result<
     (
         crate::tier_settings::Layers,
@@ -295,25 +296,43 @@ async fn scoped_settings(
     ),
     Refusal,
 > {
+    use cortexkit_role_routing::select::ProjectSettings;
     let stamped_project = caller.stamped_project();
     if let Some(settings) = settings {
         settings.check_project_stamp(stamped_project)?;
     }
     let tier_project = settings.and_then(|settings| settings.project_id.as_deref());
     let Some(project) = stamped_project.or(tier_project) else {
-        return Ok((crate::tier_settings::Layers::new(None, None), None));
+        return Ok((crate::tier_settings::Layers::default(), None));
     };
-    let enrolled = runners::enrollment::enrolled(
-        &config.v1_runners(),
-        &*deps.broca_credentials.lock().map_err(store_refusal)?,
-    );
-    let (mut layers, status) =
-        crate::project_settings::layers(project, deps.routing_config_path, &enrolled).await;
+    let view = match request_views {
+        Some(views) => views.get(deps.routing_config_path, project).await,
+        None => crate::managed_settings::project_view(deps.routing_config_path, project).await,
+    };
+    let Some(view) = view else {
+        return Ok((
+            crate::tier_settings::Layers::default(),
+            tier_project.map(|_| ProjectSettings::Unresolved),
+        ));
+    };
     // The wire contract lets an unscoped caller opt into tier settings, but
     // runner placement is operator policy keyed only by the daemon's stamp.
-    if stamped_project.is_none() {
-        layers.retain_tiers_only();
-    }
+    let enrolled = if stamped_project.is_some()
+        && view.consumers.values().any(|entry| entry.runners.is_some())
+    {
+        Some(runners::enrollment::enrolled(
+            &config.v1_runners(),
+            &*deps.broca_credentials.lock().map_err(store_refusal)?,
+        ))
+    } else {
+        None
+    };
+    let layers = crate::tier_settings::Layers::new(view.consumers.clone(), enrolled);
+    let status = if view.applied {
+        ProjectSettings::Applied
+    } else {
+        ProjectSettings::None
+    };
     Ok((layers, tier_project.map(|_| status)))
 }
 

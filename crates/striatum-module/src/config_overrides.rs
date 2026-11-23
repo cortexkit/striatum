@@ -232,23 +232,57 @@ impl LiveConfig {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn service_tier(
         &self,
         consumer: &str,
         provider: &str,
         model: &str,
     ) -> Option<cortexkit_role_routing::service_tier::ServiceTier> {
+        self.service_tier_with(consumer, provider, model, None)
+    }
+
+    pub(crate) fn service_tier_with(
+        &self,
+        consumer: &str,
+        provider: &str,
+        model: &str,
+        project: Option<&BTreeMap<String, crate::tier_settings::Consumer>>,
+    ) -> Option<cortexkit_role_routing::service_tier::ServiceTier> {
         crate::tier_settings::at_level(
             consumer,
             provider,
             model,
-            self.config.consumers.iter().map(|(id, policy)| {
-                (
-                    id.clone(),
-                    policy.service_tier,
-                    policy.service_tiers.clone().unwrap_or_default(),
-                )
-            }),
+            self.config
+                .consumers
+                .iter()
+                .map(|(id, policy)| {
+                    let scoped = project.and_then(|entries| entries.get(id));
+                    (
+                        id.clone(),
+                        scoped
+                            .and_then(|entry| entry.service_tier)
+                            .or(policy.service_tier),
+                        scoped
+                            .and_then(|entry| entry.service_tiers.as_ref())
+                            .or(policy.service_tiers.as_ref())
+                            .cloned()
+                            .unwrap_or_default(),
+                    )
+                })
+                .chain(
+                    project
+                        .into_iter()
+                        .flat_map(|entries| entries.iter())
+                        .filter(|(id, _)| !self.config.consumers.contains_key(*id))
+                        .map(|(id, entry)| {
+                            (
+                                id.clone(),
+                                entry.service_tier,
+                                entry.service_tiers.clone().unwrap_or_default(),
+                            )
+                        }),
+                ),
             self.config
                 .model_routing
                 .models
@@ -1037,6 +1071,15 @@ impl LiveConfig {
                     .map(|runners| (name.clone(), runners))
             })
             .collect()
+    }
+
+    pub(crate) fn has_more_specific_runner_list(&self, consumer: &str, than: &str) -> bool {
+        use crate::config_policy::{consumer_matches, consumer_specificity};
+        self.config.consumers.iter().any(|(name, policy)| {
+            policy.runners.is_some()
+                && consumer_matches(name, consumer)
+                && consumer_specificity(name) > consumer_specificity(than)
+        })
     }
 
     /// The operator's pin for `consumer` within `project_id`, if any.
@@ -1833,11 +1876,6 @@ pub(super) fn config_path(module_id: &str) -> Result<PathBuf, String> {
         ));
     }
     Ok(home.join("cortexkit").join(filename))
-}
-
-/// The routing settings document within a global or tier settings directory.
-pub(crate) fn config_path_in(directory: &Path) -> PathBuf {
-    directory.join("striatum.jsonc")
 }
 
 /// Parse `provider/model` or `provider/model/variant`.

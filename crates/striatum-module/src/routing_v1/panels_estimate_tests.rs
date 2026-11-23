@@ -380,19 +380,16 @@ async fn panel_estimate_admission_validation_and_normal_flags() {
 
 #[tokio::test]
 async fn panel_estimate_retains_project_settings_and_refuses_foreign_stamp() {
-    use crate::project_settings::tests::{census, root, write, Fake, ID};
+    use crate::managed_settings::test_daemon::ID;
     let _clock = crate::InjectedClock::set(NOW);
     for status in ["applied", "none", "unresolved"] {
         let (harness, route) = configured().await;
-        let project = root();
-        if status == "applied" {
-            write(&project, "{}");
+        let daemon = harness.project_daemon().await;
+        match status {
+            "applied" => daemon.set(ID, json!({})),
+            "none" => daemon.no_overrides(ID),
+            _ => daemon.refuse(ID),
         }
-        let source = Fake::new(census(&[project], None));
-        source
-            .fail
-            .store(status == "unresolved", std::sync::atomic::Ordering::Relaxed);
-        harness.settings_source(source);
         let mut params = request(10_000);
         params["settings"] = json!({"project_id":ID});
         let before = rows(&harness);

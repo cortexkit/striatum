@@ -1055,30 +1055,41 @@ async fn service_tier_pinned_variant_follow_up_steps_down_without_changing_model
 }
 
 #[tokio::test]
-async fn service_tier_project_settings_change_the_next_routing_decision() {
+async fn daemon_service_tier_view_wins_over_project_file_and_updates_on_change() {
+    use crate::managed_settings::test_daemon::ID;
     let _clock = crate::InjectedClock::set(NOW);
     let (harness, _) = setup(&["pro_500"], true, true);
     harness.edit_config(|config| {
-        config["consumers"]["sidekick"] = json!({"owner":"tier-owner","mode":"demand"})
+        config["consumers"]["sidekick"] =
+            json!({"owner":"tier-owner","mode":"demand","service_tier":"standard"})
     });
     let project = harness.store_path().parent().unwrap().join("tier-project");
     let path = project.join(".cortexkit/striatum.jsonc");
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(
-        &path,
-        r#"{"consumers":{"sidekick":{"service_tier":"fast"}}}"#,
-    )
-    .unwrap();
-    let route = harness.bind(reserved("tier-owner"), None).await;
-    let request = json!({"consumer":"sidekick", "requirements":{"iq":30}, "project_root":project});
-    let first = route.call("route.select", &request).await;
-    assert_eq!(first.0, FrameType::Response, "{}", first.1);
-    assert_eq!(first.1["result"]["service_tier_chosen"], "fast");
-    std::fs::write(
-        &path,
+        path,
         r#"{"consumers":{"sidekick":{"service_tier":"ultrafast"}}}"#,
     )
     .unwrap();
+    let daemon = harness.project_daemon().await;
+    daemon.set(
+        ID,
+        json!({"consumers":{"sidekick":{"service_tier":"fast"}}}),
+    );
+    let route = harness.bind(reserved("tier-owner"), None).await;
+    let legacy = route.call("route.select", &json!({"consumer":"sidekick", "requirements":{"iq":30}, "project_root":project, "workspace_root":project})).await;
+    assert_eq!(legacy.0, FrameType::Response, "{}", legacy.1);
+    assert_eq!(legacy.1["result"]["service_tier_chosen"], "standard");
+    let request =
+        json!({"consumer":"sidekick", "requirements":{"iq":30}, "settings":{"project_id":ID}});
+    let first = route.call("route.select", &request).await;
+    assert_eq!(first.0, FrameType::Response, "{}", first.1);
+    assert_eq!(first.1["result"]["service_tier_chosen"], "fast");
+    daemon.set(
+        ID,
+        json!({"consumers":{"sidekick":{"service_tier":"ultrafast"}}}),
+    );
+    daemon.changed(ID).await;
     let second = route.call("route.select", &request).await;
     assert_eq!(second.0, FrameType::Response, "{}", second.1);
     assert_eq!(second.1["result"]["service_tier_chosen"], "ultrafast");
@@ -1136,22 +1147,13 @@ async fn service_tier_refused_pin_records_its_real_reason_once() {
 }
 
 #[tokio::test]
-async fn service_tier_project_settings_reach_legacy_panel_members() {
+async fn service_tier_user_settings_reach_legacy_panel_members() {
     let _clock = crate::InjectedClock::set(NOW);
     let (harness, _) = setup(&["pro_500"], true, true);
-    harness.edit_config(|config| config["panels"]["audit"] = json!({"top_k":1,"by":"iq"}));
-    let project = harness
-        .store_path()
-        .parent()
-        .unwrap()
-        .join("panel-tier-project");
-    let path = project.join(".cortexkit/striatum.jsonc");
-    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    std::fs::write(
-        &path,
-        r#"{"consumers":{"prefrontal-core.athena":{"service_tier":"fast"}}}"#,
-    )
-    .unwrap();
+    harness.edit_config(|config| {
+        config["panels"]["audit"] = json!({"top_k":1,"by":"iq"});
+        config["consumers"]["prefrontal-core.athena"]["service_tier"] = json!("fast");
+    });
     let excluded: Vec<_> = harness
         .store()
         .get_facts()
@@ -1161,7 +1163,7 @@ async fn service_tier_project_settings_reach_legacy_panel_members() {
         .map(|fact| striatum_core::fact_to_route(fact).route_key)
         .collect();
     let route = harness.bind(reserved("tier-owner"), None).await;
-    let reply = route.call("route.select_panel", &json!({"taskId":"tier-panel","substrate":"broca","panelSpec":{"class":"AUDIT","diversity":"family"},"projectRoot":project,"excludeRouteKeys":excluded})).await;
+    let reply = route.call("route.select_panel", &json!({"taskId":"tier-panel","substrate":"broca","panelSpec":{"class":"AUDIT","diversity":"family"},"excludeRouteKeys":excluded})).await;
     assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
     let members = reply.1["result"]["members"].as_array().unwrap();
     assert_eq!(members.len(), 1, "{}", reply.1);
@@ -1483,85 +1485,55 @@ fn service_tier_prices_subscription_draw_and_api_mode_without_inheriting_base_di
 }
 
 #[tokio::test]
-async fn replay_tier_consumer_precedence() {
-    let _clock = crate::InjectedClock::set(NOW);
-    let _inputs = striatum_store::replay::Inputs::new(NOW as i64).install();
-    let (harness, _) = setup(&["pro_500"], true, true);
-    let _state_write_audit = super::replay_tests::audit_state_writes(&harness, "tier-consumers");
-    let fingerprint = super::replay_tests::cleared_catalog_fingerprint(&harness);
-    assert_eq!(fingerprint, "53ab34bb0b3cbf2a");
-    let project = harness.store_path().parent().unwrap().join("tier-project");
-    let path = project.join(".cortexkit/striatum.jsonc");
-    let settings = json!({"consumers": {
-        "mason": {"service_tier":"standard"},
-        "lab_planner": {"service_tier":"fast"},
-        "spec_designer": {"service_tier":"ultrafast"},
-        "athena_synthesizer": {"service_tier":"ultrafast"}
-    }});
-    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    std::fs::write(&path, serde_json::to_vec_pretty(&settings).unwrap()).unwrap();
-    let route = harness.bind(reserved("tier-owner"), None).await;
-    let mut rows = Vec::new();
-    for (name, tier_consumer) in [
-        ("Spec designer explicit", Some("spec_designer")),
-        ("consult synthesizer explicit", Some("athena_synthesizer")),
-        ("resolved pin slot", Some("lab_planner")),
-        ("consumer fallback", None),
-    ] {
-        let mut request =
-            json!({"consumer":"mason", "requirements":{"iq":30}, "project_root":project});
-        if let Some(consumer) = tier_consumer {
-            request["tier_consumer"] = json!(consumer);
-        }
-        let (ty, reply) = route.call("route.select", &request).await;
-        assert_eq!(ty, FrameType::Response, "{reply}");
-        rows.push(super::replay_tests::normalize_paths(
-            json!({"name":name, "request":request,
-            "reply":reply, "state":super::replay_tests::persistent_effects(&harness)}),
-            &harness,
-        ));
-    }
-    super::replay_tests::assert_or_record_with_fingerprint(
-        "tier-consumers",
-        json!({
-            "body_source":"service_tier_project_settings_change_the_next_routing_decision; core route_select_params resolves explicit tier consumer before pin.slot",
-            "clock_ms":NOW, "settings":settings, "rows":rows,
-        }),
-        Some(&fingerprint),
-    );
-}
-
-#[tokio::test]
-async fn entorhinal_settings_tier_consumer_precedence_and_request_cap() {
-    use crate::project_settings::tests::{census, root, write, Fake, ID};
+async fn daemon_settings_tier_consumer_precedence_and_request_cap() {
+    use crate::managed_settings::test_daemon::ID;
     use cortexkit_role_routing::select::{
         check_answer, parse_select_request_serving, SelectAnswer,
     };
     let _clock = crate::InjectedClock::set(NOW);
     let (harness, _) = setup(&["pro_500"], true, true);
     harness.edit_config(|config| {
-        config["consumers"]["spec_designer"]["pin"] = json!({"model":format!("openai/{MODEL}")});
+        for slot in ["spec_designer", "lab_planner"] {
+            config["consumers"][slot]["pin"] = json!({"model":format!("openai/{MODEL}")});
+        }
     });
-    let project = root();
-    write(
-        &project,
-        r#"{"consumers":{"mason":{"service_tier":"standard"},"spec_designer":{"service_tier":"ultrafast"},"explicit":{"service_tier":"fast"}}}"#,
+    let daemon = harness.project_daemon().await;
+    daemon.set(
+        ID,
+        json!({"consumers":{
+            "mason":{"service_tier":"standard"},
+            "spec_designer":{"service_tier":"ultrafast"},
+            "explicit":{"service_tier":"fast"},
+            "lab_planner":{"service_tier":"fast"},
+            "athena_synthesizer":{"service_tier":"ultrafast"}
+        }}),
     );
-    harness.settings_source(Fake::new(census(&[project], None)));
     let route = harness.bind(reserved("tier-owner"), Some(ID)).await;
     for (slot, explicit, requested, expected) in [
-        (true, true, None, "fast"),
-        (true, false, None, "ultrafast"),
-        (false, false, None, "standard"),
-        (true, true, Some("standard"), "standard"),
+        (Some("spec_designer"), Some("explicit"), None, "fast"),
+        (
+            Some("lab_planner"),
+            Some("athena_synthesizer"),
+            None,
+            "ultrafast",
+        ),
+        (Some("spec_designer"), None, None, "ultrafast"),
+        (Some("lab_planner"), None, None, "fast"),
+        (None, None, None, "standard"),
+        (
+            Some("spec_designer"),
+            Some("explicit"),
+            Some("standard"),
+            "standard",
+        ),
     ] {
         let mut body =
             json!({"consumer":"mason","requirements":{"iq":30},"settings":{"project_id":ID}});
-        if slot {
-            body["pin_slot"] = json!("spec_designer");
+        if let Some(slot) = slot {
+            body["pin_slot"] = json!(slot);
         }
-        if explicit {
-            body["settings"]["tier_consumer"] = json!("explicit");
+        if let Some(explicit) = explicit {
+            body["settings"]["tier_consumer"] = json!(explicit);
         }
         if let Some(requested) = requested {
             body["service_tier"] = json!(requested);
@@ -1592,19 +1564,18 @@ async fn entorhinal_settings_tier_consumer_precedence_and_request_cap() {
 
 #[tokio::test]
 async fn panel_settings_only_fast_passes_contract_checker_and_requested_tier_caps_it() {
-    use crate::project_settings::tests::{census, root, write, Fake, ID};
+    use crate::managed_settings::test_daemon::ID;
     use cortexkit_role_routing::panel::{
         check_panel_answer, parse_select_panel_request_serving, SelectPanelAnswer,
     };
     let _clock = crate::InjectedClock::set(NOW);
     let (harness, _) = setup(&["pro_500"], true, true);
     harness.edit_config(|config| config["panels"]["audit"] = json!({"top_k":1,"by":"iq"}));
-    let project = root();
-    write(
-        &project,
-        r#"{"consumers":{"explicit":{"service_tier":"fast"}}}"#,
+    let daemon = harness.project_daemon().await;
+    daemon.set(
+        ID,
+        json!({"consumers":{"explicit":{"service_tier":"fast"}}}),
     );
-    harness.settings_source(Fake::new(census(&[project], None)));
     let route = harness.bind(reserved("tier-owner"), Some(ID)).await;
     for (requested, expected) in [(None, "fast"), (Some("standard"), "standard")] {
         let mut body = json!({"class":"audit","consumer":"mason","available_routes":[format!("openai/{MODEL}")],"settings":{"project_id":ID,"tier_consumer":"explicit"}});

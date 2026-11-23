@@ -68,7 +68,7 @@ pub(super) struct SelectPanelParams {
     #[serde(default, rename = "service_tier")]
     pub(super) service_tier: Option<cortexkit_role_routing::service_tier::ServiceTier>,
     #[serde(default, rename = "workspace_root", alias = "workspaceRoot")]
-    pub(super) workspace_root: Option<String>,
+    pub(super) _workspace_root: Option<String>,
     #[serde(default)]
     pub(super) package_tokens: Option<usize>,
     pub(super) panel_spec: panel_policy::PanelRequestSpec,
@@ -1374,10 +1374,7 @@ async fn handle_select_panel(
             )
         })
         .unwrap_or_default();
-    let tier_settings = crate::tier_settings::Layers::new(
-        params.project_root.as_deref(),
-        params.workspace_root.as_deref(),
-    );
+    let tier_settings = crate::tier_settings::Layers::default();
     let tiers = classes.apply_configured_service_tiers(
         &mut prepared.facts,
         |fact| {

@@ -32,8 +32,41 @@ pub(super) fn render() -> String {
     for (name, node) in defs.iter_mut() {
         reshape(node, &scalar_defs, name, "");
     }
+    allow_project_consumers(&mut schema, defs);
     schema["$defs"] = json!(defs);
     serde_json::to_string_pretty(&schema).unwrap() + "\n"
+}
+
+fn allow_project_consumers(schema: &mut Value, defs: &mut Map<String, Value>) {
+    fn permit(node: &mut Value) {
+        node["x-ck-layers"] = json!(["user", "workspace", "project"]);
+    }
+
+    // The gate checks the layer at each step of a path. Open the containers
+    // needed to reach these fields but keep policy fields inside them user-only.
+    let consumers = &mut schema["properties"]["consumers"];
+    permit(consumers);
+    permit(&mut consumers["patternProperties"][r"^\S+$"]);
+    let consumer = defs.get_mut("ConsumerPolicy").unwrap();
+    permit(consumer);
+    let fields = &mut consumer["properties"];
+    permit(&mut fields["service_tier"]);
+    permit(&mut fields["service_tiers"]);
+    permit(&mut fields["service_tiers"]["patternProperties"][r"^\S+$"]);
+    permit(&mut fields["runners"]);
+    let item = &mut fields["runners"]["items"];
+    permit(item);
+    item["$ref"] = json!("#/$defs/ConsumerRunnerPolicy");
+
+    // Global runner enrollment uses the same shape, but none of its fields
+    // can be set by a workspace or project.
+    let mut runner = defs["RunnerPolicy"].clone();
+    permit(&mut runner);
+    for field in ["module", "harness", "routes"] {
+        permit(&mut runner["properties"][field]);
+    }
+    permit(&mut runner["properties"]["routes"]["items"]);
+    defs.insert("ConsumerRunnerPolicy".into(), runner);
 }
 
 fn reshape(node: &mut Value, scalars: &Map<String, Value>, owner: &str, field: &str) {

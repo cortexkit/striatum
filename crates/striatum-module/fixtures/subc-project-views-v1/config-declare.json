@@ -1,0 +1,1 @@
+{"op":"config.declare","schema":{"$schema":"https://json-schema.org/draft/2020-12/schema","properties":{"count":{"default":0,"description":"Counter value","type":"integer","x-ck-apply":"live","x-ck-layers":["user","project"]}},"type":"object","unevaluatedProperties":false},"user_file":"/motor-home/tmp/ckcd-0000015f/config/cortexkit/example-router.jsonc","project_dirs":[]}

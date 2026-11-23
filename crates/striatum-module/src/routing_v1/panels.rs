@@ -766,11 +766,15 @@ async fn candidates(
     let live = &shared.live_config;
     // Validate the requested project id against the caller's daemon-stamped
     // project before reading candidates, even if the panel will be empty.
-    let (layers, tier_status) =
-        super::scoped_settings(request.settings.as_ref(), caller, deps, config).await?;
-    let project_runners = layers.runners(&request.consumer);
-    let has_project_runners = project_runners.is_some();
-    let empty = crate::tier_settings::Layers::new(None, None);
+    let (layers, tier_status) = super::scoped_settings(
+        request.settings.as_ref(),
+        caller,
+        deps,
+        config,
+        Some(&shared.project_views),
+    )
+    .await?;
+    let empty = crate::tier_settings::Layers::default();
     let tier_layers = if tier_status.is_some() {
         &layers
     } else {
@@ -781,6 +785,8 @@ async fn candidates(
     let consumers = super::consumers::effective(&config);
     let mut policy =
         config.consumer_policy(&request.consumer, &Default::default(), &consumers.policies);
+    let project_runners = layers.runners(&request.consumer, config, policy.runners.as_deref());
+    let has_project_runners = project_runners.is_some();
     if let Some(runners) = project_runners {
         policy.runners = Some(runners);
         policy.runner = None;
