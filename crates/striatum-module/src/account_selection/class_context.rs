@@ -1999,12 +1999,14 @@ impl ClassContext {
         // when credit has increased; it does not spend a probe to test the increase.
         origin.console_credit_micros_at_refusal.is_some()
             && origin.credential_id.as_deref().is_some_and(|credential| {
-                crate::account_quota::console_credit::live_total_micros(
-                    &self.quota,
-                    credential,
-                    self.now_ms,
-                )
-                .is_some()
+                self.org_credit_reading(credential)
+                    .and_then(|reading| {
+                        crate::account_quota::console_credit::live_reading_total_micros(
+                            reading,
+                            self.now_ms,
+                        )
+                    })
+                    .is_some()
             })
     }
 

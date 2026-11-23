@@ -4,9 +4,20 @@ use serde_json::Value;
 use striatum_core::accounts::{CreditExpiry, Roster};
 
 use super::ClassContext;
-use crate::account_quota::console_credit::live_credit;
+use crate::account_quota::console_credit::{live_credit, org_credit_reading};
 
 impl ClassContext {
+    pub(super) fn org_credit_reading(&self, credential: &str) -> Option<&Value> {
+        org_credit_reading(&self.quota, credential, |org| {
+            self.reading_index()
+                .accounts
+                .get(org)
+                .into_iter()
+                .flatten()
+                .map(|record| &record.reading)
+        })
+    }
+
     pub(in crate::account_selection) fn expiring_org_credits(
         &self,
         roster: &Roster,
@@ -28,22 +39,8 @@ impl ClassContext {
             .flat_map(|account| &account.credentials)
             .filter_map(|credential| {
                 let id = &credential.credential_id;
-                let org_id = self.quota.credential_orgs.get(id)?;
-                let readings = self.reading_index().accounts.get(org_id)?;
-                // The vault learns the org ID from the provider for this exact key.
-                // A reading must report that org itself, not just be indexed under it.
-                let mut matching =
-                    readings
-                        .iter()
-                        .map(|record| &record.reading.entry)
-                        .filter(|entry| {
-                            entry.get("account").and_then(Value::as_str) == Some(org_id.as_str())
-                        });
-                let reading = matching.next()?;
-                if matching.next().is_some() {
-                    return None;
-                }
-                let credit = reading
+                let credit = self
+                    .org_credit_reading(id)?
                     .get("spend")?
                     .as_array()?
                     .iter()

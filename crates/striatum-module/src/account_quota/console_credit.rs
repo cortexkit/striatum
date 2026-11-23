@@ -2,7 +2,27 @@ use serde::Deserialize;
 use serde_json::Value;
 use striatum_core::{accounts::CreditExpiry, quota::SpendBalance};
 
-use super::{parse_rfc3339_ms, AccountQuotaState};
+use super::{parse_rfc3339_ms, AccountQuotaState, StoredReading};
+
+pub(crate) fn org_credit_reading<'a, I>(
+    quota: &AccountQuotaState,
+    credential: &str,
+    readings_for_org: impl FnOnce(&str) -> I,
+) -> Option<&'a Value>
+where
+    I: IntoIterator<Item = &'a StoredReading>,
+{
+    let org = quota.credential_orgs.get(credential)?;
+    // Trust the reading's reported org, not just the cache key. If more than
+    // one reading claims the org, there is no basis to pick one balance.
+    let mut matching = readings_for_org(org).into_iter().filter(|reading| {
+        reading.tombstoned_at_ms.is_none()
+            && reading.account_id == *org
+            && reading.entry.get("account").and_then(Value::as_str) == Some(org.as_str())
+    });
+    let reading = matching.next()?;
+    matching.next().is_none().then_some(&reading.entry)
+}
 
 /// `None` means there is no usable Console credit reading, not a zero balance.
 pub(crate) fn live_total_micros(
@@ -10,18 +30,12 @@ pub(crate) fn live_total_micros(
     credential: &str,
     now_ms: i64,
 ) -> Option<i64> {
-    let org = quota.credential_orgs.get(credential)?;
-    let reading = quota
-        .readings
-        .readings
-        .get(&("claude-console".into(), org.clone()))?;
-    if reading.tombstoned_at_ms.is_some()
-        || reading.entry.get("account").and_then(Value::as_str) != Some(org.as_str())
-    {
-        return None;
-    }
+    let reading = org_credit_reading(quota, credential, |_| quota.readings.readings.values())?;
+    live_reading_total_micros(reading, now_ms)
+}
+
+pub(crate) fn live_reading_total_micros(reading: &Value, now_ms: i64) -> Option<i64> {
     reading
-        .entry
         .get("spend")?
         .as_array()?
         .iter()

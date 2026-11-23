@@ -236,6 +236,65 @@ async fn billing_refusal_without_console_credit_reading_keeps_hourly_probe() {
 }
 
 #[tokio::test]
+async fn billing_fence_uses_an_org_reading_without_a_provider_name_match() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let harness = paid_anthropic_harness();
+    let org = CONSOLE_ORGS[0];
+    let mut reading = console_reading(org, "cookie:example", vec![credit(80, 7_200_000)]);
+    reading["provider"] = json!("other-spend-feed");
+    install_quota([Some(org), None], &[("other-spend-feed", vec![reading])]);
+    let broca = harness.bind(reserved("broca"), None).await;
+    refuse_first_key(&broca).await;
+
+    let _later = crate::InjectedClock::set(NOW + 3_600_001);
+    let held = broca
+        .call(
+            "route.account_for",
+            &single_key_request("no-named-feed-probe"),
+        )
+        .await;
+    assert_eq!(held.0, FrameType::Error, "{}", held.1);
+    assert_eq!(held.1["code"], "account_pool_exhausted");
+}
+
+#[tokio::test]
+async fn ambiguous_org_readings_keep_the_hourly_billing_probe() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let harness = paid_anthropic_harness();
+    let org = CONSOLE_ORGS[0];
+    let mut other = console_reading(org, "cookie:example-2", vec![]);
+    other["provider"] = json!("other-spend-feed");
+    install_quota(
+        [Some(org), None],
+        &[
+            (
+                "claude-console",
+                vec![console_reading(
+                    org,
+                    "cookie:example-1",
+                    vec![credit(80, 7_200_000)],
+                )],
+            ),
+            ("other-spend-feed", vec![other]),
+        ],
+    );
+    let broca = harness.bind(reserved("broca"), None).await;
+    refuse_first_key(&broca).await;
+
+    let _later = crate::InjectedClock::set(NOW + 3_600_001);
+    let probe = result(
+        broca
+            .call(
+                "route.account_for",
+                &single_key_request("ambiguous-org-probe"),
+            )
+            .await,
+    );
+    assert_eq!(probe["account"]["credential_id"], KEYS[0]);
+    assert_eq!(probe["reason"]["code"], "credential_fence_probe");
+}
+
+#[tokio::test]
 async fn soonest_positive_console_credit_wins_and_is_explained() {
     let _clock = crate::InjectedClock::set(NOW);
     let harness = paid_anthropic_harness();
