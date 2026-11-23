@@ -333,7 +333,7 @@ pub struct RunnerPolicy {
     pub module: String,
     /// Restrict this entry to one of the runner's named execution environments.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(title = "Execution environment")]
+    #[schemars(title = "Harness")]
     pub harness: Option<String>,
     /// Routes this runner may use, as provider, provider/model, or provider/model/variant. Omit to allow every route the runner supports.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -409,7 +409,7 @@ pub struct ProviderPolicy {
     #[schemars(title = "Subscription cost divisor")]
     pub subscription_multiplier: Option<f64>,
     /// Reserve this percentage of weekly quota for operator-facing sessions, from 0 to 100.
-    #[schemars(title = "Weekly quota reserved for operators (%)")]
+    #[schemars(title = "Weekly quota kept free for agents (%)")]
     pub keep_free_percent: Option<f64>,
     /// Count saved quota resets only near exhaustion (`emergency`) or count all unexpired resets (`capacity`).
     #[schemars(title = "When to count saved quota resets")]
@@ -587,10 +587,10 @@ pub struct ConsumerPolicy {
     #[schemars(title = "Model preferences by project")]
     pub projects: BTreeMap<String, ProjectPolicy>,
     /// Minimum reasoning quality requested, from 0 to 100.
-    #[schemars(title = "Minimum reasoning quality")]
+    #[schemars(title = "Minimum reasoning level")]
     pub iq: Option<f64>,
     /// Minimum collaboration quality requested, from 0 to 100.
-    #[schemars(title = "Minimum collaboration quality")]
+    #[schemars(title = "Minimum judgment level")]
     pub eq: Option<f64>,
     /// Minimum context capacity in tokens.
     #[schemars(title = "Minimum context (tokens)")]

@@ -248,7 +248,7 @@
         "eq": {
           "description": "Minimum collaboration quality requested, from 0 to 100.",
           "format": "double",
-          "title": "Minimum collaboration quality",
+          "title": "Minimum judgment level",
           "type": "number",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -259,7 +259,7 @@
         "iq": {
           "description": "Minimum reasoning quality requested, from 0 to 100.",
           "format": "double",
-          "title": "Minimum reasoning quality",
+          "title": "Minimum reasoning level",
           "type": "number",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -489,7 +489,7 @@
       "properties": {
         "harness": {
           "description": "Restrict this entry to one of the runner's named execution environments.",
-          "title": "Execution environment",
+          "title": "Harness",
           "type": "string",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -800,7 +800,7 @@
           "description": "Override the model's collaboration score. Use a number greater than 0, or omit to use the catalog score.",
           "exclusiveMinimum": 0,
           "format": "double",
-          "title": "Collaboration score override",
+          "title": "Judgment score override",
           "type": "number",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -1371,7 +1371,7 @@
           "default": 0.0,
           "description": "Reserve this percentage of weekly quota for operator-facing sessions, from 0 to 100.",
           "format": "double",
-          "title": "Weekly quota reserved for operators (%)",
+          "title": "Weekly quota kept free for agents (%)",
           "type": "number",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -1630,7 +1630,7 @@
       "properties": {
         "harness": {
           "description": "Restrict this entry to one of the runner's named execution environments.",
-          "title": "Execution environment",
+          "title": "Harness",
           "type": "string",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -2015,7 +2015,7 @@
         ],
         "x-ck-required": false
       },
-      "title": "Preferred runners",
+      "title": "Runners routing may use",
       "type": "array",
       "x-ck-apply": "live",
       "x-ck-layers": [

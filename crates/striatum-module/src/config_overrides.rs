@@ -1377,7 +1377,7 @@ struct RoutingConfigFile {
     consumers: BTreeMap<String, ConsumerPolicy>,
     /// Modules that can run models, in order of preference.
     #[serde(default)]
-    #[schemars(title = "Preferred runners")]
+    #[schemars(title = "Runners routing may use")]
     runners: Vec<RunnerPolicy>,
     /// Full caller identities allowed to mark a model choice as made by the user. An empty list allows nobody.
     #[serde(default = "default_pin_origin_callers")]
@@ -1861,7 +1861,7 @@ struct ModelFactOverride {
     elo: Option<f64>,
     /// Override the model's collaboration score. Use a number greater than 0, or omit to use the catalog score.
     #[schemars(transform = positive_number)]
-    #[schemars(title = "Collaboration score override")]
+    #[schemars(title = "Judgment score override")]
     eq: Option<f64>,
     /// Override generation speed in output tokens per second, from 0 upward. Omit to use measured or catalog speed.
     #[schemars(range(min = 0))]
