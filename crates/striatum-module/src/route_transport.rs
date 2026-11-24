@@ -256,7 +256,7 @@ pub(super) async fn handle_frame(
                 .await;
             };
             #[cfg(test)]
-            let handler = routing_v1::inherit_capabilities(handler);
+            let handler = routing_v1::inherit_capabilities(Box::pin(handler));
             tokio::spawn(handler);
             Ok(true)
         }
@@ -349,7 +349,9 @@ where
 {
     let runtime = tokio::runtime::Handle::current();
     #[cfg(test)]
-    let handler = routing_v1::inherit_capabilities(handler);
+    // Several test-only task-local scopes wrap the future before it runs.
+    // Keep the request-sized future out of each nested wrapper's stack frame.
+    let handler = routing_v1::inherit_capabilities(Box::pin(handler));
     #[cfg(test)]
     let test_thread = TestThreadState::capture();
     let outcome = tokio::task::spawn_blocking(move || {
