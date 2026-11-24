@@ -920,7 +920,7 @@ fn classifier_harness() -> std::sync::Arc<Harness> {
     );
     harness.set_credentials(credentials);
     harness.edit_config(|config| {
-        config["consumers"]["classifier"] = json!({"owner":"broca"});
+        config["consumers"]["broca.classifier"] = json!({"owner":"broca"});
         config["runners"] = json!([{"module":"chat-runner"}]);
     });
     harness
@@ -930,7 +930,7 @@ fn classifier_harness() -> std::sync::Arc<Harness> {
 async fn consumer_placements_classifier_excluding_caller_never_substitutes_another_runner() {
     let harness = classifier_harness();
     let caller = harness.bind(reserved("broca"), None).await;
-    let params = json!({"consumer":"classifier","requirements":{"iq":0}});
+    let params = json!({"consumer":"broca.classifier","requirements":{"iq":0}});
     let baseline = selected(caller.call("route.select", &params).await);
     assert_eq!(baseline["runner"]["module"], "broca");
     harness.edit_config(|config| {
@@ -938,14 +938,14 @@ async fn consumer_placements_classifier_excluding_caller_never_substitutes_anoth
             .as_array_mut()
             .unwrap()
             .push(json!({"module":"broca"}));
-        config["consumers"]["classifier"]["runners"] = json!([{"module":"broca"}]);
+        config["consumers"]["broca.classifier"]["runners"] = json!([{"module":"broca"}]);
     });
     assert_eq!(
         selected(caller.call("route.select", &params).await)["runner"],
         baseline["runner"]
     );
     harness.edit_config(|config| {
-        config["consumers"]["classifier"]["runners"] = json!([{"module":"chat-runner"}]);
+        config["consumers"]["broca.classifier"]["runners"] = json!([{"module":"chat-runner"}]);
     });
     refused(
         caller.call("route.select", &params).await,
@@ -957,13 +957,13 @@ async fn consumer_placements_classifier_excluding_caller_never_substitutes_anoth
 async fn consumer_placements_classifier_empty_or_unauthorized_list_never_falls_back() {
     let harness = classifier_harness();
     let caller = harness.bind(reserved("broca"), None).await;
-    let params = json!({"consumer":"classifier","requirements":{"iq":0}});
+    let params = json!({"consumer":"broca.classifier","requirements":{"iq":0}});
     assert_eq!(
         selected(caller.call("route.select", &params).await)["runner"]["module"],
         "broca"
     );
     for entries in [json!([]), json!([{"module":"broca"}])] {
-        harness.edit_config(|config| config["consumers"]["classifier"]["runners"] = entries);
+        harness.edit_config(|config| config["consumers"]["broca.classifier"]["runners"] = entries);
         refused(
             caller.call("route.select", &params).await,
             "harness_unavailable",
@@ -975,11 +975,11 @@ async fn consumer_placements_classifier_empty_or_unauthorized_list_never_falls_b
 async fn consumer_placements_classifier_entry_routes_and_harness_only_narrow() {
     let harness = classifier_harness();
     let caller = harness.bind(reserved("broca"), None).await;
-    let params = json!({"consumer":"classifier","requirements":{"iq":0}});
+    let params = json!({"consumer":"broca.classifier","requirements":{"iq":0}});
     let baseline = selected(caller.call("route.select", &params).await);
     harness.edit_config(|config| {
         config["runners"] = json!([{"module":"broca"}]);
-        config["consumers"]["classifier"]["runners"] = json!([
+        config["consumers"]["broca.classifier"]["runners"] = json!([
             {"module":"broca","routes":[baseline["route"]["provider"].clone()]}
         ]);
     });
@@ -988,13 +988,13 @@ async fn consumer_placements_classifier_entry_routes_and_harness_only_narrow() {
         baseline["runner"]
     );
     harness.edit_config(|config| {
-        config["consumers"]["classifier"]["runners"][0]["routes"] = json!(["absent-provider"])
+        config["consumers"]["broca.classifier"]["runners"][0]["routes"] = json!(["absent-provider"])
     });
     let answer = caller.call("route.select", &params).await;
     assert_eq!(answer.0, FrameType::Error, "{answer:?}");
     assert_eq!(answer.1["code"], "no_route", "{answer:?}");
     harness.edit_config(|config| {
-        config["consumers"]["classifier"]["runners"] =
+        config["consumers"]["broca.classifier"]["runners"] =
             json!([{"module":"broca","harness":"unhosted"}])
     });
     refused(

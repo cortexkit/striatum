@@ -16,6 +16,10 @@ const SERVING_KINDS: &[&str] = &["decision", "classifier"];
 const LAST_GOOD_MS: i64 = 5 * 60_000;
 pub(crate) const DESCRIBE_REQUEST: &[u8] = br#"{"method":"role.describe","params":{}}"#;
 
+pub(super) fn matches_consumer(consumer: &str) -> bool {
+    crate::config_policy::consumer_matches("broca.classifier", consumer)
+}
+
 pub(crate) fn describe_options() -> subc_client_rs::CallOptions {
     subc_client_rs::CallOptions {
         role_versions: Some(BTreeMap::from([("classifier".into(), "v1".into())])),
@@ -287,16 +291,88 @@ pub(crate) fn input_price(credentials: &BrocaCredentials, fact: &ModelFact) -> O
         .input_price(&format!("{}/{}", fact.provider_id, fact.model_id))
 }
 
-pub(crate) fn ordered_routes(credentials: &BrocaCredentials, facts: &[ModelFact]) -> Vec<String> {
-    let mut facts: Vec<_> = facts.iter().collect();
+pub(super) struct RankedRoutes {
+    ladder: Vec<String>,
+    automatic: Vec<String>,
+    graded: bool,
+}
+
+impl RankedRoutes {
+    // Only automatic graded picks require exact keys: a model ID can start
+    // with another model's ID plus a slash without sharing its grade.
+    pub(super) fn entries(&self) -> impl Iterator<Item = (&str, bool)> {
+        self.ladder
+            .iter()
+            .map(|key| (key.as_str(), false))
+            .chain(self.automatic.iter().map(|key| (key.as_str(), self.graded)))
+    }
+
+    pub(super) fn permits_recovery(&self, route: &str) -> bool {
+        !self.graded
+            || self.entries().any(|(key, exact)| {
+                key == route
+                    || (!exact
+                        && route
+                            .strip_prefix(key)
+                            .is_some_and(|rest| rest.starts_with('/')))
+            })
+    }
+}
+
+pub(super) fn ordered_routes(
+    credentials: Option<&BrocaCredentials>,
+    mut facts: Vec<&ModelFact>,
+    ladder: Vec<String>,
+    iq: f64,
+    eligible_for_bar: impl Fn(&ModelFact) -> bool,
+) -> RankedRoutes {
+    let Some(credentials) = credentials else {
+        return RankedRoutes {
+            ladder,
+            automatic: Vec::new(),
+            graded: false,
+        };
+    };
+    let mut graded = false;
+    if iq > 0.0 {
+        let grades: BTreeMap<_, _> = facts
+            .iter()
+            .copied()
+            .filter(|fact| eligible_for_bar(fact))
+            .filter_map(|fact| {
+                let route = fact_to_route(fact);
+                let grade = credentials
+                    .catalog_snapshot
+                    .as_ref()?
+                    .media_grade("decision", &route.capacity_key)?;
+                Some((route.route_key, grade))
+            })
+            .collect();
+        if let Some(top) = grades.values().copied().max_by(f64::total_cmp) {
+            graded = true;
+            let bar = super::engines::grade_bar(top, iq);
+            facts.retain(|fact| {
+                grades
+                    .get(&fact_to_route(fact).route_key)
+                    .is_some_and(|grade| *grade >= bar)
+            });
+        }
+    }
     facts.sort_by(|a, b| {
         let price = |fact| input_price(credentials, fact).unwrap_or(f64::INFINITY);
         price(a)
             .total_cmp(&price(b))
             .then_with(|| fact_to_route(a).route_key.cmp(&fact_to_route(b).route_key))
     });
-    facts
-        .into_iter()
-        .map(|fact| fact_to_route(fact).route_key)
-        .collect()
+    let mut automatic = Vec::new();
+    for route in facts.into_iter().map(|fact| fact_to_route(fact).route_key) {
+        if !ladder.contains(&route) && !automatic.contains(&route) {
+            automatic.push(route);
+        }
+    }
+    RankedRoutes {
+        ladder,
+        automatic,
+        graded,
+    }
 }

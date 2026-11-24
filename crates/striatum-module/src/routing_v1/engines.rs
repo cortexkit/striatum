@@ -16,6 +16,10 @@ use super::{store_refusal, Caller, Deps};
 #[path = "media_ranking.rs"]
 mod ranking;
 
+pub(super) fn grade_bar(top_grade: f64, level: f64) -> f64 {
+    top_grade * level / 100.0
+}
+
 #[cfg(test)]
 #[path = "media_grade_observer_tests.rs"]
 pub(crate) mod grade_observer;

@@ -1014,7 +1014,7 @@ async fn prepare_selection(
         .tool_capabilities
         .clone()
         .unwrap_or_default();
-    let classifier = consumer == "classifier";
+    let classifier = super::classifier::matches_consumer(&consumer);
     let credentials = deps.broca_credentials.lock();
     let placement = if declared_placement.is_some() {
         let credentials = credentials.as_ref().map_err(store_refusal)?;
@@ -1325,7 +1325,7 @@ async fn select_at_tier_attempt(
             inputs.priced.classes.clone()
         },
     };
-    let classifier = consumer == "classifier";
+    let classifier = super::classifier::matches_consumer(&consumer);
     let tier_consumer = request
         .settings
         .as_ref()
@@ -1693,26 +1693,48 @@ async fn select_at_tier_attempt(
         }))
     });
     let classifier_order = classifier.then(|| {
-        let mut order: Vec<String> = consumer_policy.ladder.iter().flatten().cloned().collect();
+        use striatum_core::provider_model_spec::{ExclusionPolicy, ExclusionSpecs};
+
+        let exclusions = ExclusionSpecs::parse(ExclusionPolicy {
+            operator: &operator_policy.exclude,
+            caller: &exclude,
+        })
+        .with_operator_group(&consumer_exclude);
         let eligible: Vec<_> = facts
             .iter()
             .filter(|fact| available.contains(&fact_to_route(fact).route_key))
-            .cloned()
             .collect();
-        let prices = deps
-            .broca_credentials
-            .lock()
-            .map(|credentials| super::classifier::ordered_routes(&credentials, &eligible))
-            .unwrap_or_default();
-        for route in prices {
-            if !order.contains(&route) {
-                order.push(route);
-            }
-        }
-        order
+        // Only policy- and requirement-eligible grades set the threshold.
+        // A temporary route or key block must not lower the required grade.
+        let credentials = deps.broca_credentials.lock().ok();
+        super::classifier::ordered_routes(
+            credentials.as_deref(),
+            eligible,
+            consumer_policy.ladder.iter().flatten().cloned().collect(),
+            f64::from(requirements.iq),
+            |fact| {
+                let key = fact_to_route(fact).route_key;
+                !fact.decommissioned
+                    && !fact.is_deprecated_upstream()
+                    && fact.mode_of.is_none()
+                    && fact.score_provenance != striatum_core::ScoreProvenance::Unscored
+                    && !exclusions.excludes(&key)
+                    && !rejections.contains_key(&key)
+                    && operator_config.route_allowed(&consumer, &key, false)
+                    && !snapshot
+                        .by_route
+                        .get(&key)
+                        .is_some_and(|state| state.statically_routable == Some(false))
+            },
+        )
     });
     let recovery_available = available
         .iter()
+        .filter(|key| {
+            classifier_order
+                .as_ref()
+                .is_none_or(|order| order.permits_recovery(key))
+        })
         .filter(|key| {
             consumer_policy.mode != Some(crate::config_policy::ConsumerMode::Ladder)
                 || consumer_policy.ladder.iter().flatten().any(|entry| {
@@ -2691,7 +2713,7 @@ struct Selection<'a> {
     concurrency: &'a striatum_core::concurrency_availability::ConcurrencyAvailability,
     use_concurrency: &'a std::cell::Cell<bool>,
     eligible_routes: Option<&'a [RouteRef]>,
-    classifier_order: Option<Vec<String>>,
+    classifier_order: Option<super::classifier::RankedRoutes>,
     prefer_prompt_cache: bool,
     hold_ok: bool,
     hold_wait_max_s: Option<u64>,
@@ -2782,12 +2804,12 @@ impl<'a> Selection<'a> {
             // Classifier order uses input price, not chat workload profiles or
             // output price. The ordinary scorer still admits each candidate,
             // preserving exclusions, quotas and account fences.
-            for route in order {
-                let only = available
-                    .iter()
-                    .filter(|key| *key == route || key.starts_with(&format!("{route}/")))
-                    .cloned()
-                    .collect();
+            for (route, exact) in order.entries() {
+                let only = if exact {
+                    available.get(route).into_iter().cloned().collect()
+                } else {
+                    select_policy::routes_matching(available, route)
+                };
                 match self.score_candidates(&only) {
                     Ok(mut selected) if self.account_check(&selected).is_ok() => {
                         if let Some(error) = full_error {
@@ -3369,6 +3391,8 @@ impl<'a> Selection<'a> {
             catalog.as_ref(),
             self.sources.catalog_targets,
             self.rejections,
+            // Decision models answer questions without running chat tools.
+            self.classifier_order.is_none(),
         )
         .map_err(|refusal| refused(&refusal.code, refusal.cause, refusal.message))?;
         self.check_eligible_pin(pin, &selected, parsed.variant.as_deref())?;

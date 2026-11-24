@@ -15,6 +15,7 @@ use crate::broca_credentials::BrocaCredentials;
 const JEV: &str = "typesafe/jev-1.13.0";
 const CLEF: &str = "cloudflare-workers-ai/@cf/cloudflare/clef";
 const FLASH: &str = "cloudflare-workers-ai/@cf/cloudflare/clef-flash";
+const CONSUMER: &str = "broca.classifier";
 const LIVE: &[u8] = include_bytes!("../../tests/fixtures/classifier-describe.reply.json");
 
 fn describe() -> Value {
@@ -98,14 +99,14 @@ pub(super) fn rig(
     );
     harness.set_credentials(credentials);
     harness.edit_config(|config| {
-        config["consumers"]["classifier"] = json!({"owner":"broca"});
+        config["consumers"][CONSUMER] = json!({"owner":"broca"});
         config["runners"] = json!([{"module":"chat-runner"}]);
     });
     harness
 }
 
 fn request(requirements: Value) -> Value {
-    json!({"consumer":"classifier","requirements":requirements})
+    json!({"consumer":CONSUMER,"requirements":requirements})
 }
 fn result(reply: (FrameType, Value)) -> Value {
     assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
@@ -188,19 +189,125 @@ async fn native_listing_routes_without_chat_wire_families_and_input_price_ignore
 }
 
 #[tokio::test]
+async fn only_the_broca_classifier_consumer_tree_uses_the_classifiers_listing() {
+    let harness = rig(|_| {}, |_| {});
+    harness.edit_config(|config| {
+        for consumer in ["classifier", "broca.classifierish"] {
+            config["consumers"][consumer] = json!({"owner":"broca"});
+        }
+    });
+    let route = harness.bind(reserved("broca"), None).await;
+    for consumer in [
+        CONSUMER,
+        "broca.classifier.basal",
+        "classifier",
+        "broca.classifierish",
+    ] {
+        let reply = route
+            .call(
+                "route.select",
+                &json!({"consumer":consumer,"requirements":{"iq":0}}),
+            )
+            .await;
+        if matches!(consumer, CONSUMER | "broca.classifier.basal") {
+            let answer = result(reply);
+            assert_eq!(route_key(&answer), FLASH);
+            assert_eq!(answer["runner"]["module"], "broca");
+        } else {
+            assert_eq!(reply.0, FrameType::Error, "{consumer}: {}", reply.1);
+            assert_eq!(reply.1["code"], "no_route", "{consumer}: {}", reply.1);
+            assert!(reply.1.to_string().contains("not_chat_kind:decision"));
+        }
+    }
+}
+
+fn decision_grades(catalog: &mut Value) {
+    catalog["quality_scores"] = json!({"graded_by":"operator", "graded_at_ms":1});
+    catalog["models"][JEV]["quality.grade.decision"] = json!(40);
+    catalog["models"][CLEF]["quality.grade.decision"] = json!(100);
+}
+
+#[tokio::test]
+async fn decision_grades_filter_automatic_picks_but_not_pins_or_the_settings_ladder() {
+    let harness = rig(decision_grades, |_| {});
+    let route = harness.bind(reserved("broca"), None).await;
+    // Flash is cheapest but ungraded; Jev clears 40 exactly and costs less than Clef.
+    for (iq, expected) in [(0, FLASH), (40, JEV), (41, CLEF)] {
+        assert_eq!(
+            route_key(&selected(&route, json!({"iq":iq})).await),
+            expected,
+            "iq={iq}"
+        );
+    }
+    let mut pinned = request(json!({"iq":100}));
+    pinned["pin"] = json!(FLASH);
+    assert_eq!(
+        route_key(&result(route.call("route.select", &pinned).await)),
+        FLASH
+    );
+    harness.edit_config(|config| config["consumers"][CONSUMER]["ladder"] = json!([FLASH, JEV]));
+    assert_eq!(route_key(&selected(&route, json!({"iq":100})).await), FLASH);
+    harness.edit_config(|config| config["consumers"][CONSUMER]["mode"] = json!("ladder"));
+    harness.edit_config(|config| config["consumers"][CONSUMER]["ladder"] = json!([JEV]));
+    assert_eq!(route_key(&selected(&route, json!({"iq":100})).await), JEV);
+}
+
+#[tokio::test]
+async fn decision_bar_uses_only_eligible_models() {
+    let harness = rig(decision_grades, |_| {});
+    let route = harness.bind(reserved("broca"), None).await;
+    let mut excluded = request(json!({"iq":100}));
+    excluded["exclude"] = json!([CLEF]);
+    assert_eq!(
+        route_key(&result(route.call("route.select", &excluded).await)),
+        JEV
+    );
+    assert_eq!(
+        route_key(
+            &selected(
+                &route,
+                json!({"iq":100,"input_tokens":1000,"max_cost_usd":0.00004})
+            )
+            .await
+        ),
+        FLASH
+    );
+}
+
+#[tokio::test]
+async fn decision_bar_stays_put_during_a_route_cooldown() {
+    let harness = rig(decision_grades, |_| {});
+    crate::record_cooldown_update(
+        harness.store(),
+        &serde_json::from_value(json!({
+            "routeKey":CLEF, "capacityKey":CLEF,
+            "cooldownUntil":crate::now_ms()+60_000, "lastError":"HTTP 503"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let route = harness.bind(reserved("broca"), None).await;
+    let (frame, reply) = route
+        .call("route.select", &request(json!({"iq":100})))
+        .await;
+    assert_eq!(frame, FrameType::Error, "{reply}");
+    assert_eq!(reply["code"], "no_route", "{reply}");
+    assert_eq!(reply["detail"]["reason"], "no_available_model", "{reply}");
+}
+
+#[tokio::test]
 async fn roster_precedes_price_and_silent_or_ineligible_entries_fall_back_to_price() {
     let harness = rig(|_| {}, |_| {});
     let route = harness.bind(reserved("broca"), None).await;
-    harness.edit_config(|config| config["consumers"]["classifier"]["ladder"] = json!([JEV]));
+    harness.edit_config(|config| config["consumers"][CONSUMER]["ladder"] = json!([JEV]));
     assert_eq!(route_key(&selected(&route, json!({"iq":0})).await), JEV);
-    harness.edit_config(|config| config["consumers"]["classifier"]["mode"] = json!("ladder"));
+    harness.edit_config(|config| config["consumers"][CONSUMER]["mode"] = json!("ladder"));
     assert_eq!(
         route_key(&selected(&route, json!({"iq":0,"modalities":["image"]})).await),
         FLASH
     );
-    harness.edit_config(|config| {
-        config["consumers"]["classifier"]["ladder"] = json!(["missing/model"])
-    });
+    harness
+        .edit_config(|config| config["consumers"][CONSUMER]["ladder"] = json!(["missing/model"]));
     assert_eq!(route_key(&selected(&route, json!({"iq":0})).await), FLASH);
 }
 
@@ -342,8 +449,7 @@ async fn missing_question_limit_fails_closed_and_another_modules_listing_is_igno
     let route = harness.bind(reserved("broca"), None).await;
     refused(&route, json!({"iq":0})).await;
     let harness = rig(|_| {}, |_| {});
-    harness
-        .edit_config(|config| config["consumers"]["classifier"]["owner"] = json!("another-module"));
+    harness.edit_config(|config| config["consumers"][CONSUMER]["owner"] = json!("another-module"));
     let route = harness.bind(reserved("another-module"), None).await;
     refused(&route, json!({"iq":0})).await;
     let route = harness.bind(reserved("example-consumer"), None).await;

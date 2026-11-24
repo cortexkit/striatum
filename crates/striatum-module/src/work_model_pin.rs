@@ -108,6 +108,7 @@ pub(crate) fn select(
         catalog,
         catalog_targets,
         &HashMap::new(),
+        true,
     )
 }
 
@@ -119,6 +120,7 @@ pub(crate) fn select_with_availability(
     catalog: Option<&ReasoningCatalog>,
     catalog_targets: &BTreeMap<String, String>,
     availability_rejections: &HashMap<String, String>,
+    require_tool_support: bool,
 ) -> Result<SelectedModelRoute, Refusal> {
     let (provider, requested_model) = pin.split_once('/').ok_or_else(|| {
         refuse(
@@ -192,7 +194,7 @@ pub(crate) fn select_with_availability(
             ),
         ));
     }
-    if fact.supports_tool_use != Some(true) {
+    if require_tool_support && fact.supports_tool_use != Some(true) {
         return Err(refuse(
             "missing_tool_support",
             format!("{identity}: tool support is not admitted by the catalog"),

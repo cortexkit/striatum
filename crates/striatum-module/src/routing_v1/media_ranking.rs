@@ -60,7 +60,7 @@ pub(super) fn rank<'a>(
     let bar = policy
         .iq
         .zip(top)
-        .map(|(level, top)| FactNumber(top.0 * level / 100.0));
+        .map(|(level, top)| FactNumber(super::grade_bar(top.0, level)));
     let identity = |a: &Candidate, b: &Candidate| {
         a.engine
             .provider

@@ -126,11 +126,11 @@ async fn classifier_order_ledger() {
     harness.edit_config(|config| {
         config["concurrency"] = json!({"enforcement_enabled":true,"providers":{
             "cloudflare-workers-ai":{"limit":1,"scope":"account_model"},"typesafe":{"limit":1}}});
-        config["consumers"]["classifier"]["mode"] = json!("ladder");
-        config["consumers"]["classifier"]["ladder"] = json!([FLASH, CLEF, JEV]);
+        config["consumers"]["broca.classifier"]["mode"] = json!("ladder");
+        config["consumers"]["broca.classifier"]["ladder"] = json!([FLASH, CLEF, JEV]);
     });
     let route = harness.bind(reserved("broca"), None).await;
-    let body = json!({"consumer":"classifier","requirements":{"iq":0},"detail":true});
+    let body = json!({"consumer":"broca.classifier","requirements":{"iq":0},"detail":true});
     for (i, key) in [FLASH, CLEF, JEV].into_iter().enumerate() {
         let answer = route.call("route.select", &body).await;
         let answer = response(&answer);
@@ -152,8 +152,9 @@ async fn classifier_order_ledger() {
         false,
         NOW + 30_000,
     );
-    harness
-        .edit_config(|config| config["consumer_priorities"] = json!({"classifier":"interactive"}));
+    harness.edit_config(|config| {
+        config["consumer_priorities"] = json!({"broca.classifier":"interactive"})
+    });
     pressure();
     assert_eq!(
         model(&route.call("route.select", &body).await),
@@ -161,7 +162,7 @@ async fn classifier_order_ledger() {
     );
     assert!(pressure().is_empty());
     harness.edit_config(|config| {
-        config["consumer_priorities"] = json!({"classifier":"worker"});
+        config["consumer_priorities"] = json!({"broca.classifier":"worker"});
         config["concurrency"]["enforcement_enabled"] = json!(false);
     });
     assert_eq!(

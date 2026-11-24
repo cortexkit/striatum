@@ -210,14 +210,20 @@ pub(super) fn grade_kind(kind: &str) -> Option<&str> {
     match kind {
         "transcribe" | "stream_transcribe" => Some("transcription"),
         "synthesize" => Some("speech"),
-        "image" | "video" => Some(kind),
+        "image" | "video" | "decision" => Some(kind),
         _ => None,
     }
 }
 
 pub(super) fn catalog_row(entry: &Value) -> MediaGrade {
+    let decision_kind = matches!(
+        entry["model.kind"].as_str(),
+        Some("decision" | "classifier")
+    )
+    .then_some("decision");
     let mut grades: MediaGrade = KINDS
         .into_iter()
+        .chain(decision_kind)
         .filter_map(|kind| {
             entry
                 .get(format!("quality.grade.{kind}"))
@@ -309,6 +315,27 @@ mod tests {
             assert_eq!(
                 snapshot.media_grade("transcribe", "google/gemini-4-hydrogen"),
                 None
+            );
+        }
+    }
+
+    #[test]
+    fn decision_grade_is_operator_only_and_requires_a_decision_or_classifier_row() {
+        for (kind, graded_by, grade, expected) in [
+            ("chat", "operator", json!(91), None),
+            ("decision", "operator", json!(91), Some(91.0)),
+            ("classifier", "operator", json!(83), Some(83.0)),
+            ("decision", "creator", json!(91), None),
+            ("decision", "operator", json!(0), None),
+        ] {
+            let snapshot = snapshot(
+                json!({"existence":"present", "model.kind":kind, "quality.grade.decision":grade}),
+                graded_by,
+            );
+            assert_eq!(
+                snapshot.media_grade("decision", "google/gemini-4-hydrogen"),
+                expected,
+                "{kind} / {graded_by}"
             );
         }
     }
