@@ -233,7 +233,7 @@ fn select_request(
         .as_ref()
         .map_or_else(|| super::operator_config(deps), |view| view.config.clone());
     let consumers = evaluation.as_ref().map_or_else(
-        || std::sync::Arc::new(super::consumers::effective(&config)),
+        || super::consumers::effective(&config),
         |view| view.consumers.clone(),
     );
     // Previews require registration in their own handler, but deliberately do

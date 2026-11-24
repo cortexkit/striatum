@@ -60,6 +60,19 @@ pub struct LiveConfig {
     revision: String,
 }
 
+/// Identifies one validated settings snapshot for caches of values derived
+/// from it. Holding the key keeps the snapshot's compiled policy alive, so a
+/// later snapshot can never reuse its address. A patched preview compiles its
+/// own policy and so gets its own key.
+#[derive(Clone)]
+pub(crate) struct SnapshotKey(Arc<CompiledPolicy>);
+
+impl PartialEq for SnapshotKey {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
 #[derive(Debug)]
 struct CompiledPolicy {
     entities: new_shape::EntityPolicyIndex,
@@ -186,6 +199,10 @@ pub(crate) struct PricingPatch {
 
 impl LiveConfig {
     #[cfg(test)]
+    pub(crate) fn snapshot_key(&self) -> SnapshotKey {
+        SnapshotKey(Arc::clone(&self.compiled))
+    }
+
     pub(super) fn prepared_settings(&self) -> serde_json::Value {
         serde_json::to_value(&self.config).unwrap()
     }
@@ -434,7 +451,6 @@ pub fn reasoning_catalog_for(path: &Path) -> Option<ReasoningCatalog> {
 /// Where the module's routing store lives when the daemon manages storage:
 /// `$XDG_DATA_HOME/cortexkit/striatum/store.db`, defaulting
 /// `XDG_DATA_HOME` to `~/.local/share`.
-/// Where the module's routing store lives when the daemon manages storage.
 pub fn default_store_path() -> Option<PathBuf> {
     let data_home = std::env::var_os("XDG_DATA_HOME")
         .filter(|value| !value.is_empty())
@@ -503,6 +519,13 @@ pub(crate) fn settle_live_config(path: &Path) -> Arc<LiveConfig> {
 }
 
 fn file_stamp(path: &Path) -> Result<FileStamp, String> {
+    #[cfg(test)]
+    {
+        let hook = live_snapshot_tests::STAMP_HOOK.lock().unwrap().clone();
+        if let Some(hook) = hook {
+            hook(path);
+        }
+    }
     match std::fs::read_to_string(path) {
         Ok(document) => {
             let metadata = std::fs::metadata(path).map_err(|error| error.to_string())?;
@@ -731,11 +754,25 @@ fn live_config_at_with_reporter(
     now: Instant,
     mut report_rejection: impl FnMut(&str),
 ) -> Result<Arc<LiveConfig>, String> {
-    let mut caches = live_configs().lock().unwrap();
-    if let Some(cache) = caches.get(path).filter(|cache| cache.managed) {
-        return Ok(Arc::clone(&cache.active));
+    let managed = |caches: &HashMap<PathBuf, LiveConfigCache>| {
+        caches
+            .get(path)
+            .filter(|cache| cache.managed)
+            .map(|cache| Arc::clone(&cache.active))
+    };
+    if let Some(active) = managed(&live_configs().lock().unwrap()) {
+        return Ok(active);
     }
-    let stamp = match file_stamp(path) {
+    // Read and hash the file before taking the lock that every settings
+    // reader shares, so concurrent requests don't queue behind each other's
+    // file I/O. A stamp that is stale by the time the lock is held is safe:
+    // a reload publishes only if the file's stamp still matches afterwards.
+    let stamp = file_stamp(path);
+    let mut caches = live_configs().lock().unwrap();
+    if let Some(active) = managed(&caches) {
+        return Ok(active);
+    }
+    let stamp = match stamp {
         Ok(stamp) => stamp,
         Err(error) => {
             let Some(cache) = caches.get(path) else {
@@ -1288,6 +1325,63 @@ pub async fn config_refresh_loop(
 #[cfg(test)]
 mod live_snapshot_tests {
     use super::*;
+
+    /// Runs at the start of every file stamp, so a test can hold one
+    /// reader inside its file read and hash.
+    pub(super) static STAMP_HOOK: Mutex<Option<Arc<dyn Fn(&Path) + Send + Sync>>> =
+        Mutex::new(None);
+
+    #[test]
+    fn a_file_mode_reader_does_not_wait_for_another_readers_file_hash() {
+        use std::sync::mpsc;
+        let scratch = cortexkit_test_support::ScratchDir::new("file-stamp-outside-lock");
+        let path = scratch.path().join("routing.jsonc");
+        std::fs::write(&path, "{}").unwrap();
+        initialize_config(&path).unwrap();
+        let (paused_tx, paused) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel::<()>();
+        let (second_tx, second) = mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let second_tx = Mutex::new(second_tx);
+        let paused_tx = Mutex::new(paused_tx);
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let hooked = path.clone();
+        *STAMP_HOOK.lock().unwrap() = Some(Arc::new(move |stamped: &Path| {
+            if stamped != hooked {
+                return;
+            }
+            if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                paused_tx.lock().unwrap().send(()).unwrap();
+                release_rx.lock().unwrap().recv().unwrap();
+            } else {
+                let _ = second_tx.lock().unwrap().send(());
+            }
+        }));
+        let first = std::thread::spawn({
+            let path = path.clone();
+            move || live_config(&path)
+        });
+        paused.recv().unwrap();
+        let second_call = std::thread::spawn({
+            let path = path.clone();
+            move || live_config(&path)
+        });
+        // The bound only keeps a regression from hanging the suite: the
+        // second reader must reach its own hash while the first is still
+        // held inside its hash, which it cannot do if the hash is taken
+        // under the shared lock.
+        let overlapped = second
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .is_ok();
+        release.send(()).unwrap();
+        let (first, second_call) = (first.join().unwrap(), second_call.join().unwrap());
+        *STAMP_HOOK.lock().unwrap() = None;
+        assert!(
+            overlapped,
+            "the second reader waited for the first reader's file hash"
+        );
+        assert!(Arc::ptr_eq(&first, &second_call));
+    }
 
     #[test]
     fn compiled_policy_is_snapshot_owned_and_revision_detects_same_stamp_edits() {

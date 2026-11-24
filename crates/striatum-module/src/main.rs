@@ -428,9 +428,9 @@ where
             return Err(ModuleError::Message(format!("load account state: {error}")));
         }
     }
-    // Variant overrides name efforts the catalog must publish. Config loaded
-    // before the store opened got only shape checks; check it now, and every
-    // later reload, against the stored catalog.
+    // Pinned selects check a pinned variant against the reasoning efforts the
+    // stored catalog publishes; give the settings layer that catalog now that
+    // the store is open.
     config_overrides::attach_store_catalog(config_path, store)
         .map_err(|error| ModuleError::Message(format!("{}: {error}", config_path.display())))?;
     // Seed the cache from the last persisted snapshot before anything can serve a
