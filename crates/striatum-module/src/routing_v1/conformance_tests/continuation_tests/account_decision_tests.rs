@@ -118,6 +118,54 @@ async fn continuation_from_account_decision_preserves_admission_boundaries() {
 }
 
 #[tokio::test]
+async fn continuation_used_via_started_leaves_served_attempt_unbound() {
+    let (subject, runner, request, admitted) = paused_without_selection().await;
+    let offer = result(runner.call("route.account_for", &request).await);
+    assert_account_offer(&subject, &request, &admitted, &offer);
+
+    let started = json!({
+        "kind": "admission_started", "event_id": "head-moved",
+        "admission_id": request["admission_id"], "run_id": request["run_id"],
+        "served_account_id": offer["account"], "credential_id": offer["credential_id"],
+    });
+    let mismatch = json!({
+        "effect": "served_account_mismatch",
+        "selected_account_id": admitted["account"]["account_id"],
+        "served_account_id": offer["account"],
+        "pin_generation": admitted["pin"]["generation"].as_u64().unwrap(),
+    });
+    let effects = |reply: &Value| {
+        reply["observation"]["effects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|effect| serde_json::from_str::<Value>(effect.as_str().unwrap()).unwrap())
+            .collect::<Vec<_>>()
+    };
+    let start = result(runner.call("route.account_observe", &started).await);
+    assert_eq!(start["observation"]["bound"], false, "{start}");
+    assert_eq!(
+        effects(&start),
+        vec![json!({"effect": "continuation_used"}), mismatch.clone()]
+    );
+    let (used, _, state, run_id, started_at) = offer_state(&subject, &offer);
+    assert!(used.is_some());
+    assert_eq!(state, "started");
+    assert_eq!(run_id.as_deref(), request["run_id"].as_str());
+    assert_eq!(started_at, used);
+
+    let attempt = json!({
+        "kind": "attempt", "event_id": "head-served",
+        "admission_id": request["admission_id"],
+        "served_account_id": offer["account"], "credential_id": offer["credential_id"],
+        "attempt_outcome": {"status": "served"}, "upstream_origin": "upstream",
+    });
+    let served = result(runner.call("route.account_observe", &attempt).await);
+    assert_eq!(served["observation"]["bound"], false, "{served}");
+    assert_eq!(effects(&served), vec![mismatch]);
+}
+
+#[tokio::test]
 async fn continuation_from_account_decision_chains_offered_account_decisions() {
     let (subject, runner, request, admitted) = paused_without_selection().await;
     let first = result(runner.call("route.account_for", &request).await);
