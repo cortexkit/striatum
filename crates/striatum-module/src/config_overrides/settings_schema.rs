@@ -34,7 +34,82 @@ pub(super) fn render() -> String {
     }
     allow_project_consumers(&mut schema, defs);
     schema["$defs"] = json!(defs);
+    strip_unenforced_keywords(&mut schema);
     serde_json::to_string_pretty(&schema).unwrap() + "\n"
+}
+
+fn strip_unenforced_keywords(schema: &mut Value) {
+    let Some(node) = schema.as_object_mut() else {
+        return;
+    };
+    if node.get("x-ck-kind") == Some(&json!("json")) {
+        return;
+    }
+    if node
+        .get("format")
+        .and_then(Value::as_str)
+        .is_some_and(|format| format.starts_with("uint"))
+    {
+        node.entry("minimum").or_insert(json!(0));
+    }
+    for key in [
+        "minProperties",
+        "maxProperties",
+        "dependentRequired",
+        "dependentSchemas",
+        "prefixItems",
+        "contains",
+        "minContains",
+        "maxContains",
+        "unevaluatedItems",
+        "multipleOf",
+        "format",
+        "contentEncoding",
+        "contentMediaType",
+        "contentSchema",
+        "readOnly",
+        "writeOnly",
+        "$id",
+        "$anchor",
+        "$dynamicAnchor",
+        "$vocabulary",
+        "definitions",
+        "dependencies",
+        "$recursiveAnchor",
+        "$recursiveRef",
+        "additionalItems",
+    ] {
+        node.remove(key);
+    }
+    // Only visit schema positions: defaults and property names are user data.
+    for key in ["$defs", "properties", "patternProperties"] {
+        if let Some(Value::Object(children)) = node.get_mut(key) {
+            for child in children.values_mut() {
+                strip_unenforced_keywords(child);
+            }
+        }
+    }
+    for key in [
+        "items",
+        "additionalProperties",
+        "unevaluatedProperties",
+        "propertyNames",
+        "not",
+        "if",
+        "then",
+        "else",
+    ] {
+        if let Some(child) = node.get_mut(key) {
+            strip_unenforced_keywords(child);
+        }
+    }
+    for key in ["allOf", "anyOf", "oneOf"] {
+        if let Some(Value::Array(children)) = node.get_mut(key) {
+            for child in children {
+                strip_unenforced_keywords(child);
+            }
+        }
+    }
 }
 
 fn allow_project_consumers(schema: &mut Value, defs: &mut Map<String, Value>) {
@@ -277,4 +352,100 @@ fn item_description(owner: &str, field: &str) -> &'static str {
         ("RunnerPolicy" | "ConsumerPolicy", "tool_capabilities") => "One tool capability tag.",
         _ => panic!("describe one item of {owner}.{field}"),
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stripping_preserves_json_values_unsigned_bounds_and_data() {
+        let mut schema = json!({
+            "properties": {
+                "format": {"format": "uint64"},
+                "bounded": {"format": "uint8", "minimum": 7},
+                "json": {"x-ck-kind": "json", "format": "uint32", "properties": {
+                    "nested": {"writeOnly": true}
+                }},
+                "kept": {"deprecated": true, "default": {"format": "value"}},
+                "nested": {"items": {"format": "double"}}
+            }
+        });
+        let json_value = schema["properties"]["json"].clone();
+        strip_unenforced_keywords(&mut schema);
+        assert_eq!(schema["properties"]["format"], json!({"minimum": 0}));
+        assert_eq!(schema["properties"]["bounded"], json!({"minimum": 7}));
+        assert_eq!(schema["properties"]["json"], json_value);
+        assert_eq!(
+            schema["properties"]["kept"],
+            json!({
+                "deprecated": true, "default": {"format": "value"}
+            })
+        );
+        assert_eq!(schema["properties"]["nested"]["items"], json!({}));
+
+        let mut all_keywords = json!({});
+        for key in UNENFORCED_KEYWORDS {
+            all_keywords[*key] = json!(true);
+        }
+        strip_unenforced_keywords(&mut all_keywords);
+        assert_eq!(all_keywords, json!({}));
+    }
+
+    #[test]
+    fn emitted_schema_has_no_unenforced_keywords_outside_json_values() {
+        fn walk(value: &Value, path: &str) {
+            match value {
+                Value::Object(object) => {
+                    if object.get("x-ck-kind") == Some(&json!("json")) {
+                        return;
+                    }
+                    for (key, child) in object {
+                        assert!(
+                            !UNENFORCED_KEYWORDS.contains(&key.as_str()),
+                            "unenforced keyword {key} at {path}"
+                        );
+                        walk(child, &format!("{path}/{key}"));
+                    }
+                }
+                Value::Array(items) => {
+                    for (index, child) in items.iter().enumerate() {
+                        walk(child, &format!("{path}/{index}"));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let schema: Value = serde_json::from_str(&render()).unwrap();
+        walk(&schema, "");
+    }
+
+    const UNENFORCED_KEYWORDS: &[&str] = &[
+        "minProperties",
+        "maxProperties",
+        "dependentRequired",
+        "dependentSchemas",
+        "prefixItems",
+        "contains",
+        "minContains",
+        "maxContains",
+        "unevaluatedItems",
+        "multipleOf",
+        "format",
+        "contentEncoding",
+        "contentMediaType",
+        "contentSchema",
+        "readOnly",
+        "writeOnly",
+        "$id",
+        "$anchor",
+        "$dynamicAnchor",
+        "$vocabulary",
+        "definitions",
+        "dependencies",
+        "$recursiveAnchor",
+        "$recursiveRef",
+        "additionalItems",
+    ];
 }

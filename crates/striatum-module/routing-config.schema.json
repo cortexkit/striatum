@@ -25,7 +25,6 @@
         },
         "remaining_percent": {
           "description": "Minimum quota that must remain in the pool, from 0 to 100 percent.",
-          "format": "double",
           "title": "Minimum remaining quota (%)",
           "type": "number",
           "x-ck-apply": "live",
@@ -36,7 +35,6 @@
         },
         "window_minutes": {
           "description": "Length of the quota window in minutes. Provide a window length, a pool name, or both.",
-          "format": "uint32",
           "minimum": 0,
           "title": "Quota window (minutes)",
           "type": "integer",
@@ -203,7 +201,6 @@
         "poll_ms": {
           "default": 1800000,
           "description": "Time between model catalog refreshes, in milliseconds. Must be at least 1.",
-          "format": "uint64",
           "minimum": 1,
           "title": "Refresh interval (milliseconds)",
           "type": "integer",
@@ -235,7 +232,6 @@
         },
         "context_tokens": {
           "description": "Minimum context capacity in tokens.",
-          "format": "uint64",
           "minimum": 0,
           "title": "Minimum context (tokens)",
           "type": "integer",
@@ -247,7 +243,6 @@
         },
         "eq": {
           "description": "Minimum collaboration quality requested, from 0 to 100.",
-          "format": "double",
           "title": "Minimum judgment level",
           "type": "number",
           "x-ck-apply": "live",
@@ -258,7 +253,6 @@
         },
         "iq": {
           "description": "Minimum reasoning quality requested, from 0 to 100.",
-          "format": "double",
           "title": "Minimum reasoning level",
           "type": "number",
           "x-ck-apply": "live",
@@ -288,7 +282,6 @@
         },
         "max_output_tokens": {
           "description": "Minimum output capacity in tokens.",
-          "format": "uint64",
           "minimum": 0,
           "title": "Minimum output capacity (tokens)",
           "type": "integer",
@@ -674,7 +667,6 @@
         },
         "soft_quota_remaining_percent": {
           "description": "Prefer accounts with at least this percentage of quota remaining, from 0 to 100.",
-          "format": "double",
           "title": "Preferred remaining quota (%)",
           "type": "number",
           "x-ck-apply": "live",
@@ -685,7 +677,6 @@
         },
         "spend_budget_reset_at_ms": {
           "description": "Scheduled spending-limit reset as milliseconds since the Unix epoch. Omit for no scheduled reset.",
-          "format": "int64",
           "title": "Spending limit reset (Unix milliseconds)",
           "type": "integer",
           "x-ck-apply": "live",
@@ -696,7 +687,6 @@
         },
         "spend_budget_usd": {
           "description": "Maximum account spending in US dollars. Use a positive amount or omit for no spending limit.",
-          "format": "double",
           "title": "Spending limit (USD)",
           "type": "number",
           "x-ck-apply": "live",
@@ -763,7 +753,6 @@
         "context_window_tokens": {
           "description": "Override the context window in tokens. Use a number greater than 0, or omit to use the catalog size.",
           "exclusiveMinimum": 0,
-          "format": "double",
           "title": "Context window (tokens)",
           "type": "number",
           "x-ck-apply": "live",
@@ -774,7 +763,6 @@
         },
         "cost_per_mtok_out": {
           "description": "Override cost in US dollars per million output tokens, from 0 upward.",
-          "format": "double",
           "minimum": 0,
           "title": "Price per million output tokens (USD)",
           "type": "number",
@@ -787,7 +775,6 @@
         "elo": {
           "description": "Override the model's reasoning score. Use a number greater than 0, or omit to use the catalog score.",
           "exclusiveMinimum": 0,
-          "format": "double",
           "title": "Reasoning score override",
           "type": "number",
           "x-ck-apply": "live",
@@ -799,7 +786,6 @@
         "eq": {
           "description": "Override the model's collaboration score. Use a number greater than 0, or omit to use the catalog score.",
           "exclusiveMinimum": 0,
-          "format": "double",
           "title": "Judgment score override",
           "type": "number",
           "x-ck-apply": "live",
@@ -848,7 +834,6 @@
         },
         "output_tokens_per_second": {
           "description": "Override generation speed in output tokens per second, from 0 upward. Omit to use measured or catalog speed.",
-          "format": "double",
           "minimum": 0,
           "title": "Generation speed (tokens per second)",
           "type": "number",
@@ -905,7 +890,6 @@
         "speed_multiplier": {
           "description": "Multiply the speed used to compare this model with others. Use a number greater than 0 and up to 2.",
           "exclusiveMinimum": 0,
-          "format": "double",
           "maximum": 2,
           "title": "Speed comparison multiplier",
           "type": "number",
@@ -927,7 +911,6 @@
         },
         "subscription_multiplier": {
           "description": "This setting is ignored. Set the subscription cost multiplier on the provider instead.",
-          "format": "double",
           "title": "Subscription cost divisor (ignored)",
           "type": "number",
           "x-ck-apply": "live",
@@ -956,7 +939,6 @@
       "properties": {
         "base": {
           "description": "Starting penalty before it grows with excess reasoning quality. In additive mode only; use 0 or more. If omitted in additive mode, uses 0.05.",
-          "format": "double",
           "minimum": 0,
           "title": "Starting penalty",
           "type": "number",
@@ -969,7 +951,6 @@
         "doubling": {
           "description": "Extra reasoning score needed to double the penalty. In additive mode only; use a number greater than 0. If omitted in additive mode, uses 10.",
           "exclusiveMinimum": 0,
-          "format": "double",
           "title": "Extra reasoning score to double the penalty",
           "type": "number",
           "x-ck-apply": "live",
@@ -994,7 +975,6 @@
         },
         "threshold": {
           "description": "How far the model's reasoning score may exceed the target before adding a penalty. In additive mode only; use 0 or more. If omitted in additive mode, uses 40.",
-          "format": "double",
           "minimum": 0,
           "title": "Extra reasoning score allowed without penalty",
           "type": "number",
@@ -1106,7 +1086,6 @@
         "extra": {
           "default": 0,
           "description": "Number of additional models to select, from 0 to 8 minus the leading count.",
-          "format": "uint8",
           "maximum": 7,
           "minimum": 0,
           "title": "Number of additional models",
@@ -1134,7 +1113,6 @@
         },
         "floor": {
           "description": "Minimum quality score for a panel seat, from 0 to 100. Omit to use the request's quality rules.",
-          "format": "uint8",
           "maximum": 100,
           "minimum": 0,
           "title": "Minimum panel quality score",
@@ -1147,7 +1125,6 @@
         },
         "top_k": {
           "description": "Number of leading models to select, from 1 to 8.",
-          "format": "uint8",
           "maximum": 8,
           "minimum": 1,
           "title": "Number of leading models",
@@ -1281,7 +1258,6 @@
         },
         "soft_quota_remaining_percent": {
           "description": "Prefer accounts with at least this percentage of quota remaining, from 0 to 100.",
-          "format": "double",
           "title": "Preferred remaining quota (%)",
           "type": "number",
           "x-ck-apply": "live",
@@ -1292,7 +1268,6 @@
         },
         "spend_budget_reset_at_ms": {
           "description": "Scheduled spending-limit reset as milliseconds since the Unix epoch. Omit for no scheduled reset.",
-          "format": "int64",
           "title": "Spending limit reset (Unix milliseconds)",
           "type": "integer",
           "x-ck-apply": "live",
@@ -1303,7 +1278,6 @@
         },
         "spend_budget_usd": {
           "description": "Maximum account spending in US dollars. Use a positive amount or omit for no spending limit.",
-          "format": "double",
           "title": "Spending limit (USD)",
           "type": "number",
           "x-ck-apply": "live",
@@ -1370,7 +1344,6 @@
         "keep_free_percent": {
           "default": 0.0,
           "description": "Reserve this percentage of weekly quota for operator-facing sessions, from 0 to 100.",
-          "format": "double",
           "title": "Weekly quota kept free for agents (%)",
           "type": "number",
           "x-ck-apply": "live",
@@ -1501,7 +1474,6 @@
         },
         "subscription_multiplier": {
           "description": "Divide the estimated cost of using a subscription by this number. Use a number greater than 0.",
-          "format": "double",
           "title": "Subscription cost divisor",
           "type": "number",
           "x-ck-apply": "live",
@@ -1551,7 +1523,6 @@
         "account_observation_days": {
           "default": 7,
           "description": "Days to keep reports from model runners. Minimum 1 day.",
-          "format": "uint64",
           "minimum": 1,
           "title": "Runner reports (days)",
           "type": "integer",
@@ -1563,7 +1534,6 @@
         "account_selection_days": {
           "default": 30,
           "description": "Days to keep account selections after their last activity. Minimum 7 days.",
-          "format": "uint64",
           "minimum": 7,
           "title": "Account selections (days)",
           "type": "integer",
@@ -1575,7 +1545,6 @@
         "model_route_decisions_days": {
           "default": 30,
           "description": "Days to keep the summary of each routing decision. Minimum 1 day.",
-          "format": "uint64",
           "minimum": 1,
           "title": "Routing decision summaries (days)",
           "type": "integer",
@@ -1587,7 +1556,6 @@
         "model_route_decisions_full_detail_days": {
           "default": 2,
           "description": "Days to keep full scores and quota details for each routing decision. Minimum 1 day.",
-          "format": "uint64",
           "minimum": 1,
           "title": "Full routing decision details (days)",
           "type": "integer",
@@ -1599,7 +1567,6 @@
         "model_route_decisions_full_detail_sample_one_in": {
           "default": 20,
           "description": "Keep full scoring details for one decision in this many until its summary expires. Set to 0 to keep no long-term samples.",
-          "format": "uint64",
           "minimum": 0,
           "title": "Long-term detail sampling (one in N)",
           "type": "integer",
@@ -1611,7 +1578,6 @@
         "model_route_usage_days": {
           "default": 30,
           "description": "Days to keep usage records for individual requests. Minimum 7 days.",
-          "format": "uint64",
           "minimum": 7,
           "title": "Request usage records (days)",
           "type": "integer",
@@ -1781,7 +1747,6 @@
     "consecutive_terminal_failure_threshold": {
       "default": 3,
       "description": "Number of failed sends in a row before temporarily avoiding a route. Must be at least 1.",
-      "format": "uint32",
       "minimum": 1,
       "title": "Failures before a route is avoided",
       "type": "integer",
@@ -1848,7 +1813,6 @@
       "default": 0.35,
       "description": "Set how quickly the reasoning quality target rises as a request asks for more. Use a number greater than 0.",
       "exclusiveMinimum": 0,
-      "format": "double",
       "title": "How quickly the reasoning target rises",
       "type": "number",
       "x-ck-apply": "live",
@@ -1878,7 +1842,6 @@
     "min_best_effort_adequacy": {
       "default": 0.6,
       "description": "Minimum fit for choosing a fallback model when none meets the quality target. Use a score from 0 to 1.",
-      "format": "double",
       "title": "Minimum fit for a fallback model",
       "type": "number",
       "x-ck-apply": "live",
@@ -2028,7 +1991,6 @@
       "patternProperties": {
         "^[^/\\s]+$": {
           "description": "Positive number to divide this provider's estimated subscription cost by.",
-          "format": "double",
           "type": "number",
           "x-ck-apply": "live",
           "x-ck-layers": [
@@ -2040,7 +2002,6 @@
       "title": "Subscription cost divisors",
       "type": "object",
       "unevaluatedProperties": false,
-      "writeOnly": true,
       "x-ck-apply": "live",
       "x-ck-layers": [
         "user"
