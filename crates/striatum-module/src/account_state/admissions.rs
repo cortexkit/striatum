@@ -841,10 +841,23 @@ impl AdmissionState {
         }
     }
 
-    /// Closed rows are not retained in `open`, but their start evidence still
-    /// contributes to the current pin's history. Do not reopen the admission
-    /// or add an active started-pin or inflight entry.
+    /// Closed rows are not retained in `open`, but late start evidence restores
+    /// their demand and contributes to the current pin's history. Do not reopen
+    /// the admission or count it as an active run.
     pub(crate) fn record_terminal_start(&mut self, row: &AccountAdmissionRow) {
+        self.set_demand(
+            &row.provider,
+            &row.account_id,
+            (
+                row.committed_at,
+                row.principal.clone().into(),
+                row.admission_id.clone().into(),
+            ),
+            Some(Demand {
+                state: row.state.clone().into(),
+                request_bytes: row.request_bytes,
+            }),
+        );
         self.add_pin_started(
             &Contribution {
                 principal: &row.principal,
@@ -899,6 +912,7 @@ impl AdmissionState {
         let open = self.open.get(&id).expect("checked above");
         let mut row = open.row.clone();
         let from = row.state.to_string();
+        let was_charged = row.charged;
         let was_started = row.started_at.is_some();
         let was_state_started = row.state == "started";
         change(&mut row);
@@ -916,6 +930,18 @@ impl AdmissionState {
                     started: true,
                 },
                 1,
+            );
+        }
+        if was_charged && !row.charged {
+            self.set_demand(
+                &row.provider,
+                &row.account_id,
+                (
+                    row.committed_at,
+                    row.principal.clone(),
+                    row.admission_id.clone(),
+                ),
+                None,
             );
         }
         self.restate(&row);
@@ -1014,6 +1040,9 @@ impl AdmissionState {
             |row| {
                 row.state = "finished".into();
                 row.finished_at = Some(at);
+                if row.started_at.is_none() && row.run_id.is_none() {
+                    row.charged = false;
+                }
             },
         )
     }

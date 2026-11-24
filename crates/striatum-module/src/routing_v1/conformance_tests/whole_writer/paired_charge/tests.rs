@@ -62,6 +62,16 @@ impl World {
             tx.insert_pin(&pin)?;
             tx.insert_admission(&admission)
         });
+        world.command("paired historical start", move |tx| {
+            assert!(tx.mark_admission_started(
+                &format!("reserved:{}", fixture::RUNNER_ONE),
+                "paired-historical-finished",
+                Some("paired-historical-run"),
+                case.committed_at(),
+                false,
+            )?);
+            Ok(())
+        });
         world.command("paired historical completion", move |tx| {
             assert!(tx.mark_admission_finished(
                 &format!("reserved:{}", fixture::RUNNER_ONE),
@@ -186,7 +196,7 @@ fn assert_only_finished_charge_differs(
         "the paired historical records differ in more than one bit"
     );
     assert_eq!(right.state, "finished");
-    assert!(right.started_at.is_none());
+    assert!(right.started_at.is_some());
     assert!(right.released_at.is_none());
     assert_eq!(right.committed_at, case.committed_at());
     assert_eq!(control.now, charged.now);
