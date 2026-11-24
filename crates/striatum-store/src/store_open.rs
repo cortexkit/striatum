@@ -133,7 +133,7 @@ impl SqliteRouteStateStore {
             account_state_retries: AtomicU64::new(0),
             call_counts: Default::default(),
             class_vectors: Mutex::new(HashMap::new()),
-            usage_generation: AtomicU64::new(0),
+            class_generations: Default::default(),
             reported_score_conflicts: Mutex::new(HashSet::new()),
             catalog_fingerprint: Mutex::new(None),
             resolved_facts: Mutex::new(None),

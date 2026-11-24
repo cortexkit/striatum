@@ -328,7 +328,7 @@ const MIGRATION_068: &str = include_str!("../migrations/068_account_demand_by_ac
 const MIGRATION_069: &str = include_str!("../migrations/069_task_workload.sql");
 const MIGRATION_071: &str = include_str!("../migrations/071_service_tiers.sql");
 
-fn route_state_migrations() -> [Migration; 101] {
+fn route_state_migrations() -> [Migration; 102] {
     [
         Migration {
             version: 1,
@@ -731,6 +731,10 @@ fn route_state_migrations() -> [Migration; 101] {
             version: 102,
             statements: include_str!("../migrations/102_model_mode_of.sql"),
         },
+        Migration {
+            version: 103,
+            statements: include_str!("../migrations/103_retention_lookups.sql"),
+        },
     ]
 }
 
@@ -863,12 +867,16 @@ pub struct SqliteRouteStateStore {
     /// Class vectors are means over every complete token profile in a seven-day
     /// window, recomputed from the whole population on every route selection
     /// before this cache existed (Loop R184: 1.9 million VM steps per selection
-    /// at 100k profiles). A computed vector is reused until usage is written
-    /// (`usage_generation` moves) or the window's minute boundary passes, so
-    /// selection pays the scan at most once a minute per class while usage is
-    /// quiet and never serves a vector that predates a write.
+    /// at 100k profiles). A computed vector is reused until a usage write
+    /// changes that class's population (its entry in `class_generations`
+    /// moves) or the window's minute boundary passes, so selection pays the
+    /// scan at most once a minute per class while that class is quiet and never
+    /// serves a vector that predates a write to it. Usage of another class, or
+    /// a write that only fills columns outside the token profile, leaves the
+    /// cached vector in place.
     class_vectors: Mutex<HashMap<String, CachedClassVector>>,
-    usage_generation: AtomicU64,
+    /// One generation per entry of `ENUMERATED_WORKLOAD_CLASSES`, in order.
+    class_generations: [AtomicU64; ENUMERATED_WORKLOAD_CLASSES.len()],
     /// Same-model score disagreements already logged by this process, so a
     /// read on every selection does not repeat the same warning.
     reported_score_conflicts: Mutex<HashSet<String>>,

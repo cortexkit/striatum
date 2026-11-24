@@ -730,7 +730,7 @@ impl RouteStateStore for SqliteRouteStateStore {
         if !ENUMERATED_WORKLOAD_CLASSES.contains(&workload_class) {
             return Ok(None);
         }
-        let generation = self.usage_generation.load(Ordering::Acquire);
+        let generation = self.class_generation(workload_class);
         let window_minute = (now / 60_000.0).floor() as i64;
         if let Some(cached) = self
             .class_vectors
@@ -738,7 +738,7 @@ impl RouteStateStore for SqliteRouteStateStore {
             .expect("class vector cache poisoned")
             .get(workload_class)
         {
-            if cached.usage_generation == generation && cached.window_minute == window_minute {
+            if cached.class_generation == generation && cached.window_minute == window_minute {
                 return Ok(cached.vector.clone());
             }
         }
@@ -749,7 +749,7 @@ impl RouteStateStore for SqliteRouteStateStore {
             .insert(
                 workload_class.to_string(),
                 CachedClassVector {
-                    usage_generation: generation,
+                    class_generation: generation,
                     window_minute,
                     vector: vector.clone(),
                 },

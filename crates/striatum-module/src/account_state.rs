@@ -1576,18 +1576,39 @@ impl AccountCommand<'_> {
         Ok(batch)
     }
 
+    pub(crate) fn delete_account_continuations(
+        &mut self,
+        before: i64,
+        keys: &[i64],
+    ) -> RouteStateResult<usize> {
+        #[cfg(test)]
+        let _writer_entry = striatum_store::writer_entry_trace::enter(
+            "account_command::delete_account_continuations",
+        );
+        let deleted = self
+            .sql
+            .delete_account_continuations_returning(before, keys)?;
+        self.apply_pruned_continuations(deleted)
+    }
+
+    /// The unkeyed reference form of continuation retention, applied to the
+    /// module's state the same way as the keyed production path.
+    #[cfg(test)]
     pub(crate) fn prune_account_continuations(
         &mut self,
         before: i64,
         limit: usize,
     ) -> RouteStateResult<usize> {
-        #[cfg(test)]
-        let _writer_entry = striatum_store::writer_entry_trace::enter(
-            "account_command::prune_account_continuations",
-        );
         let deleted = self
             .sql
             .prune_account_continuations_returning(before, limit)?;
+        self.apply_pruned_continuations(deleted)
+    }
+
+    fn apply_pruned_continuations(
+        &mut self,
+        deleted: Vec<striatum_store::PrunedContinuation>,
+    ) -> RouteStateResult<usize> {
         let sql = self.sql;
         if let Some(state) = self.state.as_deref_mut() {
             state.inflight.prune_continuations(&deleted);

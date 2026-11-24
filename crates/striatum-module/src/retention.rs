@@ -178,6 +178,12 @@ impl AffinitySweep {
         Ok(Some(plan))
     }
 }
+/// How long a key-pool lease or session binding is kept after it stops
+/// binding anything (release or deadline for a lease, end or idle expiry for a
+/// binding). Serving reads only live rows. Core renews a lease every few
+/// minutes while its run lives, so a renewal never names a lease this old; a
+/// renewal that names a deleted lease is answered by recreating it.
+pub const POOL_KEY_HISTORY_WINDOW_MS: i64 = DAY_MS;
 /// The oldest a generation-speed sample may be.
 pub const SPEED_SAMPLE_CAP_MS: i64 = 30 * DAY_MS;
 /// Samples kept per route and served population once they are older than the
@@ -383,6 +389,9 @@ pub struct RetentionPassReport {
     pub retired_fence_origins: usize,
     pub unscored_admissible_models: usize,
     pub quota_readings: usize,
+    /// Key-pool leases and session bindings past
+    /// [`POOL_KEY_HISTORY_WINDOW_MS`].
+    pub pool_key_rows: usize,
     /// Batches run across all tables.
     pub batches: usize,
     /// False when some table used its whole batch budget and may have more
@@ -415,6 +424,7 @@ impl RetentionPassReport {
             + self.retired_fence_origins
             + self.unscored_admissible_models
             + self.quota_readings
+            + self.pool_key_rows
     }
 }
 
@@ -834,6 +844,15 @@ fn run_retention_pass_with_affinity_sweep(
         drain("quota_reading_log", control, per_table, batches, || {
             counted(store.prune_quota_reading_log(readings_before, rows))
         });
+    let pool_before = before(now_ms, POOL_KEY_HISTORY_WINDOW_MS);
+    let (pool_key_rows, pool_key_rows_drained) =
+        drain("pool_key_history", control, per_table, batches, || {
+            counted(crate::account_writer::prune_pool_key_history(
+                store,
+                pool_before,
+                rows,
+            ))
+        });
     report.shadow_decisions = shadow;
     report.account_admissions = admissions;
     report.account_holds = holds;
@@ -858,6 +877,7 @@ fn run_retention_pass_with_affinity_sweep(
     report.retired_fence_origins = retired_origins;
     report.unscored_admissible_models = unscored;
     report.quota_readings = quota_readings;
+    report.pool_key_rows = pool_key_rows;
     report.drained = shadow_drained
         && admissions_drained
         && holds_drained
@@ -880,7 +900,8 @@ fn run_retention_pass_with_affinity_sweep(
         && call_counts_drained
         && retired_origins_drained
         && unscored_drained
-        && quota_readings_drained;
+        && quota_readings_drained
+        && pool_key_rows_drained;
     report
 }
 
@@ -2198,6 +2219,55 @@ mod tests {
                 "SELECT observed_at FROM quota_reading_log"
             ),
             NOW - 2 * DAY_MS
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Key-pool leases and session bindings used to be kept forever. A pass
+    /// now deletes those that stopped binding anything more than a day ago
+    /// and keeps every live one and every recently ended one.
+    #[test]
+    fn a_pass_prunes_key_pool_rows_a_day_after_they_stop_binding() {
+        let (dir, path, store) = scratch_store("pool-keys");
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch(&format!(
+                "INSERT INTO pool_key_lease
+                   (lease_id, provider, session_id, credential_id, workspace, acquired_at, valid_until, released_at)
+                 VALUES ('released-old', 'p', 's1', 'k', 'w', {old}, {live}, {old}),
+                        ('expired-old', 'p', 's2', 'k', 'w', {old}, {old}, NULL),
+                        ('released-recent', 'p', 's3', 'k', 'w', {old}, {old}, {recent}),
+                        ('live', 'p', 's4', 'k', 'w', {old}, {live}, NULL);
+                 INSERT INTO pool_session_affinity
+                   (provider, session_id, workspace, credential_id, bound_at, last_used_at, expires_at, ended_at)
+                 VALUES ('p', 'ended-old', 'w', 'k', {old}, {old}, {live}, {old}),
+                        ('p', 'idle-old', 'w', 'k', {old}, {old}, {old}, NULL),
+                        ('p', 'ended-recent', 'w', 'k', {old}, {old}, {old}, {recent}),
+                        ('p', 'live', 'w', 'k', {old}, {old}, {live}, NULL);",
+                old = NOW - 2 * DAY_MS,
+                recent = NOW - HOUR_MS,
+                live = NOW + HOUR_MS,
+            ))
+            .unwrap();
+        drop(connection);
+        run_retention_pass(&store, &RetentionWindows::default(), NOW, &no_pause());
+        let ids = |sql: &str| {
+            let connection = rusqlite::Connection::open(&path).unwrap();
+            let mut statement = connection.prepare(sql).unwrap();
+            statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert_eq!(
+            ids("SELECT lease_id FROM pool_key_lease ORDER BY lease_id"),
+            ["live", "released-recent"]
+        );
+        assert_eq!(
+            ids("SELECT session_id FROM pool_session_affinity ORDER BY session_id"),
+            ["ended-recent", "live"]
         );
         drop(store);
         let _ = std::fs::remove_dir_all(&dir);

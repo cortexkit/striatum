@@ -44,6 +44,7 @@ prune_account_admissions
 prune_account_affinities
 prune_account_observations
 prune_observation_events
+prune_pool_key_history
 prune_v1_decisions
 prune_v1_admissions
 prune_v1_affinities

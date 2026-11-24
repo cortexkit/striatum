@@ -35,7 +35,7 @@ fn retirement_prune_keeps_young_and_nonretirement_tombstones() {
 }
 
 #[test]
-fn cleared_fence_keeps_its_observation_through_the_prune() {
+fn cleared_fence_releases_its_observation_to_the_prune() {
     let rig = crate::block_state::tests::rig_before_block_migration("native-observation-retention");
     let now = crate::now_ms();
     rig.store.seed_block_parity_fixture_for_test(now);
@@ -79,13 +79,79 @@ fn cleared_fence_keeps_its_observation_through_the_prune() {
         rig.store
             .prune_account_observations(now - 1000, 10)
             .unwrap(),
-        1
+        2
     );
     assert_eq!(rig.published(), rig.fresh());
     rig.store.with_reader_for_test(|conn| {
-        assert_eq!(conn.query_row("SELECT count(*) FROM account_observation WHERE observation_id='protected-observation'",[],|row|row.get::<_,i64>(0))?,1);
+        // The cleared fence's kept block row guards replay; its observation
+        // ages out like any other.
+        assert_eq!(conn.query_row("SELECT count(*) FROM account_observation WHERE observation_id='protected-observation'",[],|row|row.get::<_,i64>(0))?,0);
         assert_eq!(conn.query_row("SELECT count(*) FROM account_observation WHERE observation_id='unreferenced-observation'",[],|row|row.get::<_,i64>(0))?,0);
         assert_eq!(conn.query_row("SELECT source_present,cleared_at IS NOT NULL FROM block WHERE kind='account' AND origin_key='[\"parity-fence\"]'",[],|row|Ok((row.get::<_,bool>(0)?,row.get::<_,bool>(1)?)))?,(false,true));
         Ok(())
     }).unwrap();
+}
+
+/// A held account fence keeps the observation it names. A healed fence keeps
+/// only its block row, which guards replay, so its observation ages out with
+/// the rest of the log.
+#[test]
+fn only_a_held_fence_keeps_its_observation_through_the_prune() {
+    let rig = crate::block_state::tests::rig_before_block_migration("native-observation-held");
+    let now = crate::now_ms();
+    let day = 86_400_000;
+    rig.store.seed_block_parity_fixture_for_test(now);
+    rig.store.with_writer_for_test(|conn| {
+        conn.execute("UPDATE account_fence SET observation_id='held-observation' WHERE fence_id='parity-fence'",[])?;
+        block_storage::install_migration_function(conn)?;
+        conn.execute_batch(block_storage::MIGRATION)
+    }).unwrap();
+    rig.reload();
+    assert!(rig.published().account_fence("parity-fence").is_some());
+    rig.store
+        .account_command(crate::AccountCommandKind::Maintenance, move |tx| {
+            tx.pool_sql(move |conn| {
+                conn.execute(
+                    "INSERT INTO block(kind,origin_key,provider,account_id,observation_id,evidence,
+                       evidence_at,quota,next_recheck_at,cleared_at,cleared_by,source_present)
+                     VALUES ('account','[\"healed-fence\"]','cpu-provider-0','healed-account',
+                       'healed-observation','healed',?1,1,?1,?1,'kept',0)",
+                    [now - 40 * day],
+                )?;
+                Ok(())
+            })?;
+            for id in ["held-observation", "healed-observation"] {
+                tx.insert_observation(&crate::AccountObservationRow {
+                    observation_id: id.into(),
+                    principal: "principal".into(),
+                    runner: "runner".into(),
+                    event_id: id.into(),
+                    kind: "account_limit_exhausted".into(),
+                    admission_id: None,
+                    bound: true,
+                    observation_json: "{}".into(),
+                    effects_json: "[]".into(),
+                    received_at: now - 40 * day,
+                })?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        rig.store
+            .prune_account_observations(now - 1000, 10)
+            .unwrap(),
+        1
+    );
+    assert_eq!(rig.published(), rig.fresh());
+    rig.store
+        .with_reader_for_test(|conn| {
+            let kept = conn
+                .prepare("SELECT observation_id FROM account_observation ORDER BY observation_id")?
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            assert_eq!(kept, ["held-observation"]);
+            Ok(())
+        })
+        .unwrap();
 }

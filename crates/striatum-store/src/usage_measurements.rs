@@ -39,6 +39,39 @@ pub const WORKLOAD_CLASS_USAGE_SAMPLES_SQL: &str = "SELECT input_tokens, output_
        AND cached_read_tokens IS NOT NULL
         AND cache_write_tokens IS NOT NULL";
 
+/// A usage row's workload class when the row is a complete token profile, the
+/// rows `WORKLOAD_CLASS_USAGE_SAMPLES_SQL` averages; NULL otherwise.
+const PROFILE_CLASS: &str = "CASE WHEN input_tokens IS NOT NULL AND output_tokens IS NOT NULL
+       AND reasoning_tokens IS NOT NULL AND cached_read_tokens IS NOT NULL
+       AND cache_write_tokens IS NOT NULL THEN workload_class END";
+
+impl SqliteRouteStateStore {
+    /// The generation a cached vector of `workload_class` must carry to be
+    /// reused.
+    pub(super) fn class_generation(&self, workload_class: &str) -> u64 {
+        ENUMERATED_WORKLOAD_CLASSES
+            .iter()
+            .position(|class| *class == workload_class)
+            .map_or(0, |index| {
+                self.class_generations[index].load(Ordering::Acquire)
+            })
+    }
+
+    /// Make the cached vector of one class (of every class when `None`)
+    /// recompute on its next read. Call after the write that changed that
+    /// class's profile population has committed.
+    pub(super) fn invalidate_class_vectors(&self, workload_class: Option<&str>) {
+        for (class, generation) in ENUMERATED_WORKLOAD_CLASSES
+            .iter()
+            .zip(&self.class_generations)
+        {
+            if workload_class.is_none_or(|changed| changed == *class) {
+                generation.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct ObservedSpeedAggregate {
     route_key: String,
@@ -115,7 +148,7 @@ fn observed_route_key_for_fact(
 
 #[derive(Debug, Clone)]
 pub(super) struct CachedClassVector {
-    pub(super) usage_generation: u64,
+    pub(super) class_generation: u64,
     pub(super) window_minute: i64,
     pub(super) vector: Option<ClassVector>,
 }
@@ -487,23 +520,28 @@ impl SqliteRouteStateStore {
                         None => (None, None),
                     };
                 let task_workload = task_id.as_ref().and(decision_workload);
-                let held_speed_observation = c
+                let held = c
                     .query_row(
-                        "SELECT COALESCE(output_tokens >= ?2 AND duration_ms >= ?3, FALSE)
-                         FROM model_route_usage
-                         WHERE id = ?1",
+                        &format!(
+                            "SELECT COALESCE(output_tokens >= ?2 AND duration_ms >= ?3, FALSE),
+                               {PROFILE_CLASS}
+                             FROM model_route_usage
+                             WHERE id = ?1"
+                        ),
                         params![
                             obs.id,
                             USAGE_MIN_OUTPUT_TOKENS.floor() as i64,
                             USAGE_MIN_DURATION_MS.floor() as i64,
                         ],
-                        |row| row.get::<_, bool>(0),
+                        |row| Ok((row.get::<_, bool>(0)?, row.get::<_, Option<String>>(1)?)),
                     )
                     .optional()?;
+                let held_speed_observation = held.as_ref().map(|(speed, _)| *speed);
+                let class_before = held.and_then(|(_, class)| class);
 
-                let stored_speed_values = c
+                let stored = c
                     .query_row(
-                        "INSERT INTO model_route_usage
+                        &format!("INSERT INTO model_route_usage
                            (id, task_id, route_key, capacity_key, provider_id,
                             input_tokens, output_tokens, duration_ms, observed_at,
                             reasoning_tokens, cached_read_tokens, cache_write_tokens,
@@ -544,7 +582,7 @@ impl SqliteRouteStateStore {
                               OR (model_route_usage.task_id IS NULL AND excluded.task_id IS NOT NULL)
                               OR (model_route_usage.task_workload IS NULL AND excluded.task_workload IS NOT NULL
                                   AND (model_route_usage.task_id IS NULL OR model_route_usage.task_id = excluded.task_id))
-                         RETURNING output_tokens, duration_ms",
+                         RETURNING output_tokens, duration_ms, {PROFILE_CLASS}"),
                         params![
                             obs.id,
                             obs.route_key,
@@ -562,9 +600,20 @@ impl SqliteRouteStateStore {
                             task_id,
                             task_workload,
                         ],
-                        |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?)),
+                        |row| {
+                            Ok((
+                                (row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?),
+                                row.get::<_, Option<String>>(2)?,
+                            ))
+                        },
                     )
                     .optional()?;
+                let (stored_speed_values, class_after) = stored.unzip();
+                // A class vector averages complete token profiles only, and a
+                // complete profile never changes again (every column is filled
+                // at most once). So only a row that has just become a complete
+                // profile of its class moves that class's vector.
+                let joined_class = class_after.flatten().filter(|class| class_before.as_ref() != Some(class));
 
                 let holds_speed_observation =
                     stored_speed_values.is_some_and(|(output, duration)| {
@@ -575,14 +624,14 @@ impl SqliteRouteStateStore {
                 Ok((UsageRecordResult {
                     recorded: !held_speed_observation.unwrap_or(false) && holds_speed_observation,
                     usage_recorded: held_speed_observation.is_none(),
-                }, stored_speed_values.is_some()))
+                }, joined_class))
             })
             .map_err(err)
-            .map(|(result, changed)| {
-                // Retries that supply no new measurements must not invalidate the
-                // seven-day population mean. Only inserts/enrichment can move it.
-                if changed {
-                    self.usage_generation.fetch_add(1, Ordering::AcqRel);
+            .map(|(result, joined_class)| {
+                // Retries, other classes' usage and fills of columns outside the
+                // token profile must not invalidate a seven-day population mean.
+                if let Some(class) = joined_class.as_deref() {
+                    self.invalidate_class_vectors(Some(class));
                 }
                 result
             })
@@ -662,9 +711,9 @@ mod tests {
         let mut obs = io_observation("message", 1_800_000_000_000.0);
         obs.cached_read_tokens = None;
         store.record_usage_delivery(&obs).unwrap();
-        let before = store.usage_generation.load(Ordering::Acquire);
+        let before = store.class_generation("ephemeral");
         store.record_usage_delivery(&obs).unwrap();
-        assert_eq!(store.usage_generation.load(Ordering::Acquire), before);
+        assert_eq!(store.class_generation("ephemeral"), before);
         // A NULL-only profile upgrade still invalidates, even if speed was
         // already eligible and the reply reports neither new recording effect.
         obs.cached_read_tokens = Some(200.0);
@@ -672,7 +721,7 @@ mod tests {
             store.record_usage_delivery(&obs).unwrap(),
             UsageRecordResult::default()
         );
-        assert_eq!(store.usage_generation.load(Ordering::Acquire), before + 1);
+        assert_eq!(store.class_generation("ephemeral"), before + 1);
         drop(store);
         remove_observed_speed_test_store(&dir);
     }
@@ -766,7 +815,9 @@ mod tests {
                 case.column
             );
 
-            let before = store.usage_generation.load(Ordering::Acquire);
+            let now = complete.observed_at + 1_000.0;
+            store.get_class_vector("ephemeral", now).unwrap();
+            let before = store.class_generation("ephemeral");
             store.record_usage_delivery(&complete).unwrap();
             assert_eq!(
                 stored(&complete.id, case.column),
@@ -774,16 +825,29 @@ mod tests {
                 "{}: late enrichment must persist",
                 case.column
             );
+            // Only completing a row's token profile changes the class
+            // population; these two columns are outside the profile, so the
+            // cached vector stays and must still equal a fresh recompute.
+            let outside_profile = matches!(case.column, "duration_ms" | "account_key");
+            let expected = if outside_profile { before } else { before + 1 };
             assert_eq!(
-                store.usage_generation.load(Ordering::Acquire),
-                before + 1,
-                "{}: enrichment must invalidate the population cache",
+                store.class_generation("ephemeral"),
+                expected,
+                "{}: only completing a token profile invalidates the class cache",
                 case.column
             );
+            if outside_profile {
+                assert_eq!(
+                    store.get_class_vector("ephemeral", now).unwrap(),
+                    store.compute_class_vector("ephemeral", now).unwrap(),
+                    "{}: the cached vector must equal a fresh recompute",
+                    case.column
+                );
+            }
 
             let mut conflicting = complete.clone();
             (case.conflict)(&mut conflicting);
-            let before = store.usage_generation.load(Ordering::Acquire);
+            let before = store.class_generation("ephemeral");
             store.record_usage_delivery(&conflicting).unwrap();
             assert_eq!(
                 stored(&complete.id, case.column),
@@ -792,7 +856,7 @@ mod tests {
                 case.column
             );
             assert_eq!(
-                store.usage_generation.load(Ordering::Acquire),
+                store.class_generation("ephemeral"),
                 before,
                 "{}: a conflicting repeat is still a no-op",
                 case.column
@@ -814,7 +878,7 @@ mod tests {
             assert_eq!(stored(&first.id, case.column), case.expected);
             assert_eq!(stored(&first.id, witness), Value::Null);
             conflicting.id = first.id.clone();
-            let before = store.usage_generation.load(Ordering::Acquire);
+            let before = store.class_generation("ephemeral");
             store.record_usage_delivery(&conflicting).unwrap();
             assert_eq!(
                 stored(&first.id, witness),
@@ -828,11 +892,65 @@ mod tests {
                 "{}: COALESCE must preserve the first value during another column's enrichment",
                 case.column
             );
-            assert_eq!(store.usage_generation.load(Ordering::Acquire), before + 1);
+            assert_eq!(store.class_generation("ephemeral"), before + 1);
         }
         drop(observer);
         drop(store);
         remove_observed_speed_test_store(&path);
+    }
+
+    /// A selection reuses the warm `ephemeral` class vector across usage
+    /// writes that cannot change it: another class's usage, an incomplete
+    /// profile, or a fill of a column outside the token profile. Completing an
+    /// `ephemeral` profile recomputes it. The population is changed behind the
+    /// store's back first, so only a recompute can see the change.
+    #[test]
+    fn only_writes_that_change_a_class_population_recompute_its_vector() {
+        let (dir, store) = observed_speed_test_store("class-vector-invalidation");
+        let now = 1_800_000_000_000.0;
+        store
+            .record_usage_delivery(&io_observation("ephemeral-1", now - 1_000.0))
+            .unwrap();
+        let mut no_account = io_observation("ephemeral-no-account", now - 2_000.0);
+        no_account.account_key = None;
+        store.record_usage_delivery(&no_account).unwrap();
+        let warm = store.get_class_vector("ephemeral", now).unwrap().unwrap();
+        assert_eq!(warm.sample_count, 2);
+        Connection::open(&dir)
+            .unwrap()
+            .execute(
+                "UPDATE model_route_usage SET input_tokens = 9000 WHERE id = 'ephemeral-1'",
+                [],
+            )
+            .unwrap();
+        let mut head = io_observation("head-1", now - 500.0);
+        head.workload_class = Some("head".into());
+        store.record_usage_delivery(&head).unwrap();
+        store
+            .record_usage_delivery(&io_observation("ephemeral-no-account", now - 2_000.0))
+            .unwrap();
+        let mut incomplete = io_observation("ephemeral-2", now - 300.0);
+        incomplete.cache_write_tokens = None;
+        store.record_usage_delivery(&incomplete).unwrap();
+        assert_eq!(
+            store.get_class_vector("ephemeral", now).unwrap().unwrap(),
+            warm,
+            "writes outside the ephemeral profile population reuse the warm vector"
+        );
+        store
+            .record_usage_delivery(&io_observation("ephemeral-2", now - 300.0))
+            .unwrap();
+        let fresh = store.get_class_vector("ephemeral", now).unwrap().unwrap();
+        assert_eq!(fresh.sample_count, 3);
+        assert_eq!(
+            fresh,
+            store
+                .compute_class_vector("ephemeral", now)
+                .unwrap()
+                .unwrap()
+        );
+        drop(store);
+        remove_observed_speed_test_store(&dir);
     }
 
     fn insert_usage_row(

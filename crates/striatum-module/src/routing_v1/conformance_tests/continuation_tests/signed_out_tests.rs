@@ -422,6 +422,73 @@ async fn signed_out_exclusion_survives_an_account_state_reload() {
     crate::account_state::assert_published_equals_fresh_load(&store, "after the next continue");
 }
 
+/// A portable backup restores `account_observation` empty, which drops the
+/// run's own sign-in exclusion. While the login's signed-out fence is still
+/// held, that fence keeps the run off the login: it lives in `block`, which
+/// every backup carries. (Once a usable vault listing clears the fence, a run
+/// in flight across the restore can be offered the login again; the login then
+/// works, so that costs at most one retry.)
+#[tokio::test]
+async fn signed_out_fence_keeps_the_run_off_its_login_after_a_portable_restore() {
+    let (subject, _, runner, request) = paused().await;
+    let request = signed_out(request);
+    let offer = result(runner.call("route.account_for", &request).await);
+    assert_eq!(offer["kind"], "offer", "{offer}");
+    result(
+        runner
+            .call(
+                "route.account_observe",
+                &offer_observation(&offer, "attempt", "used-signed-out-offer"),
+            )
+            .await,
+    );
+    let credential = request["exhausted"]["credential_id"].as_str().unwrap();
+    let mut credentials = fixture::continue_credentials();
+    credentials.retain(|c| {
+        c.account.credential_id == credential || c.account.credential_id == offer["credential_id"]
+    });
+    subject
+        .configure_continue_credentials(&credentials)
+        .await
+        .unwrap();
+    let store = subject.harness().store().clone();
+    store
+        .with_writer_for_test(|conn| {
+            for (table, _) in striatum_store::backup::BACKUP_EXCLUDABLE_TABLES {
+                conn.execute(&format!("DELETE FROM {table}"), [])?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    store.reload_account_state_for_test().unwrap();
+    let (observations, fences): (i64, i64) = store
+        .with_reader_for_test(|conn| {
+            Ok((
+                conn.query_row("SELECT count(*) FROM account_observation", [], |row| {
+                    row.get(0)
+                })?,
+                conn.query_row(
+                    "SELECT count(*) FROM block WHERE kind='credential' AND credential_id=?1
+                       AND code='signed_out' AND source_present=1",
+                    [credential],
+                    |row| row.get(0),
+                )?,
+            ))
+        })
+        .unwrap();
+    assert_eq!(observations, 0, "the restore dropped the observation log");
+    assert_eq!(fences, 1, "the restore kept the held signed-out fence");
+    let mut next = request.clone();
+    next["selection_id"] = json!("after-restore");
+    next["previous_decision_id"] = offer["decision_id"].clone();
+    next["exhausted"] = json!({"credential_id":offer["credential_id"],"account":offer["account"],"limit_window":"five_hour","observed_at_ms":account_selection::now_ms(),"resets_at_ms":account_selection::now_ms()+300_000});
+    let held = result(runner.call("route.account_for", &next).await);
+    assert_eq!(
+        held["kind"], "hold",
+        "the held fence must keep the run off its signed-out login: {held}"
+    );
+}
+
 #[tokio::test]
 async fn signed_out_hold_uses_only_alternate_accounts_known_reset() {
     let (subject, _, runner, request) = paused().await;
