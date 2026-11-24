@@ -73,13 +73,13 @@ impl Overrides {
                 // this project's view being fetched again.
                 let value = if key == "service_tiers" {
                     let tiers = value.as_object().ok_or_else(fail)?;
-                    let whole = scoped_source(view, &pointer, false);
+                    let whole = scoped_source(&view.sources, &pointer, false);
                     let scoped: Map<_, _> = tiers
                         .iter()
                         .filter(|(route, _)| {
                             whole
                                 || scoped_source(
-                                    view,
+                                    &view.sources,
                                     &format!("{pointer}/{}", pointer_token(route)),
                                     true,
                                 )
@@ -90,7 +90,7 @@ impl Overrides {
                         continue;
                     }
                     Value::Object(scoped)
-                } else if !scoped_source(view, &pointer, true) {
+                } else if !scoped_source(&view.sources, &pointer, true) {
                     continue;
                 } else {
                     value.clone()
@@ -116,7 +116,11 @@ impl Overrides {
                 fields.insert(key.into(), value);
             }
             if !fields.is_empty() {
-                let policy = serde_json::from_value(Value::Object(fields)).map_err(|_| fail())?;
+                let policy: Consumer =
+                    serde_json::from_value(Value::Object(fields)).map_err(|_| fail())?;
+                policy
+                    .validate_runners(name)
+                    .map_err(|reason| vec![reason])?;
                 projected.insert(name.clone(), policy);
             }
         }
@@ -143,15 +147,44 @@ fn pointer_token(key: &str) -> String {
     key.replace('~', "~0").replace('/', "~1")
 }
 
+/// Check the runner lists a workspace or project layer sets with the same
+/// rules as a user runner list, naming the offending list. Enrollment is not
+/// checked here: it belongs to the user layer and is applied per request.
+pub(crate) fn validate_scoped_runner_lists(
+    effective: &Value,
+    sources: &BTreeMap<String, Layer>,
+) -> Result<(), (String, String)> {
+    let consumers = effective.get("consumers").and_then(Value::as_object);
+    for (name, entry) in consumers.into_iter().flatten() {
+        let Some(runners) = entry.get("runners") else {
+            continue;
+        };
+        let pointer = format!("/consumers/{}/runners", pointer_token(name));
+        if !scoped_source(sources, &pointer, true) {
+            continue;
+        }
+        let policy = Consumer {
+            runners: Some(
+                serde_json::from_value(runners.clone())
+                    .map_err(|error| (pointer.clone(), error.to_string()))?,
+            ),
+            ..Consumer::default()
+        };
+        policy
+            .validate_runners(name)
+            .map_err(|reason| (pointer, reason))?;
+    }
+    Ok(())
+}
+
 /// Whether a workspace or project layer supplied the value at `pointer`, or,
 /// with `nested`, any value below it.
-fn scoped_source(view: &ConfigView, pointer: &str, nested: bool) -> bool {
+fn scoped_source(sources: &BTreeMap<String, Layer>, pointer: &str, nested: bool) -> bool {
     let scoped = |layer: &Layer| matches!(layer, Layer::Workspace | Layer::Project);
     let prefix = format!("{pointer}/");
-    view.sources.get(pointer).is_some_and(scoped)
+    sources.get(pointer).is_some_and(scoped)
         || nested
-            && view
-                .sources
+            && sources
                 .range(prefix.clone()..)
                 .take_while(|(key, _)| key.starts_with(&prefix))
                 .any(|(_, layer)| scoped(layer))

@@ -316,6 +316,15 @@ impl RoutingConfigFile {
                     ));
                 }
             }
+            // Scoring refuses demand outside 0..=100, so a value that loaded
+            // would fail every automatic request of this consumer.
+            for (field, value) in [("iq", policy.iq), ("eq", policy.eq)] {
+                if value.is_some_and(|value| !(0.0..=100.0).contains(&value)) {
+                    return Err(format!(
+                        "consumers.{name}.{field} must be a number from 0 to 100"
+                    ));
+                }
+            }
             if let Some(pin) = &policy.pin {
                 Pins {
                     synthesizer: Some(pin.clone()),

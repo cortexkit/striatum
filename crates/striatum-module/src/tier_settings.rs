@@ -33,6 +33,22 @@ pub(crate) struct Consumer {
     pub(crate) runners: Option<Vec<RunnerChoice>>,
 }
 
+impl Consumer {
+    /// A scoped runner list follows the user list's rules for names, harness
+    /// words, duplicates and route specs, so a malformed route is refused
+    /// instead of silently matching nothing.
+    pub(crate) fn validate_runners(&self, name: &str) -> Result<(), String> {
+        let Some(runners) = &self.runners else {
+            return Ok(());
+        };
+        let policies: Vec<_> = runners.iter().map(RunnerChoice::policy).collect();
+        crate::config_overrides::validate_runner_list(
+            &policies,
+            &format!("consumers.{name}.runners"),
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RunnerChoice {

@@ -934,3 +934,150 @@ async fn queued_project_refreshes_do_not_discard_the_cached_view_for_a_request()
         Some(Tier::Fast.value())
     );
 }
+
+#[test]
+fn consumer_iq_and_eq_outside_0_to_100_are_refused_by_review_and_check_config() {
+    let scratch = ScratchDir::new("consumer-demand-range");
+    let path = scratch.join("striatum.jsonc");
+    for (document, field) in [
+        (r#"{"consumers":{"work":{"iq":101}}}"#, "/consumers/work/iq"),
+        (
+            r#"{"consumers":{"work":{"eq":-0.5}}}"#,
+            "/consumers/work/eq",
+        ),
+    ] {
+        let refusal = review_refusal(document);
+        assert_eq!(refusal.paths, [field], "{document}");
+        std::fs::write(&path, document).unwrap();
+        let error = config_overrides::check_config_offline(&path, "striatum", None).unwrap_err();
+        assert!(error.contains("from 0 to 100"), "{document}: {error}");
+    }
+    for document in [
+        r#"{"consumers":{"work":{"iq":0,"eq":100}}}"#,
+        r#"{"consumers":{"work":{"iq":37.5}}}"#,
+    ] {
+        let reply = review(
+            &review_schema(),
+            "striatum",
+            ConfigReviewRequest::new(0, vec![snapshot(document)], None),
+        );
+        assert!(
+            reply.refusals.is_empty(),
+            "{document}: {:?}",
+            reply.refusals
+        );
+        std::fs::write(&path, document).unwrap();
+        config_overrides::check_config_offline(&path, "striatum", None).unwrap();
+    }
+}
+
+#[test]
+fn project_pin_schema_matches_what_loading_accepts() {
+    let schema = emitted_schema();
+    let project = &schema["$defs"]["ProjectPolicy"];
+    assert_eq!(project["required"], json!(["pin"]));
+    let pin = &project["properties"]["pin"];
+    assert!(pin.get("default").is_none(), "{pin}");
+    assert_eq!(pin["x-ck-required"], json!(true));
+    assert!(
+        !pin["description"].as_str().unwrap().contains("Leave empty"),
+        "{pin}"
+    );
+    for document in [
+        r#"{"consumers":{"mc":{"projects":{"p1":{}}}}}"#,
+        r#"{"consumers":{"mc":{"projects":{"p1":{"pin":""}}}}}"#,
+    ] {
+        review_refusal(document);
+        assert!(
+            config_overrides::validate_document(document).is_err(),
+            "{document}"
+        );
+    }
+    let pinned = r#"{"consumers":{"mc":{"projects":{"p1":{"pin":"p/m"}}}}}"#;
+    config_overrides::validate_document(pinned).unwrap();
+}
+
+fn scoped_review(project_layer: &str) -> ConfigReviewReply {
+    let mut user = snapshot(r#"{"runners":[{"module":"runner-a"}]}"#);
+    user.project_id = Some("pj-review".into());
+    let mut project = ConfigLayerSnapshot::file(
+        "striatum",
+        ConfigLayer::Project,
+        "/isolated/project/striatum.jsonc",
+        Some(project_layer.as_bytes().to_vec()),
+    );
+    project.project_id = user.project_id.clone();
+    review(
+        &review_schema(),
+        "striatum",
+        ConfigReviewRequest::new(0, vec![user, project], None),
+    )
+}
+
+#[test]
+fn project_runner_lists_follow_the_user_runner_list_rules() {
+    for (layer, reason) in [
+        (
+            r#"{"consumers":{"work":{"runners":[{"module":"runner-a","routes":["p/"]}]}}}"#,
+            "route \"p/\"",
+        ),
+        (
+            r#"{"consumers":{"work":{"runners":[{"module":"runner-a","routes":["-p"]}]}}}"#,
+            "route \"-p\"",
+        ),
+        (
+            r#"{"consumers":{"work":{"runners":[{"module":"runner-a","harness":" "}]}}}"#,
+            "non-empty words",
+        ),
+        (
+            r#"{"consumers":{"work":{"runners":[{"module":"runner-a"},{"module":"runner-a"}]}}}"#,
+            "listed once",
+        ),
+    ] {
+        let reply = scoped_review(layer);
+        assert!(reply.fields.is_empty(), "{layer}");
+        assert_eq!(reply.refusals.len(), 1, "{layer}: {:?}", reply.refusals);
+        let refusal = &reply.refusals[0];
+        assert_eq!(refusal.paths, ["/consumers/work/runners"], "{layer}");
+        assert_eq!(refusal.project_id.as_deref(), Some("pj-review"));
+        assert!(
+            refusal.reasons[0].contains(reason),
+            "{layer}: {:?}",
+            refusal.reasons
+        );
+    }
+    // An unenrolled runner is still a well-formed choice; enrollment narrows it per request.
+    let reply = scoped_review(
+        r#"{"consumers":{"work":{"runners":[{"module":"not-enrolled","harness":"h","routes":["p","p/m"]}]}}}"#,
+    );
+    assert!(reply.refusals.is_empty(), "{:?}", reply.refusals);
+}
+
+#[tokio::test]
+async fn delivered_project_runner_list_with_a_malformed_route_is_refused() {
+    use super::test_daemon::{self, Advertise, Daemon, ID};
+    use subc_protocol::config::{ConfigApplyResult, ConfigGetReply};
+
+    let dir = ScratchDir::new("project-runner-route");
+    let path = dir.join("striatum.jsonc");
+    let user = json!({"runners":[{"module":"runner-a"}]});
+    let (daemon, _connection) = Daemon::connect(&path, user.clone(), Advertise::Hello).await;
+    let layer = json!({"consumers":{"work":{"runners":[{"module":"runner-a","routes":["p/"]}]}}});
+    let mut view = test_daemon::project_view(&user, ID, &layer);
+    view.generation = 2;
+    view.attempt = Some(4);
+    view.status = ConfigStatus::Pending;
+    daemon.deliver(ID, ConfigGetReply::new(None, Some(view)));
+    assert!(project_view(&path, ID).await.is_none());
+    let reports = daemon.reports();
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].result, ConfigApplyResult::Nack);
+    assert!(
+        reports[0]
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("route \"p/\"")),
+        "{:?}",
+        reports[0].reasons
+    );
+}

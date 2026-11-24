@@ -243,6 +243,8 @@
         },
         "eq": {
           "description": "Minimum collaboration quality requested, from 0 to 100.",
+          "maximum": 100,
+          "minimum": 0,
           "title": "Minimum judgment level",
           "type": "number",
           "x-ck-apply": "live",
@@ -253,6 +255,8 @@
         },
         "iq": {
           "description": "Minimum reasoning quality requested, from 0 to 100.",
+          "maximum": 100,
+          "minimum": 0,
           "title": "Minimum reasoning level",
           "type": "number",
           "x-ck-apply": "live",
@@ -1147,16 +1151,19 @@
       "additionalProperties": false,
       "properties": {
         "pin": {
-          "default": "",
-          "description": "Prefer this model in the project, as provider/model or provider/model:variant. Leave empty for ordinary selection.",
+          "description": "Prefer this model in the project, as provider/model or provider/model:variant. Remove the project entry for ordinary selection.",
           "title": "Preferred model",
           "type": "string",
           "x-ck-apply": "live",
           "x-ck-layers": [
             "user"
-          ]
+          ],
+          "x-ck-required": true
         }
       },
+      "required": [
+        "pin"
+      ],
       "type": "object",
       "unevaluatedProperties": false
     },

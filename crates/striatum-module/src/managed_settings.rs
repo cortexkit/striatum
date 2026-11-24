@@ -226,8 +226,16 @@ fn review_layers(
         })
         .collect();
     // Runtime restrictions and enrollment are evaluated against the global
-    // configuration. A project list cannot add enrollment or invalidate it.
+    // configuration. A project list cannot add enrollment or invalidate it,
+    // but its own entries must still be well formed.
     if project.is_some() {
+        crate::project_settings::validate_scoped_runner_lists(&tuple.effective, &tuple.sources)
+            .map_err(|(path, reason)| {
+                let mut refusal =
+                    ConfigReviewRefusal::new("value_invalid", vec![path], vec![reason]);
+                refusal.project_id.clone_from(&project);
+                refusal
+            })?;
         return Ok(fields);
     }
     let effective = serde_json::to_string(&tuple.effective)
