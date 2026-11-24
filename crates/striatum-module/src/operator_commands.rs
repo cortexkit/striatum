@@ -46,11 +46,11 @@ pub(super) async fn async_main(
     let connection_file_path = match mode? {
         StartupMode::PrintManifest => return print_manifest(),
         StartupMode::CheckConfig => {
-            let path =
-                config_overrides::config_path(&crate::startup_settings::module_id_from_env())
-                    .map_err(ModuleError::Message)?;
+            let module_id = crate::startup_settings::module_id_from_env();
+            let path = config_overrides::config_path(&module_id).map_err(ModuleError::Message)?;
             let report = config_overrides::check_config_offline(
                 &path,
+                &module_id,
                 config_overrides::default_store_path().as_deref(),
             )
             .map_err(ModuleError::Message)?;

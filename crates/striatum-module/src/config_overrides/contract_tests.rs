@@ -511,7 +511,7 @@ fn check_config_counts_are_anonymous_and_available_without_variants_or_store() {
     let corrupt = rig.dir.join("corrupt.db");
     std::fs::write(&corrupt, b"not a sqlite database").unwrap();
     for path in [None, Some(missing.as_path()), Some(corrupt.as_path())] {
-        let report = check_config_offline(&rig.path, path).unwrap();
+        let report = check_config_offline(&rig.path, crate::DEFAULT_MODULE_ID, path).unwrap();
         let counts = lines(&report);
         assert_eq!(&counts[..3], expected_rules);
         assert_eq!(counts.len(), 5);
@@ -537,7 +537,9 @@ fn check_config_counts_are_anonymous_and_available_without_variants_or_store() {
     drop(connection);
     let settings_before = std::fs::read(&rig.path).unwrap();
     let store_before = std::fs::read(&store_path).unwrap();
-    let counts = lines(&check_config_offline(&rig.path, Some(&store_path)).unwrap());
+    let counts = lines(
+        &check_config_offline(&rig.path, crate::DEFAULT_MODULE_ID, Some(&store_path)).unwrap(),
+    );
     assert_eq!(&counts[..3], expected_rules);
     assert_eq!(
         &counts[3..],
@@ -548,7 +550,9 @@ fn check_config_counts_are_anonymous_and_available_without_variants_or_store() {
     assert_eq!(std::fs::read(&store_path).unwrap(), store_before);
     let mut invalid = Rig::new();
     invalid.write(r#"{"unknown-setting":true}"#);
-    assert!(check_config_offline(&invalid.path, Some(&store_path)).is_err());
+    assert!(
+        check_config_offline(&invalid.path, crate::DEFAULT_MODULE_ID, Some(&store_path)).is_err()
+    );
 }
 
 #[test]

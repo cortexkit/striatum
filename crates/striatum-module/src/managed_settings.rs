@@ -49,6 +49,29 @@ fn emitted_schema() -> &'static Value {
     })
 }
 
+fn parse_layer_document(document: &str) -> Result<Value, String> {
+    let json = subc_jsonc::jsonc_to_json(document)?;
+    serde_json::from_str(&json).map_err(|error| error.to_string())
+}
+
+pub(super) fn validate_user_file(module_id: &str, document: Option<&str>) -> Result<(), String> {
+    let user_layer = document
+        .map(parse_layer_document)
+        .transpose()?
+        .map(|value| LayerValue::new(Layer::User, value));
+    let tuple = Schema::new(emitted_schema().clone())
+        .map_err(|error| error.to_string())?
+        .review_tuple(
+            user_layer.as_slice(),
+            &ValidationContext::new(module_id, None),
+        )
+        .map_err(|error| error.to_string())?;
+    // The managed view includes schema defaults, so check that routing can
+    // also load the merged settings it would get from the daemon.
+    let effective = serde_json::to_string(&tuple.effective).map_err(|error| error.to_string())?;
+    config_overrides::validate_review_document(&effective).map_err(|(_, reason)| reason)
+}
+
 impl Settings {
     fn config_declaration(&self) -> Result<ConfigDeclareRequest, ModuleError> {
         let path = self.path.to_str().ok_or_else(|| {
@@ -153,9 +176,7 @@ fn review_layers(
         if let Some(bytes) = snapshot.bytes {
             let document =
                 String::from_utf8(bytes).map_err(|error| invalid_document(error.to_string()))?;
-            let json = subc_jsonc::jsonc_to_json(&document).map_err(invalid_document)?;
-            let value =
-                serde_json::from_str(&json).map_err(|error| invalid_document(error.to_string()))?;
+            let value = parse_layer_document(&document).map_err(invalid_document)?;
             layers.push(LayerValue::new(layer, value));
             if layer == Layer::User {
                 raw_user = Some(document);

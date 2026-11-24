@@ -1853,7 +1853,7 @@
       "default": {},
       "description": "Override catalog values or routing rules by provider/model or provider/model/variant.",
       "patternProperties": {
-        "^[^/]+/[^/]+(?:/[^/]*)?$": {
+        "^[^/]*[^/\\s][^/]*(?:/[^/]*[^/\\s][^/]*)+$": {
           "$ref": "#/$defs/ModelFactOverride",
           "description": "Overrides for this model or model variant.",
           "x-ck-apply": "live",

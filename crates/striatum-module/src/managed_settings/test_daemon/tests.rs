@@ -5,10 +5,11 @@ use std::time::Duration;
 
 use serde::Serialize;
 use serde_json::{json, Value};
+use subc_client_rs::config::{Layer, LayerValue, Schema, ValidationContext};
 use subc_protocol::config::{
-    ConfigAppliedReply, ConfigAppliedRequest, ConfigChanged, ConfigDeclareReply, ConfigGetReply,
-    ConfigGetRequest, ConfigLayer, ConfigLayerSnapshot, ConfigStatus, ConfigView,
-    CONFIG_APPLIED_OP, CONFIG_DECLARE_OP, CONFIG_GET_OP,
+    ConfigAppliedReply, ConfigAppliedRequest, ConfigChanged, ConfigDeclareReply,
+    ConfigDeclareRequest, ConfigGetReply, ConfigGetRequest, ConfigLayer, ConfigLayerSnapshot,
+    ConfigStatus, ConfigView, CONFIG_APPLIED_OP, CONFIG_DECLARE_OP, CONFIG_GET_OP,
 };
 use subc_transport::{authenticate_server, read_frame, write_frame};
 use tokio::net::{TcpListener, TcpStream};
@@ -25,6 +26,8 @@ const DAEMON_VERSION: &str = "0.50.32";
 
 #[derive(Default)]
 struct State {
+    declaration: Option<ConfigDeclareRequest>,
+    global: Option<ConfigView>,
     projects: BTreeMap<String, Reply>,
     gets: BTreeMap<String, usize>,
     reports: Vec<ConfigAppliedRequest>,
@@ -120,7 +123,10 @@ impl Daemon {
                         let value: Value = serde_json::from_slice(&request.body).unwrap();
                         let mut state = state.lock().unwrap();
                         match value["op"].as_str().unwrap() {
-                            CONFIG_DECLARE_OP => response(&request, kind, ConfigDeclareReply::new()),
+                            CONFIG_DECLARE_OP => {
+                                state.declaration = Some(serde_json::from_value(value).unwrap());
+                                response(&request, kind, ConfigDeclareReply::new())
+                            }
                             "server.describe" => {
                                 assert_eq!((request.header.ty, request.header.channel), (FrameType::Request, 0));
                                 state.module_describes += 1;
@@ -133,7 +139,8 @@ impl Daemon {
                                 let get: ConfigGetRequest = serde_json::from_value(value).unwrap();
                                 let Some(project) = get.project_id else {
                                     state.global_gets += 1;
-                                    let reply = response(&request, kind, ConfigGetReply::new(Some(active(user.clone(), None)), None));
+                                    let view = state.global.clone().unwrap_or_else(|| active(user.clone(), None));
+                                    let reply = response(&request, kind, ConfigGetReply::new(Some(view), None));
                                     assert!(session.dispatch(&reply));
                                     replied_tx.send_modify(|count| *count += 1);
                                     continue;
@@ -276,6 +283,35 @@ impl Daemon {
 
     pub(crate) async fn global_changed(&self) {
         self.change(None).await;
+    }
+
+    pub(crate) async fn reload_user_file(&self, module: &str) -> Result<(), String> {
+        let declaration = self.state.lock().unwrap().declaration.clone().unwrap();
+        let document = std::fs::read_to_string(&declaration.user_file).unwrap();
+        let json = subc_jsonc::jsonc_to_json(&document).unwrap();
+        let value = serde_json::from_str(&json).unwrap();
+        let schema = Schema::new(declaration.schema).unwrap();
+        let tuple = schema
+            .review_tuple(
+                &[LayerValue::new(Layer::User, value)],
+                &ValidationContext::new(module, None),
+            )
+            .map_err(|error| error.to_string())?;
+        let layer = ConfigLayerSnapshot::file(
+            module,
+            ConfigLayer::User,
+            declaration.user_file,
+            Some(document.into_bytes()),
+        );
+        self.state.lock().unwrap().global = Some(ConfigView::new(
+            0,
+            tuple.effective,
+            tuple.sources,
+            vec![layer],
+            ConfigStatus::Unstamped,
+        ));
+        self.global_changed().await;
+        Ok(())
     }
 
     async fn change(&self, project: Option<&str>) {

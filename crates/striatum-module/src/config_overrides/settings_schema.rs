@@ -308,7 +308,7 @@ fn map_entry(owner: &str, field: &str) -> (&'static str, &'static str) {
         ("", "consumers") => (NAME, "Routing preferences for this consumer."),
         ("", "providers") => (PROVIDER, "Settings for this provider."),
         ("", "models") => (
-            r"^[^/]+/[^/]+(?:/[^/]*)?$",
+            r"^[^/]*[^/\s][^/]*(?:/[^/]*[^/\s][^/]*)+$",
             "Overrides for this model or model variant.",
         ),
         ("", "subscription_multipliers") => (

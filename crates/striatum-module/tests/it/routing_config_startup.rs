@@ -184,6 +184,25 @@ async fn striatum_startup_and_check_config_name_the_settings_file() {
 }
 
 #[tokio::test]
+async fn check_config_refuses_a_consumer_name_the_declared_schema_rejects() {
+    let home = Home::new();
+    let path = home.config_dir(true).join("striatum.jsonc");
+    std::fs::write(
+        &path,
+        r#"{"consumer_priorities":{"broca classifier":"interactive"}}"#,
+    )
+    .unwrap();
+    home.assert_file_settings_serve(home.command(true)).await;
+
+    let message = stderr(home.run_with_args(true, &["--check-config"]));
+    assert!(message.contains(path.to_str().unwrap()), "{message}");
+    assert!(
+        message.contains("/consumer_priorities/broca classifier"),
+        "{message}"
+    );
+}
+
+#[tokio::test]
 async fn non_default_module_id_reads_and_declares_its_own_settings_file() {
     let home = Home::new();
     let path = home.config_dir(true).join("striatum-secondary.jsonc");

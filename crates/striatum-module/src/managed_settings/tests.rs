@@ -345,6 +345,70 @@ async fn consumer_probe_without_a_capability_or_valid_reply_leaves_project_views
 }
 
 #[tokio::test]
+async fn unstamped_user_file_reloads_slashed_clef_model_keys() {
+    use super::test_daemon::{Advertise, Daemon};
+    use crate::DEFAULT_MODULE_ID;
+    use std::time::Duration;
+
+    let dir = ScratchDir::new("managed-clef-model-keys");
+    let path = dir.join("striatum.jsonc");
+    std::fs::write(&path, "{}").unwrap();
+    let (daemon, _connection) = Daemon::connect(&path, json!({}), Advertise::Hello).await;
+    let initial = config_overrides::live_config(&path);
+    let keys = [
+        "cloudflare-workers-ai/@cf/cloudflare/clef",
+        "cloudflare-workers-ai/@cf/cloudflare/clef-flash",
+    ];
+    for key in keys {
+        assert!(initial.prepared_settings()["models"][key].is_null());
+    }
+    std::fs::write(
+        &path,
+        r#"{
+            // Restrict these catalog models to classification.
+            "models": {
+                "cloudflare-workers-ai/@cf/cloudflare/clef": {"only_for": ["broca.classifier"], "pin_only": false},
+                "cloudflare-workers-ai/@cf/cloudflare/clef-flash": {"only_for": ["broca.classifier"], "pin_only": false},
+            }
+        }"#,
+    )
+    .unwrap();
+    daemon.reload_user_file(DEFAULT_MODULE_ID).await.unwrap();
+    let applied = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let active = config_overrides::live_config(&path);
+            if !Arc::ptr_eq(&initial, &active) {
+                break active.prepared_settings();
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("routing did not apply the unstamped view");
+    for key in keys {
+        assert_eq!(
+            applied["models"][key]["only_for"],
+            json!(["broca.classifier"])
+        );
+        assert_eq!(applied["models"][key]["pin_only"], false);
+    }
+
+    for key in ["provider/model/", "provider//model", "provider/ /model"] {
+        std::fs::write(&path, json!({"models": {(key): {}}}).to_string()).unwrap();
+        let error = daemon
+            .reload_user_file(DEFAULT_MODULE_ID)
+            .await
+            .unwrap_err();
+        assert!(error.contains("/models/"), "{error}");
+    }
+    assert_eq!(
+        daemon.global_gets(),
+        2,
+        "invalid edits must not send a change hint"
+    );
+}
+
+#[tokio::test]
 async fn slow_consumer_probe_does_not_delay_global_settings_and_recovers_on_retry() {
     use super::test_daemon::{Advertise, Daemon, ID};
     use crate::tier_settings::Tier;

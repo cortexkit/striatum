@@ -436,9 +436,21 @@ pub fn default_store_path() -> Option<PathBuf> {
 }
 
 /// Validate the config and report counts from the store at `store_path`, read-only.
-pub fn check_config_offline(path: &Path, store_path: Option<&Path>) -> Result<String, String> {
-    initialize_config(path)?;
-    let active = live_config_at(path, Instant::now())?;
+pub fn check_config_offline(
+    path: &Path,
+    module_id: &str,
+    store_path: Option<&Path>,
+) -> Result<String, String> {
+    let document = match std::fs::read_to_string(path) {
+        Ok(document) => Some(document),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(format!("reading {}: {error}", path.display())),
+    };
+    // Check the original text first so duplicate keys and retired settings
+    // still get the routing parser's diagnostics.
+    let active = build_live_config(path, document)?;
+    crate::managed_settings::validate_user_file(module_id, active.document.as_deref())
+        .map_err(|error| format!("invalid config in {}: {error}", path.display()))?;
     let (facts, roster) = store_path
         .map(striatum_store::read_counts_offline)
         .unwrap_or_else(|| {

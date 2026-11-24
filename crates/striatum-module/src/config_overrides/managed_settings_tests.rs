@@ -188,7 +188,7 @@ fn new_settings_load_as_written() {
         "panels":{"audit":{"top_k":2,"extra":1,"by":"iq","extra_by":"eq"}}
     });
     std::fs::write(&path, settings.to_string()).unwrap();
-    let result = super::check_config_offline(&path, None);
+    let result = super::check_config_offline(&path, crate::DEFAULT_MODULE_ID, None);
     super::live_configs().lock().unwrap().remove(&path);
     std::fs::remove_dir_all(&scratch).unwrap();
     assert!(result.unwrap().contains("runner_route_rules="));
