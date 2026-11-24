@@ -1690,6 +1690,37 @@ impl ClassContext {
         resolved
     }
 
+    /// Whether `row` serves `fact` in the account class a routing decision
+    /// allows. Unlike [`Self::class`], this ignores which class quota and
+    /// metered fallback pick right now: a fork stays on its parent's login
+    /// while that login is merely exhausted, and only a login the decision
+    /// could never use is ruled out.
+    pub(super) fn serves_decision_class(
+        &self,
+        row: &cortexkit_claustrum_client::ListedCredential,
+        fact: &striatum_core::ModelFact,
+        priced_per_token: bool,
+    ) -> bool {
+        if self.media_route {
+            return media_credential_serves(row, &fact.provider_id);
+        }
+        let rows = self.credentials.listed_credentials();
+        self.serving_index
+            .fact(
+                &self.config,
+                &self.credentials,
+                fact,
+                &self.catalog,
+                &self.targets,
+            )
+            .selection
+            .iter()
+            .any(|serving| {
+                rows[serving.index].id == row.id
+                    && (!priced_per_token || (serving.metered && !serving.covered))
+            })
+    }
+
     #[cfg(test)]
     pub(crate) fn revalidate_credential(&mut self, credential: &str) {
         self.continuation_credential = Some(credential.into());

@@ -11,6 +11,38 @@ pub(super) fn hold_detail(params: &AccountForParams, mut detail: Value) -> Value
     detail
 }
 
+/// Why the child's own decision can never use a listed login.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Unqualified {
+    /// Outside the decision's account class, or not serving the model.
+    Class,
+    /// The account's plan doesn't reach the requested model.
+    ModelReach,
+    /// Outside the decision's bound service tier or its allowed logins.
+    Tier,
+}
+
+/// A fork is refused, not held, when its parent's exact login can never
+/// serve the child's decision: waiting would not change the answer, and a
+/// fork never moves to another login.
+pub(super) fn unqualified_refusal(
+    params: &AccountForParams,
+    parent: &ForkParent,
+) -> Option<OpReply> {
+    use cortexkit_role_routing::errors::AccountUnservableReason;
+    let why = params.fork_unqualified.get(&parent.credential_id)?;
+    checking("fork_parent_unqualified");
+    let reason = match why {
+        Unqualified::Tier => AccountUnservableReason::BoundTierUnavailable,
+        Unqualified::Class | Unqualified::ModelReach => AccountUnservableReason::NoEligibleAccount,
+    };
+    Some(unservable_refusal(
+        reason,
+        vec![parent.credential_id.clone()],
+        Vec::new(),
+    ))
+}
+
 pub(super) fn prepare_and_admit(
     mut parsed: AccountForParams,
     principal: &str,
@@ -19,46 +51,78 @@ pub(super) fn prepare_and_admit(
     request_fingerprint: String,
     finish: &mut Option<crate::routing_v1::accounts::AdmissionRecord>,
 ) -> Result<OpReply, OpReply> {
+    let (class, selection) = decision_class(&parsed, ctx)?;
+    let priced = class == striatum_core::accounts::AllowedAccountClass::PricedPerTokenOnly;
+    let bound = BoundTier::read(&parsed, ctx, &provider, selection.as_ref())?;
+    let model = normalize(&parsed.model);
+    let mut unqualified = BTreeMap::new();
     // Keep unavailable credentials in this roster. The allocator must hold on
     // the parent's exact binding, not silently choose a healthy sibling.
+    // Logins the child's decision can never use are left out and remembered,
+    // so a parent on one of them is refused instead.
     let mut roster = match &ctx.classes {
         Some(classes) => {
-            let accounts = classes
+            let mut accounts = Vec::new();
+            if let Some(fact) = classes
                 .facts
                 .iter()
-                .find(|fact| {
-                    fact.provider_id == provider && fact.model_id == normalize(&parsed.model)
-                })
-                .into_iter()
-                .flat_map(|fact| {
-                    classes.credentials.listed_credentials().iter().map(|row| {
-                        let mut view = classes.view(row, fact);
-                        view.credentials[0].needs_reauth =
-                            row.state != "active" || row.condition.is_some();
-                        view
-                    })
-                })
-                .collect();
+                .find(|fact| fact.provider_id == provider && fact.model_id == model)
+            {
+                for row in classes.credentials.listed_credentials() {
+                    let mut view = classes.view(row, fact);
+                    let unavailable = row.state != "active" || row.condition.is_some();
+                    // A signed-out or conditioned login isn't in the serving
+                    // index at all, so its class can't be judged until it is
+                    // usable again; until then the allocator holds on it.
+                    let why = if !unavailable && !classes.serves_decision_class(row, fact, priced) {
+                        Some(Unqualified::Class)
+                    } else if !unavailable && !view.model_reach.reaches(&model) {
+                        Some(Unqualified::ModelReach)
+                    } else if bound.as_ref().is_some_and(|bound| !bound.supports(&row.id)) {
+                        Some(Unqualified::Tier)
+                    } else {
+                        None
+                    };
+                    if let Some(why) = why {
+                        unqualified.insert(row.id.clone(), why);
+                        continue;
+                    }
+                    view.credentials[0].needs_reauth = unavailable;
+                    accounts.push(view);
+                }
+            }
             RosterBuild {
                 roster: Some(classes.roster(accounts)),
                 context: json!({}),
             }
         }
-        None => roster_for_model(ctx, &provider, Some(&normalize(&parsed.model))),
+        None => {
+            let mut roster = roster_for_model(ctx, &provider, Some(&model));
+            if let (Some(bound), Some(roster)) = (&bound, &mut roster.roster) {
+                for account in &mut roster.accounts {
+                    account.credentials.retain(|credential| {
+                        let supported = bound.supports(&credential.credential_id);
+                        if !supported {
+                            unqualified.insert(credential.credential_id.clone(), Unqualified::Tier);
+                        }
+                        supported
+                    });
+                }
+                roster
+                    .accounts
+                    .retain(|account| !account.credentials.is_empty());
+            }
+            roster
+        }
     };
-    parsed.service_tier_chosen = prepare_service_tier(
-        &mut parsed,
-        ctx,
-        &mut roster,
-        striatum_core::accounts::AllowedAccountClass::NotPayPerToken,
-        None,
-    )?;
+    parsed.fork_unqualified = unqualified;
+    parsed.service_tier_chosen = prepare_service_tier(&mut parsed, ctx, &mut roster, class, None)?;
     parsed.continuation_input = Some(continuation::Inputs::prepare(
         &parsed,
         principal,
         ctx.classes.as_ref(),
-        striatum_core::accounts::AllowedAccountClass::NotPayPerToken,
-        None,
+        class,
+        selection.as_ref(),
     ));
     let command_ctx = ctx.command_context();
     let principal = principal.to_owned();

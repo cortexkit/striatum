@@ -208,11 +208,20 @@ impl<'a> Allocator<'a> {
     // the operator override; then existing affinity; then a one-time import;
     // then `requested_account`; then scoring.
     fn run(mut self) -> Decision {
-        if let Some(parent) = &self.context.fork_parent {
-            return self.fork(parent);
-        }
+        // Only accounts this request could use if they had free quota decide
+        // whether paid credits are needed. An account the runner didn't
+        // offer, whose credential is excluded for this principal, that is over
+        // its spend budget, or whose credentials the concurrency cap removed
+        // has no free quota to give this request, so it must not keep credits
+        // switched off for an account that can serve it.
+        let usable: Vec<&AccountView> = self
+            .views
+            .iter()
+            .copied()
+            .filter(|view| self.usable_apart_from_quota(view))
+            .collect();
         let all_exhausted =
-            !self.views.is_empty() && self.views.iter().all(|view| self.free_exhausted(view));
+            !usable.is_empty() && usable.iter().all(|view| self.free_exhausted(view));
         // Routing's reserve stops new work a few points short of a plan's
         // limit, and a provider draws prepaid credits only once that limit is
         // reached, so an account the reserve holds back would never reach its
@@ -220,13 +229,18 @@ impl<'a> Allocator<'a> {
         // prepaid credits carry new work; metered overage still waits for real
         // exhaustion.
         let all_held = !all_exhausted
-            && !self.views.is_empty()
-            && self
-                .views
+            && !usable.is_empty()
+            && usable
                 .iter()
                 .all(|view| self.free_exhausted(view) || self.held_by_reserve(view));
         self.credit_mode = self.policy.paid_credits && (all_exhausted || all_held);
         self.reserve_credit_mode = self.credit_mode && !all_exhausted;
+        // A fork follows its parent's exact account, including onto paid
+        // credits: the same credit rule that admits the parent's own requests
+        // applies to its fork, so it is decided before the fork returns.
+        if let Some(parent) = &self.context.fork_parent {
+            return self.fork(parent);
+        }
         if let Some(override_) = &self.state.operator_override {
             return self.operator_override(override_);
         }
@@ -635,6 +649,15 @@ impl<'a> Allocator<'a> {
                         .is_none_or(|reset| reset > self.now)
             })
         })
+    }
+
+    /// Every hard filter passes except a confirmed block: the account would
+    /// serve this request if it had free quota (or credits) left.
+    fn usable_apart_from_quota(&self, view: &AccountView) -> bool {
+        self.hard_filters(view, None)
+            .reasons
+            .iter()
+            .all(|reason| matches!(reason, ExclusionReason::ConfirmedFence { .. }))
     }
 
     fn free_exhausted(&self, view: &AccountView) -> bool {

@@ -23,6 +23,7 @@ const NOW: u64 = 1_800_000_000_000;
 const RUNNER: &str = "class-runner";
 const OWNER: &str = "class-owner";
 
+mod fork_class_tests;
 mod paid_anthropic_shape_tests;
 mod pinned_keep_free_tests;
 mod transient_backoff_select_tests;

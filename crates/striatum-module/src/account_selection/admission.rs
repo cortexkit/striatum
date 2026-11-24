@@ -434,6 +434,11 @@ pub(crate) struct AccountForParams {
     pub(super) service_tier_chosen: Option<cortexkit_role_routing::service_tier::ServiceTier>,
     #[serde(skip)]
     pub(super) bound_tier: Option<BoundTier>,
+    /// For a fork: listed logins the child's own decision can never use (its
+    /// account class, model reach or bound service tier rule them out), with
+    /// the reason. A parent on one of them is refused, never replaced.
+    #[serde(skip)]
+    pub(super) fork_unqualified: BTreeMap<String, fork::Unqualified>,
     /// Routing generated `admission_id` itself (a continuation's reservation),
     /// so no earlier admission can hold it and the writer skips its keyed
     /// existence check.
@@ -518,6 +523,7 @@ impl AccountForParams {
             service_tier: request.service_tier,
             service_tier_chosen: None,
             bound_tier: None,
+            fork_unqualified: BTreeMap::new(),
             admission_id_generated: false,
             parent_conversation_key: serde_json::from_value(optional("parent_conversation_key"))
                 .map_err(|e| invalid(e.to_string()))?,
@@ -1113,20 +1119,19 @@ pub(crate) fn run_after_roster_hook(admission_id: &str) {
     }
 }
 
-pub(super) fn prepare_roster(
+/// The account class the request's routing decision allows, and the decision
+/// itself when the v1 store holds it. A request without a decision may use any
+/// class but pay-per-token-only.
+pub(super) fn decision_class(
     parsed: &AccountForParams,
     ctx: &Ctx<'_>,
 ) -> Result<
     (
-        RosterBuild,
-        BTreeMap<String, i64>,
         striatum_core::accounts::AllowedAccountClass,
         Option<striatum_store::V1Decision>,
-        Option<BoundTier>,
     ),
     OpReply,
 > {
-    let provider = normalize(&parsed.provider);
     let selection = parsed
         .model_decision_id
         .as_deref()
@@ -1149,6 +1154,24 @@ pub(super) fn prepare_roster(
             Err(error) => return Err(store_error(error)),
         },
     };
+    Ok((class, selection))
+}
+
+pub(super) fn prepare_roster(
+    parsed: &AccountForParams,
+    ctx: &Ctx<'_>,
+) -> Result<
+    (
+        RosterBuild,
+        BTreeMap<String, i64>,
+        striatum_core::accounts::AllowedAccountClass,
+        Option<striatum_store::V1Decision>,
+        Option<BoundTier>,
+    ),
+    OpReply,
+> {
+    let provider = normalize(&parsed.provider);
+    let (class, selection) = decision_class(parsed, ctx)?;
     let mut route_fenced = BTreeMap::new();
     let mut roster = match ctx.classes.as_ref() {
         Some(classes) => {
@@ -1498,6 +1521,12 @@ fn serve_with_pin_diagnostic(
     let mut fork_parent = fork::resolve(tx, principal, params, provider)?;
     if params.fork_of.is_some() && fork_parent.is_none() {
         return Ok(fork_invalid());
+    }
+    if let Some(refusal) = fork_parent
+        .as_ref()
+        .and_then(|parent| fork::unqualified_refusal(params, parent))
+    {
+        return Ok(refusal);
     }
     let established = match affinity_row.as_ref() {
         Some(affinity) => tx.pin_has_started(affinity)?,
