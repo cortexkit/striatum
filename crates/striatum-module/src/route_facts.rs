@@ -163,17 +163,17 @@ impl Handler {
                 broca_credentials: &handler.credentials,
             };
             let request = json!({"method":fact.op,"params":fact.params});
-            let bytes = serde_json::to_vec(&request).map_err(crate::ModuleError::Json)?;
             if fact.op == "route.report" {
                 return Ok(routing_v1::report::report(&fact.params, &caller, &deps)
                     .map(|(_, duplicate)| duplicate)
                     .map_err(|refusal| refusal.code.as_str().to_owned()));
             }
-            let reply = if routing_v1::claims(&bytes) {
+            let reply = if routing_v1::claims_request(&request) {
                 routing_v1::answer(&fact.op, &fact.params, &caller, &deps)
                     .await
                     .map_err(|refusal| refusal.code.as_str().to_owned())
             } else {
+                let bytes = serde_json::to_vec(&request).map_err(crate::ModuleError::Json)?;
                 match crate::select::answer_legacy_account(
                     &fact.op,
                     &bytes,

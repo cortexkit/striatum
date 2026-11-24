@@ -1264,6 +1264,23 @@ impl AccountCommand<'_> {
         Ok(changed)
     }
 
+    pub(crate) fn end_lease_after_finish(
+        &mut self,
+        admission: &AccountAdmissionRow,
+        at: i64,
+    ) -> RouteStateResult<bool> {
+        let pin = &admission.pin_id;
+        let generation = admission.pin_generation;
+        let remaining = match self.admission_state() {
+            Some(state) => state.pin_has_open_admissions(pin, generation),
+            None => self.sql.pin_has_open_admissions(pin, generation)?,
+        };
+        if remaining {
+            return Ok(false);
+        }
+        self.end_lease(pin, at)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn record_continuation(
         &mut self,

@@ -288,6 +288,7 @@ pub struct CredentialData {
     pub(crate) connection_file_path: Option<std::path::PathBuf>,
     /// One on-demand account-input fetch shared by concurrent admissions.
     pub(crate) admission_inputs: Arc<tokio::sync::Mutex<()>>,
+    pub(crate) admission_describes: crate::routing_v1::runners::AdmissionDescribes,
     /// The providers with no catalog rows that resolved to a catalog provider
     /// at the last [`Self::refresh_serving_methods`], each with its catalog
     /// provider. Such a provider has no Fusiform plane of its own: its serving

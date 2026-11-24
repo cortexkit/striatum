@@ -1,6 +1,29 @@
 use super::{OperatorWarnings, INJECTED_NOW_MS, OPERATOR_INFOS, OPERATOR_WARNINGS};
 use std::sync::Arc;
 
+#[derive(Default)]
+pub(crate) struct LifecycleProbe {
+    pub parses: std::sync::atomic::AtomicUsize,
+    pub callers: std::sync::atomic::AtomicUsize,
+    pub report_snapshots: std::sync::atomic::AtomicUsize,
+    pub report_catalog_reads: std::sync::atomic::AtomicUsize,
+    pub observation_rosters: std::sync::atomic::AtomicUsize,
+    pub delay_select: bool,
+    pub slow_select_lines: std::sync::Mutex<Vec<String>>,
+}
+
+thread_local! {
+    pub(crate) static LIFECYCLE_PROBE: std::cell::RefCell<Option<Arc<LifecycleProbe>>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) fn lifecycle_probe(f: impl FnOnce(&LifecycleProbe)) {
+    LIFECYCLE_PROBE.with(|probe| {
+        if let Some(probe) = probe.borrow().as_deref() {
+            f(probe);
+        }
+    });
+}
+
 /// The per-thread test state a route handler reads: the injected clocks, ID
 /// sequence and diagnostics buffer. Route handlers run on a blocking thread (see
 /// [`super::run_route_handler_off_async_workers`]), so the state of the thread that
@@ -12,6 +35,7 @@ pub(super) struct TestThreadState {
     infos: OperatorWarnings,
     replay: Option<striatum_store::replay::Inputs>,
     writer_trace: Option<striatum_store::writer_entry_trace::Trace>,
+    lifecycle: Option<Arc<LifecycleProbe>>,
 }
 
 impl TestThreadState {
@@ -22,6 +46,7 @@ impl TestThreadState {
             infos: OPERATOR_INFOS.with(|sink| Arc::clone(&sink.borrow())),
             replay: striatum_store::replay::current(),
             writer_trace: striatum_store::writer_entry_trace::current(),
+            lifecycle: LIFECYCLE_PROBE.with(|probe| probe.borrow().clone()),
         }
     }
 
@@ -38,6 +63,7 @@ impl TestThreadState {
                 infos: OPERATOR_INFOS.with(|sink| sink.replace(self.infos)),
                 replay: None,
                 writer_trace: None,
+                lifecycle: LIFECYCLE_PROBE.with(|probe| probe.replace(self.lifecycle)),
             }),
             _replay: replay,
             _writer_trace: writer_trace,
@@ -58,6 +84,7 @@ impl Drop for InstalledTestThreadState {
             INJECTED_NOW_MS.with(|clock| clock.set(previous.now_ms));
             OPERATOR_WARNINGS.with(|sink| *sink.borrow_mut() = previous.warnings);
             OPERATOR_INFOS.with(|sink| *sink.borrow_mut() = previous.infos);
+            LIFECYCLE_PROBE.with(|probe| probe.replace(previous.lifecycle));
         }
     }
 }

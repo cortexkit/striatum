@@ -2147,6 +2147,16 @@ impl AccountTx<'_> {
             .map_err(err)
     }
 
+    /// What-if runs use a private database copy without the live writer's
+    /// in-memory index. Limit the lookup there to rows for this pin.
+    pub fn pin_has_open_admissions(&self, pin: &str, generation: u64) -> RouteStateResult<bool> {
+        self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM account_admission WHERE pin_id=?1 AND pin_generation=?2
+             AND state IN ('reserved', 'started', 'expired'))",
+            params![pin, generation], |row| row.get(0),
+        ).map_err(err)
+    }
+
     pub fn insert_pin(&self, row: &AccountPinRow) -> RouteStateResult<()> {
         #[cfg(any(test, feature = "test-support"))]
         let _writer_entry =

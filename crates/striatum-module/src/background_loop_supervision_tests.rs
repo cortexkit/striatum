@@ -10,9 +10,36 @@ async fn wait_for_frame_or_stop(
     loops: &mut BackgroundLoops,
     read_half: &mut tokio::io::DuplexStream,
 ) -> Result<Option<Frame>, ModuleError> {
-    tokio::time::timeout(STOP_NOTICE_LIMIT, next_frame_or_loop_stop(read_half, loops))
-        .await
-        .expect("the serving loop must notice a stopped background loop")
+    tokio::time::timeout(
+        STOP_NOTICE_LIMIT,
+        next_frame_or_loop_stop(read_half, loops, None),
+    )
+    .await
+    .expect("the serving loop must notice a stopped background loop")
+}
+
+#[tokio::test]
+async fn a_failed_egress_wakes_serving_with_ingress_still_open() {
+    let (_daemon_writer, mut ingress) = tokio::io::duplex(1024);
+    let (egress, daemon_reader) = tokio::io::duplex(1024);
+    drop(daemon_reader);
+    let (tx, rx) = mpsc::channel(4);
+    let writing = tokio::spawn(drain_writer(egress, rx));
+    let response = Frame::build(FrameType::Pong, control_flags(), 0, 0, 7, Vec::new()).unwrap();
+    tx.send(response).await.unwrap();
+    let mut loops = BackgroundLoops::default();
+    let (wake, failure) = tokio::join!(
+        tokio::time::timeout(
+            STOP_NOTICE_LIMIT,
+            next_frame_or_loop_stop(&mut ingress, &mut loops, Some(&tx))
+        ),
+        writing,
+    );
+    assert!(failure.unwrap().is_err(), "the write direction failed");
+    assert!(wake
+        .expect("serving ignored failed egress while ingress was idle")
+        .unwrap()
+        .is_none());
 }
 
 #[tokio::test]

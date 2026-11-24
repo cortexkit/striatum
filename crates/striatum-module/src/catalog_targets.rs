@@ -12,6 +12,7 @@ fn not_ready() -> ErrorBody {
 
 pub(super) async fn serve(
     frame: Frame,
+    principal: &str,
     writer: &mpsc::Sender<Frame>,
     credentials: &SharedBrocaCredentials,
 ) -> Result<(), ModuleError> {
@@ -21,8 +22,7 @@ pub(super) async fn serve(
         frame.header.epoch,
         frame.header.corr,
     );
-    let principal = route_principal(channel, epoch);
-    if principal != "reserved:occipital" && !is_fence_lift_operator(&principal) {
+    if principal != "reserved:occipital" && !is_fence_lift_operator(principal) {
         return send_route_error(
             writer,
             ver,

@@ -30,7 +30,7 @@ mod placements_tests;
 mod watch_tests;
 #[cfg(test)]
 pub(crate) use admission::fetch_describe;
-pub(crate) use admission::{refresh_admission_tiers, tier_view_unknown};
+pub(crate) use admission::{refresh_admission_tiers, tier_view_unknown, AdmissionDescribes};
 pub(crate) use describe_cache::DescribeCache;
 pub(crate) use harness_facts::RunnerDeclaration;
 

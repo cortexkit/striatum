@@ -64,6 +64,76 @@ fn the_manifest_registers_one_selection_pass() {
     assert!(!crate::handles("route.select_again"));
 }
 
+#[tokio::test]
+async fn a_wire_v1_request_decodes_one_body_and_captures_one_caller() {
+    use crate::test_thread_state::{LifecycleProbe, LIFECYCLE_PROBE};
+    use std::sync::{atomic::Ordering::Relaxed, Arc};
+    let (_harness, route) = configured().await;
+    let baseline = route.call_raw("role.describe", &json!({})).await;
+    let probe = Arc::new(LifecycleProbe::default());
+    LIFECYCLE_PROBE.with(|slot| slot.replace(Some(probe.clone())));
+    assert_eq!(route.call_raw("role.describe", &json!({})).await, baseline);
+    assert_eq!(
+        (probe.parses.load(Relaxed), probe.callers.load(Relaxed)),
+        (1, 1)
+    );
+}
+
+#[tokio::test]
+async fn slow_v1_select_emits_a_timed_and_rate_limited_wire_line() {
+    use crate::test_thread_state::{LifecycleProbe, LIFECYCLE_PROBE};
+    use std::sync::Arc;
+    let (_harness, route) = configured().await;
+    let probe = Arc::new(LifecycleProbe {
+        delay_select: true,
+        ..Default::default()
+    });
+    LIFECYCLE_PROBE.with(|slot| slot.replace(Some(probe.clone())));
+    for _ in 0..2 {
+        let (ty, body) = route
+            .call(
+                "route.select",
+                &json!({"consumer":fixture::SUMMARY,"requirements":{"iq":50}}),
+            )
+            .await;
+        assert_eq!(ty, FrameType::Response, "{body}");
+    }
+    let lines = probe.slow_select_lines.lock().unwrap();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(
+        lines[0].starts_with("[routing] slow route.select total_ms="),
+        "{lines:?}"
+    );
+    assert!(
+        lines[0].contains("writer_queue_wait_ms=") && lines[0].contains("serialization_ms="),
+        "{lines:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_manifest_registers_every_advertised_and_v1_only_operation() {
+    let (_harness, route) = configured().await;
+    let describe = route.call("role.describe", &json!({})).await;
+    assert_eq!(describe.0, FrameType::Response, "{}", describe.1);
+    let operations = crate::served_operations();
+    let names: std::collections::BTreeSet<_> =
+        operations.iter().map(|op| op.name.as_str()).collect();
+    assert_eq!(
+        names.len(),
+        operations.len(),
+        "manifest contains duplicate operations"
+    );
+    assert!(names.iter().all(|name| crate::handles(name)));
+    let advertised = describe.1["result"]["ops"].as_array().unwrap();
+    let missing: std::collections::BTreeSet<_> = advertised
+        .iter()
+        .map(|op| op.as_str().unwrap())
+        .chain(super::V1_ONLY_OPS.iter().copied())
+        .filter(|op| !names.contains(op))
+        .collect();
+    assert!(missing.is_empty(), "served but undeclared: {missing:?}");
+}
+
 /// A harness with the kit's consumers and catalog, and a consumer route.
 pub(super) async fn configured() -> (std::sync::Arc<Harness>, Route) {
     let harness = Harness::new("dispatch");
