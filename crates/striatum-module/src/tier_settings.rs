@@ -150,7 +150,9 @@ pub(crate) struct TierResolver<'a> {
 pub(crate) struct MatchedTiers<'a> {
     pub(crate) name: &'a str,
     pub(crate) tier: Option<Tier>,
-    /// Routes a workspace or project layer set; they win over `user`.
+    /// Route tiers the request's project settings set (from its workspace or
+    /// project settings file); they take precedence over the user settings
+    /// routes in `user`.
     pub(crate) scoped: Option<&'a BTreeMap<String, Tier>>,
     pub(crate) user: Option<&'a BTreeMap<String, Tier>>,
 }

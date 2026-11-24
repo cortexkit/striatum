@@ -198,11 +198,11 @@ pub(crate) struct PricingPatch {
 }
 
 impl LiveConfig {
-    #[cfg(test)]
     pub(crate) fn snapshot_key(&self) -> SnapshotKey {
         SnapshotKey(Arc::clone(&self.compiled))
     }
 
+    #[cfg(test)]
     pub(super) fn prepared_settings(&self) -> serde_json::Value {
         serde_json::to_value(&self.config).unwrap()
     }

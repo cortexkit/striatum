@@ -226,8 +226,9 @@ fn review_layers(
         })
         .collect();
     // Runtime restrictions and enrollment are evaluated against the global
-    // configuration. A project list cannot add enrollment or invalidate it,
-    // but its own entries must still be well formed.
+    // configuration. A project list cannot change the user layer's runner
+    // enrollment, which is applied per request, but its own entries must
+    // still be well formed.
     if project.is_some() {
         crate::project_settings::validate_scoped_runner_lists(&tuple.effective, &tuple.sources)
             .map_err(|(path, reason)| {

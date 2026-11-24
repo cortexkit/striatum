@@ -434,7 +434,7 @@ impl Driver {
                     self.report = Some(report);
                     Report::Held
                 } else {
-                    // Dropped as before, but the refresh still fetches: an
+                    // The report is dropped, but the refresh still fetches: an
                     // early return would lose the change notice that started
                     // it until the daemon sent another.
                     Report::Failed
