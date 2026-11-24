@@ -2664,3 +2664,33 @@ async fn consumer_cut_target_agent_select_is_refused_like_an_unknown_member() {
         assert_eq!(reply.1["detail"]["field"], member, "{reply:?}");
     }
 }
+
+#[tokio::test]
+async fn selects_on_an_unchanged_settings_snapshot_share_one_consumer_registry() {
+    let (harness, consumer) = super::dispatch_tests::configured().await;
+    let request = json!({"consumer":fixture::SUMMARY,"requirements":{"iq":50}});
+    let select = || async {
+        let (ty, reply) = consumer.call("route.select", &request).await;
+        assert_eq!(ty, FrameType::Response, "{reply}");
+    };
+    select().await;
+    let before = consumers::registry_builds_for_test();
+    for _ in 0..3 {
+        select().await;
+    }
+    assert_eq!(
+        consumers::registry_builds_for_test() - before,
+        0,
+        "selects on the same settings and catalog rebuilt the registry"
+    );
+    harness.edit_config(|config| {
+        config["consumers"]["registry-probe"] = json!({});
+    });
+    select().await;
+    select().await;
+    assert_eq!(
+        consumers::registry_builds_for_test() - before,
+        1,
+        "a new settings snapshot builds the registry once"
+    );
+}

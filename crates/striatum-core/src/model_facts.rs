@@ -631,7 +631,7 @@ impl ModelFact {
     /// Prices one message of `vector`'s workload on this route, dimension by
     /// dimension: the sum of tokens x rate over the five token dimensions, divided
     /// by the subscription multiplier, normalized against
-    /// BASKET_REFERENCE_COST_PER_MESSAGE and clamped to 0..1.
+    /// BASKET_REFERENCE_COST_PER_MESSAGE. Known prices may exceed the reference.
     ///
     /// A dimension with no tokens needs no rate: it contributes zero whatever its
     /// rate would be (Codex runs record no cache-write tokens, so a catalog row
@@ -660,7 +660,7 @@ impl ModelFact {
         let cost = unpriced.is_empty().then(|| {
             let basket_unscaled =
                 raw_cost / 1_000_000.0 / crate::routing_config::BASKET_REFERENCE_COST_PER_MESSAGE;
-            (basket_unscaled / multiplier).clamp(0.0, 1.0)
+            (basket_unscaled / multiplier).clamp(0.0, f64::INFINITY)
         });
         BasketPrice { cost, unpriced }
     }
@@ -773,7 +773,14 @@ pub fn make_capacity_key(provider_id: &str, model_id: &str) -> String {
     format!("{provider_id}/{model_id}")
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static FACT_TO_ROUTE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 pub fn fact_to_route(fact: &ModelFact) -> ModelRoute {
+    #[cfg(test)]
+    FACT_TO_ROUTE_CALLS.with(|count| count.set(count.get() + 1));
     ModelRoute {
         provider_id: fact.provider_id.clone(),
         model_id: fact.model_id.clone(),

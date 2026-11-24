@@ -33,6 +33,22 @@ pub(crate) struct Consumer {
     pub(crate) runners: Option<Vec<RunnerChoice>>,
 }
 
+impl Consumer {
+    /// A scoped runner list follows the user list's rules for names, harness
+    /// words, duplicates and route specs, so a malformed route is refused
+    /// instead of silently matching nothing.
+    pub(crate) fn validate_runners(&self, name: &str) -> Result<(), String> {
+        let Some(runners) = &self.runners else {
+            return Ok(());
+        };
+        let policies: Vec<_> = runners.iter().map(RunnerChoice::policy).collect();
+        crate::config_overrides::validate_runner_list(
+            &policies,
+            &format!("consumers.{name}.runners"),
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RunnerChoice {
@@ -122,33 +138,56 @@ pub(crate) fn without_context(params: &serde_json::Value) -> serde_json::Value {
     params
 }
 
-pub(crate) fn at_level(
-    consumer: &str,
-    provider: &str,
-    model: &str,
-    consumers: impl Iterator<Item = (String, Option<Tier>, BTreeMap<String, Tier>)>,
-    model_tier: Option<Tier>,
-    provider_tier: Option<Tier>,
-) -> Option<ServiceTier> {
-    let mut matched: Vec<_> = consumers
-        .filter(|(name, _, _)| crate::config_policy::consumer_matches(name, consumer))
-        .collect();
-    matched.sort_by_key(|(name, _, _)| {
-        std::cmp::Reverse(crate::config_policy::consumer_specificity(name))
-    });
-    let route = format!("{provider}/{model}");
-    matched
-        .iter()
-        .find_map(|(_, _, tiers)| tiers.get(&route).copied())
-        .or_else(|| {
-            matched
-                .iter()
-                .find_map(|(_, _, tiers)| tiers.get(provider).copied())
-        })
-        .or_else(|| matched.iter().find_map(|(_, tier, _)| *tier))
-        .or(model_tier)
-        .or(provider_tier)
-        .map(Tier::value)
+/// One consumer's configured service tiers, gathered once per request so each
+/// candidate model is a few map lookups rather than a scan and copy of every
+/// configured consumer.
+pub(crate) struct TierResolver<'a> {
+    global: &'a crate::config_overrides::LiveConfig,
+    // Entries whose name matches the consumer, most specific first.
+    matched: Vec<MatchedTiers<'a>>,
+}
+
+pub(crate) struct MatchedTiers<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) tier: Option<Tier>,
+    /// Route tiers the request's project settings set (from its workspace or
+    /// project settings file); they take precedence over the user settings
+    /// routes in `user`.
+    pub(crate) scoped: Option<&'a BTreeMap<String, Tier>>,
+    pub(crate) user: Option<&'a BTreeMap<String, Tier>>,
+}
+
+impl<'a> TierResolver<'a> {
+    pub(crate) fn new(
+        global: &'a crate::config_overrides::LiveConfig,
+        mut matched: Vec<MatchedTiers<'a>>,
+    ) -> Self {
+        // A stable sort keeps settings order between equally specific names.
+        matched.sort_by_key(|entry| {
+            std::cmp::Reverse(crate::config_policy::consumer_specificity(entry.name))
+        });
+        Self { global, matched }
+    }
+
+    /// The most specific consumer entry naming the model's route, then its
+    /// provider, then the entry's own tier, then the model and provider rules.
+    pub(crate) fn resolve(&self, provider: &str, model: &str) -> Option<ServiceTier> {
+        let route = format!("{provider}/{model}");
+        let by_key = |key: &str| {
+            self.matched.iter().find_map(|entry| {
+                entry
+                    .scoped
+                    .and_then(|tiers| tiers.get(key))
+                    .or_else(|| entry.user.and_then(|tiers| tiers.get(key)))
+                    .copied()
+            })
+        };
+        by_key(&route)
+            .or_else(|| by_key(provider))
+            .or_else(|| self.matched.iter().find_map(|entry| entry.tier))
+            .or_else(|| self.global.rule_service_tier(provider, &route))
+            .map(Tier::value)
+    }
 }
 
 #[derive(Default)]
@@ -224,6 +263,15 @@ impl Layers {
         pin.or_else(|| {
             global.service_tier_with(consumer, provider, model, self.consumers.as_deref())
         })
+    }
+
+    /// Gather `consumer`'s tier settings once for a pass over many models.
+    pub(crate) fn tier_resolver<'a>(
+        &'a self,
+        global: &'a crate::config_overrides::LiveConfig,
+        consumer: &str,
+    ) -> TierResolver<'a> {
+        global.tier_resolver(consumer, self.consumers.as_deref())
     }
 }
 

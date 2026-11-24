@@ -503,6 +503,17 @@ async fn lost_probe_binding_fallback_case(legacy: bool) {
     steal_selected_probe(&harness);
     let reply = broca_select(&harness, legacy).await;
     assert_eq!(broca_selected_route(&reply, legacy), "muse/model");
+    let selected: Vec<_> = harness
+        .store()
+        .list_decisions(&striatum_store::DecisionListFilter {
+            limit: 10,
+            ..Default::default()
+        })
+        .unwrap()
+        .into_iter()
+        .filter_map(|row| row.selected_route_key)
+        .collect();
+    assert_eq!(selected, ["muse/model"]);
     assert_eq!(
         harness.store().fence_rechecks().unwrap()[0]
             .claim_owner
@@ -707,6 +718,49 @@ fn quota_probe_clock(harness: &Harness) -> striatum_store::FenceRecheck {
         .into_iter()
         .find(|origin| origin.kind == "account_route")
         .unwrap()
+}
+
+#[tokio::test]
+async fn a_failed_selection_insert_allows_the_normal_probe_recheck() {
+    let _clock = crate::InjectedClock::set(FENCE_NOW);
+    let harness = quota_probe_harness();
+    let sql = rusqlite::Connection::open(harness.store_path()).unwrap();
+    sql.execute_batch(
+        "CREATE TRIGGER fail_selected_insert BEFORE INSERT ON model_route_decisions
+         WHEN NEW.selected_route_key = 'inception/mercury-3'
+         BEGIN SELECT RAISE(ABORT, 'selection ledger insert failed'); END;",
+    )
+    .unwrap();
+    let refusal = broca_select(&harness, false).await;
+    assert_eq!(refusal.0, FrameType::Error, "{refusal:?}");
+    assert!(
+        refusal
+            .1
+            .to_string()
+            .contains("selection ledger insert failed"),
+        "{refusal:?}"
+    );
+    let origin = &harness.store().fence_rechecks().unwrap()[0];
+    if let Some(owner) = &origin.claim_owner {
+        assert!(harness.store().get_decision_by_id(owner).unwrap().is_none());
+    }
+    sql.execute_batch("DROP TRIGGER fail_selected_insert")
+        .unwrap();
+
+    // Treat a failed ledger write like a probe whose run never reported.
+    let due = FENCE_NOW + 900_000;
+    assert_eq!(origin.next_recheck_at, due as i64);
+    {
+        let _clock = crate::InjectedClock::set(due - 1);
+        let held = broca_select(&harness, false).await;
+        assert_eq!(broca_selected_route(&held, false), "muse/model");
+    }
+    let _clock = crate::InjectedClock::set(due);
+    let retried = broca_select(&harness, false).await;
+    assert_eq!(broca_selected_route(&retried, false), "inception/mercury-3");
+    let decision = retried.1["result"]["decision_id"].as_str().unwrap();
+    let rebound = &harness.store().fence_rechecks().unwrap()[0];
+    assert_eq!(rebound.claim_owner.as_deref(), Some(decision));
 }
 
 #[tokio::test]

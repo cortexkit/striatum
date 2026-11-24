@@ -84,13 +84,32 @@ struct LiveQuota {
     cache: SharedQuotaCache,
     accounts: account_quota::SharedAccountQuota,
     store: SharedStore,
-    snapshot_baseline: Arc<Mutex<HashMap<ReadingKey, crate::ProviderUsage>>>,
+    snapshot_baseline: Arc<Mutex<InventoryCoverage>>,
 }
 
 struct CommittedQuota {
     cache: crate::QuotaCache,
     readings: account_quota::AccountReadings,
-    baseline: Option<Vec<(ReadingKey, crate::ProviderUsage)>>,
+    baseline: Option<InventoryCoverage>,
+    updated: Option<ReadingKey>,
+}
+
+#[derive(Default)]
+struct InventoryCoverage {
+    entries: HashMap<ReadingKey, InventoryReading>,
+    complete: HashSet<String>,
+}
+
+struct InventoryReading {
+    entry: crate::ProviderUsage,
+    watermark: Option<(String, u64)>,
+}
+
+fn sample_watermark(body: &Value) -> Option<(&str, u64)> {
+    Some((
+        body["epoch"].as_str().filter(|epoch| !epoch.is_empty())?,
+        body["seq"].as_u64().filter(|&seq| seq != 0)?,
+    ))
 }
 
 type ReadingKey = (String, Option<String>);
@@ -124,6 +143,9 @@ impl LiveQuota {
         let envelope: Value = serde_json::from_slice(body).map_err(|e| e.to_string())?;
         let windows = crate::quota_consumer::decode_usage_result(&envelope["result"])
             .map_err(|e| e.to_string())?;
+        let updated = incremental
+            .then(|| windows.first().map(reading_key))
+            .flatten();
         let mut cache = self
             .cache
             .lock()
@@ -148,15 +170,33 @@ impl LiveQuota {
         if incremental {
             cache.restored_from_ms = None;
         }
-        let (rows, completeness) =
-            account_quota::apply_usage_reply(&mut accounts, body, at_ms as i64)?;
-        let log_rows = crate::quota_reading_rows(self.store.as_ref(), &windows, at_ms)?;
-        let baseline = (!incremental).then(|| {
-            windows
+        let decoded = account_quota::decode_usage_envelope_value(&envelope)?;
+        let baseline = (!incremental).then(|| InventoryCoverage {
+            entries: windows
                 .iter()
-                .map(|entry| (reading_key(entry), entry.clone()))
-                .collect::<Vec<_>>()
+                .zip(envelope["result"].as_array().unwrap())
+                .map(|(entry, raw)| {
+                    (
+                        reading_key(entry),
+                        InventoryReading {
+                            entry: entry.clone(),
+                            watermark: sample_watermark(raw)
+                                .map(|(epoch, seq)| (epoch.to_owned(), seq)),
+                        },
+                    )
+                })
+                .collect(),
+            // An undecodable row could be the missing account. The account
+            // merge also declines to mark omitted readings removed in that case.
+            complete: if decoded.undecodable_entries.is_empty() {
+                decoded.complete_providers.iter().cloned().collect()
+            } else {
+                HashSet::new()
+            },
         });
+        let (rows, completeness) =
+            account_quota::apply_decoded_usage_reply(&mut accounts, decoded, at_ms as i64);
+        let log_rows = crate::quota_reading_rows(self.store.as_ref(), &windows, at_ms)?;
         crate::apply_quota_refresh(&mut cache, windows, at_ms);
         self.store
             .apply_quota_delta(&log_rows, &rows, &completeness)
@@ -165,6 +205,7 @@ impl LiveQuota {
             cache,
             readings: accounts.readings,
             baseline,
+            updated,
         })
     }
 
@@ -188,10 +229,12 @@ impl LiveQuota {
         // Roster refresh has its own writer; do not overwrite its concurrent result.
         guard.readings = committed.readings;
         guard.last_insula_error = None;
-        if let Some(entries) = committed.baseline {
-            for (key, entry) in entries {
-                baseline.insert(key, entry);
-            }
+        if let Some(coverage) = committed.baseline {
+            *baseline = coverage;
+        } else if let Some(key) = committed.updated {
+            // A newer event has replaced this account. Equality with the old
+            // inventory no longer establishes that a later event is redundant.
+            baseline.entries.remove(&key);
         }
         Ok(())
     }
@@ -217,22 +260,56 @@ impl LiveQuota {
         self.publish(self.commit_body(body, incremental)?)
     }
 
-    /// A recovery snapshot may already be ahead of the durable's backlog. Until
-    /// the matching sample arrives, use snapshots rather than replaying older
-    /// states over it. No wall-clock or opaque-epoch ordering is needed.
-    fn covered_by_snapshot(&self, body: &Value) -> Result<Option<bool>, String> {
-        let entry: crate::ProviderUsage =
-            serde_json::from_value(body.clone()).map_err(|e| e.to_string())?;
-        let key = reading_key(&entry);
+    /// Compare producer observations, never routing's receipt time or opaque epoch order.
+    fn covered_by_snapshot(&self, body: &Value, after_recovery: bool) -> Result<bool, String> {
+        let entry = serde_json::from_value::<crate::ProviderUsage>(body.clone()).ok();
+        let key = entry.as_ref().map(reading_key).unwrap_or_else(|| {
+            (
+                body["provider"].as_str().unwrap_or_default().to_owned(),
+                body["account"]
+                    .as_str()
+                    .or_else(|| body["credentialRef"].as_str())
+                    .map(str::to_owned),
+            )
+        });
         let mut baseline = self
             .snapshot_baseline
             .lock()
             .map_err(|_| "quota baseline poisoned")?;
-        let matches = baseline.get(&key).map(|previous| *previous == entry);
-        if matches == Some(true) {
-            baseline.remove(&key);
+        let Some(previous) = baseline.entries.get(&key) else {
+            // Only the notice already in hand is known to predate this absence.
+            // Committing its sequence also fences older notices for that account.
+            return Ok(after_recovery && baseline.complete.contains(&key.0));
+        };
+        let same_epoch = previous
+            .watermark
+            .as_ref()
+            .zip(sample_watermark(body))
+            .filter(|((epoch, _), (incoming, _))| epoch == incoming);
+        if let Some(((_, watermark), (_, seq))) = same_epoch {
+            if seq <= *watermark {
+                return Ok(true);
+            }
         }
-        Ok(matches)
+        if entry.as_ref() == Some(&previous.entry) {
+            baseline.entries.remove(&key);
+            return Ok(true);
+        }
+        let snapshot_is_later = previous
+            .entry
+            .fetched_at
+            .as_deref()
+            .and_then(account_quota::parse_rfc3339_ms)
+            .zip(
+                body["fetchedAt"]
+                    .as_str()
+                    .and_then(account_quota::parse_rfc3339_ms),
+            )
+            .is_some_and(|(snapshot, event)| snapshot > event);
+        // When notices are missing, read Insula's current inventory after
+        // receiving the notice. That account reading supersedes the notice
+        // unless the inventory has a lower sequence in the same epoch.
+        Ok(snapshot_is_later || (after_recovery && same_epoch.is_none() && entry.is_some()))
     }
 
     fn sample_body(&self, mut body: Value) -> Result<Vec<u8>, String> {
@@ -635,17 +712,15 @@ async fn consume_one<C: StreamCursor, S: SampleSource>(
                 error
             })?;
             if !state.stale(&sample) {
-                let covered = live.covered_by_snapshot(&body)?;
-                if state.needs_snapshot(&sample) || covered == Some(false) {
+                let recovery = state.needs_snapshot(&sample);
+                if recovery {
                     cursor.in_progress().await.map_err(|e| e.to_string())?;
                     // A snapshot read after this event includes at least its observation;
                     // applying the earlier body afterwards could roll that snapshot back.
                     live.store_body(source.snapshot().await?, false).await?;
                     state.owe_snapshot = false;
-                    if live.covered_by_snapshot(&body)?.is_none() {
-                        live.store_body(live.sample_body(body)?, true).await?;
-                    }
-                } else if covered.is_none() {
+                }
+                if !live.covered_by_snapshot(&body, recovery)? {
                     live.store_body(live.sample_body(body)?, true).await?;
                 }
                 state.commit(sample);
@@ -838,6 +913,8 @@ async fn delivery_loop(
     let mut source = Insula::new(connection_file.clone(), project_root);
     let mut state = SequenceState::default();
     let mut bus = None::<quota_bus::AttachedBus>;
+    // Keep the KV watch alive across event durable attach or settlement failures.
+    let mut connection = None;
     let mut schedule = SnapshotSchedule::new(Instant::now());
     let mut reconnect = quota_bus::reconnect::Backoff::new(
         Instant::now(),
@@ -852,7 +929,7 @@ async fn delivery_loop(
                     Instant::now(),
                     striatum_store::job_timing::run(
                         "quota_feed_attach",
-                        quota_bus::attach(connection_file.clone(), handler.clone()),
+                        quota_bus::attach(&connection_file, handler.clone(), &mut connection),
                     ),
                 )
                 .await

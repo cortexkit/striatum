@@ -47,7 +47,7 @@ pub(super) fn what_if(params: &Value, caller: &Caller, deps: &Deps<'_>) -> Resul
         engines::MEDIA_KINDS,
     )?;
     let config = operator_config(deps);
-    let consumers = Arc::new(super::super::consumers::effective(&config));
+    let consumers = super::super::consumers::effective(&config);
     if !consumers.knows(&request.consumer) {
         return Err(Refusal::invalid_request(
             "consumer",

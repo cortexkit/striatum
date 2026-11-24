@@ -26,7 +26,6 @@ async fn consume_notice(
         body,
         message.headers,
         digest.as_deref(),
-        Some(NOW - 10),
         delivery.delivery_count,
     )
     .unwrap();

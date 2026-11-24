@@ -30,7 +30,7 @@ mod placements_tests;
 mod watch_tests;
 #[cfg(test)]
 pub(crate) use admission::fetch_describe;
-pub(crate) use admission::{refresh_admission_tiers, tier_view_unknown};
+pub(crate) use admission::{refresh_admission_tiers, tier_view_unknown, AdmissionDescribes};
 pub(crate) use describe_cache::DescribeCache;
 pub(crate) use harness_facts::RunnerDeclaration;
 
@@ -1116,7 +1116,9 @@ pub(crate) async fn refresh_loop(
     }
 }
 
-const WATCH_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+// Leave time for the catalog read and serialized describes before views expire.
+const WATCH_BACKSTOP: std::time::Duration =
+    std::time::Duration::from_millis(describe_cache::LAST_GOOD_MS as u64 / 2);
 const WATCH_FALLBACK: std::time::Duration = std::time::Duration::from_secs(30);
 const WATCH_RETRY_MIN: std::time::Duration = std::time::Duration::from_secs(1);
 const WATCH_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(30);
@@ -1316,18 +1318,19 @@ impl Discovery<'_> {
                 {
                     return false;
                 }
-                if let Ok(mut credentials) = self.credentials.lock() {
-                    if matches!(result, Ok(None)) {
+                self.credentials.lock().is_ok_and(|mut credentials| {
+                    let revoked = matches!(result, Ok(None));
+                    if revoked {
                         self.classifiers.revoke(module, &mut credentials);
                     }
-                    self.classifiers.reply(
+                    let valid = self.classifiers.reply(
                         module,
                         result.as_ref().ok().and_then(Option::as_ref),
                         &mut credentials,
                         crate::now_ms() as i64,
                     );
-                }
-                result.is_ok()
+                    revoked || valid
+                })
             }
             DescribeTarget::Tiers(module) => {
                 let describe = admission::fetch_describe_result(

@@ -2740,6 +2740,113 @@ fn broca_run_finished_ends_lease_and_later_release_is_noop() {
 }
 
 #[test]
+fn run_finished_builds_no_provider_rosters() {
+    use crate::test_thread_state::{LifecycleProbe, LIFECYCLE_PROBE};
+    use std::sync::atomic::Ordering::Relaxed;
+    let fixture = fixture("finish-without-rosters");
+    let ctx = fixture.ctx(true, NOW);
+    result(fixture.call(
+        &ctx,
+        ACCOUNT_FOR_OP,
+        BROCA,
+        admit_params("a", "broca:finish", "broca"),
+    ));
+    let probe = Arc::new(LifecycleProbe::default());
+    LIFECYCLE_PROBE.with(|slot| slot.replace(Some(probe.clone())));
+    let reply = result(fixture.call(&fixture.ctx(true, NOW + 1), ACCOUNT_OBSERVE_OP, BROCA,
+        json!({"event_id":"done", "caller":{"runner":"broca"}, "kind":"run_finished",
+            "admission_id":"a", "run_id":"r", "terminal_reason":"success", "upstream_origin":"upstream"})));
+    assert_eq!(
+        reply["observation"]["effects"],
+        json!([
+            {"effect":"admission_finished"}, {"effect":"lease_ended", "lease_ended":true}
+        ])
+    );
+    assert_eq!(probe.observation_rosters.load(Relaxed), 0);
+}
+
+#[test]
+fn late_finish_does_not_end_a_newer_admissions_lease() {
+    finish_pair_preserving_lease(false, false);
+}
+
+#[test]
+fn the_newer_admission_can_finish_before_the_older_one() {
+    finish_pair_preserving_lease(true, false);
+}
+
+#[test]
+fn last_of_two_admissions_finishing_in_the_same_millisecond_ends_the_lease() {
+    finish_pair_preserving_lease(false, true);
+}
+
+fn finish_pair_preserving_lease(new_first: bool, same_ms: bool) {
+    let fixture = fixture("finish-older-lease");
+    let first = result(fixture.call(
+        &fixture.ctx(true, NOW),
+        ACCOUNT_FOR_OP,
+        BROCA,
+        admit_params("old", "broca:shared", "broca"),
+    ));
+    result(fixture.call(
+        &fixture.ctx(true, NOW + 1_000),
+        ACCOUNT_OBSERVE_OP,
+        BROCA,
+        json!({"event_id":"start-old", "caller":{"runner":"broca"},
+               "kind":"admission_started", "admission_id":"old", "run_id":"old-run"}),
+    ));
+    let mut renewal = admit_params("new", "broca:shared", "broca");
+    renewal["mode"] = json!("renew");
+    renewal["expected_pin"] =
+        json!({"id":first["pin"]["id"], "generation":first["pin"]["generation"]});
+    let renewed_at = if same_ms { NOW } else { NOW + 2_000 };
+    let renewal = result(fixture.call(
+        &fixture.ctx(true, renewed_at),
+        ACCOUNT_FOR_OP,
+        BROCA,
+        renewal,
+    ));
+    assert_eq!(renewal["pin"]["id"], first["pin"]["id"]);
+    assert_eq!(
+        renewal["pin"]["lease_valid_until"] == first["pin"]["lease_valid_until"],
+        same_ms
+    );
+
+    let order = if new_first {
+        ["new", "old"]
+    } else {
+        ["old", "new"]
+    };
+    for (i, id) in order.into_iter().enumerate() {
+        let at = NOW + 3_000 + if same_ms { 0 } else { i as i64 };
+        let reply = result(fixture.call(
+            &fixture.ctx(true, at),
+            ACCOUNT_OBSERVE_OP,
+            BROCA,
+            json!({"event_id":format!("finish-{id}"), "caller":{"runner":"broca"},
+                   "kind":"run_finished", "admission_id":id, "run_id":format!("{id}-run"),
+                   "terminal_reason":"success", "upstream_origin":"upstream"}),
+        ));
+        assert_eq!(reply["observation"]["effects"][1]["lease_ended"], i == 1);
+        fixture
+            .store()
+            .account_transaction(|tx| {
+                assert_eq!(tx.admission(BROCA, id)?.unwrap().state, "finished");
+                let new = tx.admission(BROCA, "new")?.unwrap();
+                let pin = tx
+                    .affinity(BROCA, &new.conversation_hash, &new.provider)?
+                    .unwrap();
+                assert_eq!(
+                    pin.lease_valid_until,
+                    Some(if i == 1 { at } else { new.lease_valid_until })
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+}
+
+#[test]
 fn rfc3339_formats_whole_seconds_in_utc() {
     assert_eq!(rfc3339(NOW), "2026-09-29T12:00:00Z");
     assert_eq!(

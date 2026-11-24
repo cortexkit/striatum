@@ -367,6 +367,19 @@ mod tests {
     }
 
     #[test]
+    fn healthy_watch_backstop_keeps_tiers_and_routed_accounts_during_redescribe() {
+        let (mut cache, mut credentials, policies, modules) = setup();
+        let next_refresh = super::super::WATCH_BACKSTOP.as_millis() as i64;
+        cache.catalog(&modules, &policies, &mut credentials, next_refresh);
+        assert!(!super::super::admission::tier_view_unknown(
+            &credentials,
+            "runner-a",
+            next_refresh
+        ));
+        assert_eq!(credentials.runner_routed_accounts["runner-a"], ["oauth"]);
+    }
+
+    #[test]
     fn missed_polls_retain_both_views_until_five_minutes_after_last_answer() {
         let (mut cache, mut credentials, _, _) = setup();
         cache.reply("runner-a", None, &mut credentials, 30_000);

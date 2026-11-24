@@ -1,5 +1,5 @@
 //! One SDK reader for routing facts, catalog changes and Insula notices.
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{path::Path, sync::Arc, time::Duration};
 
 use cortexkit_bus_client::{BusClient, BusClientOptions, EventDelivery, EventItem};
 use cortexkit_bus_naming::AccountNames;
@@ -30,14 +30,43 @@ impl Drop for AttachedBus {
     }
 }
 
-pub(super) async fn attach(path: PathBuf, handler: Handler) -> Result<AttachedBus, String> {
-    tokio::time::timeout(Duration::from_secs(15), attach_inner(path, handler))
-        .await
-        .map_err(|_| "bus attach timeout".to_owned())?
+pub(super) struct ConnectedBus {
+    client: Arc<BusClient>,
+    multiplier_task: tokio::task::JoinHandle<()>,
 }
 
-async fn attach_inner(path: PathBuf, handler: Handler) -> Result<AttachedBus, String> {
-    let consumer = SubcConsumer::connect(&path, ConsumerOptions::default())
+impl Drop for ConnectedBus {
+    fn drop(&mut self) {
+        self.multiplier_task.abort();
+    }
+}
+
+pub(super) async fn attach(
+    path: &Path,
+    handler: Handler,
+    connection: &mut Option<ConnectedBus>,
+) -> Result<AttachedBus, String> {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        if connection
+            .as_ref()
+            .is_some_and(|bus| bus.client.connection_changes().has_changed().is_err())
+        {
+            if let Some(mut stopped) = connection.take() {
+                stopped.multiplier_task.abort();
+                let _ = (&mut stopped.multiplier_task).await;
+            }
+        }
+        if connection.is_none() {
+            *connection = Some(connect(path).await?);
+        }
+        attach_inner(Arc::clone(&connection.as_ref().unwrap().client), handler).await
+    })
+    .await
+    .map_err(|_| "bus attach timeout".to_owned())?
+}
+
+async fn connect(path: &Path) -> Result<ConnectedBus, String> {
+    let consumer = SubcConsumer::connect(path, ConsumerOptions::default())
         .await
         .map_err(|e| e.to_string())?;
     let client = BusClient::connect(
@@ -46,6 +75,18 @@ async fn attach_inner(path: PathBuf, handler: Handler) -> Result<AttachedBus, St
     )
     .await
     .map_err(|e| e.to_string())?;
+    let client = Arc::new(client);
+    let multiplier_task = tokio::spawn({
+        let client = Arc::clone(&client);
+        async move { multiplier::watch(&client).await }
+    });
+    Ok(ConnectedBus {
+        client,
+        multiplier_task,
+    })
+}
+
+async fn attach_inner(client: Arc<BusClient>, handler: Handler) -> Result<AttachedBus, String> {
     let names = AccountNames::derive(client.acct()).map_err(|e| e.to_string())?;
     let mut changes = client.connection_changes();
     let bound_revision = *changes.borrow_and_update();
@@ -61,7 +102,7 @@ async fn attach_inner(path: PathBuf, handler: Handler) -> Result<AttachedBus, St
     let (tx, deliveries) = tokio::sync::mpsc::channel(1);
     let task_names = names.clone();
     let task = tokio::spawn(async move {
-        let events = read_events(
+        let result = read_events(
             &client,
             task_names,
             &handler,
@@ -69,11 +110,8 @@ async fn attach_inner(path: PathBuf, handler: Handler) -> Result<AttachedBus, St
             changes,
             bound_revision,
             &tx,
-        );
-        let result = tokio::select! {
-            result = events => result,
-            () = multiplier::watch(&client) => Err("multiplier watch stopped".into()),
-        };
+        )
+        .await;
         unbound(
             &handler,
             result
@@ -274,7 +312,6 @@ async fn confirm(
         health.filters_ready = crate::route_facts::filters_ready(names, Some(&info.name), &filters);
         health.connection = Some(connection);
         health.revisions = Some(revisions);
-        health.oldest_unapplied_at_ms = None;
         health.last_delivery_at_ms = last_delivery_at_ms;
         health.last_ack_at_ms = last_ack_at_ms;
         health.delivered_sequence = Some(info.delivered.stream_sequence);
@@ -307,7 +344,6 @@ pub(super) fn payload(names: &AccountNames, event: &EventDelivery) -> Result<Del
         &event.body,
         event.headers().clone(),
         event.header(CONTENT_DIGEST_HEADER),
-        None,
         event.delivered_count.max(1) as u64,
     )
 }
@@ -318,7 +354,6 @@ pub(super) fn message(
     body: &[u8],
     headers: cortexkit_bus_trait::Headers,
     digest: Option<&str>,
-    published_at_ms: Option<u64>,
     delivery_count: u64,
 ) -> Result<Delivery, String> {
     let insula = subject.contains(".event.insula.quota_sampled.v1");
@@ -338,7 +373,6 @@ pub(super) fn message(
             headers,
         },
         body: body.to_vec(),
-        published_at_ms,
         delivery_count,
     })
 }

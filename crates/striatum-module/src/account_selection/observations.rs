@@ -158,9 +158,23 @@ pub(crate) fn observe_authorized(
     if let Some(reply) = invalid_pool(parsed.pool.as_deref()) {
         return because("observation_pool", reply);
     }
-    let roster_digests: BTreeMap<String, ProviderRosterFacts> = tracked_providers(ctx)
+    let providers = if matches!(
+        parsed.kind.as_str(),
+        "scoped_not_found" | "account_limit_exhausted"
+    ) {
+        tracked_providers(ctx)
+    } else {
+        Default::default()
+    };
+    let roster_digests: BTreeMap<String, ProviderRosterFacts> = providers
         .into_iter()
         .map(|provider| {
+            #[cfg(test)]
+            crate::test_thread_state::lifecycle_probe(|probe| {
+                probe
+                    .observation_rosters
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            });
             let roster = roster_for(ctx, &provider).roster;
             let digest = roster
                 .as_ref()
@@ -555,7 +569,8 @@ fn apply_bound_observation(
             let size_class = tx.admission_size_class(principal, id)?;
             let release_unanswered = if tx.mark_admission_finished(principal, id, now)? {
                 effects.push(json!({ "effect": "admission_finished" }));
-                let lease_ended = tx.end_lease(&admission.pin_id, now)?;
+                // Finishing one run cannot take the pin from another open run.
+                let lease_ended = tx.end_lease_after_finish(admission, now)?;
                 effects.push(json!({ "effect": "lease_ended", "lease_ended": lease_ended }));
                 if let Some(run) = &admission.run_id {
                     tx.finish_continuations(&admission.principal, id, run, now)?;

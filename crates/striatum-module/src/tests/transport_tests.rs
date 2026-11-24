@@ -141,6 +141,90 @@ async fn route_bind_replaces_the_epoch_for_a_reused_channel() {
     assert!(!route_epochs.contains_key(&7));
 }
 
+#[tokio::test]
+async fn a_queued_frame_keeps_its_attested_flow_after_goodbye() {
+    let rig = Rig::new("queued-flow-goodbye");
+    let store = Arc::new(rig.open_store());
+    let quota = Arc::new(Mutex::new(QuotaCache::default()));
+    let health = Arc::new(Mutex::new(CatalogReachHealth::new(600_000)));
+    let credentials = empty_broca_credentials();
+    let min_band = Arc::new(Mutex::new(None));
+    let (writer, mut replies) = mpsc::channel(4);
+    let channel = 338;
+    let epoch = 1;
+    let mut epochs = RouteEpochs::new();
+    let flags = Flags::new(false, Priority::Interactive, false);
+    let bind = json!({
+        "op":"route.bind", "route_channel":channel, "epoch":epoch,
+        "target":{"kind":"management_surface", "module_id":DEFAULT_MODULE_ID},
+        "identity":{"project_root":rig.dir, "harness":"test", "session":"1"},
+        "principal":{"kind":"reserved", "module_id":"broca"},
+        "scope":{"owner":{"kind":"reserved", "module_id":"prefrontal-core"},
+            "ref":"routing-flow", "scope_epoch":1, "kind":"head", "owner_authorized":true,
+            "attributes":{"flow_id":"routing-watch"}}
+    });
+    for frame in [
+        Frame::build(
+            FrameType::Request,
+            control_flags(),
+            0,
+            0,
+            1,
+            serde_json::to_vec(&bind).unwrap(),
+        )
+        .unwrap(),
+        Frame::build(
+            FrameType::Request,
+            flags,
+            channel,
+            epoch,
+            2,
+            br#"{"method":"route.decisions_list","params":{}}"#.to_vec(),
+        )
+        .unwrap(),
+        Frame::build(FrameType::Goodbye, flags, channel, epoch, 0, Vec::new()).unwrap(),
+    ] {
+        // Sending one ACK into an empty queue does not yield, so the spawned
+        // request first runs after Goodbye on this current-thread runtime.
+        assert!(handle_frame(
+            frame,
+            &writer,
+            &quota,
+            &store,
+            &mut epochs,
+            &min_band,
+            &rig.dir.join("routing.jsonc"),
+            &rig.dir.join("operator.jsonc"),
+            &credentials,
+            &health,
+        )
+        .await
+        .unwrap());
+    }
+    assert!(!epochs.contains_key(&channel));
+    assert_eq!(replies.try_recv().unwrap().header.corr, 1);
+    let reply = tokio::time::timeout(Duration::from_secs(5), replies.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(reply.header.corr, 2);
+    assert_eq!(
+        reply.header.ty,
+        FrameType::Error,
+        "{}",
+        String::from_utf8_lossy(&reply.body)
+    );
+    let error: ErrorBody = serde_json::from_slice(&reply.body).unwrap();
+    assert_eq!(error.code, "flow_scope_not_supported");
+    let rows = store.routing_call_counts().unwrap().counts;
+    assert!(
+        rows.iter().any(|row| row.method == "route.decisions_list"
+            && row.principal == "reserved:broca"
+            && row.calls == 1),
+        "{rows:?}"
+    );
+}
+
 /// Wire tests for failures that used to be dropped without a reply or a log line.
 mod select_wire_error_reporting {
     use super::*;
@@ -250,6 +334,24 @@ mod select_wire_error_reporting {
             br#"{"result":{}}"#.to_vec(),
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_panicking_blocking_handler_answers_internal_error() {
+        let (writer, mut replies) = mpsc::channel(4);
+        answer_route_request(&writer, 1, 7, 1, 64, |_| {
+            run_route_handler_off_async_workers(async { panic!("injected handler panic") })
+        })
+        .await;
+        let frame = replies
+            .try_recv()
+            .expect("a panicking route handler must still answer");
+        assert_eq!(
+            (frame.header.channel, frame.header.epoch, frame.header.corr),
+            (7, 1, 64)
+        );
+        assert_eq!(error_body(&frame).code, "internal_error");
+        assert!(replies.try_recv().is_err(), "exactly one reply");
     }
 
     /// A handler that already replied gets no second answer when it then

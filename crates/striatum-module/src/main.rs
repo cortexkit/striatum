@@ -102,7 +102,7 @@ use std::{
     fmt,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, Once, OnceLock},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use background::next_frame_or_loop_stop;
@@ -112,14 +112,13 @@ use background::BackgroundLoops;
 use select::price_selection_inputs;
 #[cfg(test)]
 use select::{
-    add_stage_ms, claim_ignored_caller_policy_warning, panel_availability, panel_decision_input,
-    quota_signal_json, rate_limit_route_select_line, select_availability, QuotaSignalView,
-    RouteSelectLogLimiter, RouteSelectTiming, SelectPanelBody,
+    claim_ignored_caller_policy_warning, handle_select_request, panel_availability,
+    panel_decision_input, quota_signal_json, select_availability, QuotaSignalView, SelectPanelBody,
 };
 use select::{
-    decision_input_for, handle_select_request, policy_sources_line, prepare_selection_inputs,
-    provider_auth_types, remember_provider_identity, warn_ignored_caller_policy_once,
-    DecisionProvenance, PreparedSelectionInputs, SelectParams, SelectionPolicySources,
+    decision_input_for, policy_sources_line, prepare_selection_inputs, provider_auth_types,
+    remember_provider_identity, warn_ignored_caller_policy_once, DecisionProvenance,
+    PreparedSelectionInputs, SelectParams, SelectionPolicySources,
 };
 
 use broca_credentials::{BrocaCredentials, SharedBrocaCredentials};
@@ -381,7 +380,11 @@ where
     R: AsyncRead + Unpin + Send,
 {
     send_hello(&writer, config, registered).await?;
-    let ack = expect_hello_ack(&mut read_half).await.map_err(|error| {
+    let ack = tokio::select! {
+        () = writer.closed() => return Ok(()),
+        ack = expect_hello_ack(&mut read_half) => ack,
+    }
+    .map_err(|error| {
         if registered {
             ModuleError::Message(format!("registration channel HELLO_ACK: {error}"))
         } else {
@@ -428,9 +431,9 @@ where
             return Err(ModuleError::Message(format!("load account state: {error}")));
         }
     }
-    // Variant overrides name efforts the catalog must publish. Config loaded
-    // before the store opened got only shape checks; check it now, and every
-    // later reload, against the stored catalog.
+    // Pinned selects check a pinned variant against the reasoning efforts the
+    // stored catalog publishes; give the settings layer that catalog now that
+    // the store is open.
     config_overrides::attach_store_catalog(config_path, store)
         .map_err(|error| ModuleError::Message(format!("{}: {error}", config_path.display())))?;
     // Seed the cache from the last persisted snapshot before anything can serve a
@@ -456,16 +459,13 @@ where
     let mut route_epochs = RouteEpochs::new();
     let mut read_half = Some(read_half);
     let pending_frame = if let Some(session) = &mut settings {
-        match managed_settings::wait_until_ready(
-            session,
-            read_half.take().unwrap(),
-            &writer,
-            &mut route_epochs,
-            &catalog_health,
-            &quota_cache,
-        )
-        .await?
-        {
+        let ready = tokio::select! {
+            () = writer.closed() => return Ok(()),
+            ready = managed_settings::wait_until_ready(
+                session, read_half.take().unwrap(), &writer, &mut route_epochs, &catalog_health, &quota_cache,
+            ) => ready,
+        };
+        match ready? {
             Some(frame) => Some(frame),
             None => return Ok(()),
         }
@@ -493,6 +493,7 @@ where
                     result
                 },
                 &mut loops,
+                Some(&writer),
             )
             .await,
         ),
@@ -501,7 +502,10 @@ where
     let result = loop {
         let next = match first_frame.take() {
             Some(result) => result,
-            None => next_frame_or_loop_stop(read_half.as_mut().unwrap(), &mut loops).await,
+            None => {
+                next_frame_or_loop_stop(read_half.as_mut().unwrap(), &mut loops, Some(&writer))
+                    .await
+            }
         };
         let frame = match next {
             Ok(Some(frame)) => frame,
@@ -705,6 +709,16 @@ pub(crate) fn served_operations() -> Vec<ManagementOperation> {
             name: cortexkit_role_routing::ops::ROUTE_SELECT_ENGINE.to_string(),
             kind: ManagementOperationKind::Mutate,
             description: Some("Choose the engine for one media job (transcription, synthesis, image, video, realtime) and record the decision: privacy and reachability filters first, then measured accuracy, then cost from Fusiform's prices.".to_string()),
+        },
+        ManagementOperation {
+            name: cortexkit_role_routing::ops::ROUTE_ENGINE_REPORT.to_string(),
+            kind: ManagementOperationKind::Mutate,
+            description: Some("Report how a selected media engine served a job".to_string()),
+        },
+        ManagementOperation {
+            name: cortexkit_role_routing::ops::ROUTE_ENGINE_EVAL.to_string(),
+            kind: ManagementOperationKind::Mutate,
+            description: Some("Record measured accuracy for a media engine".to_string()),
         },
         // `route.select` records the routing decision it returns.
         ManagementOperation {

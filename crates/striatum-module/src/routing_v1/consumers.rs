@@ -25,6 +25,17 @@ pub(crate) struct Catalog {
     agent_hosts: BTreeSet<String>,
     issues: Vec<String>,
     media: Arc<Mutex<Option<MediaJoin>>>,
+    // The registry for the last settings snapshot this catalog served. A
+    // catalog refresh replaces the whole catalog, and with it this entry.
+    registry: Arc<Mutex<Option<(crate::config_overrides::SnapshotKey, Arc<Registry>)>>>,
+}
+
+#[cfg(test)]
+static REGISTRY_BUILDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn registry_builds_for_test() -> usize {
+    REGISTRY_BUILDS.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 pub(super) struct MediaRoute {
@@ -291,7 +302,24 @@ impl Catalog {
         catalog
     }
 
+    /// The registry for `config`, built at most once per settings snapshot
+    /// for this catalog.
+    fn shared_effective(&self, config: &LiveConfig) -> Arc<Registry> {
+        let key = config.snapshot_key();
+        let mut cached = self.registry.lock().unwrap();
+        if let Some((cached_key, registry)) = cached.as_ref() {
+            if *cached_key == key {
+                return Arc::clone(registry);
+            }
+        }
+        let registry = Arc::new(self.effective(config));
+        *cached = Some((key, Arc::clone(&registry)));
+        registry
+    }
+
     pub(crate) fn effective(&self, config: &LiveConfig) -> Registry {
+        #[cfg(test)]
+        REGISTRY_BUILDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let mut registry = Registry {
             owners: BTreeMap::new(),
             policies: BTreeMap::new(),
@@ -367,12 +395,15 @@ impl Catalog {
     }
 }
 
-pub(crate) fn effective(config: &LiveConfig) -> Registry {
+/// The consumer registry for the current catalog and `config`. Requests on
+/// an unchanged settings snapshot share one registry instead of rebuilding
+/// ownership and inheritance for every call.
+pub(crate) fn effective(config: &LiveConfig) -> Arc<Registry> {
     CATALOG
         .get_or_init(Default::default)
         .read()
         .unwrap()
-        .effective(config)
+        .shared_effective(config)
 }
 
 pub(crate) fn is_declared_or_builtin(name: &str) -> bool {
@@ -428,12 +459,13 @@ impl Registry {
     /// Resolve each member independently, without crossing an ownership boundary.
     pub(crate) fn defaults_for(&self, consumer: &str) -> DemandDefaults {
         let mut result = DemandDefaults::default();
+        let owners = self.owners_for(consumer);
         let mut chain: Vec<_> = self
             .defaults
             .iter()
             .filter(|(name, _)| {
                 crate::config_policy::consumer_matches(name, consumer)
-                    && self.owners.get(*name) == self.owners_for(consumer)
+                    && self.owners.get(*name) == owners
             })
             .collect();
         chain.sort_by_key(|(name, _)| crate::config_policy::consumer_specificity(name));

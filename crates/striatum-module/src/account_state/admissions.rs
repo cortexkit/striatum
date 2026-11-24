@@ -377,6 +377,7 @@ impl Chain {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct AdmissionState {
     pub(crate) open: ShardedMap<RowKey, Arc<OpenAdmission>>,
+    open_by_pin: ShardedMap<(String, u64), u64>,
     /// Keyed by (provider, account id).
     pub(crate) demand: ShardedMap<(SharedText, SharedText), Arc<AccountDemand>>,
     pub(crate) latest: ShardedMap<ConversationKey, Arc<compact_rows::Latest>>,
@@ -476,6 +477,7 @@ impl AdmissionState {
             if open.row.state == "started" {
                 state.add_started_pin(&open.row.pin_id, 1);
             }
+            state.add_open_pin(&open.row.pin_id, open.row.pin_generation, 1);
             state.open.insert(
                 key(&open.row.principal, &open.row.admission_id),
                 Arc::new(open),
@@ -710,6 +712,14 @@ impl AdmissionState {
         Self::add_count(&mut self.started_by_pin, pin_id.to_owned(), delta);
     }
 
+    fn add_open_pin(&mut self, pin: &str, generation: u64, delta: i64) {
+        Self::add_count(&mut self.open_by_pin, (pin.to_owned(), generation), delta);
+    }
+
+    pub(crate) fn pin_has_open_admissions(&self, pin: &str, generation: u64) -> bool {
+        self.open_by_pin.contains_key(&(pin.to_owned(), generation))
+    }
+
     /// A started row counts toward `pin_has_started` only while it names the
     /// conversation's current pin and generation.
     fn add_pin_started(&mut self, row: &Contribution<'_>, delta: i64) {
@@ -826,6 +836,7 @@ impl AdmissionState {
             1,
         );
         if matches!(row.state.as_str(), "reserved" | "started" | "expired") {
+            self.add_open_pin(&row.pin_id, row.pin_generation, 1);
             if row.state == "started" {
                 self.add_started_pin(&row.pin_id, 1);
             }
@@ -951,6 +962,7 @@ impl AdmissionState {
         });
         if matches!(row.state.as_str(), "released" | "finished") {
             self.open.remove(&id);
+            self.add_open_pin(&row.pin_id, row.pin_generation, -1);
             self.closing.push(id);
         } else if let Some(open) = self.open.get_mut(&id) {
             Arc::make_mut(open).row = row;
@@ -1454,6 +1466,7 @@ impl AdmissionState {
         for row in deleted {
             let id = key(&row.principal, &row.admission_id);
             if let Some(open) = self.open.remove(&id) {
+                self.add_open_pin(&open.row.pin_id, open.row.pin_generation, -1);
                 if open.row.state == "started" {
                     self.add_started_pin(&open.row.pin_id, -1);
                 }

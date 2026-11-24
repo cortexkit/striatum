@@ -828,6 +828,65 @@ async fn a_v1_pin_on_a_key_pool_route_is_served() {
     assert_eq!(reply.1["result"]["pin_outcome"], "pinned");
 }
 
+static WALL_ON_ACQUIRE: std::sync::Mutex<Option<usize>> = std::sync::Mutex::new(None);
+
+pub(super) fn before_select_lease(
+    store: &striatum_store::SqliteRouteStateStore,
+    provider: &str,
+    now: i64,
+) {
+    let wall = {
+        let mut pending = WALL_ON_ACQUIRE.lock().unwrap();
+        (provider == POOL && *pending == Some(std::ptr::from_ref(store) as usize))
+            .then(|| pending.take())
+            .flatten()
+            .is_some()
+    };
+    if wall {
+        crate::account_writer::pool_wall(
+            store,
+            POOL,
+            "apikey:pool-vendor:main",
+            striatum_store::PoolWallKind::RateLimited,
+            now + 60_000,
+            "concurrent rate limit",
+            now,
+        )
+        .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn exhausted_key_pool_does_not_record_a_selected_decision() {
+    let now = 1_800_000_000_000_u64;
+    let _clock = crate::InjectedClock::set(now);
+    let harness = harness();
+    let caller = harness.bind(reserved("example-consumer"), None).await;
+    let mut request = select("mason");
+    request["pin"] = json!(format!("{POOL}/{POOL_MODEL_SHORT}"));
+    // Preflight sees an open key. The lease attempt sees the rate limit
+    // published after scoring finished.
+    *WALL_ON_ACQUIRE.lock().unwrap() = Some(Arc::as_ptr(harness.store()) as usize);
+    let (ty, reply) = caller.call("route.select", &request).await;
+    assert!(
+        WALL_ON_ACQUIRE.lock().unwrap().take().is_none(),
+        "select never reached the pool lease attempt: {reply}"
+    );
+    assert_eq!(ty, FrameType::Error, "{reply}");
+    assert_eq!(reply["code"], "pin_unavailable", "{reply}");
+    let rows = harness
+        .store()
+        .list_decisions(&striatum_store::DecisionListFilter {
+            limit: 10,
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(
+        rows.iter().all(|row| row.selected_route_key.is_none()),
+        "{rows:?}"
+    );
+}
+
 #[tokio::test]
 async fn pooled_pins_skip_a_fenced_key_but_refuse_when_every_key_is_fenced() {
     use striatum_core::route_state_store::CredentialRefusal;
@@ -1021,8 +1080,30 @@ async fn a_routed_apikey_runner_admits_renews_and_releases_the_pool_credential()
     harness
         .store()
         .account_transaction(|tx| {
-            let row = tx
+            let first = tx
+                .admission("reserved:zeta-runner", "pooled-admit")?
+                .unwrap();
+            let renewed = tx
                 .admission("reserved:zeta-runner", "pooled-renew")?
+                .unwrap();
+            assert_eq!(first.state, "reserved");
+            assert_eq!(renewed.state, "finished");
+            let affinity = tx
+                .affinity(&first.principal, &first.conversation_hash, POOL)?
+                .unwrap();
+            assert_eq!(affinity.lease_valid_until, Some(renewed.lease_valid_until));
+            Ok(())
+        })
+        .unwrap();
+    let last = runner.call("route.account_observe", &json!({
+        "event_id":"pooled-original-finished", "kind":"run_finished", "admission_id":"pooled-admit"
+    })).await;
+    assert_eq!(last.0, FrameType::Response, "{last:?}");
+    harness
+        .store()
+        .account_transaction(|tx| {
+            let row = tx
+                .admission("reserved:zeta-runner", "pooled-admit")?
                 .unwrap();
             assert_eq!(row.state, "finished");
             let affinity = tx
