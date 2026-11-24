@@ -915,15 +915,6 @@ impl RoutingConfigFile {
                     routes.push(make_route_key(provider, model, Some(variant)));
                 }
                 refuse(&format!("consumers.{name}.pin"), consumer, &routes)?;
-                if !is_slot(name) {
-                    for child in self.inherited_pin_children(name) {
-                        refuse(
-                            &format!("consumers.{name}.pin, inherited by {child:?},"),
-                            child,
-                            &routes,
-                        )?;
-                    }
-                }
             }
             for (project, project_policy) in &policy.projects {
                 let Some(route) =
@@ -943,33 +934,5 @@ impl RoutingConfigFile {
             }
         }
         Ok(())
-    }
-
-    /// Dotted descendants of `pinned` that inherit its pin and that some
-    /// provider or model rule names. A descendant no rule names is judged
-    /// exactly like `pinned`, so only these can refuse an inherited pin that
-    /// `pinned` itself may use.
-    fn inherited_pin_children<'a>(&'a self, pinned: &'a str) -> impl Iterator<Item = &'a str> {
-        let named: std::collections::BTreeSet<&str> = self
-            .providers
-            .values()
-            .map(|provider| &provider.rules)
-            .chain(self.model_routing.models.values().map(|model| &model.rules))
-            .flat_map(|rules| rules.only_for.iter().chain(rules.not_for.iter()).flatten())
-            .map(String::as_str)
-            .collect();
-        named.into_iter().filter(move |child| {
-            *child != pinned
-                && consumer_matches(pinned, child)
-                // A nearer pinned ancestor, or the child's own pin, replaces it.
-                && self
-                    .consumers
-                    .iter()
-                    .filter(|(name, policy)| {
-                        policy.pin.is_some() && !is_slot(name) && consumer_matches(name, child)
-                    })
-                    .max_by_key(|(name, _)| crate::config_policy::consumer_specificity(name))
-                    .is_some_and(|(name, _)| name == pinned)
-        })
     }
 }

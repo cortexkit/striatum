@@ -894,30 +894,6 @@ fn consumer_exclusion_groups_agree_with_the_route_rule_for_nested_model_entries(
     }
 }
 
-#[test]
-fn inherited_consumer_pin_refused_for_a_named_dotted_child_is_refused_at_load() {
-    let document = |consumers: serde_json::Value, not_for: &str| {
-        json!({"consumers": consumers, "models": {"p/m": {"not_for": [not_for]}}}).to_string()
-    };
-    let pinned = json!({"mc": {"pin": {"model": "p/m"}}});
-    let error = validate_document(&document(pinned.clone(), "mc.dream")).unwrap_err();
-    assert!(
-        error.contains("consumers.mc.pin") && error.contains("\"mc.dream\""),
-        "{error}"
-    );
-    // A pin nearer the child replaces the inherited one.
-    for consumers in [
-        json!({"mc": {"pin": {"model": "p/m"}}, "mc.dream": {"pin": {"model": "q/n"}}}),
-        json!({"mc": {"pin": {"model": "p/m"}}, "mc.dream": {"pin": {"model": "q/n"}}, "mc.dream.deep": {}}),
-    ] {
-        validate_document(&document(consumers.clone(), "mc.dream")).unwrap();
-        validate_document(&document(consumers, "mc.dream.deep")).unwrap();
-    }
-    // A rule naming a consumer outside the pinned branch cannot refuse it.
-    validate_document(&document(pinned.clone(), "other.dream")).unwrap();
-    validate_document(&document(pinned, "mcx.dream")).unwrap();
-}
-
 /// The per-model consumer scan the tier resolver replaced: it copied every
 /// consumer entry, merged scoped route tiers over user ones, then kept the
 /// entries matching `consumer`, most specific first.
