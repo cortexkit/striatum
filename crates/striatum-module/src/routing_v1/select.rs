@@ -16,7 +16,7 @@
 
 use crate::account_selection::admission::preflight_model_for_class_with_reset;
 use crate::account_selection::class_context::AccountBlock;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::Duration;
 
 use cortexkit_role_routing::errors::{NoRouteReason, PinUnavailableReason, Refusal, RefusalCode};
@@ -785,6 +785,15 @@ fn count_input_build(config: &std::sync::Arc<config_overrides::LiveConfig>, stag
         .or_default()[stage] += 1;
 }
 
+#[cfg(test)]
+pub(super) fn take_input_builds(harness: &super::conformance_tests::Harness) -> [usize; 3] {
+    INPUT_BUILDS
+        .lock()
+        .unwrap()
+        .remove(&(std::sync::Arc::as_ptr(&harness.operator_config()) as usize))
+        .unwrap_or_default()
+}
+
 /// A single selection owns the probe reservation in this pristine baseline.
 /// Every tier attempt clones it before applying tier or sticky-account filters.
 struct SelectionInputs {
@@ -1200,6 +1209,7 @@ const RUNNER_PROVIDER_LIMIT: &str = "runner_provider_limit";
 enum SelectionAttempt {
     Selected(Value),
     ProbeLost(i64),
+    PriceUnknown(String),
 }
 
 async fn select_at_tier(
@@ -1225,6 +1235,7 @@ async fn select_at_tier(
     const MAX_LOST_PROBE_RETRIES: usize = 16;
     let mut lost_until: Option<i64> = None;
     let mut lost = 0;
+    let mut unpriceable = BTreeSet::new();
     loop {
         // A tier attempt carries the scoring and account snapshots across
         // awaits. Keep that state off the stack of the callers that poll it.
@@ -1241,10 +1252,18 @@ async fn select_at_tier(
             evaluation,
             shared,
             inputs,
+            &unpriceable,
         ))
         .await
         {
             Ok(SelectionAttempt::Selected(answer)) => return Ok(answer),
+            Ok(SelectionAttempt::PriceUnknown(route)) => {
+                // Each quote retry excludes one candidate from this tier. Fail
+                // closed if an ordering path returns an excluded route again.
+                if !unpriceable.insert(route) {
+                    return Err(price_answer::unknown_refusal());
+                }
+            }
             Ok(SelectionAttempt::ProbeLost(until)) => {
                 lost_until = Some(lost_until.map_or(until, |prior| prior.min(until)));
                 lost += 1;
@@ -1286,6 +1305,7 @@ async fn select_at_tier_attempt(
     evaluation: Option<&Evaluation<'_>>,
     shared: &RequestInputs,
     inputs: &mut SelectionInputs,
+    unpriceable: &BTreeSet<String>,
 ) -> Result<SelectionAttempt, Refusal> {
     #[cfg(test)]
     count_input_build(&shared.operator_config, 2);
@@ -1584,11 +1604,16 @@ async fn select_at_tier_attempt(
         &catalog_targets,
         priced.classes.as_ref(),
     );
-    let available = candidates.available;
+    let mut rejections = candidates.rejected;
+    let mut available = candidates.available;
+    for key in unpriceable {
+        available.remove(key);
+        rejections.insert(key.clone(), price_answer::UNKNOWN.into());
+    }
     let mut usable = available.clone();
     let mut runtime_unavailable: HashSet<String> = statically_available
         .difference(&available)
-        .filter(|key| !candidates.rejected.contains_key(*key))
+        .filter(|key| !rejections.contains_key(*key))
         .cloned()
         .collect();
     let mut account_blocks = HashMap::new();
@@ -1608,7 +1633,7 @@ async fn select_at_tier_attempt(
                 striatum_core::accounts::Outcome::Admit(_)
             ) {
                 let key = fact_to_route(fact).route_key;
-                if usable.remove(&key) && !candidates.rejected.contains_key(&key) {
+                if usable.remove(&key) && !rejections.contains_key(&key) {
                     runtime_unavailable.insert(key);
                 }
                 if let Some(block) =
@@ -1620,7 +1645,6 @@ async fn select_at_tier_attempt(
         }
     }
     let subscription_keys = candidates.subscription_keys;
-    let rejections = candidates.rejected;
 
     // V1 keeps account walls out of scoring so pinned and ladder requests can
     // still inspect holds. Its ledger must nevertheless record the same timed
@@ -2124,7 +2148,7 @@ async fn select_at_tier_attempt(
             }
             return Err(refusal);
         }
-        Err(select_policy::OrderFailure::Score(no_route)) => {
+        Err(select_policy::OrderFailure::Score(mut no_route)) => {
             if selection.harness_exclusions_emptied_routes(&harness_excluded, &statically_available)
             {
                 return Err(inputs.runner_diagnostics.attach(
@@ -2134,6 +2158,7 @@ async fn select_at_tier_attempt(
                     "harness_routes",
                 ));
             }
+            price_answer::record_rejections(&mut no_route.rejected, unpriceable);
             if evaluation.is_none() {
                 selection.record_refusal(&no_route, &priced.provenance);
                 crate::select_concurrency::record(
@@ -2297,6 +2322,42 @@ async fn select_at_tier_attempt(
             .expect("the catalog scorer removed workload-ineligible models")
     };
     catalog_choice.apply_selection(&mut selected);
+    price_answer::record_rejections(&mut selected.rejected, unpriceable);
+    let chosen_tier = service_tier.or_else(|| {
+        configured_tiers
+            .get(&format!(
+                "{}/{}",
+                selected.model.provider_id, selected.model.model_id
+            ))
+            .copied()
+    });
+    let quote = |tier| {
+        price_answer::for_selection(
+            &selected,
+            &inputs.facts,
+            priced.classes.as_ref(),
+            live_config,
+            priced_per_token,
+            request,
+            demand.iq,
+            tier,
+            profile_lookup,
+        )
+    };
+    let required_price =
+        if evaluation.is_none() && !panel_seat && requirements.max_cost_usd.is_some() {
+            let Some(price) = quote(chosen_tier) else {
+                // Do not record or bind a decision the caller cannot send. Put
+                // back the account view taken for this attempt before retrying.
+                if service_tier.is_none() {
+                    inputs.priced.classes = priced.classes.take();
+                }
+                return Ok(SelectionAttempt::PriceUnknown(selected.route_key));
+            };
+            Some(price)
+        } else {
+            None
+        };
 
     let runner = select_policy::choose_runner(
         &runners,
@@ -2372,17 +2433,7 @@ async fn select_at_tier_attempt(
                 explanation,
             );
             selection.service_tier_chosen = service_tier.map(|tier| tier.as_str().to_owned());
-            selection.price = price_answer::for_selection(
-                &selected,
-                &inputs.facts,
-                priced.classes.as_ref(),
-                live_config,
-                priced_per_token,
-                request,
-                demand.iq,
-                service_tier,
-                profile_lookup,
-            );
+            selection.price = quote(service_tier);
             selection.detail = (request.detail == Some(true)).then(|| json!({
                 "basis": basis.as_str(), "explanation": selected.explanation,
                 "rejected": selected.rejected, "score": selected.score, "reasoning": catalog_choice,
@@ -2484,14 +2535,7 @@ async fn select_at_tier_attempt(
             return Ok(SelectionAttempt::ProbeLost(retry_at));
         }
     }
-    let service_tier = service_tier.or_else(|| {
-        configured_tiers
-            .get(&format!(
-                "{}/{}",
-                selected.model.provider_id, selected.model.model_id
-            ))
-            .copied()
-    });
+    let service_tier = chosen_tier;
     if let Some(tier) = service_tier {
         let accounts = priced
             .classes
@@ -2644,17 +2688,7 @@ async fn select_at_tier_attempt(
     if let Some(tier) = service_tier {
         answer = answer.with_service_tier_chosen(tier);
     }
-    if let Some(price) = price_answer::for_selection(
-        &selected,
-        &inputs.facts,
-        priced.classes.as_ref(),
-        live_config,
-        priced_per_token,
-        request,
-        demand.iq,
-        service_tier,
-        profile_lookup,
-    ) {
+    if let Some(price) = required_price.or_else(|| quote(service_tier)) {
         answer = answer.with_price(price);
     }
     let mut detail = (request.detail == Some(true)).then(|| {
@@ -3296,6 +3330,13 @@ impl<'a> Selection<'a> {
         let variant = work_model_pin::named_variant(pin, self.facts);
         let (pin_key, pin_capacity) =
             work_model_pin::route_keys(pin, variant.as_deref(), self.facts);
+        if self
+            .rejections
+            .get(&pin_key)
+            .is_some_and(|reason| reason == price_answer::UNKNOWN)
+        {
+            return Err(price_answer::unknown_refusal());
+        }
         let mut snapshot = self.snapshot.clone();
         let keep_free_exempt = keep_free_exempt
             && exempt_pinned_keep_free(
@@ -3894,14 +3935,16 @@ fn pin_reason(
 }
 
 /// Why a pin could not be served, for `detail.pin_reason` on a fell-back
-/// answer: a `pin_unavailable` refusal's own reason, otherwise the refusal
-/// code (an account or key-pool refusal of the pinned route).
+/// answer: a pin or price rejection's own reason, otherwise the refusal code
+/// (for example, an account or key-pool refusal of the pinned route).
 fn refused_pin_reason(refusal: &Refusal) -> String {
     refusal
         .detail
         .get("reason")
         .and_then(Value::as_str)
-        .filter(|_| refusal.code == cortexkit_role_routing::errors::RefusalCode::PinUnavailable)
+        .filter(|reason| {
+            refusal.code == RefusalCode::PinUnavailable || *reason == price_answer::UNKNOWN
+        })
         .map_or_else(|| refusal.code.as_str().to_owned(), str::to_owned)
 }
 
@@ -3910,6 +3953,14 @@ fn refused_pin_reason(refusal: &Refusal) -> String {
 fn no_route_refusal(no_route: &NoRouteError, now: f64) -> Refusal {
     let reason = match no_route.reason {
         RouteFailureReason::ConcurrencyFull => NoRouteReason::ConcurrencyFull,
+        RouteFailureReason::NoAvailableModel
+            if no_route
+                .rejected
+                .iter()
+                .any(|row| row.reason == price_answer::UNKNOWN) =>
+        {
+            NoRouteReason::parse(price_answer::UNKNOWN)
+        }
         RouteFailureReason::NoAvailableModel => NoRouteReason::NoAvailableModel,
         RouteFailureReason::MissingRequiredCapability => NoRouteReason::MissingCapability,
         RouteFailureReason::ContextTooSmall => NoRouteReason::ContextTooSmall,
@@ -3999,14 +4050,6 @@ mod tests {
     }
 
     const RECOVERY_NOW: u64 = 1_800_000_000_000;
-
-    fn take_input_builds(harness: &Harness) -> [usize; 3] {
-        INPUT_BUILDS
-            .lock()
-            .unwrap()
-            .remove(&(std::sync::Arc::as_ptr(&harness.operator_config()) as usize))
-            .unwrap_or_default()
-    }
 
     #[tokio::test]
     async fn tier_fallback_builds_inputs_once_and_preserves_both_fixture_picks() {
