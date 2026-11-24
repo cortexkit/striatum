@@ -97,15 +97,17 @@ fn limit_param(limit: usize) -> i64 {
     i64::try_from(limit).unwrap_or(i64::MAX)
 }
 
-/// Key-pool retention, each found by a range on its retention-clock index.
+/// Key-pool retention, each found by a range on its retention-clock index:
+/// the release time of a released lease, else its deadline; the end time of
+/// an ended session binding, else its idle expiry.
 const POOL_LEASE_PRUNE_SQL: &str = "DELETE FROM pool_key_lease WHERE rowid IN ( \
-       SELECT rowid FROM pool_key_lease INDEXED BY pool_key_lease_by_last_time \
-       WHERE MAX(valid_until, COALESCE(released_at, 0)) < ?1 \
-       ORDER BY MAX(valid_until, COALESCE(released_at, 0)) LIMIT ?2)";
+       SELECT rowid FROM pool_key_lease INDEXED BY pool_key_lease_by_end \
+       WHERE COALESCE(released_at, valid_until) < ?1 \
+       ORDER BY COALESCE(released_at, valid_until) LIMIT ?2)";
 const POOL_SESSION_PRUNE_SQL: &str = "DELETE FROM pool_session_affinity WHERE rowid IN ( \
-       SELECT rowid FROM pool_session_affinity INDEXED BY pool_session_affinity_by_last_time \
-       WHERE MAX(expires_at, COALESCE(ended_at, 0)) < ?1 \
-       ORDER BY MAX(expires_at, COALESCE(ended_at, 0)) LIMIT ?2)";
+       SELECT rowid FROM pool_session_affinity INDEXED BY pool_session_affinity_by_end \
+       WHERE COALESCE(ended_at, expires_at) < ?1 \
+       ORDER BY COALESCE(ended_at, expires_at) LIMIT ?2)";
 
 /// Parent-failure retention, found by a range on the outcome-time index so a
 /// batch reads only the rows it deletes plus one.
@@ -478,10 +480,9 @@ impl SqliteRouteStateStore {
             })
             .map_err(err)?;
         if deleted > 0 {
-            // Cached class vectors are keyed by this generation; moving it
-            // makes them recompute from the rows that remain.
-            self.usage_generation
-                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            // Cached class vectors are keyed by their class generations;
+            // moving them makes every class recompute from the rows that remain.
+            self.invalidate_class_vectors(None);
         }
         Ok(deleted)
     }

@@ -207,8 +207,8 @@ fn pool_key_retention_reads_index_ranges() {
         .store
         .with_read(|conn| {
             for (sql, index) in [
-                (POOL_LEASE_PRUNE_SQL, "pool_key_lease_by_last_time"),
-                (POOL_SESSION_PRUNE_SQL, "pool_session_affinity_by_last_time"),
+                (POOL_LEASE_PRUNE_SQL, "pool_key_lease_by_end"),
+                (POOL_SESSION_PRUNE_SQL, "pool_session_affinity_by_end"),
             ] {
                 let plan = query_plan(conn, sql, &[100.into(), 8.into()]);
                 assert!(

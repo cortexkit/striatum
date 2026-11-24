@@ -23,10 +23,10 @@ CREATE INDEX account_continue_by_last_time
   ON account_continue (MAX(COALESCE(valid_until_ms, 0), COALESCE(used_at_ms, 0),
     COALESCE(released_at_ms, 0)));
 
--- Key-pool retention: a lease stops counting once it is released or its
--- deadline passes, and a session binding once it ends or idles out. Each row's
--- retention clock is the later of those two times.
-CREATE INDEX pool_key_lease_by_last_time
-  ON pool_key_lease (MAX(valid_until, COALESCE(released_at, 0)));
-CREATE INDEX pool_session_affinity_by_last_time
-  ON pool_session_affinity (MAX(expires_at, COALESCE(ended_at, 0)));
+-- Key-pool retention: a lease stops counting when it is released, or else
+-- when its deadline passes; a session binding when it ends, or else when it
+-- idles out. That time is each row's retention clock.
+CREATE INDEX pool_key_lease_by_end
+  ON pool_key_lease (COALESCE(released_at, valid_until));
+CREATE INDEX pool_session_affinity_by_end
+  ON pool_session_affinity (COALESCE(ended_at, expires_at));

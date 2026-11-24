@@ -128,7 +128,7 @@ impl SqliteRouteStateStore {
                 let effects = &effects;
                 let usage = usage.as_ref();
                 let tx = account.conn;
-                (|| -> rusqlite::Result<(Option<V1ReportOutcome>, bool)> {
+                (|| -> rusqlite::Result<(Option<V1ReportOutcome>, Option<String>)> {
                     let standing = tx
                         .query_row(
                             "SELECT body_json, answer_json FROM routing_v1_report_delivery
@@ -154,7 +154,7 @@ impl SqliteRouteStateStore {
                             } else {
                                 None
                             },
-                            false,
+                            None,
                         ));
                     }
                     let incompatible: bool = if delivery_key == "usage"
@@ -172,7 +172,7 @@ impl SqliteRouteStateStore {
                         false
                     };
                     if incompatible {
-                        return Ok((None, false));
+                        return Ok((None, None));
                     }
                     tx.execute(
                         "INSERT INTO routing_v1_report_delivery VALUES (?1,?2,?3,?4,?5,?6)",
@@ -254,9 +254,10 @@ impl SqliteRouteStateStore {
                             )
                             .map_err(sql_error)?;
                     }
-                    if let Some(usage) = usage {
-                        insert_usage(&tx, decision_id, usage)?;
-                    }
+                    let changed_class = match usage {
+                        Some(usage) => insert_usage(&tx, decision_id, usage)?,
+                        None => None,
+                    };
                     #[cfg(test)]
                     report_crash("before_commit");
                     Ok((
@@ -264,7 +265,7 @@ impl SqliteRouteStateStore {
                             recorded: recorded.clone(),
                             duplicate: false,
                         }),
-                        usage.is_some(),
+                        changed_class,
                     ))
                 })()
                 .map_err(err)
@@ -279,9 +280,10 @@ impl SqliteRouteStateStore {
         };
         #[cfg(test)]
         report_crash("after_commit");
-        // The only in-memory change is a cache invalidation, after commit.
-        if result.1 {
-            self.usage_generation.fetch_add(1, Ordering::AcqRel);
+        // The only in-memory change is a cache invalidation, after commit,
+        // and only for the class whose profile population the report grew.
+        if let Some(class) = result.1.as_deref() {
+            self.invalidate_class_vectors(Some(class));
         }
         Ok(result.0)
     }
@@ -829,13 +831,24 @@ fn apply_account_effects(
     Ok(())
 }
 
+/// Insert a report's usage row. Returns the workload class whose
+/// class-vector population the new row joined: one with a class and every
+/// token count of the profile. Any other row cannot move a class vector.
 fn insert_usage(
     conn: &Connection,
     decision_id: &str,
     usage: &V1ReportUsage,
-) -> rusqlite::Result<()> {
+) -> rusqlite::Result<Option<String>> {
     let obs = &usage.observation;
-    conn.execute(
+    let profile = [
+        obs.input_tokens.and_then(stored_token_count),
+        stored_output_tokens(obs.output_tokens),
+        obs.reasoning_tokens.and_then(stored_token_count),
+        obs.cached_read_tokens.and_then(stored_token_count),
+        obs.cache_write_tokens.and_then(stored_token_count),
+    ];
+    let class = stored_workload_class(obs.workload_class.as_deref());
+    let inserted = conn.execute(
         "INSERT INTO model_route_usage (id,task_id,route_key,capacity_key,provider_id,input_tokens,output_tokens,
          duration_ms,observed_at,reasoning_tokens,cached_read_tokens,cache_write_tokens,workload_class,account_key,task_workload)
          SELECT ?1,task_id,?2,?3,?4,?5,?6,NULL,?7,?8,?9,?10,?11,?12,
@@ -867,7 +880,9 @@ fn insert_usage(
             usage.cost
         ],
     )?;
-    Ok(())
+    Ok((inserted == 1 && profile.iter().all(Option::is_some))
+        .then(|| class.map(str::to_owned))
+        .flatten())
 }
 
 fn report_outcome(
