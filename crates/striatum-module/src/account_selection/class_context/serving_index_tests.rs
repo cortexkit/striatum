@@ -310,6 +310,7 @@ fn assert_differential(base: &ClassContext) {
                             reset_check_at: None,
                             last_claimed_at: None,
                             claim_owner: None,
+                            early_billing_probe: false,
                             cleared_models: Vec::new(),
                         })
                 })
@@ -555,6 +556,7 @@ fn dynamic_indexes_are_lazy_once_and_probe_reservation_replaces_rechecks() {
         reset_check_at: None,
         last_claimed_at: None,
         claim_owner: None,
+        early_billing_probe: false,
         cleared_models: Vec::new(),
     };
     c.replace_rechecks(vec![origin]);

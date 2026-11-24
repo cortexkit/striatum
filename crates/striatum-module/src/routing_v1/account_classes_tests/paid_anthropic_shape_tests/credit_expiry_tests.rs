@@ -381,6 +381,210 @@ async fn soonest_positive_console_credit_wins_and_is_explained() {
     );
 }
 
+fn install_legacy_billing_wall(harness: &Harness, observed_at: i64) {
+    harness
+        .store()
+        .record_credential_entitlement_fence(
+            &CredentialRefusal {
+                provider_id: POOL.into(),
+                credential_id: KEYS[0].into(),
+                code: "billing_exhausted".into(),
+            },
+            None,
+            observed_at,
+        )
+        .unwrap();
+    harness
+        .store()
+        .account_transaction(|tx| {
+            assert!(!tx.classify_credential_quota(POOL, KEYS[0], false)?);
+            let wall = &tx.fence_rechecks()?[0];
+            assert!(wall.classified && !wall.quota);
+            assert_eq!(wall.console_credit_micros_at_refusal, None);
+            assert_eq!(wall.next_recheck_at, observed_at + 3_600_000);
+            assert!(wall.last_claimed_at.is_none());
+            Ok(())
+        })
+        .unwrap();
+}
+
+fn install_early_and_late_credit() {
+    install_readings(
+        ORGS.map(Some),
+        [
+            Some(vec![credit(20_000, 7_200_000)]),
+            Some(vec![credit(10_000, 10_800_000)]),
+        ],
+    );
+}
+
+#[tokio::test]
+async fn legacy_billing_probe_can_win_earlier_credit_and_heal() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let harness = paid_anthropic_harness();
+    install_legacy_billing_wall(&harness, NOW as i64 - 3_600_001);
+    install_early_and_late_credit();
+    let broca = harness.bind(reserved("broca"), None).await;
+    let admit = result(
+        broca
+            .call("route.account_for", &request("probe-credit"))
+            .await,
+    );
+    assert_eq!(
+        admit["account"]["credential_id"], KEYS[0],
+        "the due earlier-credit probe should beat the healthy later-expiry key: {admit}"
+    );
+    assert_eq!(admit["reason"]["code"], "credential_fence_probe");
+    let decision = harness
+        .store()
+        .account_decision(admit["reason"]["decision_id"].as_str().unwrap())
+        .unwrap()
+        .unwrap();
+    let decision: Value = serde_json::from_str(&decision.decision_json).unwrap();
+    assert_eq!(
+        decision["explanation"]["credit_expiry"]["expires_at_ms"],
+        NOW + 7_200_000
+    );
+    harness
+        .store()
+        .account_read(|tx| {
+            let clocks = tx.fence_rechecks()?;
+            assert_eq!(clocks.len(), 1);
+            assert_eq!(clocks[0].last_claimed_at, Some(NOW as i64));
+            assert_eq!(clocks[0].next_recheck_at, NOW as i64 + 3_600_000);
+            assert_eq!(tx.probe_authorization_owners()?.len(), 1);
+            Ok(())
+        })
+        .unwrap();
+
+    observe_ok(&broca, &success_observation("probe-credit", true)).await;
+    let ordinary = result(
+        broca
+            .call("route.account_for", &request("healed-credit"))
+            .await,
+    );
+    assert_eq!(ordinary["account"]["credential_id"], KEYS[0]);
+    assert_eq!(ordinary["reason"]["code"], "cold_scored");
+    assert!(harness
+        .store()
+        .credential_entitlement_fences()
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn legacy_billing_credit_opens_one_probe_before_due() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let harness = paid_anthropic_harness();
+    install_legacy_billing_wall(&harness, NOW as i64 - 1_000);
+    install_early_and_late_credit();
+    let broca = harness.bind(reserved("broca"), None).await;
+    let other = harness.bind(reserved("broca"), None).await;
+    let (left, right) = (
+        request("early-credit-probe"),
+        request("racing-credit-probe"),
+    );
+    let (left, right) = tokio::join!(
+        broca.call("route.account_for", &left),
+        other.call("route.account_for", &right),
+    );
+    let mut picks = [result(left), result(right)];
+    picks.sort_by_key(|pick| pick["account"]["credential_id"] != KEYS[0]);
+    assert_eq!(picks[0]["account"]["credential_id"], KEYS[0], "{picks:?}");
+    assert_eq!(picks[0]["reason"]["code"], "credential_fence_probe");
+    assert_eq!(picks[1]["account"]["credential_id"], KEYS[1], "{picks:?}");
+    assert_eq!(picks[1]["reason"]["code"], "cold_scored");
+    harness
+        .store()
+        .account_read(|tx| {
+            assert_eq!(tx.probe_authorization_owners()?.len(), 1);
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[tokio::test]
+async fn withdrawn_credit_leaves_the_original_recheck_until_a_probe_is_claimed() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let harness = paid_anthropic_harness();
+    let observed = NOW - 1_000;
+    install_legacy_billing_wall(&harness, observed as i64);
+    install_early_and_late_credit();
+    let broca = harness.bind(reserved("broca"), None).await;
+    let mut healthy_only = single_key_request("credit-not-offered");
+    healthy_only["candidates"]["accounts"][0] =
+        json!({"account_id": KEYS[1], "credential_id": KEYS[1]});
+    let healthy = result(broca.call("route.account_for", &healthy_only).await);
+    assert_eq!(healthy["account"]["credential_id"], KEYS[1]);
+    harness
+        .store()
+        .account_read(|tx| {
+            let wall = &tx.fence_rechecks()?[0];
+            assert_eq!(wall.next_recheck_at, observed as i64 + 3_600_000);
+            assert!(wall.last_claimed_at.is_none());
+            assert!(tx.probe_authorization_owners()?.is_empty());
+            Ok(())
+        })
+        .unwrap();
+
+    install_readings(
+        ORGS.map(Some),
+        [None, Some(vec![credit(10_000, 10_800_000)])],
+    );
+    let reply = broca
+        .call("route.account_for", &single_key_request("credit-withdrawn"))
+        .await;
+    assert_eq!(reply.0, FrameType::Error, "{}", reply.1);
+    assert_eq!(reply.1["detail"]["reset_at_ms"], observed + 3_600_000);
+
+    let _due = crate::InjectedClock::set(observed + 3_600_000);
+    let due = result(
+        broca
+            .call("route.account_for", &single_key_request("ordinary-recheck"))
+            .await,
+    );
+    assert_eq!(due["reason"]["code"], "credential_fence_probe");
+}
+
+#[tokio::test]
+async fn repeated_legacy_billing_refusal_at_flat_credit_is_not_expedited() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let harness = paid_anthropic_harness();
+    install_legacy_billing_wall(&harness, NOW as i64 - 3_600_001);
+    install_early_and_late_credit();
+    let broca = harness.bind(reserved("broca"), None).await;
+    let admitted = result(
+        broca
+            .call("route.account_for", &request("repeat-billing"))
+            .await,
+    );
+    assert_eq!(admitted["account"]["credential_id"], KEYS[0]);
+    assert_eq!(admitted["reason"]["code"], "credential_fence_probe");
+    let _after = crate::InjectedClock::set(NOW + 1);
+    observe_ok(
+        &broca,
+        &json!({"event_id":"repeat-billing-refusal", "kind":"credential_refused",
+            "admission_id":"repeat-billing", "provider_code":"billing_exhausted"}),
+    )
+    .await;
+    let fences = harness.store().credential_entitlement_fences().unwrap();
+    assert_eq!(fences.len(), 1);
+    assert_eq!(
+        fences[0].console_credit_micros_at_refusal,
+        Some(200_000_000)
+    );
+    let healthy = result(
+        broca
+            .call("route.account_for", &request("flat-credit"))
+            .await,
+    );
+    assert_eq!(healthy["account"]["credential_id"], KEYS[1]);
+    let only_refused = broca
+        .call("route.account_for", &single_key_request("flat-refused"))
+        .await;
+    assert_eq!(only_refused.0, FrameType::Error, "{}", only_refused.1);
+}
+
 #[tokio::test]
 async fn keys_without_live_console_credit_fall_back() {
     let _clock = crate::InjectedClock::set(NOW);

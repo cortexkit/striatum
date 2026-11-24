@@ -233,6 +233,7 @@ fn class_memo_revalidates_mutable_restrictions_and_clone_inputs() {
                 reset_check_at: None,
                 last_claimed_at: None,
                 claim_owner: None,
+                early_billing_probe: false,
                 cleared_models: Vec::new(),
             })
             .collect(),

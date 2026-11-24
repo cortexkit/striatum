@@ -1228,8 +1228,8 @@ impl<'a> Allocator<'a> {
             let (code, retry) = self.no_candidate(&survivors);
             return refuse(self.explanation, code, retry);
         }
-        // Prefer a healthy offered identity, but only after runner-candidate
-        // filtering. An unavailable sibling must not hide the selected probe.
+        // Prefer a healthy offered identity over ordinary probes. A billing
+        // probe with live credit can compete in the expiry ranking below.
         if eligible.iter().any(|eval| {
             eval.hard.credential_id.as_ref().is_some_and(|credential| {
                 !self.context.credential_probe_notes.contains_key(credential)
@@ -1238,6 +1238,14 @@ impl<'a> Allocator<'a> {
             eligible.retain(|eval| {
                 eval.hard.credential_id.as_ref().is_none_or(|credential| {
                     !self.context.credential_probe_notes.contains_key(credential)
+                        || (self
+                            .context
+                            .credit_backed_billing_probes
+                            .contains(credential)
+                            && self
+                                .context
+                                .credit_expiry_by_credential
+                                .contains_key(credential))
                 })
             });
         }
