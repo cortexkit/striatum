@@ -129,71 +129,145 @@ impl SqliteRouteStateStore {
                 let usage = usage.as_ref();
                 let tx = account.conn;
                 (|| -> rusqlite::Result<(Option<V1ReportOutcome>, bool)> {
-            let standing = tx.query_row(
-                "SELECT body_json, answer_json FROM routing_v1_report_delivery
+                    let standing = tx
+                        .query_row(
+                            "SELECT body_json, answer_json FROM routing_v1_report_delivery
                  WHERE decision_id=?1 AND delivery_key=?2",
-                params![decision_id, delivery_key],
-                |row| Ok(V1Recorded { body_json: row.get(0)?, answer_json: row.get(1)? }),
-            ).optional()?;
-            if let Some(standing) = standing {
-                return Ok((if delivery_key.starts_with("run:") || standing.body_json == recorded.body_json {
-                     Some(V1ReportOutcome { recorded: standing, duplicate: true })
-                } else { None }, false));
-            }
-            let incompatible: bool = if delivery_key == "usage" || delivery_key == "outcome" || delivery_key.starts_with("run:") {
-                tx.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM routing_v1_report_delivery
+                            params![decision_id, delivery_key],
+                            |row| {
+                                Ok(V1Recorded {
+                                    body_json: row.get(0)?,
+                                    answer_json: row.get(1)?,
+                                })
+                            },
+                        )
+                        .optional()?;
+                    if let Some(standing) = standing {
+                        return Ok((
+                            if delivery_key.starts_with("run:")
+                                || standing.body_json == recorded.body_json
+                            {
+                                Some(V1ReportOutcome {
+                                    recorded: standing,
+                                    duplicate: true,
+                                })
+                            } else {
+                                None
+                            },
+                            false,
+                        ));
+                    }
+                    let incompatible: bool = if delivery_key == "usage"
+                        || delivery_key == "outcome"
+                        || delivery_key.starts_with("run:")
+                    {
+                        tx.query_row(
+                            "SELECT EXISTS(SELECT 1 FROM routing_v1_report_delivery
                      WHERE decision_id=?1 AND ((?2='usage' AND delivery_key!='usage')
                          OR (?2!='usage' AND delivery_key='usage')))",
-                    params![decision_id, delivery_key], |row| row.get(0),
-                )?
-            } else { false };
-            if incompatible { return Ok((None, false)); }
-            tx.execute(
-                "INSERT INTO routing_v1_report_delivery VALUES (?1,?2,?3,?4,?5,?6)",
-                params![decision_id, delivery_key, report_id, recorded.body_json, recorded.answer_json, now],
-            )?;
-            let first = tx.execute(
-                "INSERT INTO routing_v1_report VALUES (?1,?2,?3,?4,?5)
-                 ON CONFLICT(decision_id) DO NOTHING",
-                params![decision_id, report_id, recorded.body_json, recorded.answer_json, now],
-            )? == 1;
-            if first {
-                use_continuation(account, state, decision_id, now).map_err(sql_error)?;
-                let settle = account.probe_report_matches(
-                    decision_id, effects.reported_credential.as_deref(), effects.preserve_probe).map_err(sql_error)?;
-                if settle { apply_account_effects(account, effects, now)?; }
-                if settle && failed {
-                    account.fail_authorized_probe(decision_id, now,
-                        striatum_core::fence_lifetimes::probe_is_inconclusive(outcome,error)).map_err(sql_error)?;
-                } else if settle && striatum_core::fence_lifetimes::probe_is_inconclusive(outcome,error) {
-                    let (provider,model):(Option<String>,Option<String>)=tx.query_row(
-                        "SELECT selected_provider_id,selected_model_id FROM model_route_decisions WHERE id=?1",
-                        [decision_id],|row|Ok((row.get(0)?,row.get(1)?)))?;
-                    if let (Some(provider),Some(model))=(provider,model) {
-                        account.release_inconclusive_probe(decision_id,&provider,&model,now).map_err(sql_error)?;
+                            params![decision_id, delivery_key],
+                            |row| row.get(0),
+                        )?
+                    } else {
+                        false
+                    };
+                    if incompatible {
+                        return Ok((None, false));
                     }
-                }
-                if settle { reconcile(account).map_err(sql_error)?; }
-                if failed {
-                    tx.execute("UPDATE routing_v1_affinity SET ended_at_ms=?2 WHERE decision_id=?1 AND ended_at_ms IS NULL",
-                        params![decision_id, now])?;
-                }
-                report_outcome(&tx, decision_id, outcome, error, now)?;
-            }
-            // Core can reuse one routing decision for several runs, and each
-            // run reports separately under a `run:` delivery key. Each new
-            // delivery settles that run's own test request, so healing keys on
-            // the delivery rather than on the decision's first recorded outcome.
-            if outcome == RouteOutcome::Completed && !effects.preserve_probe {
-                account.heal_report_run(decision_id, delivery_key.strip_prefix("run:"), effects, first, now)
-                    .map_err(sql_error)?;
-            }
-            if let Some(usage) = usage { insert_usage(&tx, decision_id, usage)?; }
-            #[cfg(test)]
-            report_crash("before_commit");
-             Ok((Some(V1ReportOutcome { recorded: recorded.clone(), duplicate: false }), usage.is_some()))
-            })().map_err(err)
+                    tx.execute(
+                        "INSERT INTO routing_v1_report_delivery VALUES (?1,?2,?3,?4,?5,?6)",
+                        params![
+                            decision_id,
+                            delivery_key,
+                            report_id,
+                            recorded.body_json,
+                            recorded.answer_json,
+                            now
+                        ],
+                    )?;
+                    let first = tx.execute(
+                        "INSERT INTO routing_v1_report VALUES (?1,?2,?3,?4,?5)
+                 ON CONFLICT(decision_id) DO NOTHING",
+                        params![
+                            decision_id,
+                            report_id,
+                            recorded.body_json,
+                            recorded.answer_json,
+                            now
+                        ],
+                    )? == 1;
+                    if first {
+                        use_continuation(account, state, decision_id, now).map_err(sql_error)?;
+                        let settle = account
+                            .probe_report_matches(
+                                decision_id,
+                                effects.reported_credential.as_deref(),
+                                effects.preserve_probe,
+                            )
+                            .map_err(sql_error)?;
+                        if settle {
+                            apply_account_effects(account, effects, now)?;
+                        }
+                        if settle && failed {
+                            account
+                                .fail_authorized_probe(
+                                    decision_id,
+                                    now,
+                                    striatum_core::fence_lifetimes::probe_is_inconclusive(
+                                        outcome, error,
+                                    ),
+                                )
+                                .map_err(sql_error)?;
+                        } else if settle
+                            && striatum_core::fence_lifetimes::probe_is_inconclusive(outcome, error)
+                        {
+                            let (provider, model) = decision_route(&tx, decision_id)?;
+                            if let (Some(provider), Some(model)) = (provider, model) {
+                                account
+                                    .release_inconclusive_probe(decision_id, &provider, &model, now)
+                                    .map_err(sql_error)?;
+                            }
+                        }
+                        if settle {
+                            reconcile(account).map_err(sql_error)?;
+                        }
+                        if failed {
+                            tx.execute(
+                                crate::routing_v1::END_DECISION_AFFINITY_SQL,
+                                params![decision_id, now],
+                            )?;
+                        }
+                        report_outcome(&tx, decision_id, outcome, error, now)?;
+                    }
+                    // Core can reuse one routing decision for several runs, and each
+                    // run reports separately under a `run:` delivery key. Each new
+                    // delivery settles that run's own test request, so healing keys on
+                    // the delivery rather than on the decision's first recorded outcome.
+                    if outcome == RouteOutcome::Completed && !effects.preserve_probe {
+                        account
+                            .heal_report_run(
+                                decision_id,
+                                delivery_key.strip_prefix("run:"),
+                                effects,
+                                first,
+                                now,
+                            )
+                            .map_err(sql_error)?;
+                    }
+                    if let Some(usage) = usage {
+                        insert_usage(&tx, decision_id, usage)?;
+                    }
+                    #[cfg(test)]
+                    report_crash("before_commit");
+                    Ok((
+                        Some(V1ReportOutcome {
+                            recorded: recorded.clone(),
+                            duplicate: false,
+                        }),
+                        usage.is_some(),
+                    ))
+                })()
+                .map_err(err)
             };
         let result = if self.is_private_account_copy() {
             self.account_command(AccountCommandKind::Report, move |account| {
@@ -214,6 +288,38 @@ impl SqliteRouteStateStore {
 }
 
 impl AccountTx<'_> {
+    /// The selected model, recorded provider identity and launch clock of a
+    /// decision, and whether they came from the decision ledger. A backup may
+    /// restore the ledger empty while it keeps the v1 binding, so a missing
+    /// ledger row falls back to the binding's model and creation time, which
+    /// has no provider identity. `None` when neither row exists.
+    fn report_decision_selection(
+        &self,
+        decision: &str,
+    ) -> RouteStateResult<Option<(String, Option<String>, i64, bool)>> {
+        let ledger = self
+            .conn
+            .query_row(
+                "SELECT selected_model_id,provider_identity_json,COALESCE((SELECT created_at_ms FROM routing_v1_decision
+                 WHERE decision_id=?1),created_at) FROM model_route_decisions WHERE id=?1",
+                [decision],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, true)),
+            )
+            .optional()
+            .map_err(err)?;
+        if ledger.is_some() {
+            return Ok(ledger);
+        }
+        self.conn
+            .query_row(
+                "SELECT model,created_at_ms FROM routing_v1_decision WHERE decision_id=?1",
+                [decision],
+                |row| Ok((row.get(0)?, None, row.get(1)?, false)),
+            )
+            .optional()
+            .map_err(err)
+    }
+
     /// Settle success using the admission's identity, `committed_at` cutoff and
     /// exact probe proof. Return the origins actually cleared for observation effects.
     pub fn heal_admission_success(
@@ -371,11 +477,15 @@ impl AccountTx<'_> {
             // A decision without an account admission still owns its selection
             // probe. The decision clock is the conservative launch bound when
             // no admission supplies a run-specific clock.
-            let (model, identity, at): (String, Option<String>, i64) = self.conn.query_row(
-                "SELECT selected_model_id,provider_identity_json,COALESCE((SELECT created_at_ms FROM routing_v1_decision
-                 WHERE decision_id=?1),created_at) FROM model_route_decisions WHERE id=?1",
-                [decision], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            ).map_err(err)?;
+            let Some((model, identity, at, ledger)) = self.report_decision_selection(decision)?
+            else {
+                tracing::warn!(
+                    decision,
+                    run,
+                    "completed report names an unknown decision; no fences healed"
+                );
+                return Ok(());
+            };
             if self.probe_report_matches(decision, effects.reported_credential.as_deref(), false)? {
                 let authorized = !self
                     .current_blocks()?
@@ -401,6 +511,17 @@ impl AccountTx<'_> {
                 // decision's creation. Ordinary serving recovery must not bypass
                 // those checks.
                 if authorized || !first {
+                    return Ok(());
+                }
+                // Without the ledger row (a backup may restore the ledger
+                // empty) the selected credential's identity is unknown, so
+                // there is nothing to check the lifted credential against.
+                if !ledger {
+                    tracing::warn!(
+                        decision,
+                        run,
+                        "decision ledger row is missing; serving fences not lifted"
+                    );
                     return Ok(());
                 }
                 let identity = identity.and_then(|raw| {
@@ -763,6 +884,32 @@ fn report_outcome(
         params![decision_id, outcome.as_str(), now, error],
     )
     .map(|_| ())
+}
+
+/// The provider and model a decision selected. The ledger row is preferred;
+/// when a backup restored the ledger empty, the v1 binding still names both.
+fn decision_route(
+    conn: &Connection,
+    decision_id: &str,
+) -> rusqlite::Result<(Option<String>, Option<String>)> {
+    let ledger = conn
+        .query_row(
+            "SELECT selected_provider_id,selected_model_id FROM model_route_decisions WHERE id=?1",
+            [decision_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    if let Some(route) = ledger {
+        return Ok(route);
+    }
+    Ok(conn
+        .query_row(
+            "SELECT provider,model FROM routing_v1_decision WHERE decision_id=?1",
+            [decision_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?
+        .unwrap_or((None, None)))
 }
 
 #[cfg(test)]

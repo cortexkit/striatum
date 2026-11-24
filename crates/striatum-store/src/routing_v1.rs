@@ -12,6 +12,12 @@ use striatum_core::{accounts::AllowedAccountClass, RouteStateResult};
 
 use super::{err, SqliteRouteStateStore};
 
+/// A failure report ends the affinity that still names its decision. The
+/// partial index `routing_v1_affinity_by_decision` finds those rows by key;
+/// the table's primary key leads with the affinity, not the decision.
+pub(crate) const END_DECISION_AFFINITY_SQL: &str =
+    "UPDATE routing_v1_affinity SET ended_at_ms=?2 WHERE decision_id=?1 AND ended_at_ms IS NULL";
+
 const PANEL_READ_SQL: &str =
     "SELECT state_json FROM routing_v1_panel WHERE panel_id=?1 AND principal IN (?2, ?3)";
 const AFFINITY_READ_SQL: &str = "SELECT decision_id FROM routing_v1_affinity
@@ -1002,11 +1008,7 @@ impl crate::AccountTx<'_> {
                 ],
             )?;
             if inserted == 1 && failed {
-                tx.execute(
-                    "UPDATE routing_v1_affinity SET ended_at_ms=?2
-                         WHERE decision_id=?1 AND ended_at_ms IS NULL",
-                    params![decision_id, now_ms],
-                )?;
+                tx.execute(END_DECISION_AFFINITY_SQL, params![decision_id, now_ms])?;
             }
             let standing = tx.query_row(
                 "SELECT body_json, answer_json FROM routing_v1_report WHERE decision_id = ?1",

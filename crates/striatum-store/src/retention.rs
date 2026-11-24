@@ -97,6 +97,24 @@ fn limit_param(limit: usize) -> i64 {
     i64::try_from(limit).unwrap_or(i64::MAX)
 }
 
+/// Key-pool retention, each found by a range on its retention-clock index.
+const POOL_LEASE_PRUNE_SQL: &str = "DELETE FROM pool_key_lease WHERE rowid IN ( \
+       SELECT rowid FROM pool_key_lease INDEXED BY pool_key_lease_by_last_time \
+       WHERE MAX(valid_until, COALESCE(released_at, 0)) < ?1 \
+       ORDER BY MAX(valid_until, COALESCE(released_at, 0)) LIMIT ?2)";
+const POOL_SESSION_PRUNE_SQL: &str = "DELETE FROM pool_session_affinity WHERE rowid IN ( \
+       SELECT rowid FROM pool_session_affinity INDEXED BY pool_session_affinity_by_last_time \
+       WHERE MAX(expires_at, COALESCE(ended_at, 0)) < ?1 \
+       ORDER BY MAX(expires_at, COALESCE(ended_at, 0)) LIMIT ?2)";
+
+/// Parent-failure retention, found by a range on the outcome-time index so a
+/// batch reads only the rows it deletes plus one.
+pub(crate) const PARENT_FAILURE_PRUNE_SQL: &str =
+    "DELETE FROM model_route_parent_failures WHERE rowid IN ( \
+       SELECT rowid FROM model_route_parent_failures \
+         INDEXED BY model_route_parent_failures_by_outcome \
+       WHERE COALESCE(outcome_at, 0) < ?1 ORDER BY COALESCE(outcome_at, 0) LIMIT ?2)";
+
 /// An account admission that still holds a run open: reserved and not yet
 /// started, or started and not yet finished.
 const LIVE_ADMISSION_STATES: &str = "('reserved', 'started')";
@@ -282,6 +300,7 @@ impl SqliteRouteStateStore {
     /// closed at `now_ms`, and its observations and moved-run reservations
     /// must be old. Used-offer sources outlive the started rows they succeed
     /// so deleting history cannot revive a departed account's count.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn prune_account_admissions(
         &self,
         before: i64,
@@ -322,6 +341,7 @@ impl SqliteRouteStateStore {
     /// with any affinity keeps its generations for whole-conversation cleanup.
     /// Every retained admission protects its pin (including a continuation's
     /// reservation), as do holds. Pin bodies are not cached in account state.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn prune_account_pins(&self, before: i64, limit: usize) -> RouteStateResult<usize> {
         let keys = self.plan_account_pins(before, limit)?;
         if keys.is_empty() {
@@ -354,6 +374,7 @@ impl SqliteRouteStateStore {
     /// pin generation of the same conversation, in one transaction. A
     /// conversation is kept while any stored admission or hold still names
     /// one of its pins; their retention batches remove those first.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn prune_account_affinities(
         &self,
         before: i64,
@@ -374,8 +395,10 @@ impl SqliteRouteStateStore {
 
     /// Delete at most `limit` runner observations received before
     /// `received_before` (Unix milliseconds), oldest first. An observation a
-    /// fence or exclusion still names is kept, as is a bound backoff whose
-    /// deadline is later than the cutoff (even with a zero-day log window).
+    /// held fence or exclusion still names is kept, as is a bound backoff whose
+    /// deadline is later than the cutoff (even with a zero-day log window). A
+    /// cleared fence keeps its block row, which is what guards against
+    /// replaying it, so it no longer keeps its observation.
     /// Bound sign-in evidence stays while its admission is open: a cleared
     /// global fence must not let that run be offered the same credential
     /// again, and the module's account state holds every such row of an open
@@ -405,11 +428,26 @@ impl SqliteRouteStateStore {
         })
     }
 
+    /// Delete at most `limit` key-pool rows whose retention clock is before
+    /// `before` (Unix milliseconds), oldest first: leases that were released
+    /// or ran past their deadline, then session bindings that ended or idled
+    /// out. Serving reads only live leases and bindings; a renewal names its
+    /// lease within the lease's ten-minute lifetime, and a renewal naming a
+    /// lease that is gone is answered by recreating it.
+    pub fn prune_pool_key_history(&self, before: i64, limit: usize) -> RouteStateResult<usize> {
+        self.account_command(crate::AccountCommandKind::Maintenance, move |tx| {
+            tx.prune_pool_key_history(before, limit)
+        })
+    }
+
     /// Delete at most `limit` rows of `model_route_parent_failures` whose
-    /// outcome is before `outcome_before` (Unix milliseconds). A trigger
-    /// removes a row together with its decision, but a decision ledger
-    /// restored empty from a backup leaves rows no ledger delete will ever
-    /// reach; this keeps the table bounded by the decision window either way.
+    /// outcome is before `outcome_before` (Unix milliseconds), oldest first.
+    /// A trigger removes a row together with its decision, but a decision
+    /// ledger restored empty from a backup leaves rows no ledger delete will
+    /// ever reach; this keeps the table bounded by the decision window either
+    /// way. A row without an outcome time counts as time 0 and goes in the
+    /// first batch: the head withholding reads only rows whose outcome time
+    /// is in its recent window, so such a row is never read.
     pub fn prune_parent_failures(
         &self,
         outcome_before: i64,
@@ -418,9 +456,7 @@ impl SqliteRouteStateStore {
         self.store
             .with_conn(|conn: &Connection| {
                 conn.execute(
-                    "DELETE FROM model_route_parent_failures WHERE rowid IN ( \
-                       SELECT rowid FROM model_route_parent_failures \
-                       WHERE COALESCE(outcome_at, 0) < ?1 LIMIT ?2)",
+                    PARENT_FAILURE_PRUNE_SQL,
                     params![outcome_before, limit_param(limit)],
                 )
             })
@@ -540,15 +576,39 @@ impl SqliteRouteStateStore {
     /// already deleted by account retention counts as over. A used offer also
     /// outlives every started row it succeeds, and a predecessor outlives any
     /// continuation naming its decision, so restart resolves the same source.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn prune_account_continuations(
         &self,
         before: i64,
         limit: usize,
     ) -> RouteStateResult<usize> {
         self.refuse_state_blind_admission_write("prune_account_continuations")?;
+        let keys = self.plan_account_continuations(before, limit)?;
+        if keys.is_empty() {
+            return Ok(0);
+        }
         self.account_command(crate::AccountCommandKind::Maintenance, move |tx| {
-            tx.prune_account_continuations(before, limit)
+            tx.delete_account_continuations_returning(before, &keys)
+                .map(|deleted| deleted.len())
         })
+    }
+
+    /// Find continuation answers due for deletion on a pooled reader, so the
+    /// single account writer only rechecks these rows by key. A plan never
+    /// authorizes a delete: rows can change between planning and the write.
+    pub fn plan_account_continuations(
+        &self,
+        before: i64,
+        limit: usize,
+    ) -> RouteStateResult<Vec<i64>> {
+        self.store
+            .with_read(|conn| {
+                let mut statement = conn.prepare(&continuation_candidates(false))?;
+                let rows =
+                    statement.query_map(params![before, limit_param(limit)], |row| row.get(0))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .map_err(err)
     }
 
     /// Delete at most `limit` generation-speed samples, oldest first: every
@@ -685,6 +745,72 @@ const USED_OFFER_SOURCES: &str = "
      AND l.admission_id=COALESCE(p.reservation_id,c.admission_id)
     WHERE c.decision_id IS NOT NULL AND c.used_at_ms IS NOT NULL";
 
+/// The latest of a continuation answer's own times, its retention clock. The
+/// index `account_continue_by_last_time` holds the same expression.
+const CONTINUATION_LAST_TIME: &str =
+    "MAX(COALESCE(c.valid_until_ms, 0), COALESCE(c.used_at_ms, 0), COALESCE(c.released_at_ms, 0))";
+
+/// Continuation answers due for deletion (see
+/// [`SqliteRouteStateStore::prune_account_continuations`] for the rules).
+/// Unkeyed, a pooled reader plans from a range of the retention-clock index;
+/// keyed, the account writer rechecks only the planned rowids in `?3`. A used
+/// offer's own source (the admission it moved from) is found by key from the
+/// offer itself, which is the only used offer with its principal and
+/// selection id, instead of materializing every used offer in the store.
+fn continuation_candidates(keyed: bool) -> String {
+    let source = if keyed {
+        "WHERE c.rowid IN (SELECT value FROM json_each(?3)) AND"
+    } else {
+        "INDEXED BY account_continue_by_last_time WHERE"
+    };
+    format!(
+        "SELECT c.rowid FROM account_continue c {source} {CONTINUATION_LAST_TIME} < ?1
+          AND NOT (c.used_at_ms IS NOT NULL AND EXISTS (
+            SELECT 1 FROM account_admission parent
+            WHERE parent.principal=c.principal AND parent.admission_id=c.admission_id
+              AND parent.state IN ('reserved','started','finished','released')))
+          AND NOT EXISTS (SELECT 1 FROM account_admission a
+            WHERE a.principal = c.principal
+              AND a.admission_id IN (c.admission_id, c.reservation_id)
+              AND (a.state IN {LIVE_ADMISSION_STATES}
+                OR COALESCE(a.finished_at, 0) >= ?1
+                OR COALESCE(a.released_at, 0) >= ?1))
+          AND NOT EXISTS (SELECT 1 FROM account_admission l
+            JOIN account_admission s
+              ON s.principal=l.principal AND s.run_id=c.run_id
+             AND s.provider=l.provider AND s.account_id=l.account_id
+            WHERE c.decision_id IS NOT NULL AND c.used_at_ms IS NOT NULL
+              AND l.principal=c.principal
+              AND l.admission_id=COALESCE((SELECT p.reservation_id FROM account_continue p
+                  WHERE p.principal=c.principal AND p.admission_id=c.admission_id
+                    AND p.run_id=c.run_id AND p.decision_id=c.previous_decision_id),
+                c.admission_id)
+              AND s.state='started'
+              AND (s.admission_id=l.admission_id
+                OR (s.request_mode!='renew' AND s.started_at<c.used_at_ms)))
+          AND NOT EXISTS (SELECT 1 FROM account_continue n
+            WHERE n.principal=c.principal AND n.admission_id=c.admission_id
+              AND n.run_id=c.run_id AND n.previous_decision_id=c.decision_id)
+         ORDER BY c.rowid LIMIT ?2"
+    )
+}
+
+const PRUNED_CONTINUATION_COLUMNS: &str = "rowid, principal, selection_id, admission_id, run_id, \
+     previous_decision_id, decision_id, used_at_ms IS NOT NULL";
+
+fn pruned_continuation(row: &rusqlite::Row<'_>) -> rusqlite::Result<crate::PrunedContinuation> {
+    Ok(crate::PrunedContinuation {
+        rowid: row.get(0)?,
+        principal: row.get(1)?,
+        selection_id: row.get(2)?,
+        admission_id: row.get(3)?,
+        run_id: row.get(4)?,
+        previous_decision_id: row.get(5)?,
+        decision_id: row.get(6)?,
+        used: row.get(7)?,
+    })
+}
+
 // A used offer names the run's original admission. For later moves, the
 // predecessor offer's reservation overrides that original admission as the
 // source of the move. Find both cases by the admission being checked rather
@@ -805,6 +931,9 @@ fn admission_delete_sql(keyed: bool) -> String {
 mod regression_tests;
 
 #[cfg(test)]
+mod lookup_tests;
+
+#[cfg(test)]
 mod fork_retention_tests {
     use super::*;
 
@@ -897,6 +1026,7 @@ impl crate::AccountTx<'_> {
         .map_err(err)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn prune_account_pins(&self, before: i64, limit: usize) -> RouteStateResult<usize> {
         #[cfg(any(test, feature = "test-support"))]
         let _writer_entry =
@@ -907,13 +1037,9 @@ impl crate::AccountTx<'_> {
                 &format!(
                     "DELETE FROM account_pin WHERE rowid IN ( \
                    SELECT p.rowid FROM account_pin p INDEXED BY account_pin_by_created \
-                   WHERE p.created_at < ?1 \
-                     AND NOT EXISTS (SELECT 1 FROM account_affinity f \
-                       WHERE f.principal=p.principal AND f.conversation_hash=p.conversation_hash \
-                         AND f.provider=p.provider) \
-                     AND NOT EXISTS (SELECT 1 FROM account_admission a WHERE a.pin_id=p.pin_id) \
-                     AND NOT EXISTS (SELECT 1 FROM {holds} h WHERE h.pin_id=p.pin_id) \
-                   ORDER BY p.created_at LIMIT ?2)"
+                   WHERE p.created_at < ?1 AND {} \
+                   ORDER BY p.created_at LIMIT ?2)",
+                    PIN_UNREFERENCED.replace("{holds}", &holds)
                 ),
                 params![before, limit_param(limit)],
             )
@@ -1059,6 +1185,7 @@ impl crate::AccountTx<'_> {
                        WHERE received_at < ?1 \
                          AND NOT EXISTS (SELECT 1 FROM block b \
                            WHERE b.is_origin=1 AND b.kind IN ('account','principal') \
+                             AND b.source_present=1 AND (b.cleared_by IS NULL OR b.cleared_by='kept') \
                              AND b.observation_id=account_observation.observation_id) \
                           AND NOT (kind='signed_out' AND bound=1 AND EXISTS ( \
                             SELECT 1 FROM account_admission a \
@@ -1096,17 +1223,29 @@ impl crate::AccountTx<'_> {
         .map_err(err)
     }
 
+    pub fn prune_pool_key_history(&self, before: i64, limit: usize) -> RouteStateResult<usize> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry =
+            crate::writer_entry_trace::enter("account_tx::retention::prune_pool_key_history");
+        self.retention_write(|tx| {
+            let leases = tx.execute(POOL_LEASE_PRUNE_SQL, params![before, limit_param(limit)])?;
+            let remaining = limit.saturating_sub(leases);
+            if remaining == 0 {
+                return Ok(leases);
+            }
+            let sessions = tx.execute(
+                POOL_SESSION_PRUNE_SQL,
+                params![before, limit_param(remaining)],
+            )?;
+            Ok(leases + sessions)
+        })
+    }
+
     fn retention_write<T>(
         &self,
         batch: impl FnOnce(&Connection) -> rusqlite::Result<T>,
     ) -> RouteStateResult<T> {
-        self.command_sql(|conn: &Connection| {
-            let tx = conn;
-            let result = batch(&tx)?;
-
-            Ok(result)
-        })
-        .map_err(err)
+        self.command_sql(batch).map_err(err)
     }
 
     pub fn prune_v1_decisions(
@@ -1193,26 +1332,57 @@ impl crate::AccountTx<'_> {
         })
     }
 
+    /// Unkeyed continuation retention in one statement over the whole table.
+    /// Production plans on a reader and rechecks by key
+    /// ([`Self::delete_account_continuations_returning`]); tests keep this
+    /// form as the reference the keyed path must agree with.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn prune_account_continuations(
         &self,
         before: i64,
         limit: usize,
     ) -> RouteStateResult<usize> {
-        #[cfg(any(test, feature = "test-support"))]
         let _writer_entry =
             crate::writer_entry_trace::enter("account_tx::retention::prune_account_continuations");
         self.prune_account_continuations_returning(before, limit)
             .map(|deleted| deleted.len())
     }
 
-    /// The same retention delete, returning each deleted row's identity so the
-    /// module's in-memory continuation indexes can drop exactly those rows.
+    /// Delete the planned continuation answers that are still due, returning
+    /// each deleted row's identity so the module's in-memory continuation
+    /// indexes can drop exactly those rows. Every key is rechecked here, since
+    /// planning on a reader does not reserve rows.
+    pub fn delete_account_continuations_returning(
+        &self,
+        before: i64,
+        keys: &[i64],
+    ) -> RouteStateResult<Vec<crate::PrunedContinuation>> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::retention::delete_account_continuations_returning",
+        );
+        let keys_json = serde_json::to_string(keys).map_err(err)?;
+        self.retention_write(|tx| {
+            let mut statement = tx.prepare(&format!(
+                "DELETE FROM account_continue WHERE rowid IN ({}) RETURNING {PRUNED_CONTINUATION_COLUMNS}",
+                continuation_candidates(true)
+            ))?;
+            let rows = statement.query_map(
+                params![before, limit_param(keys.len()), keys_json],
+                pruned_continuation,
+            )?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+        })
+    }
+
+    /// [`Self::prune_account_continuations`], returning each deleted row's
+    /// identity.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn prune_account_continuations_returning(
         &self,
         before: i64,
         limit: usize,
     ) -> RouteStateResult<Vec<crate::PrunedContinuation>> {
-        #[cfg(any(test, feature = "test-support"))]
         let _writer_entry = crate::writer_entry_trace::enter(
             "account_tx::retention::prune_account_continuations_returning",
         );
@@ -1246,21 +1416,9 @@ impl crate::AccountTx<'_> {
                             WHERE n.principal=c.principal AND n.admission_id=c.admission_id \
                               AND n.run_id=c.run_id AND n.previous_decision_id=c.decision_id) \
                        ORDER BY c.rowid LIMIT ?2) \
-                     RETURNING rowid, principal, selection_id, admission_id, run_id, \
-                       previous_decision_id, decision_id, used_at_ms IS NOT NULL"
+                     RETURNING {PRUNED_CONTINUATION_COLUMNS}"
             ))?;
-            let rows = statement.query_map(params![before, limit_param(limit)], |row| {
-                Ok(crate::PrunedContinuation {
-                    rowid: row.get(0)?,
-                    principal: row.get(1)?,
-                    selection_id: row.get(2)?,
-                    admission_id: row.get(3)?,
-                    run_id: row.get(4)?,
-                    previous_decision_id: row.get(5)?,
-                    decision_id: row.get(6)?,
-                    used: row.get(7)?,
-                })
-            })?;
+            let rows = statement.query_map(params![before, limit_param(limit)], pruned_continuation)?;
             rows.collect::<rusqlite::Result<Vec<_>>>()
         })
     }

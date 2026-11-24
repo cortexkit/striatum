@@ -443,6 +443,17 @@ pub(crate) fn prune_observation_events(
     store.prune_observation_events(received_before, limit)
 }
 
+pub(crate) fn prune_pool_key_history(
+    store: &SqliteRouteStateStore,
+    before: i64,
+    limit: usize,
+) -> RouteStateResult<usize> {
+    #[cfg(test)]
+    let _writer_entry =
+        striatum_store::writer_entry_trace::enter("module_adapter::prune_pool_key_history");
+    store.prune_pool_key_history(before, limit)
+}
+
 pub(crate) fn prune_v1_decisions(
     store: &SqliteRouteStateStore,
     before: i64,
@@ -484,9 +495,14 @@ pub(crate) fn prune_account_continuations(
     #[cfg(test)]
     let _writer_entry =
         striatum_store::writer_entry_trace::enter("module_adapter::prune_account_continuations");
-    // Pruning is a writer command so the admission state drops the same rows.
+    let keys = store.plan_account_continuations(before, limit)?;
+    if keys.is_empty() {
+        return Ok(0);
+    }
+    // Planning stays off the writer. Deleting is a writer command that
+    // rechecks each planned row, so the admission state drops the same rows.
     execute(store, AccountCommandKind::Maintenance, move |tx| {
-        tx.prune_account_continuations(before, limit)
+        tx.delete_account_continuations(before, &keys)
     })
 }
 

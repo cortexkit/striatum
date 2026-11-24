@@ -66,6 +66,81 @@ fn completed_report_without_admission_heals_current_selection_time_claim() {
     assert!(store.fence_rechecks().unwrap().is_empty());
 }
 
+/// Delete a decision's ledger row and keep its v1 binding, as a backup that
+/// restored `model_route_decisions` empty leaves it.
+fn drop_ledger_row(store: &SqliteRouteStateStore, id: &str) {
+    store
+        .store
+        .with_conn(|c| {
+            assert_eq!(
+                c.execute("DELETE FROM model_route_decisions WHERE id=?1", [id])?,
+                1
+            );
+            Ok(())
+        })
+        .unwrap();
+}
+
+/// A completed report on a decision whose ledger row is gone is accepted and
+/// still settles the probe the decision claimed, timed by the v1 binding.
+#[test]
+fn completed_report_without_ledger_row_heals_its_selection_time_claim() {
+    let store = SqliteRouteStateStore::open(&descriptor()).unwrap();
+    seed(&store, "d", "p");
+    claim_decision_probe(&store, 1);
+    drop_ledger_row(&store, "d");
+    report_outcome_for_run(&store, "selected", RouteOutcome::Completed, 2);
+    assert!(store.fence_rechecks().unwrap().is_empty());
+}
+
+/// An inconclusive report on a decision whose ledger row is gone still
+/// releases the probe claim, using the provider and model of the v1 binding.
+#[test]
+fn inconclusive_report_without_ledger_row_releases_its_probe_claim() {
+    let store = SqliteRouteStateStore::open(&descriptor()).unwrap();
+    seed(&store, "d", "p");
+    store
+        .record_billing_account_route_fence(&AccountRouteFence {
+            provider: "example".into(),
+            credential_id: "key".into(),
+            model: "model".into(),
+            until_ms: 1000,
+            recorded_at: 100,
+            decision_id: "old".into(),
+        })
+        .unwrap();
+    let origins = store.fence_rechecks().unwrap();
+    assert!(store
+        .account_transaction(|tx| tx.grant_fence_rechecks(&origins, 1000, Some("d")))
+        .unwrap());
+    drop_ledger_row(&store, "d");
+    store
+        .v1_commit_report(
+            "d",
+            "outcome",
+            "r",
+            &V1Recorded {
+                body_json: "{}".into(),
+                answer_json: "{}".into(),
+            },
+            RouteOutcome::Cancelled,
+            None,
+            false,
+            &V1ReportEffects::default(),
+            None,
+            |_| Ok(()),
+            1001,
+        )
+        .unwrap()
+        .unwrap();
+    let remaining = store.fence_rechecks().unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert!(
+        remaining[0].next_recheck_at <= 1001,
+        "the claim is released"
+    );
+}
+
 #[test]
 fn completed_reused_decision_without_admission_cannot_resurrect_interrupted_claim() {
     let store = SqliteRouteStateStore::open(&descriptor()).unwrap();
