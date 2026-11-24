@@ -569,7 +569,8 @@ fn parse_config_with_paths(
         return Err("invalid routing config: unknown field `shadow` under accounts; delete the retired setting".into());
     }
     crate::config_convert::reject_removed_variants(&value)?;
-    for key in ["model_routing", "account_selection", "pins", "score_alias"] {
+    crate::config_convert::reject_flat_pins(&value)?;
+    for key in ["model_routing", "account_selection", "score_alias"] {
         if value.get(key).is_some() {
             return Err(format!(
                 "old routing config key {key}; run {} <input> <output>",

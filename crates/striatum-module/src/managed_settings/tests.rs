@@ -1081,3 +1081,60 @@ async fn delivered_project_runner_list_with_a_malformed_route_is_refused() {
         reports[0].reasons
     );
 }
+
+#[tokio::test]
+async fn failed_report_retry_still_fetches_the_change_that_triggered_it() {
+    use super::test_daemon::{Advertise, Daemon};
+    use crate::tier_settings::Tier;
+    use std::time::Duration;
+
+    let dir = ScratchDir::new("report-failure-refresh");
+    let path = dir.join("striatum.jsonc");
+    let (daemon, _connection) = Daemon::connect(&path, json!({}), Advertise::Hello).await;
+    let tier = |path: &Path| {
+        config_overrides::live_config(path).service_tier("prefrontal.sidekick", "openai", "model")
+    };
+    let stamped = |generation, attempt, tier: &str| {
+        let mut view = ConfigView::new(
+            generation,
+            json!({"consumers":{"prefrontal.sidekick":{"service_tier":tier}}}),
+            BTreeMap::new(),
+            vec![],
+            ConfigStatus::Active,
+        );
+        view.attempt = Some(attempt);
+        view
+    };
+    async fn wait(what: &str, mut condition: impl FnMut() -> bool) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !condition() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{what}"));
+    }
+
+    // The daemon defers the first report, so routing keeps it for a retry.
+    daemon.refuse_reports(Some("anchor_pending"));
+    daemon.set_global(stamped(2, 1, "standard"));
+    daemon.global_changed().await;
+    wait("routing did not report generation 2", || {
+        daemon.report_attempts() == 1
+    })
+    .await;
+    assert_eq!(tier(&path), Some(Tier::Standard.value()));
+
+    // A new generation arrives while the retried report fails differently.
+    daemon.refuse_reports(Some("unavailable"));
+    daemon.set_global(stamped(3, 2, "fast"));
+    daemon.notify_global_changed();
+    wait("the change notice was lost after the report failed", || {
+        tier(&path) == Some(Tier::Fast.value())
+    })
+    .await;
+    wait("routing did not report generation 3", || {
+        daemon.report_attempts() == 3
+    })
+    .await;
+}

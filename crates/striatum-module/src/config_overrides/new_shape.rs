@@ -242,12 +242,11 @@ async fn panel_policy_memo_matches_uncached_verdicts() {
 }
 
 impl RoutingConfigFile {
-    /// Materialize the temporary interfaces used by the existing selection pass.
-    /// Only the entity-shaped fields are read from disk; the grouped views are
-    /// rebuilt atomically with each validated snapshot.
-    pub(super) fn prepare(&mut self) -> Result<(), String> {
-        // Two spellings of one policy cannot be ordered without silently
-        // discarding an operator's intent, even when their values happen to agree.
+    /// Derive the pin-only list, the consumer exclusion groups and the
+    /// subscription list from the provider and model rules. A policy patch
+    /// that edits those rules must run this again, or the derived lists keep
+    /// the unpatched rules.
+    pub(super) fn derive_entity_lists(&mut self) -> Result<(), String> {
         let mut exclusion_groups = serde_json::Map::new();
         let mut global = Vec::new();
         let mut subscription = Vec::new();
@@ -295,8 +294,19 @@ impl RoutingConfigFile {
         self.model_routing.exclude =
             serde_json::from_value(serde_json::Value::Object(exclusion_groups))
                 .map_err(|error| error.to_string())?;
+        self.model_routing.subscription = subscription;
+        Ok(())
+    }
+
+    /// Materialize the temporary interfaces used by the existing selection pass.
+    /// Only the entity-shaped fields are read from disk; the grouped views are
+    /// rebuilt atomically with each validated snapshot.
+    pub(super) fn prepare(&mut self) -> Result<(), String> {
+        self.derive_entity_lists()?;
         let mut pins = serde_json::Map::new();
         for (name, policy) in &self.consumers {
+            // Two spellings of one policy cannot be ordered without silently
+            // discarding an operator's intent, even when their values happen to agree.
             let other = striatum_core::module_identity::alternate(name);
             if other != *name && self.consumers.contains_key(other.as_ref()) {
                 return Err(format!("consumer keys {name:?} and {other:?} name the same consumer during prefrontal's rename window"));
@@ -382,7 +392,6 @@ impl RoutingConfigFile {
                 .collect(),
         );
         self.model_routing.runners = Some(self.runners.clone());
-        self.model_routing.subscription = subscription;
         for (id, provider) in &self.providers {
             if id.is_empty() || id.chars().any(char::is_whitespace) || id.contains('/') {
                 return Err(format!("invalid provider id {id:?}"));
@@ -467,6 +476,7 @@ impl LiveConfig {
                 rules.only_for = Some(value.clone());
             }
         }
+        patched.config.derive_entity_lists()?;
         Ok(Self::new(patched.config, patched.document))
     }
 
@@ -641,16 +651,32 @@ impl LiveConfig {
 
 impl RoutingConfigFile {
     fn consumer_exclusions(&self, consumer: &str) -> Vec<String> {
-        let excluded = |rules: &EntityPolicy| {
-            rules
-                .only_for
-                .as_ref()
-                .is_some_and(|names| !names.iter().any(|name| consumer_matches(name, consumer)))
-                || rules
-                    .not_for
-                    .iter()
-                    .flatten()
-                    .any(|name| consumer_matches(name, consumer))
+        let rules_at = |key: &str| {
+            if key.contains('/') {
+                self.model_routing.models.get(key).map(|model| &model.rules)
+            } else {
+                self.providers.get(key).map(|provider| &provider.rules)
+            }
+        };
+        // Resolve `only_for` and `not_for` field by field, provider first and
+        // then every configured model prefix shortest first, the same
+        // inheritance the per-route refusal uses. `inclusive` decides whether
+        // the key's own entry takes part, so the parent state excludes it.
+        let excluded = |key: &str, inclusive: bool| {
+            let (mut only_for, mut not_for) = (None, None);
+            let ends = key
+                .match_indices('/')
+                .map(|(end, _)| end)
+                .chain(inclusive.then_some(key.len()));
+            for rules in ends.filter_map(|end| rules_at(&key[..end])) {
+                only_for = rules.only_for.as_ref().or(only_for);
+                not_for = rules.not_for.as_ref().or(not_for);
+            }
+            only_for.is_some_and(|names: &Vec<String>| {
+                !names.iter().any(|name| consumer_matches(name, consumer))
+            }) || not_for.is_some_and(|names: &Vec<String>| {
+                names.iter().any(|name| consumer_matches(name, consumer))
+            })
         };
         let entities = self
             .providers
@@ -665,14 +691,9 @@ impl RoutingConfigFile {
         let mut exclusions = Vec::new();
         for (key, rules) in entities {
             if rules.only_for.is_some() || rules.not_for.is_some() {
-                let entity_excluded = excluded(rules);
-                let parent_excluded = key
-                    .split_once('/')
-                    .and_then(|(provider, _)| self.providers.get(provider))
-                    .is_some_and(|provider| excluded(&provider.rules));
-                if entity_excluded {
+                if excluded(key, true) {
                     exclusions.push(key.clone());
-                } else if parent_excluded {
+                } else if excluded(key, false) {
                     exclusions.push(format!("-{key}"));
                 }
             }
@@ -894,6 +915,15 @@ impl RoutingConfigFile {
                     routes.push(make_route_key(provider, model, Some(variant)));
                 }
                 refuse(&format!("consumers.{name}.pin"), consumer, &routes)?;
+                if !is_slot(name) {
+                    for child in self.inherited_pin_children(name) {
+                        refuse(
+                            &format!("consumers.{name}.pin, inherited by {child:?},"),
+                            child,
+                            &routes,
+                        )?;
+                    }
+                }
             }
             for (project, project_policy) in &policy.projects {
                 let Some(route) =
@@ -913,5 +943,33 @@ impl RoutingConfigFile {
             }
         }
         Ok(())
+    }
+
+    /// Dotted descendants of `pinned` that inherit its pin and that some
+    /// provider or model rule names. A descendant no rule names is judged
+    /// exactly like `pinned`, so only these can refuse an inherited pin that
+    /// `pinned` itself may use.
+    fn inherited_pin_children<'a>(&'a self, pinned: &'a str) -> impl Iterator<Item = &'a str> {
+        let named: std::collections::BTreeSet<&str> = self
+            .providers
+            .values()
+            .map(|provider| &provider.rules)
+            .chain(self.model_routing.models.values().map(|model| &model.rules))
+            .flat_map(|rules| rules.only_for.iter().chain(rules.not_for.iter()).flatten())
+            .map(String::as_str)
+            .collect();
+        named.into_iter().filter(move |child| {
+            *child != pinned
+                && consumer_matches(pinned, child)
+                // A nearer pinned ancestor, or the child's own pin, replaces it.
+                && self
+                    .consumers
+                    .iter()
+                    .filter(|(name, policy)| {
+                        policy.pin.is_some() && !is_slot(name) && consumer_matches(name, child)
+                    })
+                    .max_by_key(|(name, _)| crate::config_policy::consumer_specificity(name))
+                    .is_some_and(|(name, _)| name == pinned)
+        })
     }
 }

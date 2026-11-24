@@ -282,12 +282,15 @@ fn old_shape_is_refused_even_when_empty_or_null() {
         json!({"model_routing": {}}),
         json!({"model_routing": null}),
         json!({"account_selection": {"enabled": false}}),
-        json!({"pins": {}}),
         json!({"score_alias": {}}),
     ] {
         let error = parse_config(&value.to_string()).unwrap_err();
         assert!(error.contains(crate::config_convert::COMMAND), "{error}");
     }
+    // The converter cannot convert a top-level pins object, so the loader
+    // names the manual move instead of sending the operator to it.
+    let error = parse_config(&json!({"pins": {}}).to_string()).unwrap_err();
+    assert!(error.contains("config_key_moved: pins"), "{error}");
 }
 
 #[test]
@@ -853,4 +856,64 @@ fn converter_dropped_scoped_policy_entry_changes_v1_document_and_policy() {
     assert_ne!(converted["models"], converted_without["models"]);
     assert!(converted_without["models"].get("p/m").is_none());
     assert!(config(converted_without).route_allowed(consumer, "p/m", true));
+}
+
+#[test]
+fn consumer_exclusion_groups_agree_with_the_route_rule_for_nested_model_entries() {
+    use striatum_core::provider_model_spec::{parse_spec_list, resolve_spec};
+    let mason = "prefrontal-core.mason";
+    let sidekick = "prefrontal-core.sidekick";
+    let models = [
+        // Mason may not use model m, except its v variant.
+        json!({"p/m": {"not_for": [mason]}, "p/m/v": {"not_for": []}}),
+        json!({"p/m": {"only_for": [sidekick]}, "p/m/v": {"only_for": [mason]}}),
+        // The variant's only_for admits Mason, but it inherits m's not_for.
+        json!({"p/m": {"not_for": [mason]}, "p/m/v": {"only_for": [mason]}}),
+        json!({"p/m": {"only_for": [mason]}, "p/m/v": {"not_for": [sidekick]}}),
+    ];
+    let providers = [
+        json!({}),
+        json!({"p": {"not_for": [mason]}}),
+        json!({"p": {"only_for": [sidekick]}}),
+    ];
+    for models in &models {
+        for providers in &providers {
+            let config = config(json!({"providers": providers, "models": models}));
+            for consumer in [mason, "prefrontal-core.mason.review", sidekick] {
+                let exclusions = config.consumer_exclusions(consumer);
+                let specs = parse_spec_list(&exclusions);
+                for route in ["p/m", "p/m/v", "p/m/v/x", "p/m/w", "p/n"] {
+                    assert_eq!(
+                        resolve_spec(&specs, route, false),
+                        !config.route_allowed(consumer, route, true),
+                        "{consumer} on {route}: providers {providers} models {models} group {exclusions:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn inherited_consumer_pin_refused_for_a_named_dotted_child_is_refused_at_load() {
+    let document = |consumers: serde_json::Value, not_for: &str| {
+        json!({"consumers": consumers, "models": {"p/m": {"not_for": [not_for]}}}).to_string()
+    };
+    let pinned = json!({"mc": {"pin": {"model": "p/m"}}});
+    let error = validate_document(&document(pinned.clone(), "mc.dream")).unwrap_err();
+    assert!(
+        error.contains("consumers.mc.pin") && error.contains("\"mc.dream\""),
+        "{error}"
+    );
+    // A pin nearer the child replaces the inherited one.
+    for consumers in [
+        json!({"mc": {"pin": {"model": "p/m"}}, "mc.dream": {"pin": {"model": "q/n"}}}),
+        json!({"mc": {"pin": {"model": "p/m"}}, "mc.dream": {"pin": {"model": "q/n"}}, "mc.dream.deep": {}}),
+    ] {
+        validate_document(&document(consumers.clone(), "mc.dream")).unwrap();
+        validate_document(&document(consumers, "mc.dream.deep")).unwrap();
+    }
+    // A rule naming a consumer outside the pinned branch cannot refuse it.
+    validate_document(&document(pinned.clone(), "other.dream")).unwrap();
+    validate_document(&document(pinned, "mcx.dream")).unwrap();
 }

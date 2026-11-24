@@ -303,6 +303,16 @@ struct Driver {
     report: Option<ConfigAppliedRequest>,
 }
 
+#[derive(PartialEq)]
+enum Report {
+    /// Nothing was waiting, or the daemon accepted the report.
+    Sent,
+    /// The daemon asked for the report again later; it is kept.
+    Held,
+    /// The report could not be delivered and was dropped.
+    Failed,
+}
+
 impl Driver {
     fn finish_wait(&mut self, result: Result<(), ModuleError>) {
         if let Some(ready) = self.ready.take() {
@@ -314,7 +324,7 @@ impl Driver {
     }
 
     async fn refresh(&mut self) {
-        if !self.send_report().await {
+        if self.send_report().await == Report::Held {
             return;
         }
         let reply = self.get_with_retry(&mut RetryDelay::new()).await;
@@ -411,19 +421,24 @@ impl Driver {
         Ok(())
     }
 
-    async fn send_report(&mut self) -> bool {
+    async fn send_report(&mut self) -> Report {
         let Some(report) = self.report.take() else {
-            return true;
+            return Report::Sent;
         };
         match self.call(CONFIG_APPLIED_OP, &report).await {
-            Ok(_) => true,
+            Ok(_) => Report::Sent,
             Err(error) => {
+                log_error(CONFIG_APPLIED_OP, &error);
                 if matches!(&error, ConfigError::Refused(refusal) if refusal.code == "anchor_pending")
                 {
                     self.report = Some(report);
+                    Report::Held
+                } else {
+                    // Dropped as before, but the refresh still fetches: an
+                    // early return would lose the change notice that started
+                    // it until the daemon sent another.
+                    Report::Failed
                 }
-                log_error(CONFIG_APPLIED_OP, &error);
-                false
             }
         }
     }

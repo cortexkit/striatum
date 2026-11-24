@@ -32,6 +32,8 @@ struct State {
     gets: BTreeMap<String, usize>,
     reports: Vec<ConfigAppliedRequest>,
     report_bytes: Vec<Vec<u8>>,
+    report_attempts: usize,
+    report_refusal: Option<String>,
     global_gets: usize,
     describes: usize,
     module_describes: usize,
@@ -167,9 +169,14 @@ impl Daemon {
                                 continue;
                             }
                             CONFIG_APPLIED_OP => {
+                                state.report_attempts += 1;
+                                if let Some(code) = state.report_refusal.clone() {
+                                    response(&request, FrameType::Error, crate::ErrorBody::new(&code, "report refused"))
+                                } else {
                                 state.reports.push(serde_json::from_value(value).unwrap());
                                 state.report_bytes.push(request.body.to_vec());
                                 response(&request, kind, ConfigAppliedReply::new())
+                                }
                             }
                             op => panic!("unexpected settings request: {op}"),
                         }
@@ -271,6 +278,28 @@ impl Daemon {
 
     pub(crate) fn reports(&self) -> Vec<ConfigAppliedRequest> {
         self.state.lock().unwrap().reports.clone()
+    }
+
+    /// Serve this view to global `config.get` requests from now on.
+    pub(crate) fn set_global(&self, view: ConfigView) {
+        self.state.lock().unwrap().global = Some(view);
+    }
+
+    /// Answer every later `config.applied` with this error code, or accept
+    /// reports again with `None`.
+    pub(crate) fn refuse_reports(&self, code: Option<&str>) {
+        self.state.lock().unwrap().report_refusal = code.map(str::to_owned);
+    }
+
+    pub(crate) fn report_attempts(&self) -> usize {
+        self.state.lock().unwrap().report_attempts
+    }
+
+    /// Send a global change notice without waiting for routing to fetch.
+    pub(crate) fn notify_global_changed(&self) {
+        self.hints
+            .send(frame(FrameType::Push, 0, ConfigChanged::new(0, vec![])))
+            .unwrap();
     }
 
     pub(crate) fn report_bytes(&self) -> Vec<Vec<u8>> {
