@@ -262,6 +262,54 @@ fn decision_grades(catalog: &mut Value) {
     catalog["models"][CLEF]["quality.grade.decision"] = json!(100);
 }
 
+// Captured from Broca's classifier routed path, 24 Nov.
+#[tokio::test]
+async fn broca_classifier_routed_select_body() {
+    let harness = rig(
+        |catalog| {
+            decision_grades(catalog);
+            catalog["models"][FLASH]["quality.grade.decision"] = json!(20);
+        },
+        |_| {},
+    );
+    harness.edit_config(|config| config["consumers"]["classifier"] = json!({"owner":"broca"}));
+    let route = harness.bind(reserved("broca"), None).await;
+    let body = br#"{"consumer":"broca.classifier.basal","requirements":{"context_window":563,"input_tokens":563,"iq":0,"max_cost_usd":1.0,"questions":1},"runners":["broca"]}"#;
+    let (frame, bytes) = route.call_raw_params("route.select", body).await;
+    println!(
+        "Broca case 1 reply: {}",
+        std::str::from_utf8(&bytes).unwrap()
+    );
+    let reply: Value = serde_json::from_slice(&bytes).unwrap();
+    let answer = result((frame, reply));
+    assert_eq!(route_key(&answer), FLASH);
+    assert!(answer["decision_id"]
+        .as_str()
+        .is_some_and(|id| !id.is_empty()));
+    assert!(!answer["price"].is_null(), "{answer}");
+
+    let mut params: Value = serde_json::from_slice(body).unwrap();
+    params["pin"] = json!(JEV);
+    assert_eq!(
+        route_key(&result(route.call("route.select", &params).await)),
+        JEV
+    );
+
+    params.as_object_mut().unwrap().remove("pin");
+    params["requirements"]["iq"] = json!(50);
+    assert_eq!(
+        route_key(&result(route.call("route.select", &params).await)),
+        CLEF
+    );
+
+    params["requirements"]["iq"] = json!(0);
+    params["consumer"] = json!("classifier");
+    let (frame, reply) = route.call("route.select", &params).await;
+    assert_eq!(frame, FrameType::Error, "{reply}");
+    assert_eq!(reply["code"], "no_route", "{reply}");
+    assert_eq!(reply["detail"]["reason"], "harness_unavailable", "{reply}");
+}
+
 #[tokio::test]
 async fn decision_grades_filter_automatic_picks_but_not_pins_or_the_settings_ladder() {
     let harness = rig(decision_grades, |_| {});
