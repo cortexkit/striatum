@@ -183,7 +183,7 @@ pub(crate) fn choices_for_harness_with_effort_detail(
             json!({"catalog_version": catalog_version, "runner_module": module, "models": []}),
         );
     };
-    let reasoning = store.reasoning_catalog().map_err(store_error)?;
+    let reasoning = serving_catalog.reasoning.as_deref().ok_or_else(not_ready)?;
     let providers = facts.iter().collect();
     let subscription_specs = &config.compiled_routing_policy().subscription;
     let mut grouped: BTreeMap<(&str, &str), Vec<&ModelFact>> = BTreeMap::new();
@@ -254,7 +254,7 @@ pub(crate) fn choices_for_harness_with_effort_detail(
             config.route_allowed_with_default("head", &route, pinned, !class.subscription)
                 && registry.runs(module, &route, &capacity)
         };
-        let published = variant_policy::published(&reasoning, &aliases, provider, model);
+        let published = variant_policy::published(reasoning, &aliases, provider, model);
         let mut variants = match published {
             Some(PublishedEfforts::Published(values)) => values.clone(),
             _ => rows.iter().filter_map(|row| row.variant.clone()).collect(),

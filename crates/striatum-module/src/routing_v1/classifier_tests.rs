@@ -415,7 +415,20 @@ async fn decision_bar_stays_put_during_a_route_cooldown() {
         .await;
     assert_eq!(frame, FrameType::Error, "{reply}");
     assert_eq!(reply["code"], "no_route", "{reply}");
-    assert_eq!(reply["detail"]["reason"], "no_available_model", "{reply}");
+    assert_eq!(reply["detail"]["reason"], "quota_or_cooldown", "{reply}");
+    let rejected = reply["detail"]["rejected"].as_array().unwrap();
+    assert!(
+        rejected
+            .iter()
+            .any(|row| row["routeKey"] == CLEF && row["reason"] == "cooldown_active"),
+        "{reply}"
+    );
+    assert!(
+        rejected
+            .iter()
+            .all(|row| !row["routeKey"].as_str().unwrap().starts_with("anthropic/")),
+        "{reply}"
+    );
 }
 
 #[tokio::test]

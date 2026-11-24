@@ -865,23 +865,43 @@ fn select_panel_admitted_inner(
         ..Default::default()
     };
     let availability_label = input.availability_label.clone();
+    let reset_facts = std::cell::OnceCell::new();
     causes.extend(admission.rejected.into_iter().map(|rejected| {
         // Use the same merged route/capacity deadlines as admission. Display text
         // may change independently, and must not become a retry protocol.
-        let reset_at_ms = considered_facts
-            .iter()
-            .map(crate::model_facts::fact_to_route)
-            .find(|route| route.route_key == rejected.route_key)
-            .map(|route| {
-                crate::model_router::merged_runtime_state(&route, input.runtime_snapshot.as_ref())
-            })
-            .and_then(|runtime| match rejected.reason.as_str() {
-                "quota_exhausted" => runtime.quota_exhausted_until,
-                "cooldown_active" => runtime.cooldown_until,
-                _ => None,
-            })
-            .filter(|until| until.is_finite() && *until > 0.0)
-            .map(|until| until.ceil() as i64);
+        let reset_at_ms = matches!(
+            rejected.reason.as_str(),
+            "quota_exhausted" | "cooldown_active"
+        )
+        .then(|| {
+            reset_facts
+                .get_or_init(|| {
+                    let mut by_key = HashMap::new();
+                    for fact in &considered_facts {
+                        let key = crate::model_facts::make_route_key(
+                            &fact.provider_id,
+                            &fact.model_id,
+                            fact.variant.as_deref(),
+                        );
+                        by_key.entry(key).or_insert(fact);
+                    }
+                    by_key
+                })
+                .get(&rejected.route_key)
+        })
+        .flatten()
+        .and_then(|fact| {
+            let route = crate::model_facts::fact_to_route(fact);
+            let runtime =
+                crate::model_router::merged_runtime_state(&route, input.runtime_snapshot.as_ref());
+            if rejected.reason == "quota_exhausted" {
+                runtime.quota_exhausted_until
+            } else {
+                runtime.cooldown_until
+            }
+        })
+        .filter(|until| until.is_finite() && *until > 0.0)
+        .map(|until| until.ceil() as i64);
         PanelCause {
             reason: match rejected.reason.as_str() {
                 "decommissioned" => PanelCauseReason::Decommissioned,
@@ -1389,14 +1409,22 @@ fn select_panel_admitted_inner(
         sibling_collapses,
     });
 
+    let eligible_keys: HashSet<_> = eligible
+        .iter()
+        .map(|c| c.route.route_key.as_str())
+        .collect();
     let mut quality_candidates = considered_facts
         .iter()
         .filter(|fact| !fact.decommissioned)
         .map(|fact| {
-            let route_key = crate::model_facts::fact_to_route(fact).route_key;
+            let key = crate::model_facts::make_route_key(
+                &fact.provider_id,
+                &fact.model_id,
+                fact.variant.as_deref(),
+            );
             crate::model_router::CandidateQualityScore::from_fact(
                 fact,
-                eligible.iter().any(|c| c.route.route_key == route_key),
+                eligible_keys.contains(key.as_str()),
             )
         })
         .collect::<Vec<_>>();
@@ -1432,6 +1460,87 @@ fn reserved_headroom_reset_at_ms(runtime: &crate::model_router::RouteRuntimeStat
 #[cfg(test)]
 mod reset_tests {
     use super::*;
+
+    #[test]
+    fn panel_static_rejections_do_not_copy_the_catalog_for_each_rejection() {
+        use crate::model_facts::FACT_TO_ROUTE_CALLS;
+        use sha2::{Digest, Sha256};
+        let example = crate::model_facts_seed::model_facts_seed()
+            .iter()
+            .find(|fact| {
+                !fact.decommissioned
+                    && fact.score_provenance != crate::ScoreProvenance::Unscored
+                    && fact.model_kind.is_none()
+            })
+            .unwrap();
+        let facts: Vec<_> = (0..1000)
+            .map(|i| {
+                let mut fact = example.clone();
+                fact.provider_id = "p".into();
+                fact.model_id = format!("model-{i:04}");
+                fact.variant = None;
+                fact.family = Some(format!("family-{i}"));
+                fact
+            })
+            .collect();
+        let now = 1_800_000_000_000.0;
+        let mut snapshot = ModelRouteStateSnapshot {
+            now,
+            ..Default::default()
+        };
+        snapshot
+            .by_route
+            .entry("p/model-0999".into())
+            .or_default()
+            .cooldown_until = Some(now + 1_000.0);
+        FACT_TO_ROUTE_CALLS.with(|count| count.set(0));
+        let panel = select_panel(SelectPanelInput {
+            package_tokens: None,
+            panel_spec: PanelSpec {
+                class: PanelClass::Audit,
+                size: 3,
+                iq_floor: 0.0,
+                diversity: PanelDiversity::Family,
+                temperature_spread: None,
+            },
+            selection: PanelSelection::NPick,
+            roster: Vec::new(),
+            available_models: facts
+                .iter()
+                .skip(900)
+                .map(|fact| make_capacity_key(&fact.provider_id, &fact.model_id))
+                .collect(),
+            facts,
+            runtime_snapshot: Some(snapshot),
+            exclude_route_keys: Vec::new(),
+            operator_exclude_keys: Vec::new(),
+            required_capabilities: None,
+            availability_substrate: AvailabilitySubstrate::Host,
+            availability_label: "host".into(),
+            is_subscription_route: None,
+        })
+        .unwrap();
+        assert_eq!(panel.members.len(), 3);
+        assert!(panel
+            .rejected_causes
+            .iter()
+            .any(|cause| cause.model == "p/model-0999"
+                && cause.reset_at_ms == Some(now as i64 + 1_000)));
+        let digest = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&(&panel, &panel.rejected_causes)).unwrap())
+        );
+        assert_eq!(
+            digest,
+            "a5fe7776d3bb4348b8342fa5db56390b6cba9d95d75534b42af44d71a5fdec7c"
+        );
+        let calls = FACT_TO_ROUTE_CALLS.with(|count| count.get());
+        println!("panel_fact_copies={calls}; diagnostic_sha256={digest}");
+        assert!(
+            calls < 10_000,
+            "{calls} full route copies; diagnostic bytes sha256={digest}"
+        );
+    }
 
     #[test]
     fn reserved_headroom_shortfall_retains_earliest_known_weekly_reset() {
@@ -1652,14 +1761,14 @@ fn collapse_siblings(
         .map(|fact| make_capacity_key(&fact.provider_id, &fact.model_id))
         .collect();
     let mut groups: Vec<(String, Vec<Candidate>)> = Vec::new();
-
+    let mut indices = HashMap::new();
     for candidate in candidates {
         let group_key = sibling_group_key(&candidate.route, &capacity_keys);
-        if let Some((_, group)) = groups.iter_mut().find(|(key, _)| *key == group_key) {
-            group.push(candidate);
-        } else {
-            groups.push((group_key, vec![candidate]));
-        }
+        let index = *indices.entry(group_key.clone()).or_insert_with(|| {
+            groups.push((group_key, Vec::new()));
+            groups.len() - 1
+        });
+        groups[index].1.push(candidate);
     }
 
     let mut collapsed_candidates = Vec::new();

@@ -6057,7 +6057,7 @@ fn selection_step(
             false,
             "decision",
         ) {
-            Ok(crate::account_selection::ProbeBinding::Bound) => "Ok(Bound)".into(),
+            Ok(crate::account_selection::ProbeBinding::Bound(_)) => "Ok(Bound)".into(),
             Ok(crate::account_selection::ProbeBinding::Lost { retry_at }) => {
                 format!("Ok(Lost {{ retry_at: {retry_at} }})")
             }

@@ -232,6 +232,65 @@ async fn speed_twin_pin_matches_base_pin_with_explicit_tier() {
     }
 }
 
+#[tokio::test]
+async fn project_pin_recognizes_speed_twin_and_uses_its_tier() {
+    let _clock = crate::InjectedClock::set(NOW);
+    const TWIN: &str = "openai/gpt-6.1-sol-highspeed";
+    let (harness, credentials) = setup(&["pro_200"], true, false);
+    let mut catalog = served()["catalog.get — provider default endpoint"]["response"].clone();
+    catalog["models"][TWIN] = json!({
+        "existence":"present", "model.mode_of":{"mode":"fast", "model_id":MODEL}
+    });
+    let snapshot = crate::fusiform_catalog::decode_catalog_get(catalog.to_string()).unwrap();
+    let (facts, cursor) = snapshot.parts();
+    harness
+        .store()
+        .apply_fusiform_catalog(facts, cursor)
+        .unwrap();
+    harness.set_credentials(credentials);
+    harness.edit_config(|config| {
+        config["consumers"]["mason"]["projects"]["review-project"] = json!({"pin":TWIN});
+    });
+    let route = harness
+        .bind(reserved("tier-owner"), Some("review-project"))
+        .await;
+    let (ty, reply) = route
+        .call(
+            "route.select",
+            &json!({"consumer":"mason","requirements":{"iq":30}}),
+        )
+        .await;
+    assert_eq!(ty, FrameType::Response, "{reply}");
+    assert_eq!(
+        reply["result"]["route"],
+        json!({"provider":"openai", "model":MODEL})
+    );
+    assert_eq!(reply["result"]["service_tier_chosen"], "fast");
+    assert!(reply["result"]["explanation"]
+        .as_str()
+        .unwrap()
+        .contains("the project's operator pin"));
+
+    let (ty, fallback) = route
+        .call(
+            "route.select",
+            &json!({
+                "consumer":"mason", "requirements":{"iq":30},
+                "pin":"openai/not-in-the-catalog", "pin_fallback":"route", "service_tier":"standard"
+            }),
+        )
+        .await;
+    assert_eq!(ty, FrameType::Error, "{fallback}");
+    assert_eq!(
+        serde_json::to_vec(&fallback).unwrap(),
+        serde_json::to_vec(&json!({
+            "code":"pin_unavailable", "detail":{"pin":TWIN,"reason":"unknown_model"},
+            "message":"the pin \"openai/gpt-6.1-sol-highspeed\" cannot be served: unknown_model"
+        }))
+        .unwrap()
+    );
+}
+
 fn account_request(id: &str, tier: Option<&str>) -> Value {
     let mut request = json!({
         "provider":"openai", "model":MODEL, "conversation_key":id, "admission_id":id,
