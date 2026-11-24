@@ -205,6 +205,7 @@ pub(crate) fn read(conn: &Connection) -> rusqlite::Result<Vec<FenceRecheck>> {
             reset_check_at: row.get(12)?,
             last_claimed_at: row.get(13)?,
             claim_owner: row.get(14)?,
+            early_billing_probe: false,
             cleared_models: Vec::new(),
         })
     })?;
@@ -318,6 +319,7 @@ pub(crate) fn read_effective_at(
             }),
             last_claimed_at,
             claim_owner: None,
+            early_billing_probe: false,
             cleared_models: Vec::new(),
         });
     }

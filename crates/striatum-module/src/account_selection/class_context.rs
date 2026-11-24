@@ -1523,7 +1523,7 @@ impl ClassContext {
             // The command's own fences, not the context's: a block
             // recorded after the context was read is claimed too.
             let fences = load_fences(&*tx, provider)?;
-            let origins: Vec<_> = tx
+            let mut origins: Vec<_> = tx
                 .fence_rechecks()?
                 .into_iter()
                 .filter(|origin| {
@@ -1542,6 +1542,7 @@ impl ClassContext {
             // claim, because the claim names only the chosen origins.
             tx.check_decision_inputs(&[provider, ""])?;
             let retry_at = origins.iter().map(|origin| origin.next_recheck_at).max();
+            context.mark_early_billing_probes(&mut origins);
             let claimed = tx.bind_decision_probe(
                 &origins,
                 &owner,
@@ -2026,7 +2027,9 @@ impl ClassContext {
             return true;
         }
         let owned = self.probe_owner.is_some() && origin.claim_owner == self.probe_owner;
-        (self.recheck_at(origin, account, model) <= self.now_ms || owned)
+        (self.recheck_at(origin, account, model) <= self.now_ms
+            || owned
+            || self.legacy_billing_credit_probe(origin))
             && (!origin.quota || !self.origin_has_binding_reading(origin, account))
     }
 
@@ -3065,7 +3068,7 @@ impl ClassContext {
             // Whether the launch must pin its credential, on the clocks this
             // command decides on.
             let pin = context.needs_credential_pin_with(&all, provider, model);
-            let origins: Vec<_> = all
+            let mut origins: Vec<_> = all
                 .into_iter()
                 .filter(|origin| {
                     context.origin_applies_with(
@@ -3095,6 +3098,7 @@ impl ClassContext {
                     )
                 } else {
                     origin.due_at() <= context.now_ms
+                        || context.legacy_billing_credit_probe(origin)
                         || owner.is_some() && origin.claim_owner.as_deref() == owner
                 }
             };
@@ -3115,6 +3119,7 @@ impl ClassContext {
                     ),
                 }));
             }
+            context.mark_early_billing_probes(&mut origins);
             let lost = || LaunchRefusal::Lost {
                 retry_at: lost_probe_retry_at(&origins, owner, context.now_ms),
             };
@@ -3176,17 +3181,25 @@ impl ClassContext {
         model: &str,
     ) -> striatum_core::accounts::AllocationContext {
         let mut context = striatum_core::accounts::AllocationContext::default();
-        for row in self.credentials.listed_credentials().iter().filter(|row| {
-            self.indexed_origins(provider, self.account_id(row), &row.id, model)
-                .any(|origin| {
-                    self.origin_applies(origin, provider, self.account_id(row), &row.id, model)
-                        && self.indexed_origin_due(origin, self.account_id(row), model)
-                })
-        }) {
-            context.credential_probe_notes.insert(
-                row.id.clone(),
-                crate::credential_fences::probe_note(provider, &row.id),
-            );
+        for row in self.credentials.listed_credentials() {
+            let account = self.account_id(row);
+            let mut due = self
+                .indexed_origins(provider, account, &row.id, model)
+                .filter(|origin| {
+                    self.origin_applies(origin, provider, account, &row.id, model)
+                        && self.indexed_origin_due(origin, account, model)
+                });
+            if let Some(first) = due.next() {
+                context.credential_probe_notes.insert(
+                    row.id.clone(),
+                    crate::credential_fences::probe_note(provider, &row.id),
+                );
+                if self.legacy_billing_credit_probe(first)
+                    && due.all(|origin| self.legacy_billing_credit_probe(origin))
+                {
+                    context.credit_backed_billing_probes.insert(row.id.clone());
+                }
+            }
         }
         let class = self.fact_for(provider, model);
         if let Some(fact) = class {

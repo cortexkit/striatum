@@ -1778,7 +1778,7 @@ fn serve_with_pin_diagnostic(
             break decision;
         };
         let credential = admission.credential_id.clone();
-        let applicable: Vec<_> = origins
+        let mut applicable: Vec<_> = origins
             .iter()
             .filter(|origin| {
                 origin.kind != "principal"
@@ -1881,6 +1881,9 @@ fn serve_with_pin_diagnostic(
             concurrency_gate::Check::Room => {}
             concurrency_gate::Check::Next => continue,
             concurrency_gate::Check::Full => break decision,
+        }
+        if let Some(classes) = &ctx.classes {
+            classes.mark_early_billing_probes(&mut applicable);
         }
         let claim = || {
             let ready = applicable.iter().all(|origin| {

@@ -37,6 +37,8 @@ pub struct FenceRecheck {
     pub reset_check_at: Option<i64>,
     pub last_claimed_at: Option<i64>,
     pub claim_owner: Option<String>,
+    /// Claim-local evidence of positive linked credit, never a stored clock value.
+    pub early_billing_probe: bool,
     pub cleared_models: Vec<String>,
 }
 
@@ -124,6 +126,17 @@ impl FenceRecheck {
         self.reset_check_at.map_or(self.next_recheck_at, |reset| {
             reset.min(self.next_recheck_at)
         })
+    }
+
+    pub fn is_untried_legacy_billing_wall(&self) -> bool {
+        self.kind == "credential"
+            && self.classified
+            && !self.quota
+            && self.console_credit_micros_at_refusal.is_none()
+            && self.claim_owner.is_none()
+            && self.last_claimed_at.is_none()
+            && serde_json::from_str::<(&str, i64)>(&self.evidence)
+                .is_ok_and(|(code, at)| code == "billing_exhausted" && at == self.evidence_at)
     }
 
     pub fn applies(&self, provider: &str, account: &str, credential: &str, model: &str) -> bool {
@@ -476,6 +489,7 @@ impl From<&Block> for FenceRecheck {
             reset_check_at: block.reset_check_at,
             last_claimed_at: block.last_claimed_at,
             claim_owner: block.claim_owner.clone(),
+            early_billing_probe: false,
             cleared_models: block.cleared_models.clone(),
         }
     }
@@ -936,7 +950,15 @@ fn claim_decided(
         } else {
             reset.map_or(next, |reset| reset.min(next)) <= now
         };
-        if !quota && !due && !owned {
+        // The caller saw positive linked credit for this refusal. Use it only
+        // for this claim, not to reschedule a wall on an unchosen credential.
+        let expedited = origin.early_billing_probe
+            && origin.is_untried_legacy_billing_wall()
+            && state.generation == 0
+            && state.owner.is_none()
+            && state.next == origin.next_recheck_at
+            && state.reset == origin.reset_check_at;
+        if !quota && !due && !owned && !expedited {
             return Ok(false);
         }
         if quota && !owned {

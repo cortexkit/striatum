@@ -1,6 +1,6 @@
 //! Provider-independent account policy and per-admission facts.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -45,6 +45,7 @@ pub struct SpendReading {
 pub struct AllocationContext {
     pub fork_parent: Option<ForkParent>,
     pub credential_probe_notes: BTreeMap<String, String>,
+    pub credit_backed_billing_probes: BTreeSet<String>,
     pub hold_ok: Option<bool>,
     pub parent_account_id: Option<String>,
     pub credits: BTreeMap<String, CreditReading>,

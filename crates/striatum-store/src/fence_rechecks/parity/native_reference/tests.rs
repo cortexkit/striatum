@@ -173,6 +173,7 @@ pub(super) fn effective(conn: &Connection, now: i64) -> rusqlite::Result<Vec<Fen
                 reset_check_at: row.get::<_, Option<f64>>(14)?.map(|at| at as i64),
                 last_claimed_at: row.get(15)?,
                 claim_owner: row.get(16)?,
+                early_billing_probe: false,
                 cleared_models,
             })
         })?
