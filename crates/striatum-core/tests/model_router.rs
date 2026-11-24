@@ -4063,9 +4063,9 @@ fn live_band_extra<'a>() -> Extra<'a> {
     }
 }
 
-// The shortlisted Grok route has no separate cache-write rate, but its write
-// tokens now use input pricing. The high rate still clamps its basket cost,
-// leaving Sol as the lower-cost winner across the cutoff.
+// Grok prices cache-write tokens at its input rate because no separate rate
+// is published. Its token basket costs more than the $0.05 per-message
+// reference, and Sol stays cheaper across the quality cutoff.
 #[test]
 fn mason_iq_band_keeps_one_pricing_mode_and_one_winner_across_the_grok_cutoff() {
     let mut grok_shortlisted = Vec::new();
@@ -4093,7 +4093,7 @@ fn mason_iq_band_keeps_one_pricing_mode_and_one_winner_across_the_grok_cutoff() 
         assert!((cost("openai/gpt-6.1-sol").unwrap() - 0.022_013).abs() < 1e-5);
         if let Some(grok) = priced.routes.iter().find(|r| r.route_key == "xai/grok-5") {
             grok_shortlisted.push(iq);
-            assert_eq!(grok.cost, 1.0, "iq {iq}");
+            assert_eq!(grok.cost, 2.475_969_75, "iq {iq}");
             assert!(
                 grok.basket_pricing
                     .as_ref()

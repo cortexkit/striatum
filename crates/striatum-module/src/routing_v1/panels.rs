@@ -652,19 +652,18 @@ async fn replace(
         .into_iter()
         .chain(request.exclude.clone().unwrap_or_default())
         .collect::<Vec<_>>();
-    let families: Vec<_> = state
+    let standing: Vec<_> = state
         .answer
         .seats
         .iter()
         .filter(|s| s.slot != slot)
-        .map(|s| family(s.family.as_deref()))
         .collect();
     let shared = panel_inputs(deps, None)?;
     let (panel, package_blocked, mut rejected, _, _) = candidates(
         &state.request,
         &exclude,
         &state.served_history,
-        &families,
+        &standing,
         caller,
         deps,
         None,
@@ -747,7 +746,7 @@ async fn candidates(
     request: &SelectPanelRequest,
     extra_exclude: &[String],
     served_history: &BTreeSet<String>,
-    standing_families: &[String],
+    standing: &[&PanelSeat],
     caller: &Caller,
     deps: &Deps<'_>,
     dry: Option<&DryRun<'_>>,
@@ -780,7 +779,6 @@ async fn candidates(
     let mut policy =
         config.consumer_policy(&request.consumer, &Default::default(), &consumers.policies);
     let project_runners = layers.runners(&request.consumer, config, policy.runners.as_deref());
-    let has_project_runners = project_runners.is_some();
     if let Some(runners) = project_runners {
         policy.runners = Some(runners);
         policy.runner = None;
@@ -812,31 +810,17 @@ async fn candidates(
     .map_err(store_refusal)?;
     let registry = {
         let credentials = deps.broca_credentials.lock().map_err(store_refusal)?;
-        if has_project_runners {
-            super::runners::Registry::build_for_task(
-                super::runners::RunnerPolicies::for_consumer(config, &policy),
-                &credentials,
-                &prepared.facts,
-                super::now_ms(),
-                request.harness.as_deref(),
-                &request.seat_request(&[]).requirements,
-            )
-        } else {
-            super::runners::Registry::build_for_selection(
-                config.as_ref(),
-                &credentials,
-                &prepared.facts,
-                super::now_ms(),
-                request.harness.as_deref(),
-            )
-        }
+        super::runners::Registry::build_for_task(
+            super::runners::RunnerPolicies::for_consumer(config, &policy),
+            &credentials,
+            &prepared.facts,
+            super::now_ms(),
+            request.harness.as_deref(),
+            &request.seat_request(&[]).requirements,
+        )
     };
-    let entries = if has_project_runners {
-        registry.task_policies()
-    } else {
-        registry.policies()
-    };
-    let runners: Vec<_> = entries
+    let runners: Vec<_> = registry
+        .task_policies()
         .into_iter()
         .filter(|r| {
             request
@@ -844,21 +828,13 @@ async fn candidates(
                 .as_ref()
                 .is_none_or(|names| names.contains(&r.module))
                 && policy.runner.as_ref().is_none_or(|name| name == &r.module)
-                && if has_project_runners {
-                    registry.get(r).is_some_and(|entry| {
-                        super::runners::placements::usable(r, entry.wire_declaration())
-                            && request.harness.as_ref().is_none_or(|harness| {
-                                r.harness.as_ref().is_none_or(|bound| bound == harness)
-                                    && entry.harnesses.contains(harness)
-                            })
-                    })
-                } else {
-                    request.harness.as_ref().is_none_or(|harness| {
-                        registry
-                            .get(&r.module)
-                            .is_some_and(|entry| entry.harnesses.contains(harness))
-                    })
-                }
+                && registry.get(r).is_some_and(|entry| {
+                    super::runners::placements::usable(r, entry.wire_declaration())
+                        && request.harness.as_ref().is_none_or(|harness| {
+                            r.harness.as_ref().is_none_or(|bound| bound == harness)
+                                && entry.harnesses.contains(harness)
+                        })
+                })
         })
         .collect();
     let tier_consumer = request
@@ -868,16 +844,13 @@ async fn candidates(
         .unwrap_or(&request.consumer);
     let unprojected_snapshot = prepared.snapshot.clone();
     if let Some(classes) = &mut priced.classes {
+        let tiers = layers.tier_resolver(&config, tier_consumer);
         classes.apply_configured_service_tiers(
             &mut prepared.facts,
             |fact| {
-                layers.resolve(
-                    &config,
-                    tier_consumer,
-                    &fact.provider_id,
-                    &fact.model_id,
-                    request.service_tier,
-                )
+                request
+                    .service_tier
+                    .or_else(|| tiers.resolve(&fact.provider_id, &fact.model_id))
             },
             &runners,
             &registry,
@@ -888,6 +861,24 @@ async fn candidates(
     }
     let required = request.requirements.as_ref();
     let mut facts = prepared.facts;
+    let stored_ids = deps
+        .store
+        .canonical_ids_by_route_key()
+        .map_err(store_refusal)?;
+    let canonical_id =
+        |key: &str| stored_ids.get(&striatum_core::score_alias::catalog_key(aliases, key));
+    let standing_families: HashSet<_> = standing
+        .iter()
+        .map(|seat| family(seat.family.as_deref()))
+        .collect();
+    let standing_models: HashSet<_> = standing
+        .iter()
+        .filter_map(|seat| {
+            let route = &seat.answer.route;
+            canonical_id(&route.pin()).or_else(|| canonical_id(&route.route_key()))
+        })
+        .filter(|id| !id.trim().is_empty())
+        .collect();
     let mut rejected = Vec::new();
     facts.retain(|fact| {
         // Keep withdrawn facts until core admission can count their rejection
@@ -930,6 +921,11 @@ async fn candidates(
                 "family_duplicate",
                 "family is already represented by a standing seat",
             ))
+        } else if canonical_id(&route.route_key).is_some_and(|id| standing_models.contains(id)) {
+            Some((
+                "model_duplicate",
+                "the canonical model is already represented by a standing seat",
+            ))
         } else if !request
             .available_routes
             .as_ref()
@@ -939,13 +935,10 @@ async fn candidates(
                 "unavailable",
                 "route is not in the request's available_routes",
             ))
-        } else if !runners.iter().any(|r| {
-            if has_project_runners {
-                registry.runs(r, &route.route_key, &route.capacity_key)
-            } else {
-                registry.runs(&r.module, &route.route_key, &route.capacity_key)
-            }
-        }) {
+        } else if !runners
+            .iter()
+            .any(|r| registry.runs(r, &route.route_key, &route.capacity_key))
+        {
             Some((
                 "unavailable",
                 "no eligible requested runner serves this route",
@@ -1024,8 +1017,17 @@ async fn candidates(
                     variant: pin.variant.clone(),
                 }),
         },
-        canonical_ids: crate::panel_canonical_ids(deps.store, &facts, &aliases)
-            .map_err(store_refusal)?,
+        canonical_ids: facts
+            .iter()
+            .filter_map(|fact| {
+                let key = striatum_core::make_route_key(
+                    &fact.provider_id,
+                    &fact.model_id,
+                    fact.variant.as_deref(),
+                );
+                canonical_id(&key).map(|id| (key, id.clone()))
+            })
+            .collect(),
     };
     let families: HashMap<_, _> = facts
         .iter()

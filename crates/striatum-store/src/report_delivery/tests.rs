@@ -298,6 +298,49 @@ fn inconclusive_v1_reports_release_only_their_non_quota_probe_claim() {
     }
 }
 
+#[test]
+fn an_older_report_cannot_replace_a_newer_non_quota_wall() {
+    let store = SqliteRouteStateStore::open(&descriptor()).unwrap();
+    for (id, received, deadline) in [("new", 1_100, 601_100), ("old", 1_000, 61_000)] {
+        seed(&store, id, "p");
+        store
+            .v1_commit_report(
+                id,
+                "outcome",
+                &format!("report:{id}"),
+                &V1Recorded {
+                    body_json: "{}".into(),
+                    answer_json: "{}".into(),
+                },
+                RouteOutcome::Error,
+                Some("upstream_reset"),
+                true,
+                &V1ReportEffects {
+                    non_quota_route_fence: Some(AccountRouteFence {
+                        provider: "example".into(),
+                        credential_id: "key".into(),
+                        model: "model".into(),
+                        until_ms: deadline,
+                        recorded_at: received,
+                        decision_id: id.into(),
+                    }),
+                    ..Default::default()
+                },
+                None,
+                |_| Ok(()),
+                received,
+            )
+            .unwrap()
+            .unwrap();
+    }
+    let walls = store.non_quota_account_route_fences(1_100).unwrap();
+    assert_eq!(walls.len(), 1);
+    assert_eq!(
+        (walls[0].until_ms, walls[0].decision_id.as_str()),
+        (601_100, "new")
+    );
+}
+
 fn seed(store: &SqliteRouteStateStore, id: &str, principal: &str) {
     store
         .seed_preupgrade_decision_for_test(

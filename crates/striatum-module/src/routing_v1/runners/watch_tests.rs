@@ -32,6 +32,8 @@ struct DaemonState {
     watch_up: AtomicBool,
     block_describe: AtomicBool,
     slow_runner: AtomicBool,
+    classifier: AtomicBool,
+    classifier_describes: AtomicUsize,
     catalog_fails: AtomicBool,
     lists: AtomicUsize,
     watches: AtomicUsize,
@@ -120,7 +122,7 @@ async fn serve(
                 match body["op"].as_str() {
                     Some("server.describe") => reply(&mut stream, &request, FrameType::Response,
                         json!({"op":"server.describe","protocol_ver":1,"subc_ops":[],
-                            "capabilities":["route-close-reasons/v1"],"connected_clients":1})).await,
+                            "capabilities":["route-close-reasons/v1",subc_protocol::scope::CAP_ROUTE_ROLE_VERSIONS_V1],"connected_clients":1})).await,
                     Some("catalog.list") => {
                         let mut modules = modules(state.declared.load(Ordering::SeqCst));
                         if state.slow_runner.load(Ordering::SeqCst) {
@@ -128,6 +130,14 @@ async fn serve(
                             slow["module_id"] = json!(SLOW_RUNNER);
                             slow["spawn"] = json!(8);
                             modules.as_array_mut().unwrap().push(slow);
+                        }
+                        if state.classifier.load(Ordering::SeqCst) {
+                            modules.as_array_mut().unwrap().push(json!({
+                                "module_id":"classifier", "nonce_verified":true, "first_party":true,
+                                "incarnation":"daemon-a", "spawn":9,
+                                "roles":[], "control_ops":[],
+                                "capabilities":{"provides":["classifier/v1"]}
+                            }));
                         }
                         if state.catalog_fails.load(Ordering::SeqCst) {
                             reply(&mut stream, &request, FrameType::Error,
@@ -151,7 +161,11 @@ async fn serve(
                         }
                     }
                     Some("route.open") => {
-                        let channel = if body["target"]["module_id"] == SLOW_RUNNER { 8 } else { 7 };
+                        let channel = match body["target"]["module_id"].as_str() {
+                            Some(SLOW_RUNNER) => 8,
+                            Some("classifier") => 9,
+                            _ => 7,
+                        };
                         reply(&mut stream, &request, FrameType::Response,
                             json!({"op":"route.open","route_channel":channel,"route_epoch":3,
                                 "target":{"first_party":true,"kind":"spawn","incarnation":"daemon-a",
@@ -159,6 +173,15 @@ async fn serve(
                     }
                     Some("route.close") => reply(&mut stream, &request, FrameType::Response,
                         json!({"op":"route.close"})).await,
+                    _ if body["method"] == "role.describe" && request.header.channel == 9 => {
+                        let count = state.classifier_describes.fetch_add(1, Ordering::SeqCst);
+                        let value = if count == 0 {
+                            json!({"result":{"role":"classifier/v1","models":17}})
+                        } else {
+                            serde_json::from_slice(include_bytes!("../../../tests/fixtures/classifier-describe.reply.json")).unwrap()
+                        };
+                        reply(&mut stream, &request, FrameType::Response, value).await;
+                    }
                     _ if body["method"] == "role.describe" && request.header.channel == 8 => {
                         state.slow_describes.fetch_add(1, Ordering::SeqCst);
                     }
@@ -496,4 +519,34 @@ async fn runner_describe_misses_do_not_reconnect_or_reprobe_healthy_runners() {
         "a failed catalog exchange did not reconnect",
     )
     .await;
+}
+
+#[tokio::test]
+async fn malformed_classifier_describe_retries_without_a_catalog_push() {
+    let rig = Rig::new("watch-classifier-retry").await;
+    rig.state.classifier.store(true, Ordering::SeqCst);
+    rig.push(vec![2]);
+    until(
+        || rig.state.classifier_describes.load(Ordering::SeqCst) == 1,
+        Duration::from_secs(3),
+        "the attested classifier was not queried",
+    )
+    .await;
+    let lists = rig.state.lists.load(Ordering::SeqCst);
+    let credentials = rig.harness.credentials();
+    until(
+        || {
+            credentials
+                .lock()
+                .unwrap()
+                .classifier_models
+                .get("classifier")
+                .is_some_and(|models| !models.is_empty())
+        },
+        Duration::from_secs(5),
+        "the invalid classifier model list did not get a per-module retry",
+    )
+    .await;
+    assert_eq!(rig.state.classifier_describes.load(Ordering::SeqCst), 2);
+    assert_eq!(rig.state.lists.load(Ordering::SeqCst), lists);
 }

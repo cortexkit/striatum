@@ -139,15 +139,15 @@ impl DescribeCache {
         value: Option<&Value>,
         credentials: &mut BrocaCredentials,
         now: i64,
-    ) {
+    ) -> bool {
         if !self.modules.contains(module) {
-            return;
+            return false;
         }
         if let Some(value) = value {
             if value.get("result").unwrap_or(value)["role"] != "classifier/v1" {
                 dropped(module, "*", "wrong_describe_role", now);
                 self.revoke(module, credentials);
-                return;
+                return true;
             }
             for model in value.get("result").unwrap_or(value)["models"]
                 .as_array()
@@ -165,7 +165,9 @@ impl DescribeCache {
                 }
             }
         }
-        if let Some(models) = value.and_then(models_from_describe) {
+        let models = value.and_then(models_from_describe);
+        let valid = models.is_some();
+        if let Some(models) = models {
             credentials
                 .classifier_models
                 .insert(module.to_owned(), models);
@@ -175,6 +177,7 @@ impl DescribeCache {
             crate::warn_operator(format!("couldn't read the classifier model list; keeping the last good list for up to five minutes, then offering none module={module:?} suppressed={suppressed}"));
         }
         self.expire(credentials, now);
+        valid
     }
 
     pub(crate) fn expire(&self, credentials: &mut BrocaCredentials, now: i64) {

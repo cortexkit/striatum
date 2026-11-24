@@ -447,6 +447,38 @@ refusal_case!(
 );
 
 #[test]
+fn flat_pins_are_refused_by_the_loader_and_converter_instead_of_dropped() {
+    let moved = "config_key_moved: pins; move each pin to consumers.<slot>.pin";
+    for document in [
+        r#"{"pins":{"spec_designer":{"model":"p/m"}}}"#,
+        // An entity-shaped key sends the converter down its other branch.
+        r#"{"pins":{"spec_designer":{"model":"p/m"}},"providers":{}}"#,
+        r#"{"pins":{"spec_designer":{"model":"p/m"}},"model_routing":{}}"#,
+    ] {
+        let mut fresh = Rig::new();
+        fresh.write(document);
+        let error = initialize_config(&fresh.path).unwrap_err();
+        assert!(error.contains(moved), "{document}: {error}");
+        let converted =
+            crate::config_convert::convert_value(serde_json::from_str(document).unwrap());
+        assert!(
+            converted.as_ref().is_err_and(|error| error.contains(moved)),
+            "{document}: {converted:?}"
+        );
+    }
+    // The nested spelling still converts to consumer pins.
+    let converted = crate::config_convert::convert_value(
+        serde_json::from_str(r#"{"model_routing":{"pins":{"spec_designer":{"model":"p/m"}}}}"#)
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        converted["consumers"]["spec_designer"]["pin"],
+        serde_json::json!({"model":"p/m"})
+    );
+}
+
+#[test]
 fn retired_variant_keys_are_refused_at_startup_and_reload_with_exact_paths() {
     let cases = [
         (r#"{"variants":{"openai/gpt-6":"high"}}"#, "variants"),

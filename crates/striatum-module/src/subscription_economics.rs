@@ -387,18 +387,25 @@ fn account(reading: &Value, now: i64, account_id: &str) -> Option<QuotaAccount> 
         ))
     };
     let (time, hours) = remaining(weekly)?;
-    let mut short_walled = false;
-    let mut short_windows = Vec::new();
-    for w in windows.iter().filter(|w| !std::ptr::eq(**w, *weekly)) {
-        if let (Some(use_percent), Some((time, _))) = (used(w), remaining(w)) {
-            short_walled |= use_percent >= 100.0;
-            short_windows.push(QuotaConstraint {
-                window_minutes: w["windowMinutes"].as_i64().unwrap_or(0),
-                remaining_points: 100.0 - use_percent,
-                remaining_fraction: time,
-            });
-        }
-    }
+    let constraint = |window: &Value| {
+        let window_minutes = window["windowMinutes"].as_i64()?;
+        let (_, hours_to_reset) = remaining(window)?;
+        Some(QuotaConstraint {
+            window_minutes,
+            remaining_points: 100.0 - used(window)?,
+            // The pricing calculation caps this ratio. Keep the full time so
+            // a reported reset beyond one nominal duration still ages correctly.
+            remaining_fraction: hours_to_reset * 60.0 / window_minutes as f64,
+        })
+    };
+    let short_windows: Vec<_> = windows
+        .iter()
+        .filter(|w| !std::ptr::eq(**w, *weekly))
+        .filter_map(|window| constraint(window))
+        .collect();
+    let short_walled = short_windows
+        .iter()
+        .any(|window| window.remaining_points <= 0.0);
     let scoped_windows = usage["extraRateWindows"]
         .as_array()
         .into_iter()
@@ -415,14 +422,7 @@ fn account(reading: &Value, now: i64, account_id: &str) -> Option<QuotaAccount> 
                 // A stale reset is not fresh headroom, but only this model scope loses it.
                 return Some((scope.family, None));
             }
-            Some((
-                scope.family,
-                Some(QuotaConstraint {
-                    window_minutes: minutes,
-                    remaining_points: 100.0 - used(window)?,
-                    remaining_fraction: remaining(window)?.0,
-                }),
-            ))
+            Some((scope.family, Some(constraint(window)?)))
         })
         .collect();
     let saved = saved_resets::decode(&reading["savedResets"], account_id);
@@ -622,16 +622,15 @@ fn build_with_credentials(
     out
 }
 
-pub(crate) async fn fetch_plan_prices(connection: &Path, project: &Path) -> Value {
-    if let Ok(mut fusi) =
-        QuotaConsumer::connect_module(connection, project, "fusiform", "tool_provider").await
-    {
-        fusi.query(json!({"name":"plan.prices", "arguments":{}}))
-            .await
-            .unwrap_or(Value::Null)
-    } else {
-        Value::Null
-    }
+pub(crate) async fn fetch_plan_prices(connection: &Path, project: &Path) -> Option<Value> {
+    let mut fusi = QuotaConsumer::connect_module(connection, project, "fusiform", "tool_provider")
+        .await
+        .ok()?;
+    let reply = fusi
+        .query(json!({"name":"plan.prices", "arguments":{}}))
+        .await
+        .ok()?;
+    reply["prices"].is_array().then_some(reply)
 }
 
 pub(crate) async fn refresh(
@@ -640,15 +639,13 @@ pub(crate) async fn refresh(
     state: &SharedAccountQuota,
     listing: Option<&cortexkit_claustrum_client::ScopedCredentialListing>,
     credentials: &crate::broca_credentials::SharedBrocaCredentials,
-    quota_cache: &crate::SharedQuotaCache,
 ) {
     let now = crate::now_ms() as i64;
     let from = now - 24 * 3_600_000;
-    let reader_bound = multiplier::reader_bound(quota_cache);
     let (poll_due, generation) = cache()
         .lock()
         .map(|mut runtime| {
-            let bound = reader_bound && runtime.multipliers.ready;
+            let bound = runtime.multipliers.watch_ready();
             (
                 runtime.poll.due(bound, std::time::Instant::now()),
                 runtime.multipliers.generation,
@@ -676,21 +673,25 @@ pub(crate) async fn refresh(
     // Admission needs plan prices even when Astro's spend report is slow.
     // Publish them as soon as Fusiform answers, without waiting for Astro.
     let prices = async {
-        let prices = fetch_plan_prices(connection, project).await;
-        if let Ok(mut credentials) = credentials.lock() {
-            credentials.publish_plan_prices(&prices);
+        if let Some(prices) = fetch_plan_prices(connection, project).await {
+            if let Ok(mut credentials) = credentials.lock() {
+                credentials.publish_plan_prices(&prices);
+            }
         }
-        prices
     };
-    let (prices, report) = tokio::join!(
+    let ((), report) = tokio::join!(
         striatum_store::job_timing::run("plan_price_refresh", prices),
         striatum_store::job_timing::run("spend_report_refresh", report)
     );
-    let reader_bound = multiplier::reader_bound(quota_cache);
-    let credential_ids = credentials
+    let (credential_ids, prices) = credentials
         .lock()
         .ok()
-        .map(|credentials| credentials.api_key_credentials_by_provider(now as u64))
+        .map(|credentials| {
+            (
+                credentials.api_key_credentials_by_provider(now as u64),
+                credentials.plan_prices.clone(),
+            )
+        })
         .unwrap_or_default();
     let Some(snapshot) = state.lock().ok().map(|s| s.clone()) else {
         return;
@@ -711,7 +712,8 @@ pub(crate) async fn refresh(
             guard.poll.completed(std::time::Instant::now());
             // A watch update received during the call is newer than the poll's
             // snapshot. Do not overwrite it when the slower call returns.
-            guard.poll_report(report, generation, reader_bound);
+            let watch_ready = guard.multipliers.watch_ready();
+            guard.poll_report(report, generation, watch_ready);
         }
         let previous_inputs = guard.inputs.replace(inputs);
         (guard.prepare(now), previous_inputs)
@@ -847,6 +849,20 @@ fn overlay_pools(
                 plan.accounts.clear();
             } else {
                 for account in &mut plan.accounts {
+                    let age = |window: &mut QuotaConstraint| {
+                        window.remaining_fraction -=
+                            (elapsed * 60.0) / window.window_minutes as f64;
+                        window.remaining_fraction <= f64::EPSILON
+                    };
+                    for window in &mut account.short_windows {
+                        // Crossing a reset does not replenish the last known usage.
+                        account.short_walled |= age(window);
+                    }
+                    for (_, scoped) in &mut account.scoped_windows {
+                        if scoped.as_mut().is_some_and(age) {
+                            *scoped = None;
+                        }
+                    }
                     if account.hours_to_reset <= elapsed {
                         account.short_walled = true;
                     }
@@ -1926,6 +1942,62 @@ mod tests {
             }],
         });
         state
+    }
+
+    #[test]
+    fn cached_window_pressure_ages_until_the_reported_reset() {
+        let facts = [crate::tests::fact("anthropic", "claude-fable-5")];
+        for scoped in [false, true] {
+            let mut quota = state(30.0, None);
+            let entry = &mut quota.readings.readings.values_mut().next().unwrap().entry;
+            let window = json!({"usedPercent":95,"windowMinutes":if scoped {10080} else {60},
+                "resetsAt":if scoped {"2026-10-09T02:40:00Z"} else {"2026-10-09T01:12:00Z"}});
+            if scoped {
+                entry["usage"]["extraRateWindows"] = json!([{"id":"Fable","window":window}]);
+            } else {
+                entry["usage"]["primary"] = window;
+            }
+            let cached = build(&quota, &Value::Null, &Value::Null, NOW);
+            let price = |minutes: i64| {
+                let mut snapshot = ModelRouteStateSnapshot::default();
+                overlay_pools(
+                    cached.pools.clone(),
+                    &mut snapshot,
+                    &facts,
+                    NOW + minutes * 60_000,
+                    &RoutePricing::default(),
+                );
+                snapshot.by_capacity["anthropic/claude-fable-5"]
+                    .subscription_pool
+                    .as_ref()
+                    .unwrap()
+                    .price(1.0, None, 0.0, false)
+            };
+            let before = price(0).unwrap();
+            let later = price(11).unwrap();
+            let (initial, aged, duration) = if scoped {
+                (100., 89., 10080.)
+            } else {
+                (12., 1., 60.)
+            };
+            assert!(
+                (before.short_window_pressure.unwrap() - initial / duration / 0.05_f64.powi(2))
+                    .abs()
+                    < 1e-8
+            );
+            assert!(
+                (later.short_window_pressure.unwrap() - aged / duration / 0.05_f64.powi(2)).abs()
+                    < 1e-8,
+                "scoped={scoped}: before={before:?}, later={later:?}"
+            );
+            if !scoped {
+                assert!(before.dollars() > 20.0 && later.dollars() < 20.0);
+                assert!(
+                    price(12).is_none(),
+                    "an old reading cannot replenish the window"
+                );
+            }
+        }
     }
 
     #[test]

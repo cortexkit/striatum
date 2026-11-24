@@ -74,7 +74,31 @@ pub(super) fn report_at(
     // and null members out alike and fixes the member order.
     let body_json = serde_json::to_string(&request)
         .map_err(|error| provider_refusal("internal_error", error.to_string()))?;
+    let delivery_key = match &request.usage {
+        Some(usage) => usage
+            .run_id
+            .as_ref()
+            .map(|run| format!("run:{run}"))
+            .unwrap_or_else(|| "usage".into()),
+        None => "outcome".into(),
+    };
+    if let Some(first) = deps
+        .store
+        .v1_report_delivery(&request.decision_id, &delivery_key)
+        .map_err(store_refusal)?
+    {
+        if first.matches_report_delivery(&delivery_key, &body_json) {
+            return decode_report_answer(&first, true);
+        }
+        return Err(report_conflict());
+    }
     let effect_request = attempt::for_effects(&request, now);
+    #[cfg(test)]
+    crate::test_thread_state::lifecycle_probe(|probe| {
+        probe
+            .report_snapshots
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    });
     let credentials = deps
         .broca_credentials
         .lock()
@@ -147,14 +171,6 @@ pub(super) fn report_at(
         }
     }
 
-    let delivery_key = match &request.usage {
-        Some(usage) => usage
-            .run_id
-            .as_ref()
-            .map(|run| format!("run:{run}"))
-            .unwrap_or_else(|| "usage".into()),
-        None => "outcome".into(),
-    };
     let report_id = if delivery_key.starts_with("run:") {
         format!("report:{}:{delivery_key}", request.decision_id)
     } else {
@@ -218,14 +234,22 @@ pub(super) fn report_at(
         )
         .map_err(store_refusal)?;
     match standing {
-        Some(first) => serde_json::from_str(&first.recorded.answer_json)
-            .map(|answer| (answer, first.duplicate))
-            .map_err(|error| store_refusal(format!("stored report answer undecodable: {error}"))),
-        None => Err(Refusal::new(
-            RefusalCode::ReportConflict,
-            "a report with a different body was already recorded for this decision",
-        )),
+        Some(first) => decode_report_answer(&first.recorded, first.duplicate),
+        None => Err(report_conflict()),
     }
+}
+
+fn decode_report_answer(report: &V1Recorded, duplicate: bool) -> Result<(Value, bool), Refusal> {
+    serde_json::from_str(&report.answer_json)
+        .map(|answer| (answer, duplicate))
+        .map_err(|error| store_refusal(format!("stored report answer undecodable: {error}")))
+}
+
+fn report_conflict() -> Refusal {
+    Refusal::new(
+        RefusalCode::ReportConflict,
+        "a report with a different body was already recorded for this decision",
+    )
 }
 
 fn prepare_account_facts(
@@ -269,6 +293,7 @@ fn prepare_account_facts(
     };
     // Prepare from read-only snapshots. ClassContext::load also releases
     // reservations and reconciles fences, which must not run for a losing claim.
+    count_catalog_read();
     let mut facts = deps.store.get_facts().map_err(store_refusal)?;
     let targets = credentials.catalog_targets(&facts);
     striatum_core::score_alias::append_alias_rows(&mut facts, &targets);
@@ -475,6 +500,7 @@ fn prepare_usage(
         untimed: true,
         ..Default::default()
     };
+    count_catalog_read();
     let Some(observation) = crate::usage_facts::usage_observation_from_store(facts, deps.store)
         .map_err(store_refusal)?
     else {
@@ -503,6 +529,7 @@ fn prepare_usage(
                 .listed_credentials()
                 .iter()
                 .find(|row| row.id == credential)?;
+            count_catalog_read();
             let mut fact = deps.store.get_facts().ok()?.into_iter().find(|fact| {
                 fact.provider_id == decision.provider && fact.model_id == decision.model
             })?;
@@ -552,6 +579,15 @@ fn prepare_usage(
 
 /// A timed failure is still only an error. Confirmed exhaustion belongs to
 /// admission-bound account observations, never a model outcome report.
+fn count_catalog_read() {
+    #[cfg(test)]
+    crate::test_thread_state::lifecycle_probe(|probe| {
+        probe
+            .report_catalog_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    });
+}
+
 fn ledger_outcome(request: &ReportRequest, _now_ms: u64) -> RouteOutcome {
     match &request.outcome {
         Outcome::Completed => RouteOutcome::Completed,

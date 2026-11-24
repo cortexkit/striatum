@@ -2,10 +2,15 @@ use super::{
     CatalogSnapshot, CatalogWire, FusiformCatalogConsumer, FusiformCatalogError, MediaGrade, Value,
 };
 use std::collections::BTreeMap;
-use std::sync::{Arc, Once};
+use std::{
+    sync::{Arc, Once},
+    time::Duration,
+};
+use tokio::time::Instant;
 
 static READ_WARNING: Once = Once::new();
 static UNSUPPORTED_WARNING: Once = Once::new();
+const RETRY_AFTER: Duration = Duration::from_secs(30);
 
 #[cfg(test)]
 tokio::task_local! {
@@ -129,18 +134,7 @@ pub(super) async fn refresh_snapshot<C: CatalogWire>(
     let grades = if unsupported_this_version {
         previous
     } else {
-        match client.local_grades().await {
-            Ok(grades) => {
-                if grades.unsupported_prefix {
-                    UNSUPPORTED_WARNING.call_once(|| eprintln!("[striatum] Fusiform quality.grades does not accept prefix; caller-local grades are unknown"));
-                }
-                grades
-            }
-            Err(reason) => {
-                READ_WARNING.call_once(|| eprintln!("[striatum] Fusiform local grades unavailable; keeping the last good grades: {reason}"));
-                previous
-            }
-        }
+        refresh(client, previous).await
     };
     // Publish catalog rows and caller-local grades together so selection never
     // has to fetch grades or combine separately updated caches.
@@ -148,10 +142,67 @@ pub(super) async fn refresh_snapshot<C: CatalogWire>(
     Ok(snapshot)
 }
 
+async fn refresh<C: CatalogWire>(client: &mut C, mut previous: LocalGrades) -> LocalGrades {
+    match client.local_grades().await {
+        Ok(grades) => {
+            if grades.unsupported_prefix {
+                UNSUPPORTED_WARNING.call_once(|| eprintln!("[striatum] Fusiform quality.grades does not accept prefix; caller-local grades are unknown"));
+            }
+            grades
+        }
+        Err(reason) => {
+            READ_WARNING.call_once(|| eprintln!("[striatum] Fusiform local grades unavailable; keeping the last good grades: {reason}"));
+            previous.unsupported_prefix = false;
+            previous.retry_at = Some(Instant::now() + RETRY_AFTER);
+            previous
+        }
+    }
+}
+
+pub(super) async fn retry_if_due<C: CatalogWire>(
+    client: &mut C,
+    credentials: Option<&crate::SharedBrocaCredentials>,
+) -> Result<(), FusiformCatalogError> {
+    let Some(credentials) = credentials else {
+        return Ok(());
+    };
+    let snapshot = credentials
+        .lock()
+        .map_err(|_| super::error("credential cache poisoned"))?
+        .catalog_snapshot
+        .as_ref()
+        .filter(|snapshot| {
+            snapshot
+                .local_grades
+                .retry_at
+                .is_some_and(|at| at <= Instant::now())
+        })
+        .cloned();
+    let Some(snapshot) = snapshot else {
+        return Ok(());
+    };
+    let grades = refresh(client, snapshot.local_grades.clone()).await;
+    let mut updated = (*snapshot).clone();
+    updated.local_grades = grades;
+    let mut credentials = credentials
+        .lock()
+        .map_err(|_| super::error("credential cache poisoned"))?;
+    // An on-demand catalog apply may have published a different snapshot during the read.
+    if credentials
+        .catalog_snapshot
+        .as_ref()
+        .is_some_and(|current| Arc::ptr_eq(current, &snapshot))
+    {
+        credentials.catalog_snapshot = Some(Arc::new(updated));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(super) struct LocalGrades {
     values: BTreeMap<String, MediaGrade>,
     unsupported_prefix: bool,
+    pub(super) retry_at: Option<Instant>,
 }
 
 impl LocalGrades {
@@ -166,7 +217,7 @@ impl LocalGrades {
     pub(super) fn from_test_grade(route: &str, kind: &str, grade: f64) -> Self {
         Self {
             values: BTreeMap::from([(route.into(), BTreeMap::from([(kind.into(), grade)]))]),
-            unsupported_prefix: false,
+            ..Default::default()
         }
     }
 

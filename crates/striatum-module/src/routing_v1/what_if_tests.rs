@@ -1165,3 +1165,31 @@ async fn what_if_panel_refuses_unknown_classes_as_select_panel_does() {
     assert_eq!(ty, FrameType::Error, "iqs or panel is required: {body}");
     assert_eq!(before, rows(&harness));
 }
+
+#[tokio::test]
+async fn what_if_patch_that_lifts_pin_only_admits_the_route_like_the_same_setting() {
+    let (harness, _) = configured().await;
+    harness.edit_config(|config| {
+        config["models"]["example-provider/model-b"] = json!({"pin_only":true});
+    });
+    let operator = operator(&harness).await;
+    let before = evaluate(&operator, json!({"iqs":[0]})).await;
+    assert_ne!(
+        before["results"][0]["pick"]["route"], "example-provider/model-b",
+        "{before}"
+    );
+    let lifted = evaluate(
+        &operator,
+        json!({"iqs":[0],"policy_patch":{"models":{"example-provider/model-b":{"pin_only":false}}}}),
+    )
+    .await;
+    assert_eq!(
+        lifted["results"][0]["pick"]["route"], "example-provider/model-b",
+        "{lifted}"
+    );
+    harness.edit_config(|config| {
+        config["models"]["example-provider/model-b"] = json!({"pin_only":false});
+    });
+    let written = evaluate(&operator, json!({"iqs":[0]})).await;
+    assert_eq!(written["results"], lifted["results"]);
+}

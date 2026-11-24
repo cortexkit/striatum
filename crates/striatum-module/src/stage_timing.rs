@@ -32,6 +32,58 @@ pub(crate) fn record_serialization(start: Instant) -> Duration {
     elapsed
 }
 
+#[derive(Default)]
+pub(super) struct RouteSelectLogLimiter {
+    last_report: Option<Instant>,
+    suppressed: u64,
+}
+
+pub(super) fn rate_limit_route_select_line(
+    line: String,
+    now: Instant,
+    limiter: &mut RouteSelectLogLimiter,
+) -> Option<String> {
+    const WINDOW: Duration = Duration::from_secs(10);
+    if limiter
+        .last_report
+        .is_some_and(|last| now.saturating_duration_since(last) < WINDOW)
+    {
+        limiter.suppressed = limiter.suppressed.saturating_add(1);
+        return None;
+    }
+    limiter.last_report = Some(now);
+    let suppressed = std::mem::take(&mut limiter.suppressed);
+    Some(if suppressed == 0 {
+        line
+    } else {
+        format!("{line} (suppressed {suppressed} similar lines)")
+    })
+}
+
+pub(crate) fn emit_select(total: Duration, serialization: Duration, stages: StoreStageTiming) {
+    if total <= Duration::from_secs(1) {
+        return;
+    }
+    let ms = |ns: u64| ns as f64 / 1_000_000.0;
+    let line = format!("[routing] slow route.select total_ms={} writer_queue_wait_ms={:.3} sql_ms={:.3} commit_ms={:.3} serialization_ms={:.3}",
+        total.as_millis(), ms(stages.writer_queue_ns), ms(stages.sql_ns), ms(stages.commit_ns),
+        serialization.as_secs_f64() * 1_000.0);
+    static LIMITER: std::sync::OnceLock<std::sync::Mutex<RouteSelectLogLimiter>> =
+        std::sync::OnceLock::new();
+    let limited = LIMITER
+        .get_or_init(Default::default)
+        .lock()
+        .ok()
+        .and_then(|mut limiter| rate_limit_route_select_line(line, Instant::now(), &mut limiter));
+    if let Some(line) = limited {
+        #[cfg(test)]
+        crate::test_thread_state::lifecycle_probe(|probe| {
+            probe.slow_select_lines.lock().unwrap().push(line.clone())
+        });
+        eprintln!("{line}");
+    }
+}
+
 pub(crate) struct AccountCallTiming {
     started: Instant,
 }

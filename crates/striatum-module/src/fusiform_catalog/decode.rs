@@ -298,6 +298,7 @@ impl CatalogPage {
                 resolved_at_ms: self.resolved_at_ms,
             },
             facts: Vec::with_capacity(self.models.0.len()),
+            model_index: std::collections::HashMap::with_capacity(self.models.0.len()),
             rates: BTreeMap::new(),
             wire_apis: BTreeMap::new(),
             wire_api_models: BTreeSet::new(),
@@ -332,6 +333,9 @@ impl CatalogPage {
                 Ok((mut fact, rates)) => {
                     fact.auth_methods = auth_methods.remove(&key);
                     fact.login_methods_documented = documented.contains(&key);
+                    snapshot
+                        .model_index
+                        .insert(key.clone(), snapshot.facts.len());
                     snapshot.facts.push(fact);
                     snapshot.rates.insert(key.clone(), Arc::new(rates));
                     snapshot.media_rates.insert(key.clone(), row.media_rates);

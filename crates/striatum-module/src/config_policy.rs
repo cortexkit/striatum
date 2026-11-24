@@ -529,9 +529,9 @@ pub enum BelowBarPolicy {
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
-#[serde(default, deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
 pub struct ProjectPolicy {
-    /// Prefer this model in the project, as provider/model or provider/model:variant. Leave empty for ordinary selection.
+    /// Prefer this model in the project, as provider/model or provider/model:variant. Remove the project entry for ordinary selection.
     #[schemars(title = "Preferred model")]
     pub pin: String,
 }
@@ -587,9 +587,11 @@ pub struct ConsumerPolicy {
     #[schemars(title = "Model preferences by project")]
     pub projects: BTreeMap<String, ProjectPolicy>,
     /// Minimum reasoning quality requested, from 0 to 100.
+    #[schemars(range(min = 0, max = 100))]
     #[schemars(title = "Minimum reasoning level")]
     pub iq: Option<f64>,
     /// Minimum collaboration quality requested, from 0 to 100.
+    #[schemars(range(min = 0, max = 100))]
     #[schemars(title = "Minimum judgment level")]
     pub eq: Option<f64>,
     /// Minimum context capacity in tokens.

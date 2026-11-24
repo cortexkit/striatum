@@ -55,6 +55,9 @@ struct Slot {
     // A miss and a change notice for the same project must not race to publish
     // different views. Requests for other projects never wait for this lock.
     view: tokio::sync::Mutex<Cached>,
+    // A copy of `Cached::last_good` that a timed-out request can read without
+    // waiting for the refresh holding `view`.
+    last_good: Mutex<Option<Arc<Overrides>>>,
     warnings: Mutex<Warnings>,
 }
 
@@ -97,7 +100,10 @@ pub(crate) async fn project_view(path: &Path, project: &str) -> Option<Arc<Overr
         Ok(view) => view,
         Err(_) => {
             slot.warn_unavailable(project, "project settings lookup timed out");
-            None
+            // Refreshes queued ahead of this request can outlast its budget;
+            // the last delivered view still applies, as it would after a
+            // failed refresh.
+            slot.last_good.lock().unwrap().clone()
         }
     }
 }
@@ -139,6 +145,18 @@ fn register(path: &Path, wire: &Arc<Wire>) {
 impl Slot {
     async fn load(&self, wire: &Wire, project: &str, refresh: bool) -> Option<Arc<Overrides>> {
         let mut cache = self.view.lock().await;
+        let view = self.load_locked(&mut cache, wire, project, refresh).await;
+        self.last_good.lock().unwrap().clone_from(&cache.last_good);
+        view
+    }
+
+    async fn load_locked(
+        &self,
+        cache: &mut Cached,
+        wire: &Wire,
+        project: &str,
+        refresh: bool,
+    ) -> Option<Arc<Overrides>> {
         if !refresh {
             match &cache.retry {
                 None if cache.last_good.is_some() => return cache.last_good.clone(),

@@ -1,6 +1,7 @@
-//! The reasoning-effort values the catalog publishes per model, read for
-//! operator variant overrides. Fusiform's `capability.reasoning_options` is the
-//! authority: Broca admits a variant only when it is one of those values.
+//! The reasoning-effort values the catalog publishes per model, read when a
+//! pinned select or an operator ladder names a variant. Fusiform's
+//! `capability.reasoning_options` is the authority: Broca admits a variant only
+//! when it is one of those values.
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use std::collections::BTreeMap;

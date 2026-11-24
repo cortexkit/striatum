@@ -319,23 +319,30 @@ fn write_quota_readings(
         .map_err(|e| e.to_string())?;
     Ok(())
 }
+#[cfg(test)]
+thread_local! {
+    pub(super) static QUOTA_CAPACITY_KEYS_EXAMINED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 pub(super) fn quota_reading_rows(
     store: &SqliteRouteStateStore,
     fresh: &[ProviderUsage],
     observed_at_ms: u64,
 ) -> Result<Vec<striatum_core::route_state_store::QuotaReadingLogRow>, String> {
-    let facts = store.get_facts().map_err(|e| e.to_string())?;
+    let catalog = store.get_selection_catalog().map_err(|e| e.to_string())?;
+    let capacities = catalog.quota_capacities();
     let observed_at = i64::try_from(observed_at_ms).map_err(|e| e.to_string())?;
     let mut rows = Vec::new();
     for entry in fresh {
-        let Some(join) = striatum_core::quota::quota_route_join(entry, &facts) else {
+        let Some((provider, capacity_keys)) = capacities.lookup(entry) else {
             continue;
         };
-        let capacity_keys = striatum_core::quota::quota_capacity_keys(entry, &facts);
+        #[cfg(test)]
+        QUOTA_CAPACITY_KEYS_EXAMINED.with(|count| count.set(count.get() + capacity_keys.len()));
         rows.extend(striatum_core::quota_poll::reading_log_rows_for_poll(
             entry,
-            join.provider_id,
-            &capacity_keys,
+            provider,
+            capacity_keys,
             observed_at,
         ));
     }

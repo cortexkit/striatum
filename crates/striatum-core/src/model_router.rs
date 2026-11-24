@@ -407,7 +407,11 @@ impl CandidateQualityScore {
         Self {
             model: format!("{}/{}", fact.provider_id, fact.model_id),
             eligible,
-            route_key: fact_to_route(fact).route_key,
+            route_key: crate::model_facts::make_route_key(
+                &fact.provider_id,
+                &fact.model_id,
+                fact.variant.as_deref(),
+            ),
             elo: fact.scores.elo,
             eq: fact.scores.eq,
             elo_source: match fact.score_provenance {
@@ -730,7 +734,7 @@ fn effective_cost_per_m_tok_out(fact: &ModelFact) -> Option<f64> {
 }
 
 /// Normalized metered cost (0..1) of a route REGARDLESS of subscription status:
-/// the same formula the objective uses, kept as a residual tie-break. The price is
+/// a capped residual tie-break, not the primary cost comparison. The price is
 /// the EFFECTIVE price (list ÷ subscription multiplier), so a subsidized route is
 /// priced below its list price while an unsubsidized one sits at list. Unknown
 /// metered price maps to the max (1), NOT 0: "unknown" must not masquerade as
@@ -1182,7 +1186,10 @@ pub(crate) enum CostBasis<'v> {
 /// The output-only ladder: effective output price, then tier, then the
 /// unpriced-route rule.
 fn output_only_cost(fact: &ModelFact, _is_subscription: bool) -> f64 {
-    normalized_metered_cost(fact)
+    effective_cost_per_m_tok_out(fact).map_or_else(
+        || normalized_metered_cost(fact),
+        |rate| (rate / COST_REFERENCE_PER_MTOK).clamp(0.0, f64::INFINITY),
+    )
 }
 
 fn output_price_unknown(fact: &ModelFact) -> bool {
@@ -1361,8 +1368,7 @@ pub(crate) fn compute_objective(
     };
     if is_subscription {
         if let Some(pool) = &runtime.subscription_pool {
-            // Compute list dollars before normalization or subsidy. A clamped
-            // basket score cannot be inverted into its original message price.
+            // The pool starts from list dollars, before a subsidy or normalization.
             let (list_usd, reference) = match basis {
                 CostBasis::Basket { vector, .. } => {
                     let mut dollars = 0.0;
@@ -1588,11 +1594,6 @@ fn record_cold_start_pricing(
     } else {
         fact.basket_rate(BasketDimension::OutputExcludingReasoning)
     };
-    let reference = if tokens.is_some() {
-        crate::routing_config::BASKET_REFERENCE_COST_PER_MESSAGE
-    } else {
-        COST_REFERENCE_PER_MTOK
-    };
     let (value_multiplier, value_source, pressure) =
         if let Some(p) = &objective.subscription_pricing {
             (p.value_multiplier, p.value_source.clone(), p.plan_pressure)
@@ -1603,6 +1604,15 @@ fn record_cold_start_pricing(
                 1.0,
             )
         };
+    let final_cost_usd = objective
+        .subscription_pricing
+        .as_ref()
+        .map(|pricing| pricing.dollars())
+        .or_else(|| {
+            list_cost_usd
+                .filter(|_| !objective.price_unknown)
+                .map(|list| (list / value_multiplier).clamp(0.0, f64::INFINITY))
+        });
     objective.task_pricing = Some(TaskRoutePricing {
         profile: None,
         tokens,
@@ -1627,7 +1637,7 @@ fn record_cold_start_pricing(
             .subscription_pricing
             .as_ref()
             .and_then(|p| p.short_window_pressure),
-        final_cost_usd: (!objective.price_unknown).then_some(objective.cost * reference),
+        final_cost_usd,
         normalized_cost: objective.cost,
         omitted_dimensions: Vec::new(),
         unpriced_dimensions: objective
@@ -3287,6 +3297,28 @@ mod task_profile_pricing_tests {
             sonnet.profile.as_ref().unwrap().level,
             ProfileLevel::OwnCell
         );
+    }
+
+    #[test]
+    fn cold_start_diagnostic_keeps_actual_dollars_above_the_reference() {
+        let mut route = model("metered", "premium");
+        route.cost_per_m_tok_out = Some(60.0);
+        let selected = select(input(vec![route], false), &HashMap::new());
+        let pricing = selected.score.objective.task_pricing.unwrap();
+        assert_eq!(pricing.price_unit, "million output tokens");
+        assert_eq!(pricing.list_cost_usd, Some(60.0));
+        assert_eq!(pricing.final_cost_usd, Some(60.0));
+    }
+
+    #[test]
+    fn cold_start_cost_ranks_metered_rates_above_the_reference() {
+        let mut a = model("metered", "thirty");
+        a.cost_per_m_tok_out = Some(30.0);
+        let mut b = model("metered", "ninety");
+        b.cost_per_m_tok_out = Some(90.0);
+        b.scores.speed = 1000.0;
+        let selected = select(input(vec![a, b], false), &HashMap::new());
+        assert_eq!(selected.route_key, "metered/thirty");
     }
 
     #[test]

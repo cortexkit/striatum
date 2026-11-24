@@ -65,7 +65,7 @@ pub(crate) struct ClassContext {
 }
 
 pub(crate) enum ProbeBinding {
-    Bound,
+    Bound(Option<striatum_core::route_state_store::ProviderOutcome>),
     Lost { retry_at: i64 },
 }
 
@@ -1427,7 +1427,7 @@ impl ClassContext {
             .outcome
         else {
             if self.selection_probes.is_none() {
-                return Ok(ProbeBinding::Bound);
+                return Ok(ProbeBinding::Bound(None));
             }
             return Ok(ProbeBinding::Lost {
                 retry_at: self
@@ -1473,7 +1473,7 @@ impl ClassContext {
                 if !self.probe_eligible(provider, model, &admission.credential_id)
                     && applies_now()?.is_empty()
                 {
-                    return Ok(ProbeBinding::Bound);
+                    return Ok(ProbeBinding::Bound(None));
                 }
                 hold.owner.clone()
             }
@@ -1486,7 +1486,7 @@ impl ClassContext {
                 // launch claim to take it, and would otherwise go ahead
                 // without claiming that due probe.
                 if self.probe_eligible(provider, model, &admission.credential_id) {
-                    return Ok(ProbeBinding::Bound);
+                    return Ok(ProbeBinding::Bound(None));
                 }
                 let unseen = applies_now()?;
                 let waiting: Vec<_> = unseen
@@ -1500,7 +1500,7 @@ impl ClassContext {
                     });
                 }
                 if unseen.is_empty() {
-                    return Ok(ProbeBinding::Bound);
+                    return Ok(ProbeBinding::Bound(None));
                 }
                 // With no reservation owner, the decision claims directly.
                 decision.to_owned()
@@ -1514,7 +1514,7 @@ impl ClassContext {
         let decision = decision.to_owned();
         let claimed_admission = admission.clone();
         let release_at = self.now_ms;
-        let (claimed, retry_at) = crate::account_writer::repair(store, move |tx| {
+        let (claimed, has_origins, retry_at) = crate::account_writer::repair(store, move |tx| {
             // What the selection read as released is released first.
             tx.release_expired(release_at)?;
             let provider = owned_provider.as_str();
@@ -1550,7 +1550,7 @@ impl ClassContext {
                 &admission.credential_id,
                 context.now_ms,
             )?;
-            Ok((claimed, retry_at))
+            Ok((claimed, !origins.is_empty(), retry_at))
         })?;
         if !claimed {
             let retry_at = retry_at
@@ -1565,7 +1565,15 @@ impl ClassContext {
         if let Some(hold) = &self.selection_probes {
             hold.release_selected(provider, &admission.credential_id, self.now_ms);
         }
-        Ok(ProbeBinding::Bound)
+        // A decision ID can own a probe before its ledger row exists. Carry
+        // the granted credential to that INSERT rather than deriving it again.
+        Ok(ProbeBinding::Bound(has_origins.then(|| {
+            striatum_core::route_state_store::ProviderOutcome {
+                account_ref: admission.account_id,
+                credential_id: Some(admission.credential_id),
+                ..Default::default()
+            }
+        })))
     }
 
     pub(crate) fn class(

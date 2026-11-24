@@ -13,15 +13,6 @@ const BACKSTOP: Duration = Duration::from_secs(15 * 60);
 const BATCH_WINDOW: Duration = Duration::from_millis(20);
 const MAX_BATCH: usize = 64;
 
-pub(super) fn reader_bound(cache: &crate::SharedQuotaCache) -> bool {
-    cache.lock().is_ok_and(|cache| {
-        cache
-            .consumer
-            .route_facts
-            .reader_bound(cache.consumer.attached)
-    })
-}
-
 #[derive(Default)]
 pub(super) struct PollSchedule {
     bound: bool,
@@ -60,6 +51,8 @@ impl PollSchedule {
 
 #[derive(Default)]
 pub(super) struct State {
+    connection: Option<async_nats::Client>,
+    revisions: Option<tokio::sync::watch::Receiver<u64>>,
     entries: BTreeMap<String, Arc<Value>>,
     initial: Option<BTreeMap<String, Arc<Value>>>,
     warned: BTreeSet<String>,
@@ -151,6 +144,23 @@ fn decode(value: &[u8]) -> Option<Value> {
 }
 
 impl State {
+    fn clear_binding(&mut self) {
+        self.ready = false;
+        self.connection = None;
+        self.revisions = None;
+    }
+
+    pub(super) fn watch_ready(&self) -> bool {
+        self.ready
+            && self.connection.as_ref().is_none_or(|connection| {
+                connection.connection_state() == async_nats::connection::State::Connected
+            })
+            && self
+                .revisions
+                .as_ref()
+                .is_none_or(|changes| matches!(changes.has_changed(), Ok(false)))
+    }
+
     pub(super) fn begin(&mut self) {
         self.ready = false;
         self.initial = Some(BTreeMap::new());
@@ -249,12 +259,12 @@ struct Unbound;
 impl Drop for Unbound {
     fn drop(&mut self) {
         if let Ok(mut runtime) = super::cache().lock() {
-            runtime.multipliers.ready = false;
+            runtime.multipliers.clear_binding();
         }
     }
 }
 
-/// Borrowing the attached client keeps credential upkeep and the socket shared
+/// Borrowing the connected client keeps credential upkeep and the socket shared
 /// with the durable event reader; bucket failures never interrupt that reader.
 pub(crate) async fn watch(client: &BusClient) {
     let _unbound = Unbound;
@@ -269,7 +279,7 @@ pub(crate) async fn watch(client: &BusClient) {
             retry = Duration::from_secs(1);
         }
         if let Ok(mut runtime) = super::cache().lock() {
-            runtime.multipliers.ready = false;
+            runtime.multipliers.clear_binding();
         }
         if let Err(error) = result {
             tracing::warn!(
@@ -307,6 +317,10 @@ async fn session(client: &BusClient) -> Result<(), String> {
         .await
         .map_err(|_| "multiplier watch bind timeout".to_owned())?
         .map_err(|e| e.to_string())?;
+    if let Ok(mut runtime) = super::cache().lock() {
+        runtime.multipliers.connection = Some(connection.clone());
+        runtime.multipliers.revisions = Some(changes.clone());
+    }
     let mut health = tokio::time::interval(Duration::from_secs(1));
     let mut batch = Vec::new();
     let mut deadline = None;
@@ -445,27 +459,38 @@ mod tests {
     }
 
     #[test]
-    fn multiplier_poll_cadence_uses_real_reader_binding_and_caught_up_state() {
-        let cache = std::sync::Arc::new(std::sync::Mutex::new(crate::QuotaCache::default()));
-        let (revision, changes) = tokio::sync::watch::channel(0);
-        {
-            let mut cache = cache.lock().unwrap();
-            cache.consumer.attached = true;
-            cache.consumer.route_facts.revisions = Some(changes);
-        }
-        let start = Instant::now();
-        let mut schedule = PollSchedule::default();
+    fn caught_up_multiplier_watch_uses_backstop_even_without_event_durable() {
+        let cache = crate::SharedQuotaCache::default();
+        assert!(!cache.lock().unwrap().consumer.attached);
         let mut state = State::default();
         state.begin();
-        assert!(reader_bound(&cache));
-        assert!(schedule.due(reader_bound(&cache) && state.ready, start));
+        state.apply(BucketItem::CaughtUp);
+        let mut schedule = PollSchedule::default();
+        let now = Instant::now();
+        assert!(schedule.due(state.watch_ready(), now));
+        schedule.completed(now);
+        assert_eq!(schedule.interval(), Duration::from_secs(900));
+    }
+
+    #[test]
+    fn multiplier_poll_cadence_uses_watch_binding_and_caught_up_state() {
+        let (revision, changes) = tokio::sync::watch::channel(0);
+        let start = Instant::now();
+        let mut schedule = PollSchedule::default();
+        let mut state = State {
+            revisions: Some(changes),
+            ..Default::default()
+        };
+        state.begin();
+        assert!(!state.watch_ready());
+        assert!(schedule.due(state.watch_ready(), start));
         schedule.completed(start);
         assert_eq!(schedule.next, Some(start + Duration::from_secs(60)));
         assert!(!schedule.due(false, start + Duration::from_secs(59)));
         assert!(schedule.due(false, start + Duration::from_secs(60)));
 
         state.apply(BucketItem::CaughtUp);
-        assert!(schedule.due(reader_bound(&cache) && state.ready, start));
+        assert!(schedule.due(state.watch_ready(), start));
         schedule.completed(start);
         assert_eq!(schedule.next, Some(start + Duration::from_secs(900)));
         assert!(!schedule.due(true, start + Duration::from_secs(899)));
@@ -473,26 +498,18 @@ mod tests {
 
         revision.send_replace(1);
         assert!(
-            !reader_bound(&cache),
-            "an attached flag alone cannot relax the poll"
+            !state.watch_ready(),
+            "a caught-up flag on an obsolete watch cannot relax the poll"
         );
         let down = start + Duration::from_secs(1);
-        assert!(schedule.due(reader_bound(&cache) && state.ready, down));
+        assert!(schedule.due(state.watch_ready(), down));
         schedule.completed(down);
         assert_eq!(schedule.next, Some(down + Duration::from_secs(60)));
-        cache
-            .lock()
-            .unwrap()
-            .consumer
-            .route_facts
-            .revisions
-            .as_mut()
-            .unwrap()
-            .borrow_and_update();
+        state.revisions.as_mut().unwrap().borrow_and_update();
         state.begin();
-        assert!(!schedule.due(reader_bound(&cache) && state.ready, down));
+        assert!(!schedule.due(state.watch_ready(), down));
         state.apply(BucketItem::CaughtUp);
-        assert!(schedule.due(reader_bound(&cache) && state.ready, down));
+        assert!(schedule.due(state.watch_ready(), down));
         schedule.completed(down);
         assert_eq!(schedule.next, Some(down + Duration::from_secs(900)));
     }

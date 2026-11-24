@@ -138,7 +138,7 @@ pub(super) async fn handle_frame(
     quota_cache: &SharedQuotaCache,
     store: &SharedStore,
     route_epochs: &mut RouteEpochs,
-    min_band: &SharedMinBand,
+    _min_band: &SharedMinBand,
     routing_config_path: &Path,
     operator_config_path: &Path,
     broca_credentials: &SharedBrocaCredentials,
@@ -181,36 +181,33 @@ pub(super) async fn handle_frame(
             let writer = writer.clone();
             let quota_cache = Arc::clone(quota_cache);
             let store = Arc::clone(store);
-            let min_band = Arc::clone(min_band);
             let routing_config_path = routing_config_path.to_path_buf();
             let operator_config_path = operator_config_path.to_path_buf();
             let broca_credentials = Arc::clone(broca_credentials);
             let (ver, channel, corr) = (frame.header.ver, frame.header.channel, frame.header.corr);
+            // Bind and Goodbye are dispatched on this loop. Capture authority
+            // before either can change the channel while the request is queued.
+            let caller = routing_v1::Caller::for_route(channel, route_epoch);
             let handler = async move {
                 answer_route_request(&writer, ver, channel, route_epoch, corr, |reply| {
                     run_route_handler_off_async_workers(async move {
-                        routing_v1::record_call(&frame.body, channel, route_epoch, &store)?;
+                        let request = routing_v1::parse_route_body(&frame.body);
+                        let parsed = request.as_ref().unwrap_or(&serde_json::Value::Null);
+                        routing_v1::record_call(parsed, &caller, &store)?;
+                        let op = parsed["method"].as_str().unwrap_or_default();
                         // A flow-scoped route reaches only the ops in
                         // diagnostics_findings::FLOW_SCOPE_OPS.
-                        if let Some(refusal) = diagnostics_findings::flow_route_refusal(
-                            &frame.body,
-                            channel,
-                            route_epoch,
-                        ) {
-                            if let Ok(request) =
-                                serde_json::from_slice::<serde_json::Value>(&frame.body)
-                            {
-                                let op = request["method"].as_str().unwrap_or_default();
-                                if matches!(op, "route.account_for" | "route.account_observe") {
-                                    account_refusal_log::emit(
-                                        op,
-                                        &route_principal(channel, route_epoch),
-                                        &request["params"],
-                                        &refusal.code,
-                                        "flow_scope",
-                                        "",
-                                    );
-                                }
+                        if let Some(refusal) = diagnostics_findings::flow_route_refusal(op, &caller)
+                        {
+                            if matches!(op, "route.account_for" | "route.account_observe") {
+                                account_refusal_log::emit(
+                                    op,
+                                    &caller.principal,
+                                    &parsed["params"],
+                                    &refusal.code,
+                                    "flow_scope",
+                                    "",
+                                );
                             }
                             return send_route_error_body(
                                 &reply,
@@ -222,42 +219,33 @@ pub(super) async fn handle_frame(
                             )
                             .await;
                         }
-                        routing_v1::runners::refresh_admission_tiers(
-                            &frame.body,
-                            &routing_v1::Caller::for_route(channel, route_epoch),
-                            &routing_v1::Deps {
-                                quota_cache: &quota_cache,
-                                store: &store,
-                                routing_config_path: &routing_config_path,
-                                operator_config_path: &operator_config_path,
-                                broca_credentials: &broca_credentials,
-                            },
-                        )
-                        .await;
-                        // `routing_v1::claims` sends every `route.select` request
-                        // to the v1 parser, which rejects unknown parameters.
-                        if routing_v1::claims(&frame.body) {
-                            return routing_v1::serve(
+                        let deps = routing_v1::Deps {
+                            quota_cache: &quota_cache,
+                            store: &store,
+                            routing_config_path: &routing_config_path,
+                            operator_config_path: &operator_config_path,
+                            broca_credentials: &broca_credentials,
+                        };
+                        routing_v1::runners::refresh_admission_tiers(parsed, &caller, &deps).await;
+                        if routing_v1::claims_request(parsed) {
+                            return routing_v1::serve_request(
                                 frame,
                                 route_epoch,
+                                request,
+                                caller,
                                 &reply,
-                                &routing_v1::Deps {
-                                    quota_cache: &quota_cache,
-                                    store: &store,
-                                    routing_config_path: &routing_config_path,
-                                    operator_config_path: &operator_config_path,
-                                    broca_credentials: &broca_credentials,
-                                },
+                                &deps,
                             )
                             .await;
                         }
-                        handle_select_request(
+                        select::handle_legacy_request(
                             frame,
                             route_epoch,
+                            parsed,
+                            &caller,
                             &reply,
                             &quota_cache,
                             &store,
-                            &min_band,
                             &routing_config_path,
                             &operator_config_path,
                             &broca_credentials,
@@ -268,7 +256,7 @@ pub(super) async fn handle_frame(
                 .await;
             };
             #[cfg(test)]
-            let handler = routing_v1::inherit_capabilities(handler);
+            let handler = routing_v1::inherit_capabilities(Box::pin(handler));
             tokio::spawn(handler);
             Ok(true)
         }
@@ -353,8 +341,7 @@ pub(super) async fn answer_route_request<F, Fut>(
 /// the same order. `block_in_place` is not an option because it panics on a
 /// current-thread runtime.
 ///
-/// A panic in the handler is resumed here, so it ends this task just as it did
-/// when the handler ran on the task itself.
+/// A panic is a handler failure, so reply forwarding can still answer the caller.
 pub(super) async fn run_route_handler_off_async_workers<F, T>(handler: F) -> Result<T, ModuleError>
 where
     F: std::future::Future<Output = Result<T, ModuleError>> + Send + 'static,
@@ -362,7 +349,9 @@ where
 {
     let runtime = tokio::runtime::Handle::current();
     #[cfg(test)]
-    let handler = routing_v1::inherit_capabilities(handler);
+    // Several test-only task-local scopes wrap the future before it runs.
+    // Keep the request-sized future out of each nested wrapper's stack frame.
+    let handler = routing_v1::inherit_capabilities(Box::pin(handler));
     #[cfg(test)]
     let test_thread = TestThreadState::capture();
     let outcome = tokio::task::spawn_blocking(move || {
@@ -373,8 +362,10 @@ where
     .await;
     match outcome {
         Ok(result) => result,
-        Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
-        // The blocking pool cancels only while the runtime shuts down.
+        // Do not return panic payloads to the caller; they may contain store data.
+        Err(error) if error.is_panic() => {
+            Err(ModuleError::Message("route handler panicked".into()))
+        }
         Err(error) => Err(ModuleError::Message(format!(
             "route handler did not run to completion: {error}"
         ))),

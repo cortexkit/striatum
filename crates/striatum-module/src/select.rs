@@ -548,221 +548,11 @@ pub(super) fn price_selection_inputs_for_sweep(
     })
 }
 
-/// Where one route.select spent its time, for the slow-request log line. Each
-/// stage is a separate bucket so `unclassified_ms` (total minus every bucket)
-/// stays near zero; a large remainder means a stage is missing a timer.
-pub(super) struct RouteSelectTiming {
-    pub(super) started: Instant,
-    pub(super) is_select: std::cell::Cell<bool>,
-    pub(super) live_config_check_ms: std::cell::Cell<u64>,
-    /// Waiting for the first billing-plane load before pricing anything.
-    pub(super) billing_wait_ms: std::cell::Cell<u64>,
-    /// Decoding the parameters and resolving requirements and the caller's
-    /// available models (reads the auth file).
-    pub(super) resolve_ms: std::cell::Cell<u64>,
-    pub(super) snapshot_closure_ms: std::cell::Cell<u64>,
-    /// Live overlays, score aliases and billing-plane pricing on the facts.
-    pub(super) pricing_ms: std::cell::Cell<u64>,
-    /// Harness availability, subscription policy, exclusions and pin lookup.
-    pub(super) policy_ms: std::cell::Cell<u64>,
-    /// Reading this head's recent failed launches from the route store.
-    pub(super) head_history_ms: std::cell::Cell<u64>,
-    pub(super) selection_ms: std::cell::Cell<u64>,
-    /// Recording the selection on the winner ladder.
-    pub(super) ladder_ms: std::cell::Cell<u64>,
-    /// Writing the decision row whose id route.select returns to the caller.
-    pub(super) decision_write_ms: std::cell::Cell<u64>,
-    /// Resolving the Broca launch target (and any key-pool lease).
-    pub(super) runner_ms: std::cell::Cell<u64>,
-    /// Variant policy, explanation notes and building the response body.
-    pub(super) finish_ms: std::cell::Cell<u64>,
-    pub(super) reply_ms: std::cell::Cell<u64>,
-}
-
-/// Add `elapsed` to one stage bucket of a [`RouteSelectTiming`].
-pub(super) fn add_stage_ms(bucket: &std::cell::Cell<u64>, elapsed: Duration) {
-    bucket.set(
-        bucket
-            .get()
-            .saturating_add(elapsed.as_millis().min(u64::MAX as u128) as u64),
-    );
-}
-
-impl RouteSelectTiming {
-    pub(super) fn new() -> Self {
-        Self {
-            started: Instant::now(),
-            is_select: std::cell::Cell::new(false),
-            live_config_check_ms: std::cell::Cell::new(0),
-            billing_wait_ms: std::cell::Cell::new(0),
-            resolve_ms: std::cell::Cell::new(0),
-            snapshot_closure_ms: std::cell::Cell::new(0),
-            pricing_ms: std::cell::Cell::new(0),
-            policy_ms: std::cell::Cell::new(0),
-            head_history_ms: std::cell::Cell::new(0),
-            selection_ms: std::cell::Cell::new(0),
-            ladder_ms: std::cell::Cell::new(0),
-            decision_write_ms: std::cell::Cell::new(0),
-            runner_ms: std::cell::Cell::new(0),
-            finish_ms: std::cell::Cell::new(0),
-            reply_ms: std::cell::Cell::new(0),
-        }
-    }
-
-    pub(super) fn add_live_config_check(&self, elapsed: Duration) {
-        self.live_config_check_ms.set(
-            self.live_config_check_ms
-                .get()
-                .saturating_add(elapsed.as_millis().min(u64::MAX as u128) as u64),
-        );
-    }
-
-    #[cfg(test)]
-    pub(super) fn add_snapshot_closure(&self, elapsed: Duration) {
-        self.snapshot_closure_ms.set(
-            self.snapshot_closure_ms
-                .get()
-                .saturating_add(elapsed.as_millis().min(u64::MAX as u128) as u64),
-        );
-    }
-
-    pub(super) fn line_at(&self, now: Instant) -> Option<String> {
-        let total_ms = now
-            .saturating_duration_since(self.started)
-            .as_millis()
-            .min(u64::MAX as u128) as u64;
-        if !self.is_select.get() || total_ms <= 1_000 {
-            return None;
-        }
-        let live_config_check_ms = self.live_config_check_ms.get();
-        let billing_wait_ms = self.billing_wait_ms.get();
-        let resolve_ms = self.resolve_ms.get();
-        let snapshot_closure_ms = self.snapshot_closure_ms.get();
-        let pricing_ms = self.pricing_ms.get();
-        let policy_ms = self.policy_ms.get();
-        let head_history_ms = self.head_history_ms.get();
-        let selection_ms = self.selection_ms.get();
-        let ladder_ms = self.ladder_ms.get();
-        let decision_write_ms = self.decision_write_ms.get();
-        let runner_ms = self.runner_ms.get();
-        let finish_ms = self.finish_ms.get();
-        let reply_ms = self.reply_ms.get();
-        let classified_ms = [
-            live_config_check_ms,
-            billing_wait_ms,
-            resolve_ms,
-            snapshot_closure_ms,
-            pricing_ms,
-            policy_ms,
-            head_history_ms,
-            selection_ms,
-            ladder_ms,
-            decision_write_ms,
-            runner_ms,
-            finish_ms,
-            reply_ms,
-        ]
-        .into_iter()
-        .fold(0_u64, u64::saturating_add);
-        let unclassified_ms = total_ms.saturating_sub(classified_ms);
-        Some(format!(
-            "[routing] slow route.select total_ms={total_ms} live_config_check_ms={live_config_check_ms} snapshot_closure_ms={snapshot_closure_ms} selection_ms={selection_ms} reply_ms={reply_ms} billing_wait_ms={billing_wait_ms} resolve_ms={resolve_ms} pricing_ms={pricing_ms} policy_ms={policy_ms} head_history_ms={head_history_ms} ladder_ms={ladder_ms} decision_write_ms={decision_write_ms} runner_ms={runner_ms} finish_ms={finish_ms} unclassified_ms={unclassified_ms}"
-        ))
-    }
-}
-
-#[derive(Default)]
-pub(super) struct RouteSelectLogLimiter {
-    last_report: Option<Instant>,
-    suppressed: u64,
-}
-
-pub(super) fn rate_limit_route_select_line(
-    line: String,
-    now: Instant,
-    limiter: &mut RouteSelectLogLimiter,
-) -> Option<String> {
-    const WINDOW: Duration = Duration::from_secs(10);
-    if limiter
-        .last_report
-        .is_some_and(|last| now.saturating_duration_since(last) < WINDOW)
-    {
-        limiter.suppressed = limiter.suppressed.saturating_add(1);
-        return None;
-    }
-    limiter.last_report = Some(now);
-    let suppressed = std::mem::take(&mut limiter.suppressed);
-    Some(if suppressed == 0 {
-        line
-    } else {
-        format!("{line} (suppressed {suppressed} similar lines)")
-    })
-}
-
-fn emit_route_select_line(line: String) {
-    static LIMITER: OnceLock<Mutex<RouteSelectLogLimiter>> = OnceLock::new();
-    let now = Instant::now();
-    let Some(mut limiter) = LIMITER.get_or_init(Default::default).lock().ok() else {
-        return;
-    };
-    if let Some(line) = rate_limit_route_select_line(line, now, &mut limiter) {
-        eprintln!("{line}");
-    }
-}
-
-struct RouteSelectTimingGuard(RouteSelectTiming);
-
-impl RouteSelectTimingGuard {
-    pub(super) fn new() -> Self {
-        Self(RouteSelectTiming::new())
-    }
-}
-
-impl std::ops::Deref for RouteSelectTimingGuard {
-    type Target = RouteSelectTiming;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl Drop for RouteSelectTimingGuard {
-    fn drop(&mut self) {
-        if let Some(line) = self.0.line_at(Instant::now()) {
-            emit_route_select_line(line);
-        }
-    }
-}
-
 /// Serve retained legacy panel/account and operator operations. The public
 /// frame dispatcher sends every route.select request to routing_v1 instead.
+#[cfg(test)]
 pub(super) async fn handle_select_request(
     frame: Frame,
-    route_epoch: u32,
-    writer: &mpsc::Sender<Frame>,
-    quota_cache: &SharedQuotaCache,
-    store: &SharedStore,
-    min_band: &SharedMinBand,
-    routing_config_path: &Path,
-    operator_config_path: &Path,
-    broca_credentials: &SharedBrocaCredentials,
-) -> Result<(), ModuleError> {
-    handle_select_request_attempt(
-        frame,
-        route_epoch,
-        writer,
-        quota_cache,
-        store,
-        min_band,
-        routing_config_path,
-        operator_config_path,
-        broca_credentials,
-    )
-    .await
-}
-
-async fn handle_select_request_attempt(
-    mut frame: Frame,
     route_epoch: u32,
     writer: &mpsc::Sender<Frame>,
     quota_cache: &SharedQuotaCache,
@@ -772,15 +562,41 @@ async fn handle_select_request_attempt(
     operator_config_path: &Path,
     broca_credentials: &SharedBrocaCredentials,
 ) -> Result<(), ModuleError> {
-    let timing = RouteSelectTimingGuard::new();
-    let live_config_started = Instant::now();
+    let caller = routing_v1::Caller::for_route(frame.header.channel, route_epoch);
+    let request = routing_v1::parse_route_body(&frame.body).unwrap_or_default();
+    handle_legacy_request(
+        frame,
+        route_epoch,
+        &request,
+        &caller,
+        writer,
+        quota_cache,
+        store,
+        routing_config_path,
+        operator_config_path,
+        broca_credentials,
+    )
+    .await
+}
+
+pub(super) async fn handle_legacy_request(
+    mut frame: Frame,
+    route_epoch: u32,
+    request: &serde_json::Value,
+    caller: &routing_v1::Caller,
+    writer: &mpsc::Sender<Frame>,
+    quota_cache: &SharedQuotaCache,
+    store: &SharedStore,
+    routing_config_path: &Path,
+    operator_config_path: &Path,
+    broca_credentials: &SharedBrocaCredentials,
+) -> Result<(), ModuleError> {
     let channel = frame.header.channel;
     frame.header.epoch = route_epoch;
     let epoch = route_epoch;
     let corr = frame.header.corr;
     let ver = frame.header.ver;
     let live_config = config_overrides::live_config(routing_config_path);
-    let live_config_elapsed = live_config_started.elapsed();
 
     // Decode the method first: an unknown method must report `unknown_method` even
     // when params are absent/malformed (the params are method-specific).
@@ -800,9 +616,6 @@ async fn handle_select_request_attempt(
         }
     };
 
-    timing.is_select.set(envelope.method == ROUTE_SELECT_OP);
-    timing.add_live_config_check(live_config_elapsed);
-
     if !handles(&envelope.method) {
         return send_route_error(
             writer,
@@ -818,12 +631,13 @@ async fn handle_select_request_attempt(
     if envelope.method == ROUTE_SELECT_PANEL_OP {
         crate::info_operator(format!(
             "[routing] legacy panel call principal={}",
-            route_principal(channel, epoch)
+            caller.principal
         ));
     }
 
     if envelope.method == ROUTE_CATALOG_TARGETS_OP {
-        return crate::catalog_targets::serve(frame, writer, broca_credentials).await;
+        return crate::catalog_targets::serve(frame, &caller.principal, writer, broca_credentials)
+            .await;
     }
     if envelope.method == ROUTE_HEAD_CHOICES_OP {
         return crate::head_choices::serve(
@@ -896,13 +710,12 @@ async fn handle_select_request_attempt(
     }
 
     if account_selection::handles(&envelope.method) {
-        let principal = route_principal(channel, epoch);
-        let request: serde_json::Value = serde_json::from_slice(&frame.body).unwrap_or_default();
+        let principal = &caller.principal;
         let call = (envelope.method == account_selection::ACCOUNT_FOR_OP).then(|| {
             let credentials = broca_credentials.lock().ok();
             account_selection::call_log::AccountCall::legacy(
                 &request["params"],
-                &principal,
+                principal,
                 Some(&live_config),
                 credentials.as_deref(),
                 store,
@@ -912,7 +725,7 @@ async fn handle_select_request_attempt(
             &envelope.method,
             &frame.body,
             &request["params"],
-            &principal,
+            principal,
             store,
             broca_credentials,
             operator_config_path,
@@ -955,7 +768,7 @@ async fn handle_select_request_attempt(
         return handle_clear_cooldown(frame, writer, store).await;
     }
     if envelope.method == ROUTE_CLEAR_CREDENTIAL_FENCES_OP {
-        return handle_clear_credential_fences(frame, writer, store).await;
+        return clear_credential_fences_for(frame, &caller.principal, writer, store).await;
     }
     if envelope.method == ROUTE_COOLDOWN_STATUS_OP {
         return handle_cooldown_status(frame, writer, store).await;
@@ -969,6 +782,8 @@ async fn handle_select_request_attempt(
     if envelope.method == diagnostics_findings::OP {
         return diagnostics_findings::handle(
             frame,
+            request,
+            caller,
             writer,
             store,
             operator_config_path,
@@ -1035,12 +850,7 @@ async fn handle_select_request_attempt(
         return send_pool_reply(writer, ver, channel, epoch, corr, reply).await;
     }
     let billing_ready = if envelope.method == ROUTE_SELECT_PANEL_OP {
-        let billing_started = Instant::now();
-        let ready =
-            broca_credentials::wait_for_billing_catalog(broca_credentials, Duration::from_secs(3))
-                .await;
-        add_stage_ms(&timing.billing_wait_ms, billing_started.elapsed());
-        ready
+        broca_credentials::wait_for_billing_catalog(broca_credentials, Duration::from_secs(3)).await
     } else {
         true
     };
@@ -1070,6 +880,7 @@ async fn handle_select_request_attempt(
     if envelope.method == ROUTE_SELECT_PANEL_OP {
         return handle_select_panel(
             frame,
+            caller,
             writer,
             quota_cache,
             store,
@@ -1274,6 +1085,7 @@ pub(super) fn select_availability(
 
 async fn handle_select_panel(
     frame: Frame,
+    caller: &routing_v1::Caller,
     writer: &mpsc::Sender<Frame>,
     quota_cache: &SharedQuotaCache,
     store: &SharedStore,
@@ -1376,7 +1188,6 @@ async fn handle_select_panel(
             )
         })
         .unwrap_or_default();
-    let caller = routing_v1::Caller::for_route(channel, epoch);
     let tier_settings = match caller.stamped_project() {
         Some(project) => crate::managed_settings::project_view(routing_config_path, project)
             .await
@@ -1384,16 +1195,13 @@ async fn handle_select_panel(
             .unwrap_or_default(),
         None => crate::tier_settings::Layers::default(),
     };
+    let resolver = tier_settings.tier_resolver(&operator_config, panel_consumer.id());
     let tiers = classes.apply_configured_service_tiers(
         &mut prepared.facts,
         |fact| {
-            tier_settings.resolve(
-                &operator_config,
-                panel_consumer.id(),
-                &fact.provider_id,
-                &fact.model_id,
-                params.service_tier,
-            )
+            params
+                .service_tier
+                .or_else(|| resolver.resolve(&fact.provider_id, &fact.model_id))
         },
         &registry.policies(),
         &registry,

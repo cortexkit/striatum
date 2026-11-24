@@ -101,11 +101,12 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 pub(super) async fn next_frame_or_loop_stop<R>(
     read_half: &mut R,
     loops: &mut BackgroundLoops,
+    writer: Option<&tokio::sync::mpsc::Sender<Frame>>,
 ) -> Result<Option<Frame>, ModuleError>
 where
     R: AsyncRead + Unpin,
 {
-    frame_or_loop_stop(read_next_frame(read_half), loops).await
+    frame_or_loop_stop(read_next_frame(read_half), loops, writer).await
 }
 
 pub(super) async fn read_next_frame<R: AsyncRead + Unpin>(
@@ -119,8 +120,17 @@ pub(super) async fn read_next_frame<R: AsyncRead + Unpin>(
 pub(super) async fn frame_or_loop_stop(
     frame: impl std::future::Future<Output = Result<Option<Frame>, ModuleError>>,
     loops: &mut BackgroundLoops,
+    writer: Option<&tokio::sync::mpsc::Sender<Frame>>,
 ) -> Result<Option<Frame>, ModuleError> {
     tokio::select! {
+        // The writer's receiver closes on failure. Leave via normal cleanup;
+        // the connection owner joins the writer and returns the actual error.
+        () = async {
+            match writer {
+                Some(writer) => writer.closed().await,
+                None => std::future::pending().await,
+            }
+        } => Ok(None),
         result = frame => result,
         stopped = loops.next_stop() => {
             eprintln!("[striatum] background-loop-stopped: {stopped}");
@@ -237,7 +247,6 @@ pub(super) async fn start(
                 roster_resolver,
                 Arc::clone(&broca_credentials),
                 config.config_path.clone(),
-                Arc::clone(quota_cache),
             ),
         );
     }
@@ -297,8 +306,15 @@ pub(super) async fn start(
 
 const ACCOUNT_TICK_PERIOD: std::time::Duration = std::time::Duration::from_secs(10);
 
-async fn account_tick_loop(store: SharedStore, period: std::time::Duration) {
+fn account_ticks(period: std::time::Duration) -> tokio::time::Interval {
     let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+    // A congested writer needs one reconciliation, not one for each missed tick.
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    ticks
+}
+
+async fn account_tick_loop(store: SharedStore, period: std::time::Duration) {
+    let mut ticks = account_ticks(period);
     let mut bypasses = 0;
     loop {
         ticks.tick().await;
@@ -337,6 +353,19 @@ async fn account_tick_loop(store: SharedStore, period: std::time::Duration) {
         })
         .await;
     }
+}
+
+#[cfg(test)]
+#[tokio::test(start_paused = true)]
+async fn account_ticks_do_not_replay_each_missed_pass() {
+    use tokio::time::{advance, Instant};
+    let mut ticks = account_ticks(ACCOUNT_TICK_PERIOD);
+    ticks.tick().await;
+    advance(std::time::Duration::from_secs(35)).await;
+    ticks.tick().await;
+    let after_catch_up = Instant::now();
+    ticks.tick().await;
+    assert_eq!(after_catch_up.elapsed(), std::time::Duration::from_secs(5));
 }
 
 async fn history_mover_loop(store: SharedStore) {
@@ -684,7 +713,6 @@ mod tests {
                     Arc::new(SlowEmptyResolver),
                     credentials,
                     config_path,
-                    Arc::new(Mutex::new(crate::QuotaCache::default())),
                 ))
             },
         );
