@@ -99,7 +99,7 @@ async fn retention_after_recent_report_use_keeps_the_original_observation_path()
 }
 
 #[tokio::test]
-async fn report_delivery_succeeds_left_account_and_unbound_attempt_refreshes_moved_run() {
+async fn report_delivery_succeeds_left_account_and_bound_attempt_refreshes_moved_run() {
     const NOW: u64 = 1_790_683_200_000;
     let _clock = crate::InjectedClock::set(NOW);
     let (subject, consumer, runner, request) = paused().await;
@@ -147,6 +147,6 @@ async fn report_delivery_succeeds_left_account_and_unbound_attempt_refreshes_mov
     let harness = subject.harness();
     let conn = rusqlite::Connection::open(harness.store_path()).unwrap();
     let (bound, effect): (bool, String) = conn.query_row("SELECT bound, effects_json FROM account_observation WHERE event_id='late-moved-attempt'", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
-    assert!(!bound);
-    assert!(effect.contains("served_account_mismatch"), "{effect}");
+    assert!(bound);
+    assert_eq!(effect, "[]");
 }

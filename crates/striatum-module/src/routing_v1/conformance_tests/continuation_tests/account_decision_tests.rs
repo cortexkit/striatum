@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use super::*;
 
 async fn paused_without_selection() -> (KitSubject, Route, Value, Value) {
@@ -118,7 +120,7 @@ async fn continuation_from_account_decision_preserves_admission_boundaries() {
 }
 
 #[tokio::test]
-async fn continuation_used_via_started_leaves_served_attempt_unbound() {
+async fn continuation_used_via_started_binds_served_attempt() {
     let (subject, runner, request, admitted) = paused_without_selection().await;
     let offer = result(runner.call("route.account_for", &request).await);
     assert_account_offer(&subject, &request, &admitted, &offer);
@@ -127,12 +129,6 @@ async fn continuation_used_via_started_leaves_served_attempt_unbound() {
         "kind": "admission_started", "event_id": "head-moved",
         "admission_id": request["admission_id"], "run_id": request["run_id"],
         "served_account_id": offer["account"], "credential_id": offer["credential_id"],
-    });
-    let mismatch = json!({
-        "effect": "served_account_mismatch",
-        "selected_account_id": admitted["account"]["account_id"],
-        "served_account_id": offer["account"],
-        "pin_generation": admitted["pin"]["generation"].as_u64().unwrap(),
     });
     let effects = |reply: &Value| {
         reply["observation"]["effects"]
@@ -143,16 +139,78 @@ async fn continuation_used_via_started_leaves_served_attempt_unbound() {
             .collect::<Vec<_>>()
     };
     let start = result(runner.call("route.account_observe", &started).await);
-    assert_eq!(start["observation"]["bound"], false, "{start}");
-    assert_eq!(
-        effects(&start),
-        vec![json!({"effect": "continuation_used"}), mismatch.clone()]
+    assert!(
+        effects(&start).contains(&json!({"effect": "continuation_used"})),
+        "{start}"
     );
     let (used, _, state, run_id, started_at) = offer_state(&subject, &offer);
     assert!(used.is_some());
     assert_eq!(state, "started");
     assert_eq!(run_id.as_deref(), request["run_id"].as_str());
     assert_eq!(started_at, used);
+
+    let harness = subject.harness();
+    let store = harness.store();
+    let old_credential = admitted["account"]["credential_id"].as_str().unwrap();
+    let moved_credential = offer["credential_id"].as_str().unwrap();
+    // Seed older evidence after the move so the holds do not change which
+    // accounts the allocator can offer. The served attempt should clear only
+    // the hold on the credential it actually used.
+    for credential in [old_credential, moved_credential] {
+        store
+            .record_credential_entitlement_fence(
+                &striatum_core::route_state_store::CredentialRefusal {
+                    provider_id: fixture::SUBSCRIPTION_PROVIDER.into(),
+                    credential_id: credential.into(),
+                    code: "credential_refused".into(),
+                },
+                None,
+                account_selection::now_ms() - 3_600_001,
+            )
+            .unwrap();
+    }
+    let credential_holds = || {
+        store
+            .credential_entitlement_fences()
+            .unwrap()
+            .into_iter()
+            .map(|fence| fence.credential_id)
+            .collect::<BTreeSet<_>>()
+    };
+    let old_hold = BTreeSet::from([old_credential.to_owned()]);
+    assert_eq!(
+        credential_holds(),
+        BTreeSet::from([old_credential.to_owned(), moved_credential.to_owned()])
+    );
+    let wall_report = result(
+        runner
+            .call(
+                "route.account_observe",
+                &json!({
+                    "kind": "attempt", "event_id": "head-original-wall",
+                    "admission_id": request["admission_id"],
+                    "served_account_id": admitted["account"]["account_id"],
+                    "credential_id": old_credential, "upstream_origin": "upstream",
+                    "headers": {"anthropic-ratelimit-unified-7d-utilization": "1.0"},
+                }),
+            )
+            .await,
+    );
+    let wall_effects = effects(&wall_report);
+    let wall = &wall_effects[0];
+    assert_eq!(wall["effect"], "fence", "{wall_report}");
+    assert_eq!(
+        wall["fence"]["account_id"],
+        admitted["account"]["account_id"]
+    );
+    let original_wall_active = || {
+        store
+            .account_read(|tx| tx.active_pool_fences(fixture::SUBSCRIPTION_PROVIDER))
+            .unwrap()
+            .into_iter()
+            .any(|fence| Some(fence.evidence.fence_id.as_str()) == wall["fence_id"].as_str())
+    };
+    assert!(original_wall_active());
 
     let attempt = json!({
         "kind": "attempt", "event_id": "head-served",
@@ -161,8 +219,50 @@ async fn continuation_used_via_started_leaves_served_attempt_unbound() {
         "attempt_outcome": {"status": "served"}, "upstream_origin": "upstream",
     });
     let served = result(runner.call("route.account_observe", &attempt).await);
-    assert_eq!(served["observation"]["bound"], false, "{served}");
-    assert_eq!(effects(&served), vec![mismatch]);
+    assert_eq!(served["observation"]["bound"], true, "{served}");
+    let served_effects = effects(&served);
+    assert_eq!(served_effects.len(), 1, "{served}");
+    assert_eq!(served_effects[0]["effect"], "block_cleared", "{served}");
+    assert_eq!(credential_holds(), old_hold);
+    assert!(original_wall_active());
+    assert_eq!(start["observation"]["bound"], true, "{start}");
+
+    for (index, (account, credential)) in [
+        (&json!("third-account"), &json!("third-credential")),
+        (&offer["account"], &admitted["account"]["credential_id"]),
+        (&admitted["account"]["account_id"], &offer["credential_id"]),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut third = attempt.clone();
+        third["event_id"] = json!(format!("head-mismatch-{index}"));
+        third["served_account_id"] = account.clone();
+        third["credential_id"] = credential.clone();
+        let refused = result(runner.call("route.account_observe", &third).await);
+        assert_eq!(refused["observation"]["bound"], false, "{refused}");
+        assert_eq!(
+            effects(&refused),
+            vec![json!({
+                "effect": "served_account_mismatch",
+                "selected_account_id": admitted["account"]["account_id"],
+                "served_account_id": account,
+                "pin_generation": admitted["pin"]["generation"],
+            })]
+        );
+    }
+    assert_eq!(credential_holds(), old_hold);
+
+    let mut late = attempt;
+    late["event_id"] = json!("head-late-original");
+    late["served_account_id"] = admitted["account"]["account_id"].clone();
+    late["credential_id"] = admitted["account"]["credential_id"].clone();
+    let served = result(runner.call("route.account_observe", &late).await);
+    assert_eq!(served["observation"]["bound"], true, "{served}");
+    let served_effects = effects(&served);
+    assert_eq!(served_effects.len(), 1, "{served}");
+    assert_eq!(served_effects[0]["effect"], "block_cleared", "{served}");
+    assert!(credential_holds().is_empty());
 }
 
 #[tokio::test]

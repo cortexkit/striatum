@@ -252,7 +252,7 @@ pub(super) fn record_observation(
     let observation_id = new_id("aco");
     // `routing_v1::accounts` resolves the admission's principal before the
     // transaction; a decision owner's event stays under the owner's principal.
-    let success_admission = match (&parsed.attempt_outcome, &parsed.admission_id) {
+    let mut success_admission = match (&parsed.attempt_outcome, &parsed.admission_id) {
         (Some(_), Some(id)) => tx.admission_for_success(admission_principal, id)?,
         _ => None,
     };
@@ -277,6 +277,7 @@ pub(super) fn record_observation(
     })?;
     let mut effects: Vec<Value> = Vec::new();
     let bound;
+    let mut continued_admission = None;
     let served_providers: BTreeSet<String> =
         if allow_served_account && parsed.kind == "transient_backoff" {
             ctx.classes
@@ -320,17 +321,38 @@ pub(super) fn record_observation(
                     }
                 }
             }
-            // Attempts served by a different account name the original admission
-            // but are stored unbound. Refresh its started reservations before the
-            // bound-only effects, including one this observation just started.
+            // Refresh through the original admission so its started reservations
+            // are refreshed too, including one this observation just started.
             if parsed.kind == "attempt" {
                 tx.observe_admission(row, now)?;
             }
-            let mismatch = parsed
+            let account_mismatch = parsed
                 .served_account_id
                 .as_deref()
                 .is_some_and(|served| served != row.account_id);
-            if mismatch {
+            // Account evidence can follow a used offer, but a run finish still
+            // closes the original admission and the whole chain of reservations.
+            let latest = match (&parsed.served_account_id, &parsed.credential_id) {
+                (Some(_), Some(credential))
+                    if parsed.kind != "run_finished"
+                        && (account_mismatch || *credential != row.credential_id) =>
+                {
+                    tx.latest_used_continuation(&row.principal, &row.admission_id)?
+                }
+                _ => None,
+            };
+            let has_used_offer = latest.is_some();
+            continued_admission = latest.filter(|current| {
+                parsed.served_account_id.as_deref() == Some(current.account_id.as_str())
+                    && parsed.credential_id.as_deref() == Some(current.credential_id.as_str())
+            });
+            if let Some(current) = &continued_admission {
+                bound = true;
+                if parsed.attempt_outcome.is_some() {
+                    success_admission =
+                        tx.admission_for_success(&current.principal, &current.admission_id)?;
+                }
+            } else if account_mismatch || has_used_offer {
                 tracing::warn!(
                     admission = %row.admission_id,
                     selected = %row.account_id,
@@ -352,6 +374,7 @@ pub(super) fn record_observation(
             }
         }
     }
+    let admission = continued_admission.or(admission);
     if parsed.kind == "credential_refused" {
         apply_credential_refused(&*tx, ctx, parsed, admission.as_ref(), &mut effects)?;
     } else if parsed.kind == "transient_backoff" && parsed.retry_at_ms.is_some() && bound {
