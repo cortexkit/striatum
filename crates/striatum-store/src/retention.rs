@@ -1029,7 +1029,6 @@ impl crate::AccountTx<'_> {
         .map_err(err)
     }
 
-    #[cfg(any(test, feature = "test-support"))]
     pub fn prune_account_pins(&self, before: i64, limit: usize) -> RouteStateResult<usize> {
         #[cfg(any(test, feature = "test-support"))]
         let _writer_entry =
@@ -1336,15 +1335,15 @@ impl crate::AccountTx<'_> {
     }
 
     /// Unkeyed continuation retention in one statement over the whole table.
-    /// Production plans on a reader and rechecks by key
+    /// The module's retention plans on a reader and rechecks by key
     /// ([`Self::delete_account_continuations_returning`]); tests keep this
     /// form as the reference the keyed path must agree with.
-    #[cfg(any(test, feature = "test-support"))]
     pub fn prune_account_continuations(
         &self,
         before: i64,
         limit: usize,
     ) -> RouteStateResult<usize> {
+        #[cfg(any(test, feature = "test-support"))]
         let _writer_entry =
             crate::writer_entry_trace::enter("account_tx::retention::prune_account_continuations");
         self.prune_account_continuations_returning(before, limit)
@@ -1380,12 +1379,12 @@ impl crate::AccountTx<'_> {
 
     /// [`Self::prune_account_continuations`], returning each deleted row's
     /// identity.
-    #[cfg(any(test, feature = "test-support"))]
     pub fn prune_account_continuations_returning(
         &self,
         before: i64,
         limit: usize,
     ) -> RouteStateResult<Vec<crate::PrunedContinuation>> {
+        #[cfg(any(test, feature = "test-support"))]
         let _writer_entry = crate::writer_entry_trace::enter(
             "account_tx::retention::prune_account_continuations_returning",
         );
