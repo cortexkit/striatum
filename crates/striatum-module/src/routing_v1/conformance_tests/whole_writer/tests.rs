@@ -699,7 +699,10 @@ async fn generated_request_groups_compare_all_state_after_every_real_step() {
             stringify!(generated_request_groups_compare_all_state_after_every_real_step),
             |_| {},
         );
-        assert_eq!((seeds, groups, states), (6, 264, 6_547));
+        // Each of 24 paired charge witnesses starts an admission in
+        // both the charged and uncharged worlds, adding 24 * 2 comparisons
+        // to the original count of 6,547.
+        assert_eq!((seeds, groups, states), (6, 264, 6_595));
         println!("compared {states} whole states across {seeds} seeds and {groups} generated request groups");
         return;
     };
