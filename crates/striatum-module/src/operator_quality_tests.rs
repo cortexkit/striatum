@@ -164,14 +164,19 @@ fn quality_precedence_for_mapping(catalog_provider: &str, mapped_provider: &str)
         }
     }}).to_string()).unwrap();
     let config = crate::config_overrides::settle_live_config(&config_path);
-    let mut shadowed = config.shadowed_operator_grades(&store.operator_quality().unwrap());
+    let mut facts = store.get_facts().unwrap();
+    let targets = credentials.lock().unwrap().catalog_targets(&facts);
+    striatum_core::score_alias::append_alias_rows(&mut facts, &targets);
+    let mut shadowed = config.shadowed_operator_grades(
+        &store.operator_quality().unwrap(),
+        facts
+            .iter()
+            .map(|fact| (fact.provider_id.as_str(), fact.model_id.as_str())),
+    );
     shadowed.sort();
     let mut expected_shadowed = vec![catalog_route.clone(), mapped_route.clone()];
     expected_shadowed.sort();
     assert_eq!(shadowed, expected_shadowed);
-    let mut facts = store.get_facts().unwrap();
-    let targets = credentials.lock().unwrap().catalog_targets(&facts);
-    striatum_core::score_alias::append_alias_rows(&mut facts, &targets);
     config.apply(&mut facts);
     config.apply(&mut facts);
     for provider in [catalog_provider, mapped_provider] {

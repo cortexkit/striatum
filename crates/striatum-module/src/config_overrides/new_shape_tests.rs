@@ -184,6 +184,48 @@ fn nested_quality_overrides_beat_operator_grades() {
 }
 
 #[test]
+fn model_overlays_and_dormant_keys_use_catalog_model_identity() {
+    let clef = "cloudflare-workers-ai/@cf/cloudflare/clef";
+    let xhigh = "openai/gpt-6.2-sol/xhigh";
+    let missing = "cloudflare-workers-ai/@cf/cloudflare/missing";
+    let config = config(json!({"models": {
+        (clef): {"elo": 1500},
+        (xhigh): {"elo": 1600},
+        (missing): {"elo": 1700},
+    }}));
+    let fact = |provider, model, variant| {
+        serde_json::from_value::<ModelFact>(json!({
+            "providerID": provider, "modelID": model, "variant": variant,
+            "scores": {"elo": 1000, "eq": 1000, "speed": 0}, "confidence": "curated"
+        }))
+        .unwrap()
+    };
+    let mut facts = vec![
+        fact("cloudflare-workers-ai", "@cf/cloudflare/clef", None),
+        fact("cloudflare-workers-ai", "@cf/cloudflare/clef-flash", None),
+        fact("openai", "gpt-6.2-sol", Some("xhigh")),
+        fact("openai", "gpt-6.2-sol", Some("high")),
+    ];
+    let catalog = CatalogModelIds::from_facts(&facts);
+    assert_eq!(
+        parse_model_key(clef, Some(&catalog)),
+        Some(("cloudflare-workers-ai", "@cf/cloudflare/clef", None))
+    );
+    assert_eq!(
+        parse_model_key(xhigh, Some(&catalog)),
+        Some(("openai", "gpt-6.2-sol", Some("xhigh")))
+    );
+    assert_eq!(config.dormant_model_keys(&facts), [missing]);
+    let outcome = config.apply(&mut facts);
+    assert_eq!(outcome.applied, 2);
+    assert_eq!(outcome.unknown_keys, [missing]);
+    assert_eq!(
+        facts.iter().map(|fact| fact.scores.elo).collect::<Vec<_>>(),
+        [1500.0, 1000.0, 1600.0, 1000.0]
+    );
+}
+
+#[test]
 fn absent_model_config_is_dormant_and_reported_without_creating_candidates() {
     let config = config(json!({"models": {
         "p/stale": {"elo": 1500, "eq": 1500},
