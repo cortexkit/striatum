@@ -30,7 +30,6 @@
 //! nothing about entitlement, so a reading cannot lift or convert that fence.
 
 use std::collections::BTreeMap;
-#[cfg(test)]
 use std::collections::HashSet;
 
 use striatum_core::route_state_store::{CredentialEntitlementFence, CredentialRefusal};

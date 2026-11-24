@@ -225,8 +225,9 @@ pub(super) fn demand_with(
 /// reading's time, or, for an account it places on paid credits, the credit
 /// reading's time, because it then sets the quota reading aside. Credit
 /// placement needs `paid_credits` and a spendable credit reading; when both
-/// hold, the earlier of the two times bounds the read, without repeating the
-/// allocator's further conditions for credit mode. `scored` is the view the
+/// hold, the earlier of the two times bounds the read. Whether the allocator
+/// then actually enters credit mode isn't checked here: the earlier floor reads
+/// every row either outcome can count. `scored` is the view the
 /// allocator scores: when it carries no quota reading time, every admission
 /// can count. The round-robin and hybrid strategies order accounts by how many
 /// admissions each holds, whatever their age, so they need the whole history.
