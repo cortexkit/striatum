@@ -81,6 +81,8 @@ mod account_refusal_codes_tests;
 #[cfg(test)]
 mod add_shapes_tests;
 #[cfg(test)]
+mod broca_output_cap_harness_1124_tests;
+#[cfg(test)]
 mod concurrency_samples_tests;
 #[cfg(test)]
 mod conformance_tests;

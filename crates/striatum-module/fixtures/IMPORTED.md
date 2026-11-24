@@ -170,3 +170,22 @@ IDs.
 The `learned_org` case includes a top-level `org_id` on an Anthropic API key
 with no account identity. SHA-256:
 `4ff7e45c2839f71873c1ca12ffe5ea3e15d35897e3610bb884a26a6f0329b691`.
+
+## Broca split output-cap harness
+
+`broca-output-cap-harness-1124/` preserves both supplied files byte for byte
+from `.cortexkit/internal-docs/samples/broca-output-cap-harness-1124/`.
+`routing-slot.json` is the exact proposed `routing/v1` role declaration slot
+supplied by Broca. `current-live-routing-slot.json` was captured from
+`modules[broca].role_declarations["routing/v1"]` in `ck --json catalog` at
+23:28 UTC on 24 November 2026. The baseline was re-serialized as compact JSON;
+its value matches what the daemon served, but its bytes are not Broca's
+original serialization.
+
+Both source files were checked against the supplied byte counts and SHA-256
+prefixes before import.
+
+| Imported path | Bytes | SHA-256 |
+| --- | ---: | --- |
+| `broca-output-cap-harness-1124/routing-slot.json` | 2191 | `168755640c483cbd479e915a103a8f335d39f0d4cc8ab4579da1140c6d6b9987` |
+| `broca-output-cap-harness-1124/current-live-routing-slot.json` | 1277 | `6c54624ca04c67c6a6d295849837ccbff28ac0cc9fe840f0298cc51a46a1fa5d` |
