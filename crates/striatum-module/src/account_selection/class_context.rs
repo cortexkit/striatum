@@ -3266,6 +3266,11 @@ fn add_spend_inputs(
     {
         return;
     }
+    // A reading may list both credit pools: prepaid `credits` and metered
+    // `extra_usage`. Merge them, so their order can't decide the account's
+    // reading: it can spend when either pool can, and counts as prepaid when a
+    // spendable pool is the prepaid one.
+    let mut credit: Option<CreditReading> = None;
     for pool in entry
         .get("spend")
         .and_then(Value::as_array)
@@ -3286,14 +3291,14 @@ fn add_spend_inputs(
             };
             let spendable =
                 pool.get("spendable").and_then(Value::as_bool) != Some(false) && remaining > 0.0;
-            context.credits.insert(
-                account.to_owned(),
-                CreditReading {
-                    observed_at_ms: at,
-                    spendable,
-                    prepaid: pool_id == Some("credits"),
-                },
-            );
+            let prepaid = spendable && pool_id == Some("credits");
+            let merged = credit.get_or_insert(CreditReading {
+                observed_at_ms: at,
+                spendable: false,
+                prepaid: false,
+            });
+            merged.spendable |= spendable;
+            merged.prepaid |= prepaid;
         } else if let (Some(total), Some(remaining)) = (amount("total"), amount("remaining")) {
             context.spend.insert(
                 account.to_owned(),
@@ -3303,6 +3308,9 @@ fn add_spend_inputs(
                 },
             );
         }
+    }
+    if let Some(credit) = credit {
+        context.credits.insert(account.to_owned(), credit);
     }
 }
 
@@ -3347,6 +3355,53 @@ mod spend_input_tests {
             !context.credits["a"].prepaid,
             "extra usage is metered overage"
         );
+    }
+
+    /// One reading can list both a prepaid `credits` pool and an
+    /// `extra_usage` pool. Their order in the reading must not decide whether
+    /// the account can spend: any spendable pool makes it spendable, and it is
+    /// prepaid when a spendable pool is the prepaid one.
+    #[test]
+    fn both_credit_pools_in_one_reading_merge_whatever_their_order() {
+        let at = 1_800_000_000_000;
+        let pool = |id: &str, minor: i64, spendable: bool| json!({"id":id,"spendable":spendable,"remaining":{"minor":minor,"exponent":0,"unit":"usd"}});
+        for (pools, spendable, prepaid) in [
+            (
+                [pool("credits", 100, true), pool("extra_usage", 0, false)],
+                true,
+                true,
+            ),
+            (
+                [pool("extra_usage", 100, true), pool("credits", 0, true)],
+                true,
+                false,
+            ),
+            (
+                [pool("extra_usage", 100, true), pool("credits", 100, true)],
+                true,
+                true,
+            ),
+            (
+                [pool("extra_usage", 0, true), pool("credits", 0, false)],
+                false,
+                false,
+            ),
+        ] {
+            for reversed in [false, true] {
+                let mut pools = pools.to_vec();
+                if reversed {
+                    pools.reverse();
+                }
+                let entry = json!({"fetchedAt":rfc3339(at),"spend":pools});
+                let mut context = striatum_core::accounts::AllocationContext::default();
+                add_spend_inputs(&mut context, "a", &entry);
+                assert_eq!(
+                    (context.credits["a"].spendable, context.credits["a"].prepaid),
+                    (spendable, prepaid),
+                    "{entry}"
+                );
+            }
+        }
     }
 }
 

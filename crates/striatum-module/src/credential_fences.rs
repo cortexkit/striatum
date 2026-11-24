@@ -594,7 +594,8 @@ pub(crate) fn live_with_eligibility(
     enum ListingRepair {
         SignedOut(CredentialEntitlementFence, String),
         Adopt(String, String),
-        Clear(CredentialEntitlementFence),
+        /// The refusal as this read saw it, and the login's current listing.
+        Clear(CredentialEntitlementFence, Option<String>),
     }
     let mut repairs = Vec::new();
     let mut live = Vec::with_capacity(fences.len());
@@ -628,7 +629,7 @@ pub(crate) fn live_with_eligibility(
                 fence.listing_fingerprint = Some(current.to_owned());
                 live.push(fence);
             }
-            _ => repairs.push(ListingRepair::Clear(fence)),
+            _ => repairs.push(ListingRepair::Clear(fence, current)),
         }
     }
     if !repairs.is_empty() || eligibility_changed {
@@ -637,7 +638,8 @@ pub(crate) fn live_with_eligibility(
             hook();
         }
         let now = crate::account_selection::now_ms();
-        crate::account_writer::repair(store, move |tx| {
+        let kept = crate::account_writer::repair(store, move |tx| {
+            let mut kept = Vec::new();
             for repair in &repairs {
                 match repair {
                     ListingRepair::SignedOut(fence, fingerprint) => {
@@ -646,7 +648,25 @@ pub(crate) fn live_with_eligibility(
                     ListingRepair::Adopt(credential, fingerprint) => {
                         tx.adopt_credential_entitlement_fingerprint(&credential, &fingerprint)?
                     }
-                    ListingRepair::Clear(fence) => {
+                    ListingRepair::Clear(fence, listing) => {
+                        // The decision to clear was made from a read taken
+                        // before this command. A newer refusal for the same
+                        // login may have replaced the one read, and its quota
+                        // holds share the login's hold prefix: clear only
+                        // while the refusal read is still the current one.
+                        let current = tx.credential_entitlement_fence(
+                            &fence.provider_id,
+                            &fence.credential_id,
+                        )?;
+                        if current.as_ref() != Some(fence) {
+                            // A newer refusal recorded against the listing
+                            // this request sees still applies to it.
+                            kept.extend(current.filter(|current| {
+                                current.listing_fingerprint.is_some()
+                                    && current.listing_fingerprint == *listing
+                            }));
+                            continue;
+                        }
                         clear_quota_holds_in(tx, &fence, "vault_listing_changed", now)?;
                         tx.clear_credential_entitlement_fences(
                             &fence.credential_id,
@@ -658,9 +678,10 @@ pub(crate) fn live_with_eligibility(
             if let Some(listings) = &listings {
                 tx.reconcile_account_eligibility(listings)?;
             }
-            Ok(())
+            Ok(kept)
         })
         .map_err(|e| e.to_string())?;
+        live.extend(kept);
     }
     Ok(live)
 }
