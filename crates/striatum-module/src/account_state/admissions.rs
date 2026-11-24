@@ -841,10 +841,23 @@ impl AdmissionState {
         }
     }
 
-    /// Closed rows are not retained in `open`, but their start evidence still
-    /// contributes to the current pin's history. Do not reopen the admission
-    /// or add an active started-pin or inflight entry.
+    /// Closed rows are not retained in `open`, but late start evidence restores
+    /// their demand and contributes to the current pin's history. Do not reopen
+    /// the admission or count it as an active run.
     pub(crate) fn record_terminal_start(&mut self, row: &AccountAdmissionRow) {
+        self.set_demand(
+            &row.provider,
+            &row.account_id,
+            (
+                row.committed_at,
+                row.principal.clone().into(),
+                row.admission_id.clone().into(),
+            ),
+            Some(Demand {
+                state: row.state.clone().into(),
+                request_bytes: row.request_bytes,
+            }),
+        );
         self.add_pin_started(
             &Contribution {
                 principal: &row.principal,

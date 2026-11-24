@@ -103,6 +103,72 @@ async fn finished_unsent_admission_removes_demand_but_started_admission_keeps_it
     }
 }
 
+#[tokio::test]
+async fn late_start_restores_finished_demand_to_in_order_result() {
+    let _clock = crate::InjectedClock::set(1_800_000_000_000);
+    let mut results = Vec::new();
+    for finish_first in [false, true] {
+        let harness = providers(false, false);
+        let route = harness.bind(reserved("colliculus"), None).await;
+        let decision = selected(&route, &request()).await;
+        let admitted = admit(&route, &decision, "demand").await;
+        let account = admitted["account"]["account_id"].as_str().unwrap();
+        if finish_first {
+            observe(&route, "demand", "run_finished", json!({})).await;
+            assert!(crate::account_state::snapshot(harness.store())
+                .unwrap()
+                .admissions
+                .demand("openai", account, None)
+                .is_empty());
+        }
+        observe(
+            &route,
+            "demand",
+            "admission_started",
+            json!({"run_id":"run"}),
+        )
+        .await;
+        if !finish_first {
+            observe(&route, "demand", "run_finished", json!({})).await;
+        }
+        let (row, demand) = harness
+            .store()
+            .account_read(|tx| {
+                Ok((
+                    tx.admission("reserved:colliculus", "demand")?.unwrap(),
+                    tx.demand("openai", account, None)?,
+                ))
+            })
+            .unwrap();
+        assert!(row.charged);
+        assert_eq!(row.state, "finished");
+        assert_eq!(
+            demand.iter().map(|entry| entry.request_bytes).sum::<u64>(),
+            1
+        );
+        assert_eq!(
+            crate::account_state::snapshot(harness.store())
+                .unwrap()
+                .admissions
+                .demand("openai", account, None),
+            demand
+        );
+        crate::account_state::assert_published_equals_fresh_load(
+            harness.store(),
+            "after start and finish",
+        );
+        results.push((
+            row.charged,
+            row.state,
+            row.run_id,
+            row.started_at,
+            row.finished_at,
+            demand,
+        ));
+    }
+    assert_eq!(results[0], results[1]);
+}
+
 fn effects(reply: &Value) -> Vec<Value> {
     reply["observation"]["effects"]
         .as_array()

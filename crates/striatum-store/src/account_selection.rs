@@ -1917,10 +1917,11 @@ impl AccountTx<'_> {
             == 1;
         if !changed {
             // Redelivery can put the start after the finish. Retain the run's
-            // evidence without reopening the admission or its concurrency slot.
+            // evidence and restore its demand without reopening the admission
+            // or its concurrency slot.
             // An anonymous start already recorded its first start time.
             self.conn.execute(
-                "UPDATE account_admission SET run_id = ?3, started_at = ?4, started_late = ?5, \
+                "UPDATE account_admission SET run_id = ?3, started_at = ?4, started_late = ?5, charged = 1, \
                  last_observed_at = MAX(COALESCE(last_observed_at, ?4), ?4) \
                  WHERE principal = ?1 AND admission_id = ?2 AND state = 'finished'
                    AND run_id IS NULL AND started_at IS NULL",
