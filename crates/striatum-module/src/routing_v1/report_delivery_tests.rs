@@ -25,6 +25,101 @@ async fn decision(route: &Route, affinity: &str) -> String {
 }
 
 #[tokio::test]
+async fn summary_request_reports_record_usage_without_repeating_effects() {
+    use rusqlite::types::Value as SqlValue;
+
+    let (harness, route) = configured().await;
+    let id = decision(&route, "summary-request-reports").await;
+    let bodies = [
+        r#"{"decision_id":"decision-1","outcome":"completed","usage":{"cached_input_tokens":20,"input_tokens":100,"output_tokens":10,"run_id":"head:mc-summary:1-4:decision-1:turn-one:turn1"}}"#,
+        r#"{"decision_id":"decision-1","outcome":"completed","usage":{"cached_input_tokens":20,"input_tokens":100,"output_tokens":10,"run_id":"head:mc-summary:1-4:decision-1:turn-one:turn2"}}"#,
+        r#"{"decision_id":"decision-1","outcome":"completed","usage":{"cached_input_tokens":20,"input_tokens":100,"output_tokens":10,"run_id":"head:mc-summary:1-4:decision-1:turn-one:check:stable-check"}}"#,
+    ].map(|body| body.replace("decision-1", &id));
+    let snapshot = || {
+        let conn = rusqlite::Connection::open(harness.store_path()).unwrap();
+        let tables: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        tables
+            .into_iter()
+            .map(|table| {
+                let mut query = conn
+                    .prepare(&format!("SELECT * FROM \"{}\"", table.replace('"', "\"\"")))
+                    .unwrap();
+                let columns = query.column_count();
+                let rows: Vec<Vec<SqlValue>> = query
+                    .query_map([], |row| {
+                        (0..columns).map(|column| row.get(column)).collect()
+                    })
+                    .unwrap()
+                    .collect::<Result<_, _>>()
+                    .unwrap();
+                (table, rows)
+            })
+            .collect::<Vec<_>>()
+    };
+    let first = route
+        .call_raw_params("route.report", bodies[0].as_bytes())
+        .await;
+    assert_eq!(first.0, FrameType::Response, "{:?}", first.1);
+    let conn = rusqlite::Connection::open(harness.store_path()).unwrap();
+    let ledger = || -> String {
+        conn.query_row(
+            "SELECT outcome FROM model_route_decisions WHERE id=?1",
+            [&id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(ledger(), "completed");
+    let before = snapshot();
+    for body in &bodies[1..] {
+        let answer = route.call_raw_params("route.report", body.as_bytes()).await;
+        assert_eq!(answer.0, FrameType::Response, "{:?}", answer.1);
+    }
+    let after = snapshot();
+    let effects_only = |rows: &Vec<(String, Vec<Vec<SqlValue>>)>| {
+        rows.iter()
+            .filter(|(table, _)| {
+                !matches!(
+                    table.as_str(),
+                    "routing_v1_report_delivery" | "model_route_usage"
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(effects_only(&after), effects_only(&before));
+    assert_eq!(ledger(), "completed");
+    let totals: (i64, i64, i64, i64) = conn.query_row(
+        "SELECT count(*), sum(input_tokens), sum(cached_read_tokens), sum(output_tokens) FROM model_route_usage WHERE substr(id,1,length(?1))=?1",
+        [format!("routing-v1-report:{id}:run:")], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    ).unwrap();
+    assert_eq!(totals, (3, 300, 60, 30));
+    assert_eq!(
+        route
+            .call_raw_params("route.report", bodies[0].as_bytes())
+            .await,
+        first
+    );
+    assert_eq!(snapshot(), after);
+
+    let legacy_id = decision(&route, "summary-legacy-conflict").await;
+    result(route.call("route.report", &json!({"decision_id":legacy_id,"outcome":"completed","usage":{"cached_input_tokens":20,"input_tokens":100,"output_tokens":10}})).await);
+    let legacy_run_body = bodies[0].replace(&id, &legacy_id);
+    let conflict = route
+        .call_raw_params("route.report", legacy_run_body.as_bytes())
+        .await;
+    assert_eq!(conflict.0, FrameType::Error);
+    let error: Value = serde_json::from_slice(&conflict.1).unwrap();
+    assert_eq!(error["code"], "report_conflict");
+}
+
+#[tokio::test]
 async fn a_replayed_report_returns_identical_bytes_without_preparing_effects() {
     use crate::test_thread_state::{LifecycleProbe, LIFECYCLE_PROBE};
     use std::sync::{atomic::Ordering::Relaxed, Arc};
