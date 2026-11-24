@@ -355,6 +355,29 @@ impl SqliteRouteStateStore {
         selected_workload: Option<&str>,
         task_ref: Option<&str>,
     ) -> RouteStateResult<String> {
+        self.record_decision_with_task_ref_and_identity(
+            input,
+            selected_harness,
+            selected_workload,
+            task_ref,
+            None,
+        )
+    }
+
+    /// Insert the audit row once admission succeeds, including the credential
+    /// that owns a previously bound quota probe, when there is one.
+    pub fn record_decision_with_task_ref_and_identity(
+        &self,
+        input: &DecisionInput,
+        selected_harness: Option<&str>,
+        selected_workload: Option<&str>,
+        task_ref: Option<&str>,
+        probe_identity: Option<&striatum_core::route_state_store::ProviderOutcome>,
+    ) -> RouteStateResult<String> {
+        let identity_json = probe_identity
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(err)?;
         let id = input.decision_id.clone().unwrap_or_else(new_decision_id);
         let id_ret = id.clone();
         let created_at = now_ms();
@@ -369,8 +392,8 @@ impl SqliteRouteStateStore {
                          selected_model_id, selected_variant, score_json, rejected_json, explanation_json,
                          quota_signal_json, policy_revision, anchor_version, catalog_fingerprint, created_at,
                          selected_harness, selected_workload, consumer, allowed_providers_json,
-                         project_id, workdir, allowed_account_class
-                       ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28)",
+                         project_id, workdir, allowed_account_class, provider_identity_json
+                       ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29)",
                     params![
                         id,
                         if input.decision_kind.is_empty() { "single" } else { &input.decision_kind },
@@ -400,6 +423,7 @@ impl SqliteRouteStateStore {
                         input.project_id,
                         input.workdir,
                         input.allowed_account_class.as_str(),
+                        identity_json,
                     ],
                 )?;
                 operator_quality::observe_decision(c, &input.score_json, created_at)?;

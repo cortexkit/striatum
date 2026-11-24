@@ -721,6 +721,49 @@ fn quota_probe_clock(harness: &Harness) -> striatum_store::FenceRecheck {
 }
 
 #[tokio::test]
+async fn a_failed_selection_insert_allows_the_normal_probe_recheck() {
+    let _clock = crate::InjectedClock::set(FENCE_NOW);
+    let harness = quota_probe_harness();
+    let sql = rusqlite::Connection::open(harness.store_path()).unwrap();
+    sql.execute_batch(
+        "CREATE TRIGGER fail_selected_insert BEFORE INSERT ON model_route_decisions
+         WHEN NEW.selected_route_key = 'inception/mercury-3'
+         BEGIN SELECT RAISE(ABORT, 'selection ledger insert failed'); END;",
+    )
+    .unwrap();
+    let refusal = broca_select(&harness, false).await;
+    assert_eq!(refusal.0, FrameType::Error, "{refusal:?}");
+    assert!(
+        refusal
+            .1
+            .to_string()
+            .contains("selection ledger insert failed"),
+        "{refusal:?}"
+    );
+    let origin = &harness.store().fence_rechecks().unwrap()[0];
+    if let Some(owner) = &origin.claim_owner {
+        assert!(harness.store().get_decision_by_id(owner).unwrap().is_none());
+    }
+    sql.execute_batch("DROP TRIGGER fail_selected_insert")
+        .unwrap();
+
+    // Treat a failed ledger write like a probe whose run never reported.
+    let due = FENCE_NOW + 900_000;
+    assert_eq!(origin.next_recheck_at, due as i64);
+    {
+        let _clock = crate::InjectedClock::set(due - 1);
+        let held = broca_select(&harness, false).await;
+        assert_eq!(broca_selected_route(&held, false), "muse/model");
+    }
+    let _clock = crate::InjectedClock::set(due);
+    let retried = broca_select(&harness, false).await;
+    assert_eq!(broca_selected_route(&retried, false), "inception/mercury-3");
+    let decision = retried.1["result"]["decision_id"].as_str().unwrap();
+    let rebound = &harness.store().fence_rechecks().unwrap()[0];
+    assert_eq!(rebound.claim_owner.as_deref(), Some(decision));
+}
+
+#[tokio::test]
 async fn decision_probe_without_account_admission_holds_for_fifteen_minutes() {
     let _clock = crate::InjectedClock::set(FENCE_NOW);
     let harness = quota_probe_harness();

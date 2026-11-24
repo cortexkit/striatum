@@ -2518,8 +2518,8 @@ async fn select_at_tier_attempt(
         striatum_core::accounts::AllowedAccountClass::from_pay_per_token(priced_per_token);
     let decision_id = striatum_store::new_decision_id();
     decision.decision_id = Some(decision_id.clone());
-    if let Some(classes) = &priced.classes {
-        let binding = classes
+    let probe_identity = if let Some(classes) = &priced.classes {
+        match classes
             .bind_selected_probe(
                 deps.store,
                 &selected.model.provider_id,
@@ -2527,18 +2527,23 @@ async fn select_at_tier_attempt(
                 priced_per_token,
                 &decision_id,
             )
-            .map_err(store_refusal)?;
-        if let account_selection::ProbeBinding::Lost { retry_at } = binding {
-            // Retry the same tier with the lost credential held. Each conflict
-            // removes a credential from this request's remaining candidates.
-            if let Some(original) = &inputs.priced.classes {
-                original.remember_probe_holds(classes);
-            } else {
-                inputs.priced.classes = priced.classes.take();
+            .map_err(store_refusal)?
+        {
+            account_selection::ProbeBinding::Bound(identity) => identity,
+            account_selection::ProbeBinding::Lost { retry_at } => {
+                // Retry the same tier with the lost credential held. Each conflict
+                // removes a credential from this request's remaining candidates.
+                if let Some(original) = &inputs.priced.classes {
+                    original.remember_probe_holds(classes);
+                } else {
+                    inputs.priced.classes = priced.classes.take();
+                }
+                return Ok(SelectionAttempt::ProbeLost(retry_at));
             }
-            return Ok(SelectionAttempt::ProbeLost(retry_at));
         }
-    }
+    } else {
+        None
+    };
     let service_tier = chosen_tier;
     let now_ms = now_ms();
     let expires_at_ms = now_ms + DECISION_TTL_MS;
@@ -2696,11 +2701,12 @@ async fn select_at_tier_attempt(
     let value = serde_json::to_value(answer)
         .map_err(|error| provider_refusal("internal_error", error.to_string()))?;
     deps.store
-        .record_decision_with_task_ref(
+        .record_decision_with_task_ref_and_identity(
             &decision,
             Some(&runner.module),
             None,
             request.task_ref.as_deref(),
+            probe_identity.as_ref(),
         )
         .map_err(store_refusal)?;
     if let Some(tier) = service_tier {
