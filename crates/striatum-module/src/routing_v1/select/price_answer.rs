@@ -1,13 +1,16 @@
 //! Settlement prices use catalog rates and task tokens, never the quota-scarcity
 //! adjustment used to rank routes.
 
+use std::collections::BTreeSet;
+
 use cortexkit_role_routing::{
+    errors::{NoRouteReason, Refusal},
     price::{Price, RatesPerMtok},
     select::SelectRequest,
     service_tier::ServiceTier,
 };
 use serde_json::Number;
-use striatum_core::model_router::SelectedModelRoute;
+use striatum_core::model_router::{RejectedRoute, SelectedModelRoute};
 use striatum_core::price_rates::{
     resolve_price_rates, PriceBasis, PriceBilling, PriceRateRequest, PriceRates, ReasoningRate,
 };
@@ -15,6 +18,27 @@ use striatum_core::task_profile::TokenVector;
 use striatum_core::ModelFact;
 
 use crate::{account_selection::ClassContext, config_overrides::LiveConfig};
+
+pub(super) const UNKNOWN: &str = "price_unknown";
+
+pub(super) fn unknown_refusal() -> Refusal {
+    Refusal::no_route(NoRouteReason::parse(UNKNOWN), None)
+}
+
+pub(super) fn record_rejections(rejected: &mut Vec<RejectedRoute>, unpriceable: &BTreeSet<String>) {
+    if unpriceable.is_empty() {
+        return;
+    }
+    // The generic availability filter marks excluded candidates as unavailable.
+    // Preserve the specific reason even when an ordered pass omits those rows.
+    rejected.retain(|row| !unpriceable.contains(&row.route_key));
+    rejected.extend(unpriceable.iter().map(|key| RejectedRoute {
+        route_key: key.clone(),
+        reason: UNKNOWN.into(),
+        detail: None,
+        credential_ids: Vec::new(),
+    }));
+}
 
 pub(super) fn for_selection(
     selected: &SelectedModelRoute,

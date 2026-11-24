@@ -390,9 +390,39 @@ async fn mixed_credentials_quote_subscription_or_metered_and_fallback_uses_list_
         .await
         .unwrap();
     assert_eq!(fallback["price"], paid["price"]);
-    for (consumer, answer) in [("mason", sub), ("codemode", paid), ("mason", fallback)] {
+    for (consumer, answer) in [
+        ("mason", sub.clone()),
+        ("codemode", paid),
+        ("mason", fallback),
+    ] {
         checked(&body(consumer), &answer);
     }
+
+    h.edit_config(|config| {
+        config["providers"]["synthetic"]["accounts"]["metered_fallback"] = json!(false)
+    });
+    let snapshot = crate::fusiform_catalog::decode_catalog_get(
+        &serde_json::to_vec(&json!({
+            "catalog_version":1,"resolved_at_ms":1,"models":{
+                "synthetic/model":{
+                    "existence":"present",
+                    "rate.input":{"state":"priced","currency":"USD","units":4,"exponent":0}
+                }
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    h.credentials().lock().unwrap().catalog_snapshot = Some(snapshot);
+    let mut capped = body("mason");
+    capped["requirements"]["input_tokens"] = json!(535);
+    capped["requirements"]["max_cost_usd"] = json!(0.5);
+    let quoted_subscription = route
+        .select_with_profiles(&capped, &profiles)
+        .await
+        .unwrap();
+    assert_eq!(quoted_subscription["route"], sub["route"]);
+    assert_eq!(quoted_subscription["price"], sub["price"]);
 }
 
 #[tokio::test]
