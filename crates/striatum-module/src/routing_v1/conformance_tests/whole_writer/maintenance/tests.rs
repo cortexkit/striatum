@@ -34,8 +34,9 @@ impl World {
         self.adapter("retention/v1 affinities", |store| {
             writer::prune_v1_affinities(store, before, 10)
         });
-        // Key-pool retention shares this step so the compared-state count of
-        // the generated worlds stays the same.
+        // Key-pool retention shares this step rather than adding one: every
+        // step adds whole-state comparisons, and the generated-world test pins
+        // how many it makes.
         self.adapter("retention/continuations", |store| {
             writer::prune_pool_key_history(store, before, 10)?;
             writer::prune_account_continuations(store, before, 10)
@@ -56,7 +57,8 @@ impl World {
             striatum_store::AccountTx::release_expired_admission_probes(tx, now)?;
             striatum_store::AccountTx::prune_account_continuations(tx, before, 10)?;
             // Continuation retention runs its writer command only when the
-            // reader plans a due row; drive the keyed recheck itself as well.
+            // reader plans a due row, so call that command
+            // (delete_account_continuations) directly as well.
             tx.delete_account_continuations(before, &[])?;
             Ok(())
         });
