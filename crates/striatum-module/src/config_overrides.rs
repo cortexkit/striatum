@@ -841,7 +841,7 @@ fn validate_live_config(
         }
     }
     for (key, model) in &section.models {
-        if parse_model_key(key).is_none() {
+        if parse_model_key(key, None).is_none() {
             return Err(format!("invalid model key {key}"));
         }
         for value in [
@@ -1134,16 +1134,21 @@ impl LiveConfig {
         &self.pricing
     }
 
-    pub(crate) fn shadowed_operator_grades(
+    pub(crate) fn shadowed_operator_grades<'a>(
         &self,
-        grades: &BTreeMap<String, striatum_store::OperatorQuality>,
+        grades: &'a BTreeMap<String, striatum_store::OperatorQuality>,
+        models: impl Iterator<Item = (&'a str, &'a str)>,
     ) -> Vec<String> {
+        let catalog = CatalogModelIds::from_models(
+            models.chain(grades.keys().filter_map(|key| key.split_once('/'))),
+        );
         self.config
             .model_routing
             .models
             .iter()
             .filter(|(key, entry)| {
-                let (provider, model, _) = parse_model_key(key).expect("validated model key");
+                let (provider, model, _) =
+                    parse_model_key(key, Some(&catalog)).expect("validated model key");
                 (entry.elo.is_some() || entry.eq.is_some())
                     && grades.contains_key(&format!("{provider}/{model}"))
             })
@@ -1154,11 +1159,22 @@ impl LiveConfig {
     pub fn apply(&self, facts: &mut Vec<ModelFact>) -> SelectionOverrideOutcome {
         let section = &self.config.model_routing;
         let mut unknown_keys = section.models.keys().cloned().collect::<HashSet<_>>();
+        let overrides: HashMap<_, _> = if section.models.is_empty() {
+            HashMap::new()
+        } else {
+            let catalog = CatalogModelIds::from_facts(facts);
+            section
+                .models
+                .iter()
+                .filter_map(|(key, model)| {
+                    canonical_model_key(key, &catalog).map(|route| (route, (key, model)))
+                })
+                .collect()
+        };
         let mut applied = 0;
         for fact in facts.iter_mut() {
-            let key = make_route_key(&fact.provider_id, &fact.model_id, fact.variant.as_deref());
-            if let Some(model) = section.models.get(&key) {
-                unknown_keys.remove(&key);
+            if let Some(&(key, model)) = overrides.get(&fact_model_key(fact)) {
+                unknown_keys.remove(key);
                 applied += 1;
                 let observed_speed = fact.scores.speed;
                 let quality = (fact.scores.elo, fact.scores.eq, fact.score_provenance);
@@ -1918,23 +1934,54 @@ pub(super) fn config_path(module_id: &str) -> Result<PathBuf, String> {
     Ok(home.join("cortexkit").join(filename))
 }
 
-/// Parse `provider/model` or `provider/model/variant`.
-fn parse_model_key(key: &str) -> Option<(String, String, Option<String>)> {
-    let parts: Vec<&str> = key.trim().split('/').collect();
-    if parts.len() < 2 || parts.len() > 3 {
+type ModelKey<'a> = (&'a str, &'a str, Option<&'a str>);
+
+struct CatalogModelIds<'a>(HashSet<(&'a str, &'a str)>);
+
+impl<'a> CatalogModelIds<'a> {
+    fn from_facts(facts: &'a [ModelFact]) -> Self {
+        Self::from_models(
+            facts
+                .iter()
+                .map(|fact| (fact.provider_id.as_str(), fact.model_id.as_str())),
+        )
+    }
+
+    fn from_models(models: impl Iterator<Item = (&'a str, &'a str)>) -> Self {
+        // Only model ids with a slash could also be read as a model and variant.
+        Self(models.filter(|(_, model)| model.contains('/')).collect())
+    }
+}
+
+fn fact_model_key(fact: &ModelFact) -> ModelKey<'_> {
+    (&fact.provider_id, &fact.model_id, fact.variant.as_deref())
+}
+
+fn parse_model_key<'a>(
+    key: &'a str,
+    catalog: Option<&CatalogModelIds<'_>>,
+) -> Option<ModelKey<'a>> {
+    let (provider, rest) = key.trim().split_once('/')?;
+    let (provider, rest) = (provider.trim(), rest.trim());
+    if provider.is_empty() || rest.split('/').any(|part| part.trim().is_empty()) {
         return None;
     }
-    let provider = parts[0].trim();
-    let model = parts[1].trim();
-    if provider.is_empty() || model.is_empty() {
-        return None;
+    // The catalog does not use the same slash-form route for two identities.
+    // If a model id and a variant ever share a spelling, prefer the model id.
+    if catalog.is_some_and(|catalog| catalog.0.contains(&(provider, rest))) {
+        return Some((provider, rest, None));
     }
-    let variant = parts
-        .get(2)
-        .map(|v| v.trim())
-        .filter(|v| !v.is_empty())
-        .map(|v| v.to_string());
-    Some((provider.to_string(), model.to_string(), variant))
+    Some(match rest.rsplit_once('/') {
+        Some((model, variant)) => (provider, model.trim(), Some(variant.trim())),
+        None => (provider, rest, None),
+    })
+}
+
+fn canonical_model_key<'a>(key: &'a str, catalog: &CatalogModelIds<'_>) -> Option<ModelKey<'a>> {
+    let (provider, model, variant) = parse_model_key(key, Some(catalog))?;
+    // Validation accepts whitespace around segments, but only keys spelled
+    // exactly like catalog routes may change model facts or count as served.
+    (key == make_route_key(provider, model, variant)).then_some((provider, model, variant))
 }
 
 fn merge_override(base: &ModelFact, ov: &ModelFactOverride) -> ModelFact {
@@ -2448,11 +2495,21 @@ fn apply_overrides<S: RouteStateStore>(
     let mut next_override_keys: HashSet<String> = HashSet::new();
 
     for (key, ov) in overrides {
-        let Some((provider_id, model_id, variant)) = parse_model_key(key) else {
+        let Some(mut parsed) = parse_model_key(key, None) else {
             outcome.skipped.push(key.clone());
             continue;
         };
-        let route_key = make_route_key(&provider_id, &model_id, variant.as_deref());
+        if parsed.2.is_some() {
+            let capacity_keys = store
+                .get_capacity_keys_for_provider(parsed.0)
+                .map_err(|error| format!("reading catalog models for {key}: {error}"))?;
+            let catalog = CatalogModelIds::from_models(
+                capacity_keys.iter().filter_map(|key| key.split_once('/')),
+            );
+            parsed = parse_model_key(key, Some(&catalog)).expect("validated model key");
+        }
+        let (provider_id, model_id, variant) = parsed;
+        let route_key = make_route_key(provider_id, model_id, variant);
         let existing_fact = store
             .get_fact_by_route_key(&route_key)
             .map_err(|error| format!("reading override base {route_key}: {error}"))?;
@@ -2474,9 +2531,9 @@ fn apply_overrides<S: RouteStateStore>(
                 login_methods_documented: false,
                 speed_is_fleet_median: false,
                 decommissioned: false,
-                provider_id,
-                model_id,
-                variant,
+                provider_id: provider_id.into(),
+                model_id: model_id.into(),
+                variant: variant.map(str::to_owned),
                 family: None,
                 scores: ModelScores::default(),
                 context_window: None,
@@ -2570,16 +2627,20 @@ mod tests {
     #[test]
     fn parses_provider_model_and_variant_keys() {
         assert_eq!(
-            parse_model_key("openai/gpt-5.5"),
-            Some(("openai".into(), "gpt-5.5".into(), None))
+            parse_model_key("openai/gpt-5.5", None),
+            Some(("openai", "gpt-5.5", None))
         );
         assert_eq!(
-            parse_model_key("anthropic/claude/high"),
-            Some(("anthropic".into(), "claude".into(), Some("high".into())))
+            parse_model_key("anthropic/claude/high", None),
+            Some(("anthropic", "claude", Some("high")))
         );
-        assert_eq!(parse_model_key("bare"), None);
-        assert_eq!(parse_model_key("a/b/c/d"), None);
-        assert_eq!(parse_model_key("/m"), None);
+        assert_eq!(
+            parse_model_key("a/b/c/d", None),
+            Some(("a", "b/c", Some("d")))
+        );
+        for invalid in ["bare", "/m", "p/", "p/m/", "p/m//x", "p/m/ /x"] {
+            assert_eq!(parse_model_key(invalid, None), None, "{invalid:?}");
+        }
     }
 
     #[test]

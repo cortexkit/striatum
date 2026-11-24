@@ -435,7 +435,7 @@ impl LiveConfig {
     ) -> Result<Self, String> {
         let mut patched = self.clone();
         for (route, patch) in models {
-            if super::parse_model_key(route).is_none() {
+            if super::parse_model_key(route, None).is_none() {
                 return Err(format!("invalid provider/model key {route:?}"));
             }
             let rules = &mut patched

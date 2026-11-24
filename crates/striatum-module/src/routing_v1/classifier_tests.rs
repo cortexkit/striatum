@@ -223,6 +223,46 @@ async fn only_the_broca_classifier_consumer_tree_uses_the_classifiers_listing() 
 }
 
 #[tokio::test]
+async fn slashed_model_settings_enable_clef_only_for_classifier() {
+    let harness = rig(|_| {}, |_| {});
+    let other_consumer = "broca.classifierish";
+    harness.edit_config(|config| {
+        config["consumers"][other_consumer] = json!({"owner":"broca"});
+        config["providers"]["cloudflare-workers-ai"]["pin_only"] = json!(true);
+        config["providers"]["typesafe"]["pin_only"] = json!(true);
+    });
+    let route = harness.bind(reserved("broca"), None).await;
+    refused(&route, json!({"iq":0})).await;
+
+    harness.edit_config(|config| {
+        config["models"][CLEF] = json!({"pin_only":false,"only_for":[CONSUMER]});
+    });
+    assert_eq!(route_key(&selected(&route, json!({"iq":0})).await), CLEF);
+
+    for consumer in [CONSUMER, other_consumer] {
+        let inventory = result(
+            route
+                .call("route.consumer_models", &json!({"consumer":consumer}))
+                .await,
+        );
+        let excluded = |model: &str| {
+            inventory["models"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| {
+                    entry["provider"] == "cloudflare-workers-ai" && entry["model"] == model
+                })
+                .unwrap()["excluded"]
+                .as_bool()
+                .unwrap()
+        };
+        assert_eq!(excluded("@cf/cloudflare/clef"), consumer != CONSUMER);
+        assert!(excluded("@cf/cloudflare/clef-flash"));
+    }
+}
+
+#[tokio::test]
 async fn unscored_chat_does_not_inherit_classifier_admission() {
     let harness = rig(
         |catalog| {

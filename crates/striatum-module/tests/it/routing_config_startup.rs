@@ -231,6 +231,28 @@ async fn non_default_module_id_reads_and_declares_its_own_settings_file() {
 }
 
 #[test]
+fn check_config_accepts_slashed_catalog_model_keys() {
+    let home = Home::new();
+    std::fs::write(
+        home.config_dir(true).join("striatum.jsonc"),
+        r#"{"models":{
+            "cloudflare-workers-ai/@cf/cloudflare/clef":{
+                "pin_only":false,"only_for":["broca.classifier"]
+            },
+            "cloudflare-workers-ai/@cf/cloudflare/clef-flash":{
+                "pin_only":false,"only_for":["broca.classifier"]
+            },
+            "openai/gpt-6.2-sol/xhigh":{"pin_only":true}
+        }}"#,
+    )
+    .unwrap();
+    let output = home.run_with_args(true, &["--check-config"]);
+    let report = String::from_utf8(output.stderr).unwrap();
+    assert!(output.status.success(), "{report}");
+    assert!(report.contains("config check passed:"), "{report}");
+}
+
+#[test]
 fn empty_xdg_config_home_falls_back_to_home() {
     let home = Home::new();
     let expected = home.config_dir(false).join("striatum.jsonc");

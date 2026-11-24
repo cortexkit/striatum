@@ -1947,6 +1947,11 @@ fn apply_catalog_snapshot(
             &store
                 .operator_quality()
                 .map_err(|reason| error(format!("read operator quality: {reason}")))?,
+            snapshot
+                .facts
+                .iter()
+                .filter(|fact| fact.present)
+                .map(|fact| (fact.provider_id.as_str(), fact.model_id.as_str())),
         );
         if !shadowed.is_empty() {
             eprintln!(

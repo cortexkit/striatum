@@ -64,10 +64,9 @@ impl LiveConfig {
             striatum_core::score_alias::append_alias_rows(&mut manual, &manual_targets);
         }
         let dormant_keys = self.dormant_model_keys(&served);
-        let manual_upsert_keys = manual
-            .iter()
-            .map(|fact| make_route_key(&fact.provider_id, &fact.model_id, fact.variant.as_deref()))
-            .filter(|key| dormant_keys.contains(key))
+        let manual_upsert_keys = matching_model_keys(dormant_keys.iter(), &manual)
+            .into_iter()
+            .cloned()
             .collect();
         Ok(ModelConfigPresence {
             dormant_keys,
@@ -76,14 +75,9 @@ impl LiveConfig {
     }
 
     pub(crate) fn dormant_model_keys(&self, facts: &[ModelFact]) -> Vec<String> {
-        let served = facts
-            .iter()
-            .map(|fact| make_route_key(&fact.provider_id, &fact.model_id, fact.variant.as_deref()))
-            .collect::<HashSet<_>>();
-        let mut keys = self
-            .config
-            .model_routing
-            .models
+        let configured = &self.config.model_routing.models;
+        let served = matching_model_keys(configured.keys(), facts);
+        let mut keys = configured
             .keys()
             .filter(|key| !served.contains(*key))
             .cloned()
@@ -114,6 +108,16 @@ impl LiveConfig {
             eprintln!("[striatum] {} has models entries the catalog doesn't serve (catalog version {version}), so they do nothing: {keys:?}; of these, routes kept by a manual upsert, where the settings still apply: {manual:?}", path.display());
         }
     }
+}
+
+fn matching_model_keys<'a>(
+    keys: impl Iterator<Item = &'a String>,
+    facts: &[ModelFact],
+) -> HashSet<&'a String> {
+    let catalog = CatalogModelIds::from_facts(facts);
+    let served: HashSet<_> = facts.iter().map(fact_model_key).collect();
+    keys.filter(|key| canonical_model_key(key, &catalog).is_some_and(|id| served.contains(&id)))
+        .collect()
 }
 
 #[cfg(test)]
