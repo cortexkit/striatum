@@ -1227,6 +1227,7 @@ pub(crate) mod allocation_tests;
 mod decode;
 pub(crate) mod efforts;
 mod media_grades;
+mod refresh;
 mod speed_twins;
 #[cfg(test)]
 pub(crate) use media_grades::{count_calls, inherit_calls};
@@ -2233,21 +2234,8 @@ async fn poll_cycle<C: CatalogWire>(
     })
     .await?;
     let credentials = client.credentials();
-    let published_differs = match &credentials {
-        Some(cache) => cache
-            .lock()
-            .map_err(|_| error("credential cache poisoned"))?
-            .catalog_snapshot
-            .as_ref()
-            .is_some_and(|snapshot| snapshot.version() != status.catalog_version),
-        None => false,
-    };
-    // The facts transaction advances the cursor before operator grades are
-    // committed and the catalog used by request handlers is published.
-    let should_get = published_differs
-        || cursor
-            .map(|cursor| status.catalog_version != cursor.catalog_version)
-            .unwrap_or(true);
+    let should_get =
+        refresh::needs_catalog_get(credentials.as_ref(), cursor, status.catalog_version)?;
     let get_calls = if should_get {
         let snapshot = media_grades::refresh_snapshot(client).await?;
         striatum_store::job_timing::run(
@@ -2347,24 +2335,7 @@ pub async fn catalog_refresh_loop(
                 if let Ok(mut health) = health.lock() {
                     health.set_poll_ms(cadence);
                 }
-                let retry = credentials.lock().ok().and_then(|guard| {
-                    guard
-                        .billing_catalog
-                        .retry_at
-                        .values()
-                        .copied()
-                        .chain(
-                            guard
-                                .catalog_snapshot
-                                .as_ref()
-                                .and_then(|snapshot| snapshot.local_grades.retry_at),
-                        )
-                        .min()
-                });
-                let delay = retry.map_or(Duration::from_millis(cadence), |due| {
-                    Duration::from_millis(cadence)
-                        .min(due.saturating_duration_since(tokio::time::Instant::now()))
-                });
+                let delay = refresh::poll_delay(&credentials, Duration::from_millis(cadence));
                 if wait_for_catalog_cycle(&wake, &rebind_wake, delay).await {
                     bootstrapped = false;
                 }
