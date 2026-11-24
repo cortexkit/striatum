@@ -1698,6 +1698,37 @@ impl ClassContext {
         resolved
     }
 
+    /// Whether `row` serves `fact` in the account class a routing decision
+    /// allows. Unlike [`Self::class`], this ignores which class quota and
+    /// metered fallback pick right now: a fork stays on its parent's login
+    /// while that login is merely exhausted, and only a login the decision
+    /// could never use is ruled out.
+    pub(super) fn serves_decision_class(
+        &self,
+        row: &cortexkit_claustrum_client::ListedCredential,
+        fact: &striatum_core::ModelFact,
+        priced_per_token: bool,
+    ) -> bool {
+        if self.media_route {
+            return media_credential_serves(row, &fact.provider_id);
+        }
+        let rows = self.credentials.listed_credentials();
+        self.serving_index
+            .fact(
+                &self.config,
+                &self.credentials,
+                fact,
+                &self.catalog,
+                &self.targets,
+            )
+            .selection
+            .iter()
+            .any(|serving| {
+                rows[serving.index].id == row.id
+                    && (!priced_per_token || (serving.metered && !serving.covered))
+            })
+    }
+
     #[cfg(test)]
     pub(crate) fn revalidate_credential(&mut self, credential: &str) {
         self.continuation_credential = Some(credential.into());
@@ -3243,6 +3274,11 @@ fn add_spend_inputs(
     {
         return;
     }
+    // A reading may list both credit pools: prepaid `credits` and metered
+    // `extra_usage`. Merge them, so their order can't decide the account's
+    // reading: it can spend when either pool can, and counts as prepaid when a
+    // spendable pool is the prepaid one.
+    let mut credit: Option<CreditReading> = None;
     for pool in entry
         .get("spend")
         .and_then(Value::as_array)
@@ -3263,14 +3299,14 @@ fn add_spend_inputs(
             };
             let spendable =
                 pool.get("spendable").and_then(Value::as_bool) != Some(false) && remaining > 0.0;
-            context.credits.insert(
-                account.to_owned(),
-                CreditReading {
-                    observed_at_ms: at,
-                    spendable,
-                    prepaid: pool_id == Some("credits"),
-                },
-            );
+            let prepaid = spendable && pool_id == Some("credits");
+            let merged = credit.get_or_insert(CreditReading {
+                observed_at_ms: at,
+                spendable: false,
+                prepaid: false,
+            });
+            merged.spendable |= spendable;
+            merged.prepaid |= prepaid;
         } else if let (Some(total), Some(remaining)) = (amount("total"), amount("remaining")) {
             context.spend.insert(
                 account.to_owned(),
@@ -3280,6 +3316,9 @@ fn add_spend_inputs(
                 },
             );
         }
+    }
+    if let Some(credit) = credit {
+        context.credits.insert(account.to_owned(), credit);
     }
 }
 
@@ -3324,6 +3363,53 @@ mod spend_input_tests {
             !context.credits["a"].prepaid,
             "extra usage is metered overage"
         );
+    }
+
+    /// One reading can list both a prepaid `credits` pool and an
+    /// `extra_usage` pool. Their order in the reading must not decide whether
+    /// the account can spend: any spendable pool makes it spendable, and it is
+    /// prepaid when a spendable pool is the prepaid one.
+    #[test]
+    fn both_credit_pools_in_one_reading_merge_whatever_their_order() {
+        let at = 1_800_000_000_000;
+        let pool = |id: &str, minor: i64, spendable: bool| json!({"id":id,"spendable":spendable,"remaining":{"minor":minor,"exponent":0,"unit":"usd"}});
+        for (pools, spendable, prepaid) in [
+            (
+                [pool("credits", 100, true), pool("extra_usage", 0, false)],
+                true,
+                true,
+            ),
+            (
+                [pool("extra_usage", 100, true), pool("credits", 0, true)],
+                true,
+                false,
+            ),
+            (
+                [pool("extra_usage", 100, true), pool("credits", 100, true)],
+                true,
+                true,
+            ),
+            (
+                [pool("extra_usage", 0, true), pool("credits", 0, false)],
+                false,
+                false,
+            ),
+        ] {
+            for reversed in [false, true] {
+                let mut pools = pools.to_vec();
+                if reversed {
+                    pools.reverse();
+                }
+                let entry = json!({"fetchedAt":rfc3339(at),"spend":pools});
+                let mut context = striatum_core::accounts::AllocationContext::default();
+                add_spend_inputs(&mut context, "a", &entry);
+                assert_eq!(
+                    (context.credits["a"].spendable, context.credits["a"].prepaid),
+                    (spendable, prepaid),
+                    "{entry}"
+                );
+            }
+        }
     }
 }
 

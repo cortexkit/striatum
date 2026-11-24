@@ -3445,15 +3445,36 @@ fn demand_reads_each_roster_account_only_from_the_admissions_that_can_count() {
         ..AllocatorPolicy::default()
     };
     assert_eq!(loaded(&no_credits, &credits(true)), bounded);
-    // Counting strategies, and an account that may go on paid credits,
-    // charge admissions of any age.
+    // An account that may go on paid credits is scored from the earlier of
+    // its quota and credit readings: a newer credit reading changes nothing,
+    // an older one lowers the floor to the credit reading's.
+    assert_eq!(loaded(&sticky, &credits(true)), bounded);
+    let older_credit = AllocationContext {
+        credits: BTreeMap::from([(
+            ACCOUNT_A.to_string(),
+            striatum_core::accounts::CreditReading {
+                observed_at_ms: observed - 1,
+                spendable: true,
+                prepaid: false,
+            },
+        )]),
+        ..AllocationContext::default()
+    };
+    assert_eq!(
+        loaded(&sticky, &older_credit),
+        vec![
+            row(ACCOUNT_A, floor),
+            row(ACCOUNT_A, floor + 1),
+            row(ACCOUNT_B, floor - 3_600_000),
+        ]
+    );
+    // Counting strategies charge admissions of any age.
     let every_roster_admission = vec![
         row(ACCOUNT_A, floor - 1),
         row(ACCOUNT_A, floor),
         row(ACCOUNT_A, floor + 1),
         row(ACCOUNT_B, floor - 3_600_000),
     ];
-    assert_eq!(loaded(&sticky, &credits(true)), every_roster_admission);
     for strategy in [AccountStrategy::RoundRobin, AccountStrategy::Hybrid] {
         let policy = AllocatorPolicy {
             strategy,

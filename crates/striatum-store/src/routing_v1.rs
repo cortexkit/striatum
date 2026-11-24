@@ -115,13 +115,14 @@ impl SqliteRouteStateStore {
             .map_err(err)
     }
 
+    /// Read on a pooled reader like [`Self::v1_decision`].
     pub fn decision_service_tier(
         &self,
         decision_id: &str,
     ) -> RouteStateResult<Option<(String, Vec<String>)>> {
         let row: Option<(String, String)> = self
             .store
-            .with_conn(|c: &Connection| {
+            .with_read(|c: &Connection| {
                 c.query_row(
                     "SELECT service_tier_chosen, service_tier_accounts_json
                  FROM model_route_decisions WHERE id=?1 AND service_tier_chosen IS NOT NULL",
@@ -264,9 +265,12 @@ impl SqliteRouteStateStore {
 
     /// The binding of `decision_id`, whoever selected it. Callers check the
     /// principal or runner themselves so a refusal never says which it was.
+    /// Read on a pooled reader: account requests call this before queuing
+    /// their writer command, and the writer connection is held for whole
+    /// batches.
     pub fn v1_decision(&self, decision_id: &str) -> RouteStateResult<Option<V1Decision>> {
         self.store
-            .with_conn(|c: &Connection| {
+            .with_read(|c: &Connection| {
                 c.query_row(
                     "SELECT decision_id, principal, consumer, project_id, provider, model, variant,
                             runner_module, affinity, created_at_ms, expires_at_ms, allowed_account_class
@@ -368,14 +372,15 @@ impl SqliteRouteStateStore {
         })
     }
 
-    /// The first v1 admission a runner made under `admission_id`.
+    /// The first v1 admission a runner made under `admission_id`, read on a
+    /// pooled reader like [`Self::v1_decision`].
     pub fn v1_admission(
         &self,
         principal: &str,
         admission_id: &str,
     ) -> RouteStateResult<Option<V1Recorded>> {
         self.store
-            .with_conn(|c: &Connection| {
+            .with_read(|c: &Connection| {
                 c.query_row(
                     ADMISSION_READ_SQL,
                     params![principal, admission_id, alternate(principal).as_ref()],
@@ -508,6 +513,52 @@ mod tests {
             created_at_ms: 1,
             expires_at_ms: 2,
         }
+    }
+
+    /// Account requests read their decision, its service tier and any earlier
+    /// admission before queuing a writer command. Those reads must not wait
+    /// for the writer connection, which the account writer holds for a whole
+    /// batch (or a state reload).
+    #[test]
+    fn request_path_reads_do_not_wait_for_the_writer_connection() {
+        let store = std::sync::Arc::new(store("pooled-reads"));
+        store.v1_record_decision(&decision("held", None)).unwrap();
+        let (holding_tx, holding) = std::sync::mpsc::channel();
+        let (release_tx, release) = std::sync::mpsc::channel::<()>();
+        let writer = {
+            let store = store.clone();
+            std::thread::spawn(move || {
+                store
+                    .store
+                    .with_conn(|_| {
+                        holding_tx.send(()).unwrap();
+                        release.recv().ok();
+                        Ok(())
+                    })
+                    .unwrap();
+            })
+        };
+        holding.recv().unwrap();
+        let (done_tx, done) = std::sync::mpsc::channel();
+        let reader = {
+            let store = store.clone();
+            std::thread::spawn(move || {
+                let decision = store.v1_decision("held").unwrap();
+                let tier = store.decision_service_tier("held").unwrap();
+                let admission = store.v1_admission("reserved:runner", "none").unwrap();
+                done_tx
+                    .send((decision.is_some(), tier.is_none(), admission.is_none()))
+                    .unwrap();
+            })
+        };
+        let answer = done.recv_timeout(std::time::Duration::from_secs(5));
+        release_tx.send(()).unwrap();
+        writer.join().unwrap();
+        reader.join().unwrap();
+        assert_eq!(
+            answer.expect("the reads waited for the held writer connection"),
+            (true, true, true)
+        );
     }
 
     #[test]

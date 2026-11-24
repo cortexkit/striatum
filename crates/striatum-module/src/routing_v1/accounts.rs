@@ -517,7 +517,7 @@ fn account_for_inner(
         match account_selection::admission::account_for_parsed(
             parsed,
             &authority.principal,
-            &ctx,
+            ctx,
             Some(record),
         ) {
             OpReply::Result(result) => Ok(result),
@@ -700,8 +700,18 @@ fn continue_account(
     )?;
     let describe =
         serde_json::from_value(super::describe::describe(deps)?).map_err(internal_unavailable)?;
-    let request =
+    let mut request =
         cortexkit_role_routing::account_continue::parse_continue_request(params, &describe)?;
+    // A head authorized by its session scope had its admission stored under
+    // the scope's reference, with the reference as its conversation key (see
+    // admit and observe). Continue looks it up the same way, and keys its
+    // replay record by the scope too, so two heads of one owner can't read or
+    // collide with each other's selection ids.
+    if let Some(scope) = authority.session {
+        request.admission_id = authority.admission_key(&request.admission_id);
+        request.selection_id = authority.admission_key(&request.selection_id);
+        request.conversation_key = scope.reference.clone();
+    }
     let flags = config_overrides::live_config(deps.routing_config_path).account_flags();
     let policy = config_overrides::live_config(deps.routing_config_path).allocator_policy("");
     checking("account_context");

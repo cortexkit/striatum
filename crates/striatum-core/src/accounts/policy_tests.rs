@@ -461,3 +461,136 @@ fn soft_quota_exempts_one_account_and_floors_match_the_pool_key() {
         "an existing pin cannot bypass an explicit floor"
     );
 }
+
+/// Paid credits switch on once every account that could serve this request is
+/// out of free quota. An account the request can't use at all (the runner did
+/// not offer it, its credential is excluded for this principal, it is over its
+/// spend budget, or the concurrency cap already took its credentials away) has
+/// no free quota to offer, so it must not keep credits switched off for a
+/// usable account.
+#[test]
+fn an_unusable_sibling_does_not_switch_off_paid_credits() {
+    let base = || {
+        let mut state = state(&["a", "b"]);
+        state.policy.paid_credits = true;
+        state.fences = vec![fence("a", ResetTime::Missing)];
+        state
+    };
+    let mut inputs = AllocationContext::default();
+    inputs.credits.insert("a".into(), credit(true));
+    let on_credits = |decision: Decision, case: &str| match decision.outcome {
+        Outcome::Admit(admission) => {
+            assert_eq!(admission.account_id, "a", "{case}");
+            assert_eq!(admission.reason, AdmitReason::PaidCredits, "{case}");
+        }
+        other => panic!("{case}: {other:?}"),
+    };
+    // A healthy sibling the request can use still comes before credits.
+    assert_eq!(
+        chosen(decide_with_context(&request(), &base(), NOW, &inputs)),
+        "b"
+    );
+
+    let mut offered_a = request();
+    offered_a.candidates = Some(RunnerCandidates {
+        view_digest: "runner".into(),
+        accounts: vec![CandidateRef {
+            account_id: "a".into(),
+            credential_id: "credential-a".into(),
+        }],
+    });
+    on_credits(
+        decide_with_context(&offered_a, &base(), NOW, &inputs),
+        "sibling the runner did not offer",
+    );
+
+    let mut excluded = base();
+    excluded.principal_exclusions = vec![PrincipalExclusion {
+        principal: "runner".into(),
+        credential_id: "credential-b".into(),
+        runner_view_digest: String::new(),
+        roster_view_digest: "vault".into(),
+        recorded_at_ms: NOW,
+    }];
+    on_credits(
+        decide_with_context(&request(), &excluded, NOW, &inputs),
+        "sibling excluded for this principal",
+    );
+
+    let mut budget = base();
+    budget.policy.spend_budget = Some(10.0);
+    let mut over_budget = inputs.clone();
+    over_budget.spend.insert(
+        "b".into(),
+        SpendReading {
+            used: 10.0,
+            reset_at_ms: Some(NOW + 60_000),
+        },
+    );
+    on_credits(
+        decide_with_context(&request(), &budget, NOW, &over_budget),
+        "sibling over its spend budget",
+    );
+
+    let mut capped = base();
+    capped.roster.as_mut().unwrap().accounts[1]
+        .credentials
+        .clear();
+    on_credits(
+        decide_with_context(&request(), &capped, NOW, &inputs),
+        "sibling the concurrency cap emptied",
+    );
+
+    // With no usable account at all, credits never switch on by default.
+    let mut none = base();
+    none.roster.as_mut().unwrap().accounts[0]
+        .credentials
+        .clear();
+    none.roster.as_mut().unwrap().accounts[1]
+        .credentials
+        .clear();
+    assert!(!matches!(
+        decide_with_context(&request(), &none, NOW, &inputs).outcome,
+        Outcome::Admit(_)
+    ));
+}
+
+/// A fork runs on its parent's exact account. When that account is out of
+/// free quota and its paid credits carry the parent's own requests, the fork
+/// must be admitted on the same credits rather than held behind the block.
+#[test]
+fn a_fork_of_a_parent_on_paid_credits_is_admitted_on_credits() {
+    let mut state = state(&["a"]);
+    state.policy.paid_credits = true;
+    state.fences = vec![fence("a", ResetTime::Missing)];
+    state.affinity = Some(affinity());
+    let mut inputs = AllocationContext::default();
+    inputs.credits.insert("a".into(), credit(true));
+    match decide_with_context(&request(), &state, NOW, &inputs).outcome {
+        Outcome::Admit(admission) => assert_eq!(admission.reason, AdmitReason::PaidCredits),
+        other => panic!("the parent continues on credits: {other:?}"),
+    }
+    state.affinity = None;
+    inputs.fork_parent = Some(policy::ForkParent {
+        admission_id: "parent".into(),
+        account_id: "a".into(),
+        credential_id: "credential-a".into(),
+        pin_id: "pin".into(),
+        pin_generation: 1,
+        blocked_until_ms: None,
+    });
+    let decision = decide_with_context(&request(), &state, NOW, &inputs);
+    match decision.outcome {
+        Outcome::Admit(admission) => {
+            assert_eq!(admission.account_id, "a");
+            assert_eq!(admission.credential_id, "credential-a");
+        }
+        other => panic!("the fork follows its parent onto credits: {other:?}"),
+    }
+    // Without credits the same fork still holds on its parent's block.
+    inputs.credits.clear();
+    assert!(matches!(
+        decide_with_context(&request(), &state, NOW, &inputs).outcome,
+        Outcome::Hold(_)
+    ));
+}

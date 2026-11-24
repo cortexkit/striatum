@@ -151,14 +151,17 @@ pub(super) fn load_demand(
         |provider, account, floor| tx.demand(provider, account, floor),
         provider,
         roster,
+        roster,
         policy,
         context,
     )
 }
 
 /// [`load_demand`] over any source of `ACCOUNT_DEMAND_SQL` rows: SQL, or the
-/// account state, which keeps the same rows in memory.
-fn demand_with(
+/// account state, which keeps the same rows in memory. `allocator_roster` is
+/// the roster the allocator will score, whose quota readings may have been
+/// set aside for a due probe.
+pub(super) fn demand_with(
     mut read: impl FnMut(
         &str,
         &str,
@@ -166,13 +169,22 @@ fn demand_with(
     ) -> RouteStateResult<Vec<striatum_store::AccountDemandRow>>,
     provider: &str,
     roster: Option<&Roster>,
+    allocator_roster: Option<&Roster>,
     policy: &AllocatorPolicy,
     context: &striatum_core::accounts::AllocationContext,
 ) -> RouteStateResult<Vec<AdmissionDemand>> {
     // One read per account; a repeated account keeps its lowest floor.
     let mut floors: BTreeMap<&str, Option<EpochMs>> = BTreeMap::new();
     for view in roster.map_or(&[][..], |roster| &roster.accounts) {
-        let floor = demand_floor(view, policy, context);
+        let scored = allocator_roster
+            .and_then(|roster| {
+                roster
+                    .accounts
+                    .iter()
+                    .find(|scored| scored.account_id == view.account_id)
+            })
+            .unwrap_or(view);
+        let floor = demand_floor(view, scored, policy, context);
         floors
             .entry(view.account_id.as_str())
             .and_modify(|kept| *kept = kept.zip(floor).map(|(a, b)| a.min(b)))
@@ -184,7 +196,14 @@ fn demand_with(
             read(provider, account_id, floor)?
                 .into_iter()
                 .filter_map(|row| {
-                    let state: AdmissionState = serde_json::from_value(json!(row.state)).ok()?;
+                    let state = match row.state.as_str() {
+                        "reserved" => AdmissionState::Reserved,
+                        "started" => AdmissionState::Started,
+                        "released" => AdmissionState::Released,
+                        "expired" => AdmissionState::Expired,
+                        "finished" => AdmissionState::Finished,
+                        _ => return None,
+                    };
                     Some(AdmissionDemand {
                         account_id: row.account_id,
                         state,
@@ -201,37 +220,43 @@ fn demand_with(
 /// count in the allocator, or `None` when one of any age counts.
 ///
 /// The allocator charges an account's non-released admissions committed
-/// after its quota reading less `reflection_lag_ms`: an older one is already
-/// reflected in the reading. With no reading (or no reading time) it charges
-/// every one. It also charges every one to an account it places on paid
-/// credits, because it then sets the reading aside. Credit placement needs
-/// `paid_credits` and a spendable credit reading for the account; when both
-/// hold, the whole history is kept, without repeating the allocator's further
-/// conditions for credit mode. The round-robin and hybrid strategies order
-/// accounts by how many admissions each holds, whatever their age, so they
-/// need the whole history too.
+/// after its observation point less `reflection_lag_ms`: an older one is
+/// already reflected in the reading. The observation point is the quota
+/// reading's time, or, for an account it places on paid credits, the credit
+/// reading's time, because it then sets the quota reading aside. Credit
+/// placement needs `paid_credits` and a spendable credit reading; when both
+/// hold, the earlier of the two times bounds the read. Whether the allocator
+/// then actually enters credit mode isn't checked here: the earlier floor reads
+/// every row either outcome can count. `scored` is the view the
+/// allocator scores: when it carries no quota reading time, every admission
+/// can count. The round-robin and hybrid strategies order accounts by how many
+/// admissions each holds, whatever their age, so they need the whole history.
 fn demand_floor(
     view: &AccountView,
+    scored: &AccountView,
     policy: &AllocatorPolicy,
     context: &striatum_core::accounts::AllocationContext,
 ) -> Option<EpochMs> {
-    let may_use_credits = policy.paid_credits
-        && context
-            .credits
-            .get(&view.account_id)
-            .is_some_and(|credit| credit.spendable);
-    if may_use_credits
-        || matches!(
-            policy.strategy,
-            AccountStrategy::RoundRobin | AccountStrategy::Hybrid
-        )
-    {
+    if matches!(
+        policy.strategy,
+        AccountStrategy::RoundRobin | AccountStrategy::Hybrid
+    ) {
         return None;
     }
-    let observed_at = view.quota.as_ref()?.observed_at_ms?;
+    let credit = context
+        .credits
+        .get(&view.account_id)
+        .filter(|credit| policy.paid_credits && credit.spendable);
+    let observed_at = match credit {
+        Some(credit) => scored
+            .quota
+            .as_ref()?
+            .observed_at_ms?
+            .min(credit.observed_at_ms),
+        None => view.quota.as_ref()?.observed_at_ms?,
+    };
     Some(observed_at.saturating_sub(policy.reflection_lag_ms))
 }
-
 fn load_exclusions(
     tx: &(impl BlockReads + ?Sized),
     principal: &str,
@@ -434,6 +459,11 @@ pub(crate) struct AccountForParams {
     pub(super) service_tier_chosen: Option<cortexkit_role_routing::service_tier::ServiceTier>,
     #[serde(skip)]
     pub(super) bound_tier: Option<BoundTier>,
+    /// For a fork: listed logins the child's own decision can never use (its
+    /// account class, model reach or bound service tier rule them out), with
+    /// the reason. A parent on one of them is refused, never replaced.
+    #[serde(skip)]
+    pub(super) fork_unqualified: BTreeMap<String, fork::Unqualified>,
     /// Routing generated `admission_id` itself (a continuation's reservation),
     /// so no earlier admission can hold it and the writer skips its keyed
     /// existence check.
@@ -518,6 +548,7 @@ impl AccountForParams {
             service_tier: request.service_tier,
             service_tier_chosen: None,
             bound_tier: None,
+            fork_unqualified: BTreeMap::new(),
             admission_id_generated: false,
             parent_conversation_key: serde_json::from_value(optional("parent_conversation_key"))
                 .map_err(|e| invalid(e.to_string()))?,
@@ -733,13 +764,26 @@ pub(super) fn account_for(
         Err(reply) => return reply,
     };
     parsed.call = call;
+    // Legacy callers keep their context; admission sets this request's probe
+    // owner on its own copy.
+    let ctx = Ctx {
+        store: ctx.store,
+        accounts: ctx.accounts,
+        flags: ctx.flags.clone(),
+        policy: ctx.policy,
+        now_ms: ctx.now_ms,
+        classes: ctx.classes.clone(),
+    };
     account_for_parsed(parsed, principal, ctx, None)
 }
 
+/// Takes the request's context by value: it was built for this one request,
+/// so setting the probe owner in place avoids copying the whole class context
+/// (and losing the lazily built indexes a copy starts without).
 pub(crate) fn account_for_parsed(
     parsed: AccountForParams,
     principal: &str,
-    ctx: &Ctx<'_>,
+    mut ctx: Ctx<'_>,
     finish: Option<crate::routing_v1::accounts::AdmissionRecord>,
 ) -> OpReply {
     if !ctx.flags.enabled {
@@ -752,18 +796,10 @@ pub(crate) fn account_for_parsed(
         );
     }
     let provider = normalize(&parsed.provider);
-    let mut classes = ctx.classes.clone();
-    if let Some(classes) = &mut classes {
+    if let Some(classes) = &mut ctx.classes {
         classes.probe_owner = parsed.model_decision_id.clone();
     }
-    let ctx = &Ctx {
-        store: ctx.store,
-        accounts: ctx.accounts,
-        flags: ctx.flags.clone(),
-        policy: ctx.policy,
-        now_ms: ctx.now_ms,
-        classes,
-    };
+    let ctx = &ctx;
     let request_fingerprint = fingerprint(&parsed);
     checking("admission_replay");
     let admission_id = parsed.admission_id.clone();
@@ -1113,20 +1149,19 @@ pub(crate) fn run_after_roster_hook(admission_id: &str) {
     }
 }
 
-pub(super) fn prepare_roster(
+/// The account class the request's routing decision allows, and the decision
+/// itself when the v1 store holds it. A request without a decision may use any
+/// class but pay-per-token-only.
+pub(super) fn decision_class(
     parsed: &AccountForParams,
     ctx: &Ctx<'_>,
 ) -> Result<
     (
-        RosterBuild,
-        BTreeMap<String, i64>,
         striatum_core::accounts::AllowedAccountClass,
         Option<striatum_store::V1Decision>,
-        Option<BoundTier>,
     ),
     OpReply,
 > {
-    let provider = normalize(&parsed.provider);
     let selection = parsed
         .model_decision_id
         .as_deref()
@@ -1149,6 +1184,24 @@ pub(super) fn prepare_roster(
             Err(error) => return Err(store_error(error)),
         },
     };
+    Ok((class, selection))
+}
+
+pub(super) fn prepare_roster(
+    parsed: &AccountForParams,
+    ctx: &Ctx<'_>,
+) -> Result<
+    (
+        RosterBuild,
+        BTreeMap<String, i64>,
+        striatum_core::accounts::AllowedAccountClass,
+        Option<striatum_store::V1Decision>,
+        Option<BoundTier>,
+    ),
+    OpReply,
+> {
+    let provider = normalize(&parsed.provider);
+    let (class, selection) = decision_class(parsed, ctx)?;
     let mut route_fenced = BTreeMap::new();
     let mut roster = match ctx.classes.as_ref() {
         Some(classes) => {
@@ -1303,6 +1356,7 @@ pub(crate) fn preflight_model_for_class_with_reset(
             |provider, account, floor| Ok(state.admissions.demand(provider, account, floor)),
             provider,
             roster.roster.as_ref(),
+            roster.roster.as_ref(),
             &policy,
             &inputs,
         ),
@@ -1310,6 +1364,7 @@ pub(crate) fn preflight_model_for_class_with_reset(
             demand_with(
                 |provider, account, floor| tx.demand(provider, account, floor),
                 provider,
+                roster.roster.as_ref(),
                 roster.roster.as_ref(),
                 &policy,
                 &inputs,
@@ -1499,6 +1554,12 @@ fn serve_with_pin_diagnostic(
     if params.fork_of.is_some() && fork_parent.is_none() {
         return Ok(fork_invalid());
     }
+    if let Some(refusal) = fork_parent
+        .as_ref()
+        .and_then(|parent| fork::unqualified_refusal(params, parent))
+    {
+        return Ok(refusal);
+    }
     let established = match affinity_row.as_ref() {
         Some(affinity) => tx.pin_has_started(affinity)?,
         None => false,
@@ -1548,17 +1609,6 @@ fn serve_with_pin_diagnostic(
         let hash = conversation_hash(&salt, principal, parent);
         inputs.parent_account_id = tx.parent_used_account(principal, &hash, provider, now)?;
     }
-    let admissions = if params.fork_of.is_some() {
-        Vec::new()
-    } else {
-        demand_with(
-            |provider, account, floor| tx.demand(provider, account, floor),
-            provider,
-            roster.roster.as_ref(),
-            &policy,
-            &inputs,
-        )?
-    };
     let blocks = load_blocks(tx, provider)?;
     let bound_pool = request_pool(params.pool.as_deref(), provider, &params.model);
     let mut origins = tx.admission_fence_rechecks(provider)?;
@@ -1670,6 +1720,20 @@ fn serve_with_pin_diagnostic(
             }
         }
     }
+    // Read after the probe roster: an account whose reading is set aside for
+    // a due probe is scored without that reading's time.
+    let admissions = if params.fork_of.is_some() {
+        Vec::new()
+    } else {
+        demand_with(
+            |provider, account, floor| tx.demand(provider, account, floor),
+            provider,
+            roster.roster.as_ref(),
+            probe_roster.as_ref(),
+            &policy,
+            &inputs,
+        )?
+    };
     let mut fences = load_fences(tx, provider)?;
     fences.retain(|fence| {
         params.fork_of.is_some() || {
@@ -1886,7 +1950,13 @@ fn serve_with_pin_diagnostic(
         match claimed {
             striatum_store::CredentialProbeClaim::Claimed => break decision,
             striatum_store::CredentialProbeClaim::Unfenced => {
-                inputs.credential_probe_notes.remove(&credential);
+                // The claim above only answers `Claimed` or `Blocked`. Nothing
+                // here would change the allocator's next pick, so retrying
+                // would spin inside the account writer; fail the command.
+                return Err(RouteStateStoreError(
+                    "credential probe claim answered `Unfenced`, which admission cannot act on"
+                        .into(),
+                ));
             }
             striatum_store::CredentialProbeClaim::Blocked => {
                 // Another request can claim the probe after scoring prepared

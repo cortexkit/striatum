@@ -432,6 +432,8 @@ use status::*;
 pub(crate) mod observations;
 use observations::*;
 #[cfg(test)]
+mod demand_floor_tests;
+#[cfg(test)]
 mod tests;
 
 pub(crate) use class_context::{ClassContext, ProbeBinding};
