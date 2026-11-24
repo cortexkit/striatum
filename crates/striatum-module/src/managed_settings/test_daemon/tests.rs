@@ -281,6 +281,14 @@ impl Daemon {
         self.change(Some(project)).await;
     }
 
+    /// Send a project change notice without waiting for routing to fetch,
+    /// for a project whose fetch the daemon will not answer.
+    pub(crate) fn notify_changed(&self, project: &str) {
+        let mut notice = ConfigChanged::new(0, vec![]);
+        notice.project_id = Some(project.into());
+        self.hints.send(frame(FrameType::Push, 0, notice)).unwrap();
+    }
+
     pub(crate) async fn global_changed(&self) {
         self.change(None).await;
     }
@@ -444,8 +452,25 @@ pub(crate) fn project_view(user: &Value, project: &str, layer: &Value) -> Config
             *merged = overlay.clone();
         }
     }
+    // The daemon names the layer that supplied each leaf: object keys merge
+    // one by one, while a list or scalar belongs wholly to the last layer.
+    fn sources(into: &mut BTreeMap<String, Layer>, at: String, value: &Value, layer: Layer) {
+        match value.as_object() {
+            Some(object) => {
+                for (key, value) in object {
+                    let key = key.replace('~', "~0").replace('/', "~1");
+                    sources(into, format!("{at}/{key}"), value, layer);
+                }
+            }
+            None => {
+                into.insert(at, layer);
+            }
+        }
+    }
     let mut view = active(user.clone(), Some(project));
     merge(&mut view.effective, layer);
+    sources(&mut view.sources, String::new(), user, Layer::User);
+    sources(&mut view.sources, String::new(), layer, Layer::Project);
     let mut snapshot = ConfigLayerSnapshot::file(
         DEFAULT_MODULE_ID,
         ConfigLayer::Project,

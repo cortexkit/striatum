@@ -66,18 +66,35 @@ impl Overrides {
                 let Some(value) = entry.get(key) else {
                     continue;
                 };
-                let pointer = format!(
-                    "/consumers/{}/{key}",
-                    name.replace('~', "~0").replace('/', "~1")
-                );
-                if user.and_then(|user| user.get(key)) == Some(value)
-                    && !matches!(
-                        view.sources.get(&pointer),
-                        Some(Layer::Workspace | Layer::Project)
-                    )
-                {
+                let pointer = format!("/consumers/{}/{key}", pointer_token(name));
+                // Keep only what a workspace or project layer set. A value the
+                // view inherited from the user layer must keep following
+                // routing's own user settings, which may change later without
+                // this project's view being fetched again.
+                let value = if key == "service_tiers" {
+                    let tiers = value.as_object().ok_or_else(fail)?;
+                    let whole = scoped_source(view, &pointer, false);
+                    let scoped: Map<_, _> = tiers
+                        .iter()
+                        .filter(|(route, _)| {
+                            whole
+                                || scoped_source(
+                                    view,
+                                    &format!("{pointer}/{}", pointer_token(route)),
+                                    true,
+                                )
+                        })
+                        .map(|(route, tier)| (route.clone(), tier.clone()))
+                        .collect();
+                    if scoped.is_empty() {
+                        continue;
+                    }
+                    Value::Object(scoped)
+                } else if !scoped_source(view, &pointer, true) {
                     continue;
-                }
+                } else {
+                    value.clone()
+                };
                 let value = if key == "runners" {
                     let mut list = Vec::new();
                     for item in value.as_array().ok_or_else(fail)? {
@@ -94,7 +111,7 @@ impl Overrides {
                     }
                     Value::Array(list)
                 } else {
-                    value.clone()
+                    value
                 };
                 fields.insert(key.into(), value);
             }
@@ -120,6 +137,24 @@ fn consumer_map(object: &Map<String, Value>) -> Option<Option<&Map<String, Value
         Some(value) => value.as_object().map(Some),
         None => Some(None),
     }
+}
+
+fn pointer_token(key: &str) -> String {
+    key.replace('~', "~0").replace('/', "~1")
+}
+
+/// Whether a workspace or project layer supplied the value at `pointer`, or,
+/// with `nested`, any value below it.
+fn scoped_source(view: &ConfigView, pointer: &str, nested: bool) -> bool {
+    let scoped = |layer: &Layer| matches!(layer, Layer::Workspace | Layer::Project);
+    let prefix = format!("{pointer}/");
+    view.sources.get(pointer).is_some_and(scoped)
+        || nested
+            && view
+                .sources
+                .range(prefix.clone()..)
+                .take_while(|(key, _)| key.starts_with(&prefix))
+                .any(|(_, layer)| scoped(layer))
 }
 
 fn scoped_field(key: &str) -> bool {

@@ -761,3 +761,176 @@ async fn failed_project_refresh_keeps_cached_runners_and_tiers_until_a_successfu
     );
     assert_eq!(daemon.gets(ID), 4);
 }
+
+async fn wait_for_new_global(path: &Path, before: &Arc<config_overrides::LiveConfig>) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while Arc::ptr_eq(before, &config_overrides::live_config(path)) {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("routing did not apply the new user settings");
+}
+
+fn project_tier(
+    path: &Path,
+    view: &crate::project_settings::Overrides,
+    consumer: &str,
+    provider: &str,
+) -> Option<cortexkit_role_routing::service_tier::ServiceTier> {
+    let config = config_overrides::live_config(path);
+    crate::tier_settings::Layers::new(view.consumers.clone(), None)
+        .resolve(&config, consumer, provider, "model", None)
+}
+
+#[tokio::test]
+async fn user_tier_edit_reaches_a_cached_project_that_only_adds_its_own_tier() {
+    use super::test_daemon::{Advertise, Daemon, ID};
+    use crate::tier_settings::Tier;
+    use crate::DEFAULT_MODULE_ID;
+
+    let dir = ScratchDir::new("project-inherited-tiers");
+    let path = dir.join("striatum.jsonc");
+    let consumer = "prefrontal.sidekick";
+    let user = |tier| json!({"consumers":{consumer:{"service_tiers":{"openai":tier}}}});
+    std::fs::write(&path, user("fast").to_string()).unwrap();
+    let (daemon, _connection) = Daemon::connect(&path, user("fast"), Advertise::Hello).await;
+    daemon.set(
+        ID,
+        json!({"consumers":{consumer:{"service_tiers":{"anthropic":"standard"}}}}),
+    );
+    let view = project_view(&path, ID).await.unwrap();
+    assert_eq!(
+        project_tier(&path, &view, consumer, "openai"),
+        Some(Tier::Fast.value())
+    );
+    assert_eq!(
+        project_tier(&path, &view, consumer, "anthropic"),
+        Some(Tier::Standard.value())
+    );
+
+    // The operator changes the user tier; the daemon sends only a global notice.
+    let before = config_overrides::live_config(&path);
+    std::fs::write(&path, user("standard").to_string()).unwrap();
+    daemon.reload_user_file(DEFAULT_MODULE_ID).await.unwrap();
+    wait_for_new_global(&path, &before).await;
+    let view = project_view(&path, ID).await.unwrap();
+    assert_eq!(daemon.gets(ID), 1, "the project view stays cached");
+    assert_eq!(
+        project_tier(&path, &view, consumer, "openai"),
+        Some(Tier::Standard.value()),
+        "no scoped layer set the openai tier"
+    );
+    assert_eq!(
+        project_tier(&path, &view, consumer, "anthropic"),
+        Some(Tier::Standard.value())
+    );
+}
+
+#[tokio::test]
+async fn project_view_built_on_another_user_layer_keeps_routings_user_values() {
+    use super::test_daemon::{self, Advertise, Daemon, ID};
+    use crate::tier_settings::Tier;
+    use subc_protocol::config::ConfigGetReply;
+
+    let dir = ScratchDir::new("project-user-skew");
+    let path = dir.join("striatum.jsonc");
+    let applied = json!({"consumers":{"prefrontal.sidekick":{"service_tier":"standard"}}});
+    let (daemon, _connection) = Daemon::connect(&path, applied, Advertise::Hello).await;
+    // The daemon merged this project over a user layer routing has not applied.
+    let skewed = json!({"consumers":{"prefrontal.sidekick":{"service_tier":"fast"}}});
+    let layer = json!({"consumers":{"prefrontal.lab":{"service_tier":"ultrafast"}}});
+    daemon.deliver(
+        ID,
+        ConfigGetReply::new(Some(test_daemon::project_view(&skewed, ID, &layer)), None),
+    );
+    let view = project_view(&path, ID).await.unwrap();
+    assert_eq!(
+        view.consumers.keys().collect::<Vec<_>>(),
+        ["prefrontal.lab"],
+        "only the project's own consumer is a project override"
+    );
+    assert_eq!(
+        project_tier(&path, &view, "prefrontal.sidekick", "openai"),
+        Some(Tier::Standard.value())
+    );
+    assert_eq!(
+        project_tier(&path, &view, "prefrontal.lab", "openai"),
+        Some(Tier::Ultrafast.value())
+    );
+}
+
+#[tokio::test]
+async fn project_tiers_resolve_as_before_when_the_user_layers_agree() {
+    use super::test_daemon::{Advertise, Daemon, ID};
+    use crate::tier_settings::Tier;
+
+    let dir = ScratchDir::new("project-tiers-unchanged");
+    let path = dir.join("striatum.jsonc");
+    let user = json!({"consumers":{"prefrontal.sidekick":{
+        "service_tier":"standard",
+        "service_tiers":{"openai":"standard","openai/model":"fast","google":"standard"}
+    }}});
+    let (daemon, _connection) = Daemon::connect(&path, user, Advertise::Hello).await;
+    daemon.set(
+        ID,
+        json!({"consumers":{
+            "prefrontal.sidekick":{"service_tier":"fast","service_tiers":{"openai":"ultrafast"}},
+            "prefrontal.sidekick.review":{"service_tiers":{"google":"fast"}}
+        }}),
+    );
+    let view = project_view(&path, ID).await.unwrap();
+    for (consumer, provider, tier) in [
+        // The user's model entry outranks the project's provider entry.
+        ("prefrontal.sidekick", "openai", Tier::Fast),
+        ("prefrontal.sidekick", "google", Tier::Standard),
+        ("prefrontal.sidekick", "anthropic", Tier::Fast),
+        ("prefrontal.sidekick.review", "openai", Tier::Fast),
+        ("prefrontal.sidekick.review", "google", Tier::Fast),
+        ("prefrontal.sidekick.review", "anthropic", Tier::Fast),
+    ] {
+        assert_eq!(
+            project_tier(&path, &view, consumer, provider),
+            Some(tier.value()),
+            "{consumer} on {provider}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn queued_project_refreshes_do_not_discard_the_cached_view_for_a_request() {
+    use super::test_daemon::{Advertise, Daemon, ID};
+    use crate::tier_settings::Tier;
+
+    let dir = ScratchDir::new("project-refresh-queue");
+    let path = dir.join("striatum.jsonc");
+    let consumer = "prefrontal.sidekick";
+    let user = json!({"consumers":{consumer:{"service_tier":"standard"}}});
+    let (daemon, _connection) = Daemon::connect(&path, user, Advertise::Hello).await;
+    daemon.set(ID, json!({"consumers":{consumer:{"service_tier":"fast"}}}));
+    let view = project_view(&path, ID).await.unwrap();
+    assert_eq!(
+        project_tier(&path, &view, consumer, "openai"),
+        Some(Tier::Fast.value())
+    );
+
+    tokio::time::pause();
+    daemon.delay(ID);
+    for _ in 0..3 {
+        daemon.notify_changed(ID);
+    }
+    // Wait until the first refresh is fetching; the other two queue behind it.
+    while daemon.gets(ID) < 2 {
+        tokio::task::yield_now().await;
+    }
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    let view = project_view(&path, ID)
+        .await
+        .expect("the request falls back to the last delivered project view");
+    assert_eq!(
+        project_tier(&path, &view, consumer, "openai"),
+        Some(Tier::Fast.value())
+    );
+}

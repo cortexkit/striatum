@@ -258,16 +258,18 @@ impl LiveConfig {
                 .iter()
                 .map(|(id, policy)| {
                     let scoped = project.and_then(|entries| entries.get(id));
+                    // A scoped map holds only the routes a workspace or
+                    // project layer set; every other route keeps the user's tier.
+                    let mut tiers = policy.service_tiers.clone().unwrap_or_default();
+                    if let Some(scoped) = scoped.and_then(|entry| entry.service_tiers.as_ref()) {
+                        tiers.extend(scoped.iter().map(|(route, tier)| (route.clone(), *tier)));
+                    }
                     (
                         id.clone(),
                         scoped
                             .and_then(|entry| entry.service_tier)
                             .or(policy.service_tier),
-                        scoped
-                            .and_then(|entry| entry.service_tiers.as_ref())
-                            .or(policy.service_tiers.as_ref())
-                            .cloned()
-                            .unwrap_or_default(),
+                        tiers,
                     )
                 })
                 .chain(
