@@ -3,12 +3,14 @@ mod rebind_tests {
     use cortexkit_bus_inmemory::{InMemoryBus, InMemoryConfig};
     use cortexkit_bus_naming::AccountNames;
     use cortexkit_bus_trait::{ContentDigest, DurableOwner, Headers, Stream, StreamCursor};
+    use std::collections::VecDeque;
     use striatum_store::AccountCommandKind;
 
     struct WakeWire {
         inner: FakeWire,
         credentials: crate::broca_credentials::SharedBrocaCredentials,
         status_calls: usize,
+        local_grades: VecDeque<Result<media_grades::LocalGrades, FusiformCatalogError>>,
     }
 
     impl CatalogWire for WakeWire {
@@ -21,6 +23,9 @@ mod rebind_tests {
         async fn catalog_status(&mut self) -> Result<CatalogStatusReply, FusiformCatalogError> {
             self.status_calls += 1;
             self.inner.catalog_status().await
+        }
+        async fn local_grades(&mut self) -> Result<media_grades::LocalGrades, FusiformCatalogError> {
+            self.local_grades.pop_front().unwrap_or_else(|| Ok(Default::default()))
         }
         async fn close(&mut self) -> Result<(), FusiformCatalogError> {
             self.inner.close().await
@@ -60,6 +65,7 @@ mod rebind_tests {
                 },
                 credentials,
                 status_calls: 0,
+                local_grades: VecDeque::new(),
             };
             bootstrap_cycle(&mut wire, &handler.store, &health, None, None)
                 .await
@@ -142,7 +148,6 @@ mod rebind_tests {
             let delivery = crate::route_facts::Delivery {
                 message,
                 body: bytes,
-                published_at_ms: None,
                 delivery_count: 1,
             };
             assert!(self
@@ -155,6 +160,48 @@ mod rebind_tests {
                 "event must be acknowledged"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn incomplete_catalog_apply_retries_and_wakes_at_the_committed_version() {
+        let mut rig = WakeRig::new("rebind-partial-apply").await;
+        rig.change_catalog(1);
+        let sql = rusqlite::Connection::open(rig._rig.dir.join("route.db")).unwrap();
+        sql.execute_batch("CREATE TRIGGER refuse_quality BEFORE INSERT ON routing_operator_quality_state BEGIN SELECT RAISE(ABORT, 'quality write failed'); END;").unwrap();
+        let failed = poll_cycle(&mut rig.wire, &rig.handler.store, &rig.health, None, None)
+            .await.err().expect("quality write should fail");
+        assert!(failed.to_string().contains("quality write failed"), "{failed}");
+        assert_eq!(rig.handler.store.fusiform_catalog_cursor().unwrap().unwrap().catalog_version, 1);
+        assert_eq!(rig.wire.credentials.lock().unwrap().catalog_snapshot.as_ref().unwrap().cursor.catalog_version, 0);
+        sql.execute_batch("DROP TRIGGER refuse_quality").unwrap();
+
+        rig.newer_event().await;
+        let wake = rig.wire.credentials.lock().unwrap().catalog_wake.clone();
+        let woke = tokio::time::timeout(Duration::ZERO, wake.notified()).await.is_ok();
+        let retried = poll_cycle(&mut rig.wire, &rig.handler.store, &rig.health, None, None)
+            .await.unwrap();
+        assert_eq!((woke, retried.get_calls), (true, 1));
+        assert_eq!(rig.wire.credentials.lock().unwrap().catalog_snapshot.as_ref().unwrap().cursor.catalog_version, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transient_local_grade_failure_recovers_at_same_catalog_version_without_refetch() {
+        use media_grades::LocalGrades;
+        let mut rig = WakeRig::new("retry-local-grade").await;
+        let route = "runner/example";
+        let grade = |score| Ok(LocalGrades::from_test_grade("local:runner/example", "transcription", score));
+        let current_grade = |rig: &WakeRig| rig.wire.credentials.lock().unwrap().catalog_snapshot.as_ref().unwrap().local_media_grade("transcribe", route);
+        rig.wire.local_grades = VecDeque::from([grade(59.0), Err(error("temporary timeout")), grade(63.0)]);
+        rig.change_catalog(1);
+        poll_cycle(&mut rig.wire, &rig.handler.store, &rig.health, None, None).await.unwrap();
+        assert_eq!(current_grade(&rig), Some(59.0));
+        rig.change_catalog(2);
+        poll_cycle(&mut rig.wire, &rig.handler.store, &rig.health, None, None).await.unwrap();
+        assert_eq!(current_grade(&rig), Some(59.0));
+        tokio::time::advance(Duration::from_secs(61)).await;
+        let cycle = poll_cycle(&mut rig.wire, &rig.handler.store, &rig.health, None, None).await.unwrap();
+        assert_eq!(cycle.get_calls, 0);
+        assert_eq!(current_grade(&rig), Some(63.0));
     }
 
     #[tokio::test]

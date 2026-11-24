@@ -622,16 +622,15 @@ fn build_with_credentials(
     out
 }
 
-pub(crate) async fn fetch_plan_prices(connection: &Path, project: &Path) -> Value {
-    if let Ok(mut fusi) =
-        QuotaConsumer::connect_module(connection, project, "fusiform", "tool_provider").await
-    {
-        fusi.query(json!({"name":"plan.prices", "arguments":{}}))
-            .await
-            .unwrap_or(Value::Null)
-    } else {
-        Value::Null
-    }
+pub(crate) async fn fetch_plan_prices(connection: &Path, project: &Path) -> Option<Value> {
+    let mut fusi = QuotaConsumer::connect_module(connection, project, "fusiform", "tool_provider")
+        .await
+        .ok()?;
+    let reply = fusi
+        .query(json!({"name":"plan.prices", "arguments":{}}))
+        .await
+        .ok()?;
+    reply["prices"].is_array().then_some(reply)
 }
 
 pub(crate) async fn refresh(
@@ -640,15 +639,13 @@ pub(crate) async fn refresh(
     state: &SharedAccountQuota,
     listing: Option<&cortexkit_claustrum_client::ScopedCredentialListing>,
     credentials: &crate::broca_credentials::SharedBrocaCredentials,
-    quota_cache: &crate::SharedQuotaCache,
 ) {
     let now = crate::now_ms() as i64;
     let from = now - 24 * 3_600_000;
-    let reader_bound = multiplier::reader_bound(quota_cache);
     let (poll_due, generation) = cache()
         .lock()
         .map(|mut runtime| {
-            let bound = reader_bound && runtime.multipliers.ready;
+            let bound = runtime.multipliers.watch_ready();
             (
                 runtime.poll.due(bound, std::time::Instant::now()),
                 runtime.multipliers.generation,
@@ -676,21 +673,25 @@ pub(crate) async fn refresh(
     // Admission needs plan prices even when Astro's spend report is slow.
     // Publish them as soon as Fusiform answers, without waiting for Astro.
     let prices = async {
-        let prices = fetch_plan_prices(connection, project).await;
-        if let Ok(mut credentials) = credentials.lock() {
-            credentials.publish_plan_prices(&prices);
+        if let Some(prices) = fetch_plan_prices(connection, project).await {
+            if let Ok(mut credentials) = credentials.lock() {
+                credentials.publish_plan_prices(&prices);
+            }
         }
-        prices
     };
-    let (prices, report) = tokio::join!(
+    let ((), report) = tokio::join!(
         striatum_store::job_timing::run("plan_price_refresh", prices),
         striatum_store::job_timing::run("spend_report_refresh", report)
     );
-    let reader_bound = multiplier::reader_bound(quota_cache);
-    let credential_ids = credentials
+    let (credential_ids, prices) = credentials
         .lock()
         .ok()
-        .map(|credentials| credentials.api_key_credentials_by_provider(now as u64))
+        .map(|credentials| {
+            (
+                credentials.api_key_credentials_by_provider(now as u64),
+                credentials.plan_prices.clone(),
+            )
+        })
         .unwrap_or_default();
     let Some(snapshot) = state.lock().ok().map(|s| s.clone()) else {
         return;
@@ -711,7 +712,8 @@ pub(crate) async fn refresh(
             guard.poll.completed(std::time::Instant::now());
             // A watch update received during the call is newer than the poll's
             // snapshot. Do not overwrite it when the slower call returns.
-            guard.poll_report(report, generation, reader_bound);
+            let watch_ready = guard.multipliers.watch_ready();
+            guard.poll_report(report, generation, watch_ready);
         }
         let previous_inputs = guard.inputs.replace(inputs);
         (guard.prepare(now), previous_inputs)

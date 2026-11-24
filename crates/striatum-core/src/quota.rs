@@ -547,6 +547,16 @@ pub fn quota_route_join_for_source<'a>(
     api_provider: Option<&'a str>,
     facts: &'a [ModelFact],
 ) -> Option<QuotaRouteJoin<'a>> {
+    quota_route_join_with(provider, api_provider, || {
+        sole_provider_serving_prefix(facts, ANTIGRAVITY_QUOTA_JOIN.route_model_prefix)
+    })
+}
+
+fn quota_route_join_with<'a>(
+    provider: &str,
+    api_provider: Option<&'a str>,
+    antigravity_provider: impl FnOnce() -> Option<&'a str>,
+) -> Option<QuotaRouteJoin<'a>> {
     let antigravity = provider == ANTIGRAVITY_QUOTA_JOIN.insula_provider;
     if let Some(provider_id) = api_provider.filter(|slug| !slug.trim().is_empty()) {
         return Some(QuotaRouteJoin {
@@ -558,10 +568,7 @@ pub fn quota_route_join_for_source<'a>(
         return None;
     }
     Some(QuotaRouteJoin {
-        provider_id: sole_provider_serving_prefix(
-            facts,
-            ANTIGRAVITY_QUOTA_JOIN.route_model_prefix,
-        )?,
+        provider_id: antigravity_provider()?,
         antigravity_family_only: true,
     })
 }
@@ -573,6 +580,60 @@ fn quota_join_matches_capacity(join: QuotaRouteJoin<'_>, capacity_key: &str) -> 
     provider_id == join.provider_id
         && (!join.antigravity_family_only
             || model_id.starts_with(ANTIGRAVITY_QUOTA_JOIN.route_model_prefix))
+}
+
+/// Capacity lookup for repeated quota readings against one resolved catalog.
+#[derive(Clone, Default)]
+pub struct QuotaCapacityIndex {
+    by_provider: std::collections::HashMap<String, Vec<String>>,
+    antigravity: std::collections::HashMap<String, Vec<String>>,
+    antigravity_provider: Option<String>,
+}
+
+impl QuotaCapacityIndex {
+    pub fn new(facts: &[ModelFact]) -> Self {
+        let mut index = Self {
+            antigravity_provider: sole_provider_serving_prefix(
+                facts,
+                ANTIGRAVITY_QUOTA_JOIN.route_model_prefix,
+            )
+            .map(str::to_owned),
+            ..Default::default()
+        };
+        for fact in facts {
+            let key = make_capacity_key(&fact.provider_id, &fact.model_id);
+            // Use the same split as the linear matcher, including model IDs with slashes.
+            let (provider, model) = key.split_once('/').expect("capacity key contains slash");
+            if model.starts_with(ANTIGRAVITY_QUOTA_JOIN.route_model_prefix) {
+                index
+                    .antigravity
+                    .entry(provider.to_owned())
+                    .or_default()
+                    .push(key.clone());
+            }
+            index
+                .by_provider
+                .entry(provider.to_owned())
+                .or_default()
+                .push(key);
+        }
+        index
+    }
+
+    pub fn lookup<'a>(&'a self, entry: &'a ProviderUsage) -> Option<(&'a str, &'a [String])> {
+        let join = quota_route_join_with(&entry.provider, entry.api_provider.as_deref(), || {
+            self.antigravity_provider.as_deref()
+        })?;
+        let index = if join.antigravity_family_only {
+            &self.antigravity
+        } else {
+            &self.by_provider
+        };
+        Some((
+            join.provider_id,
+            index.get(join.provider_id).map_or(&[], Vec::as_slice),
+        ))
+    }
 }
 
 /// The route capacities an entry can inform, including Antigravity's family-only

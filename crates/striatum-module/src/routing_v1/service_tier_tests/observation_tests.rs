@@ -644,6 +644,32 @@ async fn stalled_on_demand_plan_prices_refuse_with_integer_retry_seconds() {
 }
 
 #[tokio::test]
+async fn failed_plan_poll_keeps_prices_for_tiered_admission() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, mut credentials) = legacy_broca_setup();
+    let request = bound_request(&harness, "after-failed-plan-poll", false).await;
+    let prices = credentials.plan_prices.clone();
+    let scratch = cortexkit_test_support::ScratchDir::new("failed-plan-poll");
+    let path = scratch.path().join("connection.json");
+    credentials.connection_file_path = None;
+    let credentials = Arc::new(std::sync::Mutex::new(credentials));
+    let quota = Arc::new(std::sync::Mutex::new(
+        crate::account_quota::AccountQuotaState::default(),
+    ));
+    crate::subscription_economics::refresh(&path, scratch.path(), &quota, None, &credentials).await;
+    let credentials = Arc::try_unwrap(credentials)
+        .unwrap_or_else(|_| panic!("unexpected credentials owner"))
+        .into_inner()
+        .unwrap();
+    assert_eq!(credentials.plan_prices, prices);
+    harness.set_credentials(credentials);
+    let runner = harness.bind(reserved("broca"), None).await;
+    let admitted = runner.call("route.account_for", &request).await;
+    assert_eq!(admitted.0, FrameType::Response, "{}", admitted.1);
+    assert_eq!(admitted.1["result"]["service_tier_chosen"], "fast");
+}
+
+#[tokio::test]
 async fn startup_plan_prices_do_not_wait_for_the_astro_spend_report() {
     let _clock = crate::InjectedClock::set(NOW);
     let (_, mut credentials) = legacy_broca_setup();
@@ -667,7 +693,6 @@ async fn startup_plan_prices_do_not_wait_for_the_astro_spend_report() {
             &quota,
             None,
             &credentials,
-            &Arc::new(std::sync::Mutex::new(crate::QuotaCache::default())),
         ),
     )
     .await

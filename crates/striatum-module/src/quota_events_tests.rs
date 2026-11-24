@@ -87,7 +87,6 @@ async fn metadata_timeouts_keep_insula_and_catalog_deliveries_alive_without_reco
                 &crate::route_facts::Delivery {
                     message: event.message,
                     body: catalog.to_vec(),
-                    published_at_ms: Some(crate::now_ms()),
                     delivery_count: event.delivery_count,
                 },
             )
@@ -506,8 +505,8 @@ fn accountless_siblings_clear_their_own_snapshot_baselines() {
     let [first, second] = kimi_siblings();
     store_snapshot(&live, vec![first.clone(), second.clone()]);
     for entry in [&first, &second] {
-        assert_eq!(live.covered_by_snapshot(entry).unwrap(), Some(true));
-        assert_eq!(live.covered_by_snapshot(entry).unwrap(), None);
+        assert!(live.covered_by_snapshot(entry, false).unwrap());
+        assert!(!live.covered_by_snapshot(entry, false).unwrap());
     }
 }
 
@@ -1350,6 +1349,86 @@ async fn exact_body_bytes_are_verified_and_stored_before_ack() {
 }
 
 #[test]
+fn quota_reading_log_examines_only_joined_capacity_keys_and_matches_reference() {
+    use striatum_core::quota::{quota_capacity_keys, quota_route_join};
+    use striatum_core::quota_poll::reading_log_rows_for_poll;
+    use striatum_core::route_state_store::FactSource;
+
+    let (_scratch, live) = fixture();
+    for index in 0..212 {
+        let provider = if index < 12 {
+            "test-capacity-provider"
+        } else {
+            "other-capacity-provider"
+        };
+        live.store
+            .upsert_fact(
+                &crate::tests::fact(provider, &format!("model-{index}")),
+                FactSource::Seed,
+            )
+            .unwrap();
+    }
+    let entry = serde_json::from_value(json!({"provider":"codex", "apiProvider":"test-capacity-provider", "account":"work", "usage":{"primary":{"usedPercent":37.0,"windowMinutes":300}}})).unwrap();
+    let facts = live.store.get_facts().unwrap();
+    let expected = reading_log_rows_for_poll(
+        &entry,
+        quota_route_join(&entry, &facts).unwrap().provider_id,
+        &quota_capacity_keys(&entry, &facts),
+        42,
+    );
+    assert!(!expected.is_empty());
+    // Warm the catalog before measuring another reading of the same revision.
+    assert_eq!(
+        crate::quota_reading_rows(&live.store, std::slice::from_ref(&entry), 42).unwrap(),
+        expected
+    );
+    crate::quota_cache::QUOTA_CAPACITY_KEYS_EXAMINED.with(|count| count.set(0));
+    assert_eq!(
+        crate::quota_reading_rows(&live.store, &[entry], 42).unwrap(),
+        expected
+    );
+    assert_eq!(
+        crate::quota_cache::QUOTA_CAPACITY_KEYS_EXAMINED.with(std::cell::Cell::get),
+        12,
+        "matched capacity keys among {} resolved facts",
+        facts.len()
+    );
+}
+
+#[test]
+fn quota_capacity_index_preserves_antigravity_family_and_ambiguity() {
+    use striatum_core::quota::{quota_capacity_keys, quota_route_join, QuotaCapacityIndex};
+
+    let implicit = json!({"provider": "antigravity", "account": "work"});
+    let explicit = json!({"provider": "antigravity", "apiProvider": "google", "account": "work"});
+    let ordinary = json!({"provider": "gemini", "apiProvider": "google", "account": "work"});
+    let mut facts = vec![
+        crate::tests::fact("google", "antigravity-gemini-preview"),
+        crate::tests::fact("google", "gemini-preview"),
+    ];
+    for ambiguous in [false, true] {
+        if ambiguous {
+            facts.push(crate::tests::fact("another", "antigravity-gemini-preview"));
+        }
+        let index = QuotaCapacityIndex::new(&facts);
+        for (entry, expected_count) in [
+            (&implicit, usize::from(!ambiguous)),
+            (&explicit, 1),
+            (&ordinary, 2),
+        ] {
+            let entry = serde_json::from_value(entry.clone()).unwrap();
+            let old_join = quota_route_join(&entry, &facts).map(|join| join.provider_id);
+            let old_keys = quota_capacity_keys(&entry, &facts);
+            assert_eq!(old_keys.len(), expected_count);
+            assert_eq!(
+                index.lookup(&entry),
+                old_join.map(|provider| (provider, old_keys.as_slice()))
+            );
+        }
+    }
+}
+
+#[test]
 fn quota_samples_and_usage_snapshots_share_the_api_provider_join() {
     let (_event_scratch, event_live) = fixture();
     let (_snapshot_scratch, snapshot_live) = fixture();
@@ -1443,16 +1522,8 @@ async fn sdk_notice_tampered_digest_termed_without_applying() {
     let mut headers = original.message.headers;
     let tampered = ContentDigest::of_bytes(b"tampered").to_string();
     headers.insert("Ck-Content-Digest".into(), tampered.clone());
-    let payload = quota_bus::message(
-        SUBJECT.into(),
-        key,
-        b"",
-        headers,
-        Some(&tampered),
-        Some(crate::now_ms()),
-        1,
-    )
-    .unwrap();
+    let payload =
+        quota_bus::message(SUBJECT.into(), key, b"", headers, Some(&tampered), 1).unwrap();
     cursor.adapter_message = Some(payload.message);
     assert!(matches!(
         consume_one(
@@ -1536,6 +1607,172 @@ async fn duplicate_and_out_of_order_sequences_are_ignored() {
 }
 
 #[tokio::test]
+async fn alternating_in_order_notices_apply_without_inventory_round_trips() {
+    let (_scratch, live) = fixture();
+    let bus = bus();
+    let mut cursor = Cursor::new(&bus, &live).await;
+    let mut sequence = SequenceState::default();
+    let named = |account: &str, seq, used| body("epoch-z", seq, used).replace("work", account);
+    let mut latest = [named("first", 1, 10), named("second", 1, 20)];
+    let inventory =
+        |latest: &[String]| format!(r#"{{"result":[{}]}}"#, latest.join(",")).into_bytes();
+    let mut source = Source {
+        snapshot: inventory(&latest),
+        ..Default::default()
+    };
+    // Establish both account sequences, then do a periodic full inventory.
+    for sample in &latest {
+        publish(&bus, &mut source, sample).await;
+        consume_one(&mut cursor, &mut source, &live, &mut sequence, SUBJECT)
+            .await
+            .unwrap();
+    }
+    let now = Instant::now();
+    maintain_inventory(
+        &mut source,
+        &live,
+        &mut SnapshotSchedule::new(now),
+        &mut sequence,
+        now,
+    )
+    .await;
+    let before = source.snapshots;
+    for seq in 2..=11 {
+        for (index, account) in ["first", "second"].into_iter().enumerate() {
+            let percent = seq + 10 * index as u64;
+            latest[index] = named(account, seq, percent);
+            source.snapshot = inventory(&latest);
+            publish(&bus, &mut source, &latest[index]).await;
+            consume_one(&mut cursor, &mut source, &live, &mut sequence, SUBJECT)
+                .await
+                .unwrap();
+            let rows = live.store.account_quota_readings().unwrap();
+            let row = rows.iter().find(|row| row.account_id == account).unwrap();
+            let stored: Value = serde_json::from_str(&row.entry_json).unwrap();
+            assert_eq!(stored["usage"]["primary"]["usedPercent"], percent);
+        }
+    }
+    assert_eq!(cursor.acks, 22);
+    assert_eq!(
+        source.snapshots - before,
+        0,
+        "usage.get calls for 20 in-order events"
+    );
+}
+
+#[tokio::test]
+async fn recovery_inventory_absence_does_not_resurrect_pending_notice() {
+    let (_scratch, live) = fixture();
+    let old = body("epoch-z", 7, 10);
+    live.store(&snapshot_body(&old), false).unwrap();
+    let mut source = Source {
+        snapshot: br#"{"result":[],"completeProviders":["codex"]}"#.to_vec(),
+        ..Default::default()
+    };
+    let bus = bus();
+    publish(&bus, &mut source, &old).await;
+    let mut cursor = Cursor::new(&bus, &live).await;
+    let mut sequence = SequenceState::default();
+    sequence.commit(serde_json::from_str(&body("retired", 1, 10)).unwrap());
+    let now = Instant::now();
+    maintain_inventory(
+        &mut source,
+        &live,
+        &mut SnapshotSchedule::new(now),
+        &mut sequence,
+        now,
+    )
+    .await;
+    assert!(live.store.account_quota_readings().unwrap()[0]
+        .tombstoned_at
+        .is_some());
+    consume_one(&mut cursor, &mut source, &live, &mut sequence, SUBJECT)
+        .await
+        .unwrap();
+    assert_eq!(cursor.acks, 1);
+    assert!(live.store.account_quota_readings().unwrap()[0]
+        .tombstoned_at
+        .is_some());
+
+    for pending in [body("retired", 6, 99), body("epoch-z", 6, 99)] {
+        publish(&bus, &mut source, &pending).await;
+        consume_one(&mut cursor, &mut source, &live, &mut sequence, SUBJECT)
+            .await
+            .unwrap();
+        assert!(live.store.account_quota_readings().unwrap()[0]
+            .tombstoned_at
+            .is_some());
+    }
+    publish(&bus, &mut source, &body("epoch-z", 8, 42)).await;
+    consume_one(&mut cursor, &mut source, &live, &mut sequence, SUBJECT)
+        .await
+        .unwrap();
+    assert!(live.store.account_quota_readings().unwrap()[0]
+        .tombstoned_at
+        .is_none());
+    assert_eq!(used(&live), 42.0);
+    assert_eq!((cursor.acks, source.snapshots), (4, 2));
+}
+
+#[tokio::test]
+async fn snapshot_without_ordering_markers_does_not_block_in_order_notice() {
+    let (_scratch, live) = fixture();
+    let bus = bus();
+    let mut cursor = Cursor::new(&bus, &live).await;
+    let mut sequence = SequenceState::default();
+    sequence.commit(serde_json::from_str(&body("epoch-z", 1, 10)).unwrap());
+    let snapshot = br#"{"result":[{"provider":"codex","account":"work","apiProvider":"openai","usage":{"primary":{"usedPercent":10,"windowMinutes":300}}}]}"#;
+    live.store(snapshot, false).unwrap();
+    let mut source = Source {
+        snapshot: snapshot.to_vec(),
+        ..Default::default()
+    };
+    publish(&bus, &mut source, &body("epoch-z", 2, 42)).await;
+    consume_one(&mut cursor, &mut source, &live, &mut sequence, SUBJECT)
+        .await
+        .unwrap();
+    assert_eq!(used(&live), 42.0);
+    assert_eq!((cursor.acks, source.snapshots), (1, 0));
+}
+
+#[tokio::test]
+async fn verified_undecodable_quota_event_is_kept_degraded_and_acked() {
+    let (_scratch, live) = fixture();
+    let bad =
+        r#"{"provider":"codex","account":"work","spend":"not-a-list","epoch":"epoch-z","seq":1}"#;
+    let bus = bus();
+    let mut source = Source {
+        snapshot: br#"{"result":[]}"#.to_vec(),
+        ..Default::default()
+    };
+    publish(&bus, &mut source, bad).await;
+    let mut cursor = Cursor::new(&bus, &live).await;
+    // A body whose typed account row cannot decode can still land in quota windows.
+    cursor.verify_publication = false;
+    consume_one(
+        &mut cursor,
+        &mut source,
+        &live,
+        &mut SequenceState::default(),
+        SUBJECT,
+    )
+    .await
+    .unwrap();
+    assert_eq!((cursor.acks, cursor.naks, cursor.terms), (1, 0, 0));
+    let cache = live.cache.lock().unwrap();
+    assert!(cache.available);
+    assert_eq!(
+        cache.windows[0].error_class.as_deref(),
+        Some("decode_failed")
+    );
+    let (_snapshot_scratch, snapshot_live) = fixture();
+    snapshot_live.store(&snapshot_body(bad), false).unwrap();
+    assert!(stored_rows(&live).is_empty());
+    assert!(stored_rows(&snapshot_live).is_empty());
+    assert_eq!(cache.windows, snapshot_live.cache.lock().unwrap().windows);
+}
+
+#[tokio::test]
 async fn gap_and_opaque_epoch_change_recover_without_rolling_back_snapshot() {
     let (_scratch, live) = fixture();
     let bus = bus();
@@ -1578,7 +1815,7 @@ async fn gap_and_opaque_epoch_change_recover_without_rolling_back_snapshot() {
         20.0,
         "a retired epoch must not replace the new process's reading"
     );
-    assert_eq!(source.snapshots, 4);
+    assert_eq!(source.snapshots, 3);
     assert_eq!(cursor.acks, 5);
 }
 
@@ -2005,7 +2242,7 @@ async fn incremental_event_keeps_restored_siblings_and_account_metadata() {
     )
     .unwrap();
     live.cache.lock().unwrap().restored_from_ms = Some(1);
-    live.snapshot_baseline.lock().unwrap().clear();
+    *live.snapshot_baseline.lock().unwrap() = InventoryCoverage::default();
     let bus = bus();
     let sample = body("epoch-z", 2, 70);
     let mut source = Source::default();

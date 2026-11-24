@@ -19,7 +19,7 @@
 //! fixture at Fusiform `245826d`.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -406,6 +406,7 @@ enum CatalogRate {
 pub(crate) struct CatalogSnapshot {
     cursor: FusiformCatalogCursor,
     facts: Vec<FusiformFactUpdate>,
+    model_index: HashMap<String, usize>,
     rates: BTreeMap<String, Arc<ModelRates>>,
     pub(crate) wire_apis: BTreeMap<String, String>,
     /// Rows serving an endpoint in `wire.api`, distinct from `wire_apis`' wire families.
@@ -531,9 +532,13 @@ impl CatalogSnapshot {
     }
 
     pub(crate) fn model(&self, model: &str) -> Option<&FusiformFactUpdate> {
-        self.facts
-            .iter()
-            .find(|fact| model == format!("{}/{}", fact.provider_id, fact.model_id))
+        #[cfg(test)]
+        allocation_tests::MODEL_LOOKUP_PROBES.with(|count| count.set(count.get() + 1));
+        self.model_index.get(model).map(|&index| &self.facts[index])
+    }
+
+    pub(crate) fn version(&self) -> i64 {
+        self.cursor.catalog_version
     }
 
     /// Keep the provider index tied to the version of the catalog that supplied it.
@@ -1222,6 +1227,7 @@ pub(crate) mod allocation_tests;
 mod decode;
 pub(crate) mod efforts;
 mod media_grades;
+mod refresh;
 mod speed_twins;
 #[cfg(test)]
 pub(crate) use media_grades::{count_calls, inherit_calls};
@@ -1368,6 +1374,11 @@ fn decode_catalog_get_legacy(bytes: &[u8]) -> Result<CatalogSnapshot, FusiformCa
             catalog_version: reply.catalog_version,
             resolved_at_ms: reply.resolved_at_ms,
         },
+        model_index: facts
+            .iter()
+            .enumerate()
+            .map(|(index, fact)| (format!("{}/{}", fact.provider_id, fact.model_id), index))
+            .collect(),
         facts,
         rates,
         retained,
@@ -2222,9 +2233,9 @@ async fn poll_cycle<C: CatalogWire>(
             .map_err(|reason| error(format!("read Fusiform cursor: {reason}")))
     })
     .await?;
-    let should_get = cursor
-        .map(|cursor| status.catalog_version != cursor.catalog_version)
-        .unwrap_or(true);
+    let credentials = client.credentials();
+    let should_get =
+        refresh::needs_catalog_get(credentials.as_ref(), cursor, status.catalog_version)?;
     let get_calls = if should_get {
         let snapshot = media_grades::refresh_snapshot(client).await?;
         striatum_store::job_timing::run(
@@ -2244,6 +2255,7 @@ async fn poll_cycle<C: CatalogWire>(
         .await?;
         1
     } else {
+        media_grades::retry_if_due(client, credentials.as_ref()).await?;
         striatum_store::job_timing::run("billing_plane_refresh", client.refresh_planes(None))
             .await?;
         if let (Some(path), Some(cursor)) = (config_path, cursor) {
@@ -2323,14 +2335,7 @@ pub async fn catalog_refresh_loop(
                 if let Ok(mut health) = health.lock() {
                     health.set_poll_ms(cadence);
                 }
-                let retry = credentials
-                    .lock()
-                    .ok()
-                    .and_then(|guard| guard.billing_catalog.retry_at.values().min().copied());
-                let delay = retry.map_or(Duration::from_millis(cadence), |due| {
-                    Duration::from_millis(cadence)
-                        .min(due.saturating_duration_since(tokio::time::Instant::now()))
-                });
+                let delay = refresh::poll_delay(&credentials, Duration::from_millis(cadence));
                 if wait_for_catalog_cycle(&wake, &rebind_wake, delay).await {
                     bootstrapped = false;
                 }

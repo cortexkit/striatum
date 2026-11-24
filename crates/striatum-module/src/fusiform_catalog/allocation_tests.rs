@@ -1,6 +1,43 @@
 use super::*;
 use rusqlite::{types::ValueRef, Connection};
 
+thread_local! {
+    pub(super) static MODEL_LOOKUP_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[test]
+fn catalog_model_lookup_is_bounded_and_matches_linear_lookup() {
+    let snapshot = decode_catalog_get(&live_shaped_reply()).unwrap();
+    MODEL_LOOKUP_PROBES.with(|count| count.set(0));
+    for key in [
+        "anthropic/claude-sonnet-4-5-0",
+        "unmapped-provider/claude-sonnet-4-5-12192",
+        "missing/model",
+    ] {
+        let expected = snapshot
+            .facts
+            .iter()
+            .find(|fact| key == format!("{}/{}", fact.provider_id, fact.model_id));
+        let actual = snapshot.model(key);
+        assert_eq!(
+            actual.map(std::ptr::from_ref),
+            expected.map(std::ptr::from_ref),
+            "{key}"
+        );
+        assert_eq!(
+            snapshot.input_price(key),
+            expected.and_then(|fact| fact.input_rate),
+            "{key}"
+        );
+    }
+    assert_eq!(
+        MODEL_LOOKUP_PROBES.with(std::cell::Cell::get),
+        6,
+        "three model and three price lookup probes among {} rows",
+        snapshot.facts.len()
+    );
+}
+
 fn samples() -> Value {
     serde_json::from_str(include_str!("../../fixtures/served-payloads.json")).unwrap()
 }

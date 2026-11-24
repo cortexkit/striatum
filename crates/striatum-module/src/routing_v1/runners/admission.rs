@@ -3,6 +3,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use cortexkit_claustrum_client::{CredentialResolver, ScopedCredentialListing};
 use serde_json::Value;
 use subc_client_rs::{CallOptions, ConsumerOptions, SubcConsumer};
 
@@ -212,31 +213,23 @@ async fn refresh_account_inputs(credentials: &crate::SharedBrocaCredentials) {
         tokio::spawn(async move {
             let _guard = guard;
             let _ = tokio::time::timeout(Duration::from_secs(2), async {
-                let listing = async {
-                    use cortexkit_claustrum_client::CredentialResolver;
-                    let needed = credentials
-                        .lock()
-                        .is_ok_and(|credentials| credentials.listing_version().is_none());
-                    if needed {
-                        let resolver = crate::vault::VaultResolver::new(path.clone(), "striatum");
-                        if let Ok(listing) = resolver.list_scoped().await {
-                            if let Ok(mut credentials) = credentials.lock() {
-                                credentials.apply_listing(&listing, crate::now_ms());
-                            }
-                        }
-                    }
-                };
+                let listing = refresh_cold_listing(&credentials, async {
+                    crate::vault::VaultResolver::new(path.clone(), "striatum")
+                        .list_scoped()
+                        .await
+                        .ok()
+                });
                 let plans = async {
                     let needed = credentials.lock().is_ok_and(|credentials| {
                         credentials.plan_prices["prices"].as_array().is_none()
                     });
                     if needed {
-                        let prices = crate::subscription_economics::fetch_plan_prices(
+                        if let Some(prices) = crate::subscription_economics::fetch_plan_prices(
                             &path,
                             path.parent().unwrap_or(Path::new(".")),
                         )
-                        .await;
-                        if prices["prices"].is_array() {
+                        .await
+                        {
                             if let Ok(mut credentials) = credentials.lock() {
                                 credentials.publish_plan_prices(&prices);
                             }
@@ -256,4 +249,57 @@ async fn refresh_account_inputs(credentials: &crate::SharedBrocaCredentials) {
         });
     }
     let _ = tokio::time::timeout(Duration::from_secs(2), gate.lock()).await;
+}
+
+async fn refresh_cold_listing(
+    credentials: &crate::SharedBrocaCredentials,
+    list: impl std::future::Future<Output = Option<ScopedCredentialListing>>,
+) {
+    let needed = credentials
+        .lock()
+        .is_ok_and(|cache| cache.listing_version().is_none());
+    if needed {
+        if let Some(listing) = list.await {
+            if let Ok(mut cache) = credentials.lock() {
+                // The regular vault watch may have published while the cold read was in flight.
+                if cache.listing_version().is_none() {
+                    cache.apply_listing(&listing, crate::now_ms());
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn delayed_cold_admission_listing_cannot_overwrite_watched_view() {
+    let credentials = crate::SharedBrocaCredentials::default();
+    let (started, in_flight) = tokio::sync::oneshot::channel();
+    let (release, delayed) = tokio::sync::oneshot::channel();
+    let listing = |view: &str| ScopedCredentialListing {
+        view: view.into(),
+        ..Default::default()
+    };
+    tokio::join!(
+        refresh_cold_listing(&credentials, async {
+            started.send(()).unwrap();
+            delayed.await.unwrap();
+            Some(listing("active-key-view"))
+        }),
+        async {
+            in_flight.await.unwrap();
+            credentials
+                .lock()
+                .unwrap()
+                .apply_listing(&listing("needs-reauth-view"), crate::now_ms());
+            release.send(()).unwrap();
+        }
+    );
+    assert_eq!(
+        credentials
+            .lock()
+            .unwrap()
+            .listing_version()
+            .map(|(view, _)| view),
+        Some("needs-reauth-view")
+    );
 }
