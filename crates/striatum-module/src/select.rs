@@ -1384,16 +1384,13 @@ async fn handle_select_panel(
             .unwrap_or_default(),
         None => crate::tier_settings::Layers::default(),
     };
+    let resolver = tier_settings.tier_resolver(&operator_config, panel_consumer.id());
     let tiers = classes.apply_configured_service_tiers(
         &mut prepared.facts,
         |fact| {
-            tier_settings.resolve(
-                &operator_config,
-                panel_consumer.id(),
-                &fact.provider_id,
-                &fact.model_id,
-                params.service_tier,
-            )
+            params
+                .service_tier
+                .or_else(|| resolver.resolve(&fact.provider_id, &fact.model_id))
         },
         &registry.policies(),
         &registry,

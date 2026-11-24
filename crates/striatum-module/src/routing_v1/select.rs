@@ -1338,17 +1338,10 @@ async fn select_at_tier_attempt(
             .classes
             .as_mut()
             .map(|classes| {
+                let tiers = tier_settings.tier_resolver(&operator_config, tier_consumer);
                 classes.apply_configured_service_tiers(
                     &mut facts,
-                    |fact| {
-                        tier_settings.resolve(
-                            &operator_config,
-                            tier_consumer,
-                            &fact.provider_id,
-                            &fact.model_id,
-                            None,
-                        )
-                    },
+                    |fact| tiers.resolve(&fact.provider_id, &fact.model_id),
                     &runners,
                     &registry,
                     priced_per_token,

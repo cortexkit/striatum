@@ -868,16 +868,13 @@ async fn candidates(
         .unwrap_or(&request.consumer);
     let unprojected_snapshot = prepared.snapshot.clone();
     if let Some(classes) = &mut priced.classes {
+        let tiers = layers.tier_resolver(&config, tier_consumer);
         classes.apply_configured_service_tiers(
             &mut prepared.facts,
             |fact| {
-                layers.resolve(
-                    &config,
-                    tier_consumer,
-                    &fact.provider_id,
-                    &fact.model_id,
-                    request.service_tier,
-                )
+                request
+                    .service_tier
+                    .or_else(|| tiers.resolve(&fact.provider_id, &fact.model_id))
             },
             &runners,
             &registry,

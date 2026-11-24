@@ -249,52 +249,67 @@ impl LiveConfig {
         model: &str,
         project: Option<&BTreeMap<String, crate::tier_settings::Consumer>>,
     ) -> Option<cortexkit_role_routing::service_tier::ServiceTier> {
-        crate::tier_settings::at_level(
-            consumer,
-            provider,
-            model,
-            self.config
-                .consumers
-                .iter()
-                .map(|(id, policy)| {
-                    let scoped = project.and_then(|entries| entries.get(id));
-                    // A scoped map holds only the routes a workspace or
-                    // project layer set; every other route keeps the user's tier.
-                    let mut tiers = policy.service_tiers.clone().unwrap_or_default();
-                    if let Some(scoped) = scoped.and_then(|entry| entry.service_tiers.as_ref()) {
-                        tiers.extend(scoped.iter().map(|(route, tier)| (route.clone(), *tier)));
-                    }
-                    (
-                        id.clone(),
-                        scoped
-                            .and_then(|entry| entry.service_tier)
-                            .or(policy.service_tier),
-                        tiers,
-                    )
-                })
-                .chain(
-                    project
-                        .into_iter()
-                        .flat_map(|entries| entries.iter())
-                        .filter(|(id, _)| !self.config.consumers.contains_key(*id))
-                        .map(|(id, entry)| {
-                            (
-                                id.clone(),
-                                entry.service_tier,
-                                entry.service_tiers.clone().unwrap_or_default(),
-                            )
-                        }),
-                ),
-            self.config
-                .model_routing
-                .models
-                .get(&format!("{provider}/{model}"))
-                .and_then(|model| model.rules.service_tier),
-            self.config
-                .providers
-                .get(provider)
-                .and_then(|provider| provider.rules.service_tier),
-        )
+        self.tier_resolver(consumer, project)
+            .resolve(provider, model)
+    }
+
+    /// The tier entries `consumer` inherits, borrowed from these settings and
+    /// the project overrides, in settings order with user entries first.
+    pub(crate) fn tier_resolver<'a>(
+        &'a self,
+        consumer: &str,
+        project: Option<&'a BTreeMap<String, crate::tier_settings::Consumer>>,
+    ) -> crate::tier_settings::TierResolver<'a> {
+        use crate::config_policy::consumer_matches;
+        use crate::tier_settings::MatchedTiers;
+        let user = self
+            .config
+            .consumers
+            .iter()
+            .filter(|(id, _)| consumer_matches(id, consumer))
+            .map(|(id, policy)| {
+                let scoped = project.and_then(|entries| entries.get(id));
+                MatchedTiers {
+                    name: id,
+                    tier: scoped
+                        .and_then(|entry| entry.service_tier)
+                        .or(policy.service_tier),
+                    scoped: scoped.and_then(|entry| entry.service_tiers.as_ref()),
+                    user: policy.service_tiers.as_ref(),
+                }
+            });
+        let project_only = project
+            .into_iter()
+            .flatten()
+            .filter(|(id, _)| {
+                !self.config.consumers.contains_key(*id) && consumer_matches(id, consumer)
+            })
+            .map(|(id, entry)| MatchedTiers {
+                name: id,
+                tier: entry.service_tier,
+                scoped: entry.service_tiers.as_ref(),
+                user: None,
+            });
+        crate::tier_settings::TierResolver::new(self, user.chain(project_only).collect())
+    }
+
+    /// The service tier a model rule, or else its provider's rule, sets.
+    pub(crate) fn rule_service_tier(
+        &self,
+        provider: &str,
+        route: &str,
+    ) -> Option<crate::tier_settings::Tier> {
+        self.config
+            .model_routing
+            .models
+            .get(route)
+            .and_then(|model| model.rules.service_tier)
+            .or_else(|| {
+                self.config
+                    .providers
+                    .get(provider)
+                    .and_then(|provider| provider.rules.service_tier)
+            })
     }
     fn new(mut config: RoutingConfigFile, document: Option<String>) -> Self {
         // Expand the old spelling on its own entry, before dotted inheritance.
