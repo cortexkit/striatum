@@ -42,7 +42,9 @@ fn writer_steps<T>(store: &SqliteRouteStateStore, run: impl FnOnce() -> T) -> (T
             Ok(())
         })
         .unwrap();
+    let started = std::time::Instant::now();
     let result = run();
+    let elapsed = started.elapsed();
     store
         .store
         .with_conn(|conn| {
@@ -50,7 +52,10 @@ fn writer_steps<T>(store: &SqliteRouteStateStore, run: impl FnOnce() -> T) -> (T
             Ok(())
         })
         .unwrap();
-    (result, steps.load(std::sync::atomic::Ordering::Relaxed))
+    let steps = steps.load(std::sync::atomic::Ordering::Relaxed);
+    // Printed for cost comparisons across builds (`--no-capture`).
+    eprintln!("writer steps (x100 instructions): {steps}; call took {elapsed:?}");
+    (result, steps)
 }
 
 /// With 20,000 recent parent-failure copies and nothing due, a retention
