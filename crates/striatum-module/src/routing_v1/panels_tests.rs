@@ -58,6 +58,43 @@ async fn panel(route: &Route, request: &Value) -> SelectPanelAnswer {
 }
 
 #[tokio::test]
+async fn panel_ranks_only_models_reached_by_the_consumer_runners() {
+    let h = Harness::new("panel-consumer-runners");
+    let mut catalog = fixture::catalog();
+    let original = catalog.models[0].clone();
+    catalog.models = [("strong", "claude", 100), ("allowed", "gpt", 80)]
+        .map(|(model, family, iq)| {
+            let mut fact = original.clone();
+            fact.model = model.into();
+            fact.family = Some(family.into());
+            fact.iq = iq;
+            fact
+        })
+        .into();
+    let [strong, allowed] = [0, 1].map(|i| catalog.models[i].route_key());
+    catalog.runners[0].route_keys = vec![strong.clone()];
+    catalog.runners[1].route_keys = vec![allowed.clone()];
+    let runner = catalog.runners[1].module.clone();
+    install_catalog(&h, &catalog);
+    install_panel_families(&h, &catalog);
+    h.edit_config(|c| {
+        c["panels"]["audit"] = json!({"top_k":1,"by":"iq","extra":0,"floor":100});
+        c["consumers"][fixture::SUMMARY] =
+            json!({"owner":"prefrontal-core","runners":[{"module":runner,"routes":[allowed]}]});
+    });
+    let route = h.bind(reserved("prefrontal-core"), None).await;
+    let answer = panel(
+        &route,
+        &json!({"class":"audit","consumer":fixture::SUMMARY,
+        "available_routes":[strong, allowed]}),
+    )
+    .await;
+    assert_eq!(answer.seats.len(), 1, "{answer:?}");
+    assert_eq!(answer.seats[0].answer.route.route_key(), allowed);
+    assert_eq!(answer.seats[0].answer.runner.module, runner);
+}
+
+#[tokio::test]
 async fn decommissioned_panel_candidate_is_not_seated_or_named_in_shortfall() {
     let (harness, route, mut request) = configured().await;
     harness.edit_config(|config| {

@@ -1316,18 +1316,19 @@ impl Discovery<'_> {
                 {
                     return false;
                 }
-                if let Ok(mut credentials) = self.credentials.lock() {
-                    if matches!(result, Ok(None)) {
+                self.credentials.lock().is_ok_and(|mut credentials| {
+                    let revoked = matches!(result, Ok(None));
+                    if revoked {
                         self.classifiers.revoke(module, &mut credentials);
                     }
-                    self.classifiers.reply(
+                    let valid = self.classifiers.reply(
                         module,
                         result.as_ref().ok().and_then(Option::as_ref),
                         &mut credentials,
                         crate::now_ms() as i64,
                     );
-                }
-                result.is_ok()
+                    revoked || valid
+                })
             }
             DescribeTarget::Tiers(module) => {
                 let describe = admission::fetch_describe_result(

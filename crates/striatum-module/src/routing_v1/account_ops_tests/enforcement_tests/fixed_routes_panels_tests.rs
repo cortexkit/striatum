@@ -356,3 +356,34 @@ async fn panel_ledger_replaces_full_seats_without_relaxing_floor_family_or_packa
         assert_eq!(pressure().len(), would_refuse);
     }
 }
+
+#[tokio::test]
+async fn explicit_panel_replacement_excludes_the_standing_models_weights() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, _) = setup("synthetic", false);
+    panel_models(&harness, false);
+    harness.edit_config(|config| {
+        config["panels"]["audit"] = json!({"top_k":2,"by":"iq","extra":0,"floor":80});
+    });
+    let consumer = harness.bind(reserved("class-owner"), None).await;
+    let answer = panel_answer(
+        &consumer,
+        &json!({"class":"audit","consumer":"mason",
+        "seed":"fixed","package_tokens":10_000}),
+    )
+    .await;
+    assert_eq!(seated(&answer), ["model", "standing"], "{answer}");
+    let replacement = consumer
+        .call(
+            "route.select_panel",
+            &json!({"replace":{
+                "panel_id":answer["panel_id"], "slot":answer["seats"][0]["slot"]
+            }}),
+        )
+        .await;
+    let result = response(&replacement);
+    assert_eq!(
+        result["seat"]["answer"]["route"]["model"], "spare",
+        "{result}"
+    );
+}

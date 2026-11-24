@@ -503,6 +503,17 @@ async fn lost_probe_binding_fallback_case(legacy: bool) {
     steal_selected_probe(&harness);
     let reply = broca_select(&harness, legacy).await;
     assert_eq!(broca_selected_route(&reply, legacy), "muse/model");
+    let selected: Vec<_> = harness
+        .store()
+        .list_decisions(&striatum_store::DecisionListFilter {
+            limit: 10,
+            ..Default::default()
+        })
+        .unwrap()
+        .into_iter()
+        .filter_map(|row| row.selected_route_key)
+        .collect();
+    assert_eq!(selected, ["muse/model"]);
     assert_eq!(
         harness.store().fence_rechecks().unwrap()[0]
             .claim_owner

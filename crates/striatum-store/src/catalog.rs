@@ -281,6 +281,9 @@ pub struct CatalogFactsSnapshot {
     pub facts: Vec<ModelFact>,
     pub providers: BTreeSet<String>,
     pub efforts: Arc<BTreeMap<String, crate::CatalogEfforts>>,
+    /// Published variants from the same committed reader view. Writer-only
+    /// snapshots used for uncommitted fact reads don't load this index.
+    pub reasoning: Option<Arc<ReasoningCatalog>>,
 }
 
 pub(super) fn next_catalog_cache_identity() -> u64 {
@@ -492,7 +495,7 @@ impl SqliteRouteStateStore {
         {
             return Ok(Arc::clone(snapshot));
         }
-        let (rows, efforts) = self
+        let (rows, efforts, reasoning) = self
             .store
             .with_read(|connection| {
                 // A pooled reader arrives inside its own read transaction. The
@@ -504,15 +507,17 @@ impl SqliteRouteStateStore {
                     None
                 };
                 let (rows, efforts) = self.load_resolved_facts(connection)?;
+                let reasoning = reasoning_catalog::read_reasoning_catalog(connection)?;
                 if let Some(tx) = tx {
                     crate::connection_store::timed_commit(tx)?;
                 }
-                Ok((rows, efforts))
+                Ok((rows, efforts, reasoning))
             })
             .map_err(err)?;
         let snapshot = Arc::new(CatalogFactsSnapshot {
             generation,
             efforts: Arc::new(efforts),
+            reasoning: Some(Arc::new(reasoning)),
             providers: rows
                 .iter()
                 .map(|(fact, _)| fact.provider_id.clone())
@@ -555,6 +560,7 @@ impl SqliteRouteStateStore {
             generation,
             providers,
             efforts,
+            reasoning: None,
             facts: facts
                 .into_iter()
                 .filter_map(|(fact, present)| present.then_some(fact))
@@ -644,11 +650,15 @@ impl SqliteRouteStateStore {
 
     /// The reasoning-effort values the catalog publishes for every stored model.
     pub fn reasoning_catalog(&self) -> RouteStateResult<ReasoningCatalog> {
-        self.store
-            .with_conn(|connection: &Connection| {
-                reasoning_catalog::read_reasoning_catalog(connection)
-            })
-            .map_err(err)
+        self.shared_reasoning_catalog()
+            .map(|catalog| (*catalog).clone())
+    }
+
+    pub fn shared_reasoning_catalog(&self) -> RouteStateResult<Arc<ReasoningCatalog>> {
+        self.get_selection_catalog()?
+            .reasoning
+            .clone()
+            .ok_or_else(|| err("selection catalog has no reasoning index"))
     }
 
     /// All durable catalog rows, including each row's routing-exclusion state.

@@ -127,6 +127,48 @@ fn selection_catalog_and_speed_reads_only_take_the_writer_for_the_change_key() {
 }
 
 #[test]
+fn shared_reasoning_catalog_uses_only_the_writer_local_key_check() {
+    use std::sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    };
+    let dir = cortexkit_test_support::ScratchDir::new("reasoning-catalog-off-writer");
+    let store = store(&dir);
+    let writer_steps = Arc::new(AtomicU64::new(0));
+    let counter = writer_steps.clone();
+    store
+        .with_writer_for_test(|conn| {
+            conn.progress_handler(
+                1,
+                Some(move || {
+                    counter.fetch_add(1, Ordering::Relaxed);
+                    false
+                }),
+            );
+            Ok(())
+        })
+        .unwrap();
+    let expected = striatum_store::read_reasoning_catalog_offline(&dir.join("store.db")).unwrap();
+    assert!(!expected.models.is_empty());
+    let mut previous = None;
+    for _ in 0..2 {
+        writer_steps.store(0, Ordering::Relaxed);
+        let catalog = store.shared_reasoning_catalog().unwrap();
+        assert_eq!(*catalog, expected);
+        if let Some(previous) = previous {
+            assert!(Arc::ptr_eq(&catalog, &previous));
+        }
+        let steps = writer_steps.load(Ordering::Relaxed);
+        println!("reasoning_writer_vm_steps={steps}");
+        assert!(
+            steps < 100,
+            "{steps} writer VM steps to read reasoning options"
+        );
+        previous = Some(catalog);
+    }
+}
+
+#[test]
 fn catalog_inventory_cache_uses_only_the_writer_local_key_check() {
     let dir = cortexkit_test_support::ScratchDir::new("catalog-off-writer");
     let store = store(&dir);
