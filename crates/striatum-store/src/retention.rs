@@ -448,8 +448,10 @@ impl SqliteRouteStateStore {
     /// ledger restored empty from a backup leaves rows no ledger delete will
     /// ever reach; this keeps the table bounded by the decision window either
     /// way. A row without an outcome time counts as time 0 and goes in the
-    /// first batch: the head withholding reads only rows whose outcome time
-    /// is in its recent window, so such a row is never read.
+    /// first batch. The table's only reader, route.select's check for which
+    /// of a parent session's recent workers were refused on content-policy
+    /// grounds, reads only rows whose outcome time is in its recent window,
+    /// so such a row is never read.
     pub fn prune_parent_failures(
         &self,
         outcome_before: i64,
