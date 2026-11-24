@@ -1269,6 +1269,9 @@ impl AccountCommand<'_> {
         admission: &AccountAdmissionRow,
         at: i64,
     ) -> RouteStateResult<bool> {
+        #[cfg(test)]
+        let _writer_entry =
+            striatum_store::writer_entry_trace::enter("account_command::end_lease_after_finish");
         let pin = &admission.pin_id;
         let generation = admission.pin_generation;
         let remaining = match self.admission_state() {

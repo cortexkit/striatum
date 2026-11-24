@@ -2150,6 +2150,10 @@ impl AccountTx<'_> {
     /// What-if runs use a private database copy without the live writer's
     /// in-memory index. Limit the lookup there to rows for this pin.
     pub fn pin_has_open_admissions(&self, pin: &str, generation: u64) -> RouteStateResult<bool> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::account_selection::pin_has_open_admissions",
+        );
         self.conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM account_admission WHERE pin_id=?1 AND pin_generation=?2
              AND state IN ('reserved', 'started', 'expired'))",

@@ -23,6 +23,10 @@ pub(super) const READ_ONLY: &[(&str, &str)] = &[
         "tests whether a matching pin has a started admission",
     ),
     (
+        "account_tx::account_selection::pin_has_open_admissions",
+        "checks a what-if store for admissions still open on one pin",
+    ),
+    (
         "account_tx::account_selection::admission",
         "selects one admission by principal and id",
     ),
