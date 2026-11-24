@@ -616,8 +616,19 @@ pub(super) fn is_fence_lift_operator(principal: &str) -> bool {
 /// Lift every credential entitlement fence on one named vault credential at
 /// once, for use right after topping it up. Operator-only (see
 /// [`is_fence_lift_operator`]); the reply names what was lifted.
+#[cfg(test)]
 pub(super) async fn handle_clear_credential_fences(
     frame: Frame,
+    writer: &mpsc::Sender<Frame>,
+    store: &SharedStore,
+) -> Result<(), ModuleError> {
+    let principal = route_principal(frame.header.channel, frame.header.epoch);
+    clear_credential_fences_for(frame, &principal, writer, store).await
+}
+
+pub(super) async fn clear_credential_fences_for(
+    frame: Frame,
+    principal: &str,
     writer: &mpsc::Sender<Frame>,
     store: &SharedStore,
 ) -> Result<(), ModuleError> {
@@ -627,8 +638,7 @@ pub(super) async fn handle_clear_credential_fences(
         frame.header.epoch,
         frame.header.corr,
     );
-    let principal = route_principal(channel, epoch);
-    if !is_fence_lift_operator(&principal) {
+    if !is_fence_lift_operator(principal) {
         return send_route_error(
             writer,
             ver,

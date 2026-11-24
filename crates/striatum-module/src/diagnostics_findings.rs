@@ -1102,13 +1102,9 @@ pub(crate) const FLOW_SCOPE_NOT_SUPPORTED: &str = "flow_scope_not_supported";
 /// [`FLOW_SCOPE_OPS`]. A route is flow-scoped when the daemon stamped its
 /// scope with a flow id; any other route, scoped or not, gets `None` and is
 /// served as before.
-pub(crate) fn flow_route_refusal(body: &[u8], channel: u16, epoch: u32) -> Option<ErrorBody> {
-    crate::route_scope_authority(channel, epoch)?.flow_id?;
-    let op = serde_json::from_slice::<Value>(body)
-        .ok()
-        .and_then(|request| request.get("method")?.as_str().map(str::to_owned))
-        .unwrap_or_default();
-    (!FLOW_SCOPE_OPS.contains(&op.as_str())).then(|| flow_scope_refusal(&op))
+pub(crate) fn flow_route_refusal(op: &str, caller: &routing_v1::Caller) -> Option<ErrorBody> {
+    caller.scope_authority.as_ref()?.flow_id.as_ref()?;
+    (!FLOW_SCOPE_OPS.contains(&op)).then(|| flow_scope_refusal(op))
 }
 
 fn flow_scope_refusal(op: &str) -> ErrorBody {
@@ -1122,9 +1118,14 @@ fn flow_scope_refusal(op: &str) -> ErrorBody {
     .with_detail(json!({ "op": op, "allowed_ops": FLOW_SCOPE_OPS }))
 }
 
+#[cfg(test)]
 fn parse_request(body: &[u8]) -> Result<Request, String> {
     let request: Value = serde_json::from_slice(body)
         .map_err(|error| format!("{OP} request body is not JSON: {error}"))?;
+    parse_params(&request)
+}
+
+fn parse_params(request: &Value) -> Result<Request, String> {
     match request.get("params") {
         None | Some(Value::Null) => Ok(Request::default()),
         Some(params) => serde_json::from_value::<Request>(params.clone())
@@ -1145,6 +1146,8 @@ fn window_ms(request: &Request) -> Result<i64, String> {
 /// Answer one `diagnostics.findings` request on its route.
 pub(crate) async fn handle(
     frame: Frame,
+    request: &Value,
+    caller: &routing_v1::Caller,
     writer: &mpsc::Sender<Frame>,
     store: &SharedStore,
     config_path: &std::path::Path,
@@ -1156,7 +1159,7 @@ pub(crate) async fn handle(
         frame.header.epoch,
         frame.header.corr,
     );
-    let reply = answer(&frame.body, channel, epoch, store, config_path, credentials);
+    let reply = answer(request, caller, store, config_path, credentials);
     let (ty, body) = match reply {
         Ok(result) => (
             FrameType::Response,
@@ -1181,17 +1184,15 @@ pub(crate) async fn handle(
 }
 
 fn answer(
-    body: &[u8],
-    channel: u16,
-    epoch: u32,
+    request: &Value,
+    caller: &routing_v1::Caller,
     store: &SharedStore,
     config_path: &std::path::Path,
     credentials: &crate::broca_credentials::SharedBrocaCredentials,
 ) -> Result<Value, ErrorBody> {
-    admit(&routing_v1::Caller::for_route(channel, epoch))
-        .map_err(|message| ErrorBody::new("not_permitted", message))?;
+    admit(caller).map_err(|message| ErrorBody::new("not_permitted", message))?;
     let request =
-        parse_request(body).map_err(|message| ErrorBody::new("invalid_request", message))?;
+        parse_params(request).map_err(|message| ErrorBody::new("invalid_request", message))?;
     let window_ms =
         window_ms(&request).map_err(|message| ErrorBody::new("invalid_request", message))?;
     let now_ms = crate::now_ms() as i64;

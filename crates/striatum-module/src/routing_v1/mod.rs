@@ -161,13 +161,24 @@ pub(crate) const V1_ONLY_OPS: &[&str] = &[
 ];
 
 /// Whether the `routing/v1` surface answers this request body.
-///
-/// The per-operation discriminator is documented in `shapes`. Mixed bodies
-/// go to v1 for a named refusal, never to a permissive legacy decoder.
+pub(crate) fn parse_route_body(body: &[u8]) -> serde_json::Result<Value> {
+    #[cfg(test)]
+    crate::test_thread_state::lifecycle_probe(|probe| {
+        probe
+            .parses
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    });
+    serde_json::from_slice(body)
+}
+
+#[cfg(test)]
 pub(crate) fn claims(body: &[u8]) -> bool {
-    let Ok(Value::Object(request)) = serde_json::from_slice::<Value>(body) else {
-        return false;
-    };
+    parse_route_body(body).as_ref().is_ok_and(claims_request)
+}
+
+/// When v1 claims a method and parameter shape, its parser can name invalid
+/// members instead of letting the legacy decoder silently ignore them.
+pub(crate) fn claims_request(request: &Value) -> bool {
     let Some(method) = request.get("method").and_then(Value::as_str) else {
         return false;
     };
@@ -229,6 +240,12 @@ impl Caller {
     }
 
     pub(crate) fn for_route(channel: u16, epoch: u32) -> Self {
+        #[cfg(test)]
+        crate::test_thread_state::lifecycle_probe(|probe| {
+            probe
+                .callers
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
         Self {
             binding: Some((channel, epoch)),
             principal: crate::route_principal(channel, epoch),
@@ -339,26 +356,49 @@ async fn scoped_settings(
 }
 
 /// Answer one v1 request on its route and send the reply frame.
+#[cfg(test)]
 pub(crate) async fn serve(
     frame: Frame,
     route_epoch: u32,
     writer: &mpsc::Sender<Frame>,
     deps: &Deps<'_>,
 ) -> Result<(), ModuleError> {
+    let caller = Caller::for_route(frame.header.channel, route_epoch);
+    let request = parse_route_body(&frame.body);
+    serve_request(frame, route_epoch, request, caller, writer, deps).await
+}
+
+pub(crate) async fn serve_request(
+    frame: Frame,
+    route_epoch: u32,
+    request: serde_json::Result<Value>,
+    caller: Caller,
+    writer: &mpsc::Sender<Frame>,
+    deps: &Deps<'_>,
+) -> Result<(), ModuleError> {
     let timing = crate::stage_timing::AccountCallTiming::new();
     let (ver, channel, corr) = (frame.header.ver, frame.header.channel, frame.header.corr);
-    let caller = Caller::for_route(channel, route_epoch);
     let mut operation = String::new();
     let mut call_params = Value::Null;
     let mut call_stages = striatum_store::StoreStageTiming::default();
-    let reply = match serde_json::from_slice::<Value>(&frame.body) {
-        Ok(request) => {
-            let method = request
-                .get("method")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned();
-            let params = request.get("params").cloned().unwrap_or(Value::Null);
+    let reply = match request {
+        Ok(mut request) => {
+            let method = match request.get_mut("method").map(Value::take) {
+                Some(Value::String(method)) => method,
+                _ => String::new(),
+            };
+            let params = request
+                .get_mut("params")
+                .map(Value::take)
+                .unwrap_or(Value::Null);
+            #[cfg(test)]
+            if method == ops::ROUTE_SELECT {
+                crate::test_thread_state::lifecycle_probe(|probe| {
+                    if probe.delay_select {
+                        std::thread::sleep(std::time::Duration::from_millis(1_050));
+                    }
+                });
+            }
             #[cfg(test)]
             if matches!(
                 method.as_str(),
@@ -402,7 +442,8 @@ pub(crate) async fn serve(
             // awaiting panel cannot pick up another request's store work.
             let (reply, stages) = if matches!(
                 method.as_str(),
-                ops::ROUTE_ACCOUNT_FOR
+                ops::ROUTE_SELECT
+                    | ops::ROUTE_ACCOUNT_FOR
                     | ops::ROUTE_ACCOUNT_OBSERVE
                     | ops::ROUTE_SELECT_PANEL
                     | ops::ROUTE_HEAD_CHOICES
@@ -475,6 +516,8 @@ pub(crate) async fn serve(
         );
     } else if operation == ops::ROUTE_HEAD_CHOICES {
         timing.emit_head_choices(total, serialization, call_stages);
+    } else if operation == ops::ROUTE_SELECT {
+        crate::stage_timing::emit_select(total, serialization, call_stages);
     }
     let reply = Frame::build_with_version(
         ver,
@@ -490,26 +533,22 @@ pub(crate) async fn serve(
 }
 
 pub(crate) fn record_call(
-    body: &[u8],
-    channel: u16,
-    epoch: u32,
+    request: &Value,
+    caller: &Caller,
     store: &striatum_store::SqliteRouteStateStore,
 ) -> Result<(), ModuleError> {
-    if let Ok(request) = serde_json::from_slice::<Value>(body) {
-        if let Some(method) = request.get("method").and_then(Value::as_str) {
-            if method == crate::ROUTE_WHAT_IF_OP {
-                return Ok(());
-            }
-            let params = request.get("params").unwrap_or(&Value::Null);
-            let caller = Caller::for_route(channel, epoch);
-            store
-                .record_routing_call(
-                    method,
-                    shapes::census_shape(method, params),
-                    &caller.principal,
-                )
-                .map_err(|error| ModuleError::Message(error.to_string()))?;
+    if let Some(method) = request.get("method").and_then(Value::as_str) {
+        if method == crate::ROUTE_WHAT_IF_OP {
+            return Ok(());
         }
+        let params = request.get("params").unwrap_or(&Value::Null);
+        store
+            .record_routing_call(
+                method,
+                shapes::census_shape(method, params),
+                &caller.principal,
+            )
+            .map_err(|error| ModuleError::Message(error.to_string()))?;
     }
     Ok(())
 }

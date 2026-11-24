@@ -1,4 +1,6 @@
+use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -8,6 +10,27 @@ use crate::broca_credentials::BrocaCredentials;
 
 use super::super::{accounts, Caller, Deps};
 use super::DescribeCache;
+
+type DescribeFlight = tokio::sync::Mutex<Option<tokio::time::Instant>>;
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct AdmissionDescribes(Arc<Mutex<BTreeMap<String, Arc<DescribeFlight>>>>);
+
+impl AdmissionDescribes {
+    fn flight(&self, module: &str) -> Option<Arc<DescribeFlight>> {
+        let mut flights = self.0.lock().ok()?;
+        let now = tokio::time::Instant::now();
+        flights.retain(|_, flight| {
+            Arc::strong_count(flight) > 1
+                || flight
+                    .try_lock()
+                    .is_ok_and(|retry| retry.is_some_and(|at| at > now))
+        });
+        Some(flights.entry(module.to_owned()).or_default().clone())
+    }
+}
+
+const DESCRIBE_RETRY_DELAY: Duration = Duration::from_secs(5);
 
 pub(crate) fn tier_view_unknown(credentials: &BrocaCredentials, module: &str, now: i64) -> bool {
     match credentials.runner_describe_observed.get(module) {
@@ -53,10 +76,7 @@ pub(super) async fn fetch_describe_result(
 
 /// Poll unknown tier views before admission. A cold cache cannot establish
 /// either that a bound tier is unavailable or that a fresh request must step down.
-pub(crate) async fn refresh_admission_tiers(body: &[u8], caller: &Caller, deps: &Deps<'_>) {
-    let Ok(request) = serde_json::from_slice::<Value>(body) else {
-        return;
-    };
+pub(crate) async fn refresh_admission_tiers(request: &Value, caller: &Caller, deps: &Deps<'_>) {
     if request["method"] != "route.account_for" || request["params"]["mode"] == "continue" {
         return;
     }
@@ -76,8 +96,48 @@ pub(crate) async fn refresh_admission_tiers(body: &[u8], caller: &Caller, deps: 
         return;
     };
     refresh_account_inputs(deps.broca_credentials).await;
-    let path = deps.broca_credentials.lock().ok().and_then(|credentials| {
-        tier_view_unknown(&credentials, &module, crate::now_ms() as i64)
+    let module = module.as_str();
+    refresh_admission_describe(module, deps.broca_credentials, |path| async move {
+        let consumer = SubcConsumer::connect(&path, ConsumerOptions::default())
+            .await
+            .ok()?;
+        fetch_describe(
+            &consumer,
+            &path,
+            module,
+            &super::super::operator_config(deps).v1_runners(),
+            deps.broca_credentials,
+        )
+        .await
+    })
+    .await;
+}
+
+async fn refresh_admission_describe<F>(
+    module: &str,
+    credentials: &crate::SharedBrocaCredentials,
+    describe: impl FnOnce(std::path::PathBuf) -> F,
+) where
+    F: std::future::Future<Output = Option<Value>>,
+{
+    let Some(flights) = credentials
+        .lock()
+        .ok()
+        .map(|credentials| credentials.admission_describes.clone())
+    else {
+        return;
+    };
+    let Some(flight) = flights.flight(module) else {
+        return;
+    };
+    // Join the in-flight refresh rather than admitting against an unknown view
+    // while another request may be about to publish a successful describe.
+    let mut retry_at = flight.lock().await;
+    if retry_at.is_some_and(|at| at > tokio::time::Instant::now()) {
+        return;
+    }
+    let path = credentials.lock().ok().and_then(|credentials| {
+        tier_view_unknown(&credentials, module, crate::now_ms() as i64)
             .then(|| credentials.connection_file_path.clone())
             .flatten()
     });
@@ -86,30 +146,53 @@ pub(crate) async fn refresh_admission_tiers(body: &[u8], caller: &Caller, deps: 
     };
     // Bound the connection, route open and describe together. No credentials
     // lock is held while the runner or daemon is unavailable.
-    let describe = tokio::time::timeout(Duration::from_secs(2), async {
-        let consumer = SubcConsumer::connect(&path, ConsumerOptions::default())
-            .await
-            .ok()?;
-        fetch_describe(
-            &consumer,
-            &path,
-            &module,
-            &super::super::operator_config(deps).v1_runners(),
-            deps.broca_credentials,
-        )
+    let describe = tokio::time::timeout(Duration::from_secs(2), describe(path))
         .await
-    })
-    .await
-    .ok()
-    .flatten();
-    if let Ok(mut credentials) = deps.broca_credentials.lock() {
-        DescribeCache::default().reply(
-            &module,
+        .ok()
+        .flatten();
+    if let Ok(mut credentials) = credentials.lock() {
+        let accepted = DescribeCache::default().reply(
+            module,
             describe.as_ref(),
             &mut credentials,
             crate::now_ms() as i64,
         );
+        *retry_at = (!accepted).then(|| tokio::time::Instant::now() + DESCRIBE_RETRY_DELAY);
     }
+}
+
+#[cfg(test)]
+#[tokio::test(start_paused = true)]
+async fn a_failed_request_describe_is_shared_and_retried_after_backoff() {
+    use std::cell::Cell;
+
+    let credentials = Arc::new(Mutex::new(BrocaCredentials::default()));
+    credentials.lock().unwrap().connection_file_path = Some("unused-with-injected-describe".into());
+    let calls = Cell::new(0);
+    let fail = |_| async {
+        calls.set(calls.get() + 1);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        None
+    };
+    tokio::join!(
+        refresh_admission_describe("runner", &credentials, fail),
+        refresh_admission_describe("runner", &credentials, fail),
+    );
+    refresh_admission_describe("runner", &credentials, fail).await;
+    assert_eq!(
+        calls.get(),
+        1,
+        "one dial for the two concurrent requests and immediate retry"
+    );
+    refresh_admission_describe("other-runner", &credentials, fail).await;
+    assert_eq!(
+        calls.get(),
+        2,
+        "one runner's failure must not delay another"
+    );
+    tokio::time::advance(Duration::from_secs(5)).await;
+    refresh_admission_describe("runner", &credentials, fail).await;
+    assert_eq!(calls.get(), 3, "retry after the negative result expires");
 }
 
 async fn refresh_account_inputs(credentials: &crate::SharedBrocaCredentials) {

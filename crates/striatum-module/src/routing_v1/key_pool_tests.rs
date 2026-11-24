@@ -1021,8 +1021,30 @@ async fn a_routed_apikey_runner_admits_renews_and_releases_the_pool_credential()
     harness
         .store()
         .account_transaction(|tx| {
-            let row = tx
+            let first = tx
+                .admission("reserved:zeta-runner", "pooled-admit")?
+                .unwrap();
+            let renewed = tx
                 .admission("reserved:zeta-runner", "pooled-renew")?
+                .unwrap();
+            assert_eq!(first.state, "reserved");
+            assert_eq!(renewed.state, "finished");
+            let affinity = tx
+                .affinity(&first.principal, &first.conversation_hash, POOL)?
+                .unwrap();
+            assert_eq!(affinity.lease_valid_until, Some(renewed.lease_valid_until));
+            Ok(())
+        })
+        .unwrap();
+    let last = runner.call("route.account_observe", &json!({
+        "event_id":"pooled-original-finished", "kind":"run_finished", "admission_id":"pooled-admit"
+    })).await;
+    assert_eq!(last.0, FrameType::Response, "{last:?}");
+    harness
+        .store()
+        .account_transaction(|tx| {
+            let row = tx
+                .admission("reserved:zeta-runner", "pooled-admit")?
                 .unwrap();
             assert_eq!(row.state, "finished");
             let affinity = tx

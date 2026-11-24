@@ -25,6 +25,29 @@ async fn decision(route: &Route, affinity: &str) -> String {
 }
 
 #[tokio::test]
+async fn a_replayed_report_returns_identical_bytes_without_preparing_effects() {
+    use crate::test_thread_state::{LifecycleProbe, LIFECYCLE_PROBE};
+    use std::sync::{atomic::Ordering::Relaxed, Arc};
+    let (_harness, route) = configured().await;
+    let id = decision(&route, "prepare-replay").await;
+    let body = json!({"decision_id":id,"outcome":"completed","usage":{"run_id":"replay","output_tokens":20}});
+    let probe = Arc::new(LifecycleProbe::default());
+    LIFECYCLE_PROBE.with(|slot| slot.replace(Some(probe.clone())));
+    let first = route.call_raw("route.report", &body).await;
+    assert_eq!(first.0, FrameType::Response);
+    assert_eq!(probe.report_snapshots.swap(0, Relaxed), 1);
+    assert!(probe.report_catalog_reads.swap(0, Relaxed) >= 1);
+    assert_eq!(route.call_raw("route.report", &body).await, first);
+    assert_eq!(
+        (
+            probe.report_snapshots.load(Relaxed),
+            probe.report_catalog_reads.load(Relaxed)
+        ),
+        (0, 0)
+    );
+}
+
+#[tokio::test]
 pub(super) async fn report_run_repeat_returns_first_answer_and_usage_but_new_runs_count() {
     let (harness, route) = configured().await;
     let id = decision(&route, "repeat").await;

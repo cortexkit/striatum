@@ -1282,7 +1282,7 @@ async fn clean_eof_and_goodbye_flush_the_last_published_cache() {
             .unwrap();
         }
         drop(peer);
-        let frame = crate::background::next_frame_or_loop_stop(&mut reader, &mut loops)
+        let frame = crate::background::next_frame_or_loop_stop(&mut reader, &mut loops, None)
             .await
             .unwrap();
         if let Some(frame) = frame {

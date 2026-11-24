@@ -83,6 +83,18 @@ impl SqliteRouteStateStore {
         .map(|outcome| outcome.map(|outcome| outcome.recorded))
     }
 
+    /// Read a committed answer by its delivery key. A miss is only a hint: the
+    /// writer must check again before it accepts a new delivery.
+    pub fn v1_report_delivery(
+        &self,
+        decision_id: &str,
+        delivery_key: &str,
+    ) -> RouteStateResult<Option<V1Recorded>> {
+        self.store
+            .with_conn(|conn| report_delivery(conn, decision_id, delivery_key))
+            .map_err(err)
+    }
+
     /// As [`Self::v1_commit_report`], with the first accepted report's
     /// continuation use delegated to `use_continuation`. It receives the
     /// writer's opaque working state, so the module can keep its in-memory
@@ -129,14 +141,9 @@ impl SqliteRouteStateStore {
                 let usage = usage.as_ref();
                 let tx = account.conn;
                 (|| -> rusqlite::Result<(Option<V1ReportOutcome>, bool)> {
-            let standing = tx.query_row(
-                "SELECT body_json, answer_json FROM routing_v1_report_delivery
-                 WHERE decision_id=?1 AND delivery_key=?2",
-                params![decision_id, delivery_key],
-                |row| Ok(V1Recorded { body_json: row.get(0)?, answer_json: row.get(1)? }),
-            ).optional()?;
+            let standing = report_delivery(tx, decision_id, delivery_key)?;
             if let Some(standing) = standing {
-                return Ok((if delivery_key.starts_with("run:") || standing.body_json == recorded.body_json {
+                return Ok((if standing.matches_report_delivery(delivery_key, &recorded.body_json) {
                      Some(V1ReportOutcome { recorded: standing, duplicate: true })
                 } else { None }, false));
             }
@@ -210,6 +217,26 @@ impl SqliteRouteStateStore {
             self.usage_generation.fetch_add(1, Ordering::AcqRel);
         }
         Ok(result.0)
+    }
+}
+
+fn report_delivery(
+    conn: &rusqlite::Connection,
+    decision_id: &str,
+    delivery_key: &str,
+) -> rusqlite::Result<Option<V1Recorded>> {
+    conn.query_row(
+        "SELECT body_json, answer_json FROM routing_v1_report_delivery WHERE decision_id=?1 AND delivery_key=?2",
+        params![decision_id, delivery_key],
+        |row| Ok(V1Recorded { body_json: row.get(0)?, answer_json: row.get(1)? }),
+    ).optional()
+}
+
+impl V1Recorded {
+    /// A run-keyed retry always returns the first answer for that run. Other
+    /// keys accept only an identical canonical body.
+    pub fn matches_report_delivery(&self, delivery_key: &str, body_json: &str) -> bool {
+        delivery_key.starts_with("run:") || self.body_json == body_json
     }
 }
 
@@ -490,15 +517,22 @@ impl AccountTx<'_> {
         merged.until_ms = merged
             .until_ms
             .min(fence.recorded_at.saturating_add(3_600_000));
-        let mut reported = fence.recorded_at;
         if let Some((prior, last)) =
             blocks.non_quota_route_fence(&fence.provider, &fence.credential_id, &fence.model, kind)
         {
+            // Keep the newer deadline and any probe claim against that evidence.
+            if fence.recorded_at < last {
+                return Ok(());
+            }
             merged.recorded_at = prior.recorded_at;
-            reported = last.max(fence.recorded_at);
         }
-        let row = crate::block_storage::account_route_source(&merged, origin, kind, Some(reported))
-            .map_err(err)?;
+        let row = crate::block_storage::account_route_source(
+            &merged,
+            origin,
+            kind,
+            Some(fence.recorded_at),
+        )
+        .map_err(err)?;
         drop(blocks);
         crate::block_storage::write_source(self.conn, &row).map_err(err)?;
         self.conn
