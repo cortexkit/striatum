@@ -3,16 +3,15 @@
 use std::sync::Arc;
 
 use cortexkit_role_classifier::describe::{check_describe, RoleDescribe};
-use cortexkit_role_routing_conformance::CatalogModel;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use striatum_core::ModelFact;
+use striatum_core::{Confidence, RouteStateStore, ScoreProvenance};
 use subc_protocol::FrameType;
 
-use super::conformance_tests::{catalog_fact, reserved, Harness, Route};
+use super::conformance_tests::{reserved, Harness, Route};
 use crate::broca_credentials::BrocaCredentials;
 
-const JEV: &str = "typesafe/jev-1.13.0";
+pub(super) const JEV: &str = "typesafe/jev-1.13.0";
 const CLEF: &str = "cloudflare-workers-ai/@cf/cloudflare/clef";
 const FLASH: &str = "cloudflare-workers-ai/@cf/cloudflare/clef-flash";
 const CONSUMER: &str = "broca.classifier";
@@ -28,6 +27,7 @@ fn catalog() -> Value {
         let rate = entry["price"]["input_per_mtok_usd"].as_f64().unwrap();
         let mut row = json!({
             "existence":"present", "model.kind":"decision",
+            "capability.tool_call": false,
             "capability.input_modalities": if entry["images"].is_null() { vec!["text"] } else { vec!["text", "image"] },
             "rate.input":{"state":"priced","currency":"USD","units":(rate * 1e9).round() as i64,"exponent":9},
             "rate.output":{"state":"stated_zero"}
@@ -50,40 +50,38 @@ pub(super) fn rig(
     let snapshot =
         crate::fusiform_catalog::decode_catalog_get(&serde_json::to_vec(&catalog).unwrap())
             .unwrap();
-    let facts: Vec<ModelFact> = snapshot
-        .parts()
-        .0
-        .iter()
-        .enumerate()
-        .map(|(rank, update)| {
-            let mut fact = catalog_fact(
-                &CatalogModel {
-                    provider: update.provider_id.clone(),
-                    model: update.model_id.clone(),
-                    family: None,
-                    iq: 80,
-                    context_window: 200_000,
-                    max_output_tokens: 32_000,
-                    tool_calls: false,
-                    modalities: Vec::new(),
-                    structured_output: false,
-                    priced_per_token: true,
-                },
-                rank,
-            );
-            fact.context_window = update.context_window;
-            fact.input_rate = update.input_rate;
-            fact.cost_per_m_tok_out = update.cost_per_mtok_out;
-            fact.supports_vision = update.supports_vision;
-            fact.supports_tool_use = Some(false);
-            fact
-        })
-        .collect();
-    harness.install_facts(&facts);
+    let (rows, cursor) = snapshot.parts();
+    let providers = rows.iter().map(|row| row.provider_id.clone()).collect();
+    // Import first-sight rows just as a credential-backed live refresh does.
+    // A synthetic override would give the decision rows a chat score source.
     harness
         .store()
-        .apply_fusiform_catalog(snapshot.parts().0, snapshot.parts().1)
+        .apply_fusiform_catalog_for_providers(rows, cursor, &providers)
         .unwrap();
+    let facts: Vec<_> = harness
+        .store()
+        .get_facts()
+        .unwrap()
+        .into_iter()
+        .filter(|fact| {
+            snapshot
+                .model(&format!("{}/{}", fact.provider_id, fact.model_id))
+                .is_some()
+        })
+        .collect();
+    assert_eq!(facts.len(), rows.len());
+    for fact in &facts {
+        assert_eq!(
+            fact.model_kind.as_deref(),
+            catalog["models"][format!("{}/{}", fact.provider_id, fact.model_id)]["model.kind"]
+                .as_str(),
+        );
+        assert_eq!(fact.score_provenance, ScoreProvenance::Unscored);
+        assert_eq!(fact.scores.elo, 0.0);
+        assert_eq!(fact.scores.eq, 0.0);
+        assert_eq!(fact.confidence, Confidence::Unknown);
+        assert_eq!(fact.supports_tool_use, Some(false));
+    }
     let mut credentials = BrocaCredentials::api_test_credentials(&facts);
     credentials.publish_plan_prices(&json!({"prices":[]}));
     credentials.catalog_snapshot = Some(snapshot);
@@ -101,6 +99,9 @@ pub(super) fn rig(
     harness.edit_config(|config| {
         config["consumers"][CONSUMER] = json!({"owner":"broca"});
         config["runners"] = json!([{"module":"chat-runner"}]);
+        for provider in &providers {
+            config["providers"][provider]["pin_only"] = json!(false);
+        }
     });
     harness
 }
@@ -219,6 +220,40 @@ async fn only_the_broca_classifier_consumer_tree_uses_the_classifiers_listing() 
             assert!(reply.1.to_string().contains("not_chat_kind:decision"));
         }
     }
+}
+
+#[tokio::test]
+async fn unscored_chat_does_not_inherit_classifier_admission() {
+    let harness = rig(
+        |catalog| {
+            catalog["models"][FLASH]
+                .as_object_mut()
+                .unwrap()
+                .remove("model.kind");
+        },
+        |_| {},
+    );
+    harness.edit_config(|config| config["consumers"]["broca.chat"] = json!({"owner":"broca"}));
+    let route = harness.bind(reserved("broca"), None).await;
+    // The cheapest model is in the listing but is a chat row, not a decision row.
+    assert_eq!(route_key(&selected(&route, json!({"iq":0})).await), JEV);
+    let (frame, reply) = route
+        .call(
+            "route.select",
+            &json!({"consumer":"broca.chat","requirements":{"iq":50}}),
+        )
+        .await;
+    assert_eq!(frame, FrameType::Error, "{reply}");
+    assert_eq!(reply["code"], "no_route", "{reply}");
+    assert!(
+        reply["detail"]["rejected"]
+            .as_array()
+            .is_some_and(|rows| rows
+                .iter()
+                .any(|row| row["routeKey"] == FLASH
+                    && row["reason"] == "unscored_awaiting_placement")),
+        "{reply}"
+    );
 }
 
 fn decision_grades(catalog: &mut Value) {

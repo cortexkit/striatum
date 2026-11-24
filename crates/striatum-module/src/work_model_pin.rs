@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use striatum_core::model_facts::{fact_to_route, ModelFact, ModelRequirements};
 use striatum_core::model_router::{
-    admit_routes_with_availability, select_model_route_with_availability, SelectModelRouteInput,
+    admit_routes_with_score_policy, evaluate_model_route_with_concurrency, SelectModelRouteInput,
     SelectedModelRoute,
 };
 use striatum_core::provider_model_spec::ExclusionPolicy;
@@ -108,7 +108,7 @@ pub(crate) fn select(
         catalog,
         catalog_targets,
         &HashMap::new(),
-        true,
+        false,
     )
 }
 
@@ -120,7 +120,7 @@ pub(crate) fn select_with_availability(
     catalog: Option<&ReasoningCatalog>,
     catalog_targets: &BTreeMap<String, String>,
     availability_rejections: &HashMap<String, String>,
-    require_tool_support: bool,
+    classifier: bool,
 ) -> Result<SelectedModelRoute, Refusal> {
     let (provider, requested_model) = pin.split_once('/').ok_or_else(|| {
         refuse(
@@ -194,7 +194,8 @@ pub(crate) fn select_with_availability(
             ),
         ));
     }
-    if require_tool_support && fact.supports_tool_use != Some(true) {
+    // Decision models answer questions without running chat tools.
+    if !classifier && fact.supports_tool_use != Some(true) {
         return Err(refuse(
             "missing_tool_support",
             format!("{identity}: tool support is not admitted by the catalog"),
@@ -213,7 +214,7 @@ pub(crate) fn select_with_availability(
     // refusal. Per-attempt caller exclusions, availability, credentials,
     // capability and quota walls still apply.
     input.operator_exclude_keys.clear();
-    let admission = admit_routes_with_availability(
+    let admission = admit_routes_with_score_policy(
         &input.facts,
         input.runtime_snapshot.as_ref(),
         ExclusionPolicy::caller_only(&input.exclude_route_keys),
@@ -223,6 +224,7 @@ pub(crate) fn select_with_availability(
         &input.requirements,
         config,
         availability_rejections,
+        classifier,
     );
     let Some(admitted) = admission.admitted.first() else {
         let rejection = &admission.rejected[0];
@@ -277,32 +279,41 @@ pub(crate) fn select_with_availability(
         .get_or_insert_with(Default::default)
         .min_context
         .get_or_insert(0.0);
-    let mut selected =
-        select_model_route_with_availability(input, config, slots, &[], availability_rejections)
-            .map_err(|error| {
-                // The scorer can reject an admitted pin for subscription reserve.
-                // Its summary code alone cannot tell the caller what must recover.
-                let message = error.rejected.first().map_or_else(
-                    || error.message.clone(),
-                    |rejected| {
-                        format!(
-                            "{pin}: {}{}",
-                            rejected.reason,
-                            rejected
-                                .detail
-                                .as_ref()
-                                .map(|detail| format!(" ({detail})"))
-                                .unwrap_or_default()
-                        )
-                    },
-                );
-                let mut refusal = refuse(error.reason.as_str(), message);
-                refusal.cause = error
-                    .rejected
-                    .first()
-                    .map(|rejected| rejected.reason.clone());
-                refusal
-            })?;
+    let mut selected = evaluate_model_route_with_concurrency(
+        input,
+        config,
+        slots,
+        &[],
+        availability_rejections,
+        &Default::default(),
+        None,
+        None,
+        classifier,
+    )
+    .map_err(|error| {
+        // The scorer can reject an admitted pin for subscription reserve.
+        // Its summary code alone cannot tell the caller what must recover.
+        let message = error.rejected.first().map_or_else(
+            || error.message.clone(),
+            |rejected| {
+                format!(
+                    "{pin}: {}{}",
+                    rejected.reason,
+                    rejected
+                        .detail
+                        .as_ref()
+                        .map(|detail| format!(" ({detail})"))
+                        .unwrap_or_default()
+                )
+            },
+        );
+        let mut refusal = refuse(error.reason.as_str(), message);
+        refusal.cause = error
+            .rejected
+            .first()
+            .map(|rejected| rejected.reason.clone());
+        refusal
+    })?;
     selected.score.adequacy = adequacy.adequacy;
     selected.score.raw_adequacy = adequacy.raw_adequacy;
     selected.score.metrics = adequacy.metrics;

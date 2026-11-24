@@ -15,8 +15,9 @@ use striatum_core::model_facts::{
 };
 use striatum_core::model_facts_seed::model_facts_seed;
 use striatum_core::model_router::{
-    admit_routes, price_selection_shortlist, select_model_route, select_model_route_with_config,
-    BasketVectorSource, ModelRouteStateSnapshot, PricingMode, RouteFailureReason,
+    admit_routes, evaluate_model_route_with_concurrency, price_selection_shortlist,
+    select_model_route, select_model_route_with_config, BasketVectorSource,
+    ModelRouteStateSnapshot, PricingMode, RequiredCapabilities, RouteFailureReason,
     RouteRuntimeState, SelectModelRouteInput,
 };
 use striatum_core::{
@@ -161,6 +162,76 @@ fn input<'a>(
         prefer_prompt_cache: extra.prefer_prompt_cache,
         providers_without_prompt_cache: extra.providers_without_prompt_cache,
         providers_without_cache_write_reports: HashSet::new(),
+    }
+}
+
+#[test]
+fn only_classifier_decision_admission_can_use_unscored_rows_and_report_their_cooldown() {
+    for kind in [None, Some("decision"), Some("classifier")] {
+        let mut model = fact(FactBuilder {
+            provider_id: "fixture".into(),
+            model_id: "unscored".into(),
+            confidence: Some(Confidence::Unknown),
+            ..Default::default()
+        });
+        model.score_provenance = ScoreProvenance::Unscored;
+        model.model_kind = kind.map(str::to_owned);
+        let key = "fixture/unscored";
+        let route = |allow_unscored_decisions, runtime_snapshot| {
+            let input = input(
+                vec![model.clone()],
+                req(0.0, 0.0),
+                Extra {
+                    required_capabilities: Some(RequiredCapabilities {
+                        vision: None,
+                        min_context: Some(0.0),
+                    }),
+                    runtime_snapshot,
+                    ..Default::default()
+                },
+            );
+            evaluate_model_route_with_concurrency(
+                input,
+                &DEFAULT_ROUTING_CONFIG,
+                None,
+                &[],
+                &HashMap::new(),
+                &Default::default(),
+                None,
+                None,
+                allow_unscored_decisions,
+            )
+        };
+        for allow in [false, true] {
+            if allow && kind.is_some() {
+                let selected = route(true, None).unwrap();
+                let candidate = &selected.score.candidates[0];
+                assert!(candidate.eligible);
+                assert_eq!((candidate.elo, candidate.eq), (0.0, 0.0));
+                assert_eq!(
+                    (candidate.elo_source, candidate.eq_source),
+                    ("unscored", "unscored")
+                );
+                let cooldown = ModelRouteStateSnapshot {
+                    now: 10.0,
+                    by_route: HashMap::from([(
+                        key.into(),
+                        RouteRuntimeState {
+                            cooldown_until: Some(20.0),
+                            ..Default::default()
+                        },
+                    )]),
+                    ..Default::default()
+                };
+                let refusal = route(true, Some(cooldown)).unwrap_err();
+                assert_eq!(refusal.rejected[0].reason, "cooldown_active");
+                assert_eq!(refusal.adequate_blockers.get(key), Some(&Some(20.0)));
+                assert_eq!(refusal.earliest_reset, Some(20.0));
+            } else {
+                let refusal = route(allow, None).unwrap_err();
+                assert_eq!(refusal.rejected[0].reason, "unscored_awaiting_placement");
+            }
+        }
     }
 }
 

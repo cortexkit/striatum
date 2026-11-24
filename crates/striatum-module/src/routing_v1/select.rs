@@ -1717,7 +1717,6 @@ async fn select_at_tier_attempt(
                 !fact.decommissioned
                     && !fact.is_deprecated_upstream()
                     && fact.mode_of.is_none()
-                    && fact.score_provenance != striatum_core::ScoreProvenance::Unscored
                     && !exclusions.excludes(&key)
                     && !rejections.contains_key(&key)
                     && operator_config.route_allowed(&consumer, &key, false)
@@ -2774,7 +2773,7 @@ impl<'a> Selection<'a> {
         // refusal. Ignore quota walls, blocks and cooldowns here: a hostable route
         // behind a cooldown still belongs to ranking and keeps the scorer's timed
         // refusal.
-        let admission = striatum_core::model_router::admit_routes_with_availability(
+        let admission = striatum_core::model_router::admit_routes_with_score_policy(
             &input.facts,
             None,
             striatum_core::provider_model_spec::ExclusionPolicy {
@@ -2787,6 +2786,7 @@ impl<'a> Selection<'a> {
             &input.requirements,
             &self.pass().routing_config(),
             &rejections,
+            self.classifier_order.is_some(),
         );
         !admission
             .admitted
@@ -3090,6 +3090,7 @@ impl<'a> Selection<'a> {
                         self.consumer_exclude,
                         &recovery_rejections,
                         &account_resets,
+                        self.classifier_order.is_some(),
                     );
                 error
             });
@@ -3172,6 +3173,7 @@ impl<'a> Selection<'a> {
             &profiles,
             evaluation,
             self.use_concurrency.get().then_some(self.concurrency),
+            self.classifier_order.is_some(),
         )
     }
 
@@ -3391,8 +3393,7 @@ impl<'a> Selection<'a> {
             catalog.as_ref(),
             self.sources.catalog_targets,
             self.rejections,
-            // Decision models answer questions without running chat tools.
-            self.classifier_order.is_none(),
+            self.classifier_order.is_some(),
         )
         .map_err(|refusal| refused(&refusal.code, refusal.cause, refusal.message))?;
         self.check_eligible_pin(pin, &selected, parsed.variant.as_deref())?;
@@ -3585,6 +3586,7 @@ impl<'a> Selection<'a> {
             &[],
             self.rejections,
             &account_resets,
+            self.classifier_order.is_some(),
         );
         block.reset_at_ms = reset.map(|reset| reset as i64);
         block.reset_at_ms.map(|_| block)

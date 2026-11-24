@@ -413,11 +413,13 @@ impl CandidateQualityScore {
             elo_source: match fact.score_provenance {
                 ScoreProvenance::OperatorGrade => "operator_grade",
                 ScoreProvenance::EloOverride => "override",
+                ScoreProvenance::Unscored if eligible => "unscored",
                 _ => "curated",
             },
             eq_source: match fact.eq_source.as_deref() {
                 Some("operator_grade") => "operator_grade",
                 Some("override") => "override",
+                _ if eligible && fact.score_provenance == ScoreProvenance::Unscored => "unscored",
                 _ => "curated",
             },
         }
@@ -918,6 +920,43 @@ pub fn admit_routes_with_availability(
     config: &RoutingConfig,
     availability_rejections: &HashMap<String, String>,
 ) -> AdmissionResult {
+    admit_routes_with_score_policy(
+        facts,
+        runtime_snapshot,
+        exclusions,
+        operator_group,
+        required_capabilities,
+        available_models,
+        requirements,
+        config,
+        availability_rejections,
+        false,
+    )
+}
+
+fn unscored_requires_placement(fact: &ModelFact, allow_unscored_decisions: bool) -> bool {
+    // Classifiers rank decision models on a separate catalog grade. These rows
+    // need not have chat Elo, and their chat score provenance stays unscored.
+    fact.score_provenance == ScoreProvenance::Unscored
+        && !(allow_unscored_decisions
+            && matches!(fact.model_kind.as_deref(), Some("decision" | "classifier")))
+}
+
+/// Apply the usual admission checks with an explicit opt-in for decision rows.
+/// Routing opts in for the classifier path, where the daemon verifies the
+/// calling module and routing uses that module's own `classifier/v1` listing.
+pub fn admit_routes_with_score_policy(
+    facts: &[ModelFact],
+    runtime_snapshot: Option<&ModelRouteStateSnapshot>,
+    exclusions: ExclusionPolicy<'_>,
+    operator_group: &[String],
+    required_capabilities: Option<RequiredCapabilities>,
+    available_models: &HashSet<String>,
+    requirements: &ModelRequirements,
+    config: &RoutingConfig,
+    availability_rejections: &HashMap<String, String>,
+    allow_unscored_decisions: bool,
+) -> AdmissionResult {
     let now = runtime_snapshot.map(|s| s.now).unwrap_or_else(now_millis);
     let exclusion_specs = ExclusionSpecs::parse(exclusions).with_operator_group(operator_group);
     let mut static_candidates = Vec::new();
@@ -974,7 +1013,7 @@ pub fn admit_routes_with_availability(
             });
             continue;
         }
-        if fact.score_provenance == ScoreProvenance::Unscored {
+        if unscored_requires_placement(fact, allow_unscored_decisions) {
             rejected.push(RejectedRoute {
                 route_key: route.route_key,
                 reason: "unscored_awaiting_placement".to_string(),
@@ -1924,6 +1963,7 @@ fn admit_and_price_shortlist(
     availability_rejections: &HashMap<String, String>,
     profiles: &RouteTaskProfiles,
     mut evaluation: Option<&mut RouteEvaluation>,
+    allow_unscored_decisions: bool,
 ) -> Result<PricedAdmission, NoRouteError> {
     let requirements = input.requirements;
 
@@ -1969,7 +2009,7 @@ fn admit_and_price_shortlist(
         admitted: mut admissible,
         mut rejected,
         top_routable,
-    } = admit_routes_with_availability(
+    } = admit_routes_with_score_policy(
         &input.facts,
         input.runtime_snapshot.as_ref(),
         ExclusionPolicy {
@@ -1982,6 +2022,7 @@ fn admit_and_price_shortlist(
         &requirements,
         config,
         availability_rejections,
+        allow_unscored_decisions,
     );
     if let Some(view) = evaluation.as_deref_mut() {
         view.top_routable = BTreeMap::from([
@@ -2037,12 +2078,19 @@ fn admit_and_price_shortlist(
             operator_group,
             availability_rejections,
             &HashMap::new(),
+            allow_unscored_decisions,
         );
         return Err(NoRouteError {
             candidates: candidate_quality_scores(&input.facts, &admissible),
             reason: classify_empty_admission(&rejected),
             message: "no admissible model route for requirements".to_string(),
-            adequate_blockers: adequate_blockers(input, config, top_routable, &rejected),
+            adequate_blockers: adequate_blockers(
+                input,
+                config,
+                top_routable,
+                &rejected,
+                allow_unscored_decisions,
+            ),
             rejected,
             requirements: Some(requirements),
             best_rejected: None,
@@ -2089,6 +2137,7 @@ fn admit_and_price_shortlist(
             operator_group,
             availability_rejections,
             &HashMap::new(),
+            allow_unscored_decisions,
         );
 
         let message = if refuse_below_bar {
@@ -2118,7 +2167,13 @@ fn admit_and_price_shortlist(
                 RouteFailureReason::AllRoutesInadequate
             },
             message,
-            adequate_blockers: adequate_blockers(input, config, top_routable, &rejected),
+            adequate_blockers: adequate_blockers(
+                input,
+                config,
+                top_routable,
+                &rejected,
+                allow_unscored_decisions,
+            ),
             rejected,
             requirements: Some(requirements),
             best_rejected,
@@ -2323,6 +2378,7 @@ pub fn price_selection_shortlist_with_profiles(
         &HashMap::new(),
         profiles,
         None,
+        false,
     )?;
     Ok(PricedShortlist {
         use_basket: priced.use_basket,
@@ -2440,6 +2496,7 @@ pub fn evaluate_model_route_with_profiles(
         profiles,
         evaluation,
         None,
+        false,
     )
 }
 
@@ -2453,6 +2510,7 @@ pub fn evaluate_model_route_with_concurrency(
     profiles: &RouteTaskProfiles,
     evaluation: Option<&mut RouteEvaluation>,
     concurrency: Option<&crate::concurrency_availability::ConcurrencyAvailability>,
+    allow_unscored_decisions: bool,
 ) -> Result<SelectedModelRoute, NoRouteError> {
     let PricedAdmission {
         admissible,
@@ -2472,6 +2530,7 @@ pub fn evaluate_model_route_with_concurrency(
         availability_rejections,
         profiles,
         evaluation,
+        allow_unscored_decisions,
     )?;
 
     // Deterministic ordering. COST-PRIMARY lexicographic among adequate models.
@@ -2751,6 +2810,7 @@ fn adequate_blockers(
     config: &RoutingConfig,
     top_routable: TopRoutableScores,
     rejected: &[RejectedRoute],
+    allow_unscored_decisions: bool,
 ) -> std::collections::BTreeMap<String, Option<f64>> {
     let reasons: HashMap<_, _> = rejected
         .iter()
@@ -2764,7 +2824,7 @@ fn adequate_blockers(
             let reason = reasons.get(route.route_key.as_str())?;
             if fact.decommissioned
                 || fact.is_deprecated_upstream()
-                || fact.score_provenance == ScoreProvenance::Unscored
+                || unscored_requires_placement(fact, allow_unscored_decisions)
                 || capability_rejection_reason(fact, input.required_capabilities).is_some()
                 || !score_adequacy(fact, &input.requirements, top_routable, config)
                     .clears_adequacy_floor()
@@ -2796,6 +2856,7 @@ pub fn earliest_admissible_recovery(
     operator_group: &[String],
     availability_rejections: &HashMap<String, String>,
     account_resets: &HashMap<String, f64>,
+    allow_unscored_decisions: bool,
 ) -> (Option<f64>, Option<String>) {
     let Some(snapshot) = input.runtime_snapshot.as_ref() else {
         return (None, None);
@@ -2843,7 +2904,7 @@ pub fn earliest_admissible_recovery(
             }
         }
     }
-    let admission = admit_routes_with_availability(
+    let admission = admit_routes_with_score_policy(
         &input.facts,
         Some(&recovered),
         ExclusionPolicy {
@@ -2856,6 +2917,7 @@ pub fn earliest_admissible_recovery(
         &input.requirements,
         config,
         availability_rejections,
+        allow_unscored_decisions,
     );
     let earliest = admission
         .admitted

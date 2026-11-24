@@ -867,63 +867,17 @@ async fn consumer_placements_repeated_selects_never_parse_loaded_lists() {
 }
 
 fn classifier_harness() -> std::sync::Arc<Harness> {
-    let harness = Harness::new("classifier-placements");
-    let description: Value = serde_json::from_slice(include_bytes!(
-        "../../../tests/fixtures/classifier-describe.reply.json"
-    ))
-    .unwrap();
-    let model = &description["result"]["models"][0];
-    let key = model["model"].as_str().unwrap();
-    let (provider, name) = key.split_once('/').unwrap();
-    let rate = model["price"]["input_per_mtok_usd"].as_f64().unwrap();
-    let snapshot = crate::fusiform_catalog::decode_catalog_get(&serde_json::to_vec(&json!({
-        "catalog_version":1, "resolved_at_ms":1, "models":{key:{
-            "existence":"present", "model.kind":"decision",
-            "capability.input_modalities":["text"],
-            "rate.input":{"state":"priced","currency":"USD","units":(rate * 1e9).round() as i64,"exponent":9},
-            "rate.output":{"state":"stated_zero"}
-        }}
-    })).unwrap()).unwrap();
-    let mut fact = crate::routing_v1::conformance_tests::catalog_fact(
-        &cortexkit_role_routing_conformance::CatalogModel {
-            provider: provider.into(),
-            model: name.into(),
-            family: None,
-            iq: 80,
-            context_window: 200_000,
-            max_output_tokens: 32_000,
-            tool_calls: false,
-            modalities: Vec::new(),
-            structured_output: false,
-            priced_per_token: true,
+    use super::super::classifier_tests::{rig, JEV};
+
+    rig(
+        |catalog| {
+            catalog["models"]
+                .as_object_mut()
+                .unwrap()
+                .retain(|model, _| model == JEV)
         },
-        0,
-    );
-    fact.input_rate = snapshot.parts().0[0].input_rate.clone();
-    fact.cost_per_m_tok_out = snapshot.parts().0[0].cost_per_mtok_out;
-    let facts = vec![fact];
-    harness.install_facts(&facts);
-    harness
-        .store()
-        .apply_fusiform_catalog(snapshot.parts().0, snapshot.parts().1)
-        .unwrap();
-    let mut credentials = crate::broca_credentials::BrocaCredentials::api_test_credentials(&facts);
-    credentials.publish_plan_prices(&json!({"prices":[]}));
-    credentials.catalog_snapshot = Some(snapshot);
-    let mut cache = crate::routing_v1::classifier::DescribeCache::default();
-    cache.catalog(&json!([{"module_id":"broca", "nonce_verified":true,"capabilities":{"provides":["classifier/v1"]}}]), &mut credentials, crate::now_ms() as i64);
-    cache.reply(
-        "broca",
-        Some(&description),
-        &mut credentials,
-        crate::now_ms() as i64,
-    );
-    harness.set_credentials(credentials);
-    harness.edit_config(|config| {
-        config["consumers"]["broca.classifier"] = json!({"owner":"broca"});
-        config["runners"] = json!([{"module":"chat-runner"}]);
-    });
-    harness
+        |_| {},
+    )
 }
 
 #[tokio::test]
