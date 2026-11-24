@@ -31,7 +31,6 @@ pub(crate) struct Health {
     pub duplicate: u64,
     pub refused: u64,
     pub publishers: BTreeMap<String, PublisherHealth>,
-    pub oldest_unapplied_at_ms: Option<u64>,
     pub retries: u64,
     pub ack_wait_ms: Option<u64>,
     pub last_delivery_at_ms: Option<u64>,
@@ -78,17 +77,23 @@ impl Serialize for Health {
             "lastAckAtMs": self.last_ack_at_ms,
             "deliveredSequence": self.delivered_sequence,
             "refused":self.refused, "retries":self.retries,
-            "oldestUnappliedAtMs":self.oldest_unapplied_at_ms,
-            "oldestUnappliedAgeMs":self.oldest_unapplied_at_ms.map(|at| crate::now_ms().saturating_sub(at)),
-        }).serialize(serializer)
+        })
+        .serialize(serializer)
     }
+}
+
+#[cfg(test)]
+#[test]
+fn health_does_not_advertise_unavailable_backlog_age() {
+    let health = serde_json::to_value(Health::default()).unwrap();
+    assert!(health.get("oldestUnappliedAgeMs").is_none(), "{health}");
+    assert!(health.get("oldestUnappliedAtMs").is_none(), "{health}");
 }
 
 /// The payload seam between a durable transport and the shared handler.
 pub(crate) struct Delivery {
     pub message: Message,
     pub body: Vec<u8>,
-    pub published_at_ms: Option<u64>,
     pub delivery_count: u64,
 }
 
@@ -205,10 +210,8 @@ impl Handler {
         let Delivery {
             message,
             body,
-            published_at_ms,
             delivery_count,
         } = delivery;
-        let published_at_ms = *published_at_ms;
         let Ok(subject) = names.parse_event_subject(&message.subject) else {
             return Ok(false);
         };
@@ -263,13 +266,25 @@ impl Handler {
                     .map_err(|e| e.to_string())?;
                 return Ok(true);
             };
-            let store = self.store.clone();
-            let cursor_version =
+            let applied_version = self
+                .credentials
+                .lock()
+                .map_err(|_| "catalog credentials poisoned")?
+                .catalog_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.version());
+            let applied_version = if applied_version.is_some() {
+                applied_version
+            } else {
+                // Startup fetches the full catalog independently of event wakes.
+                let store = self.store.clone();
                 crate::stage_timing::spawn_job_blocking(move || store.fusiform_catalog_cursor())
                     .await
                     .map_err(|e| e.to_string())?
-                    .map_err(|e| e.to_string())?;
-            if cursor_version.is_none_or(|cursor| version > cursor.catalog_version) {
+                    .map_err(|e| e.to_string())?
+                    .map(|cursor| cursor.catalog_version)
+            };
+            if applied_version.is_none_or(|applied| version > applied) {
                 self.wake_catalog()?;
             }
             cursor.ack().await.map_err(|e| e.to_string())?;
@@ -277,9 +292,6 @@ impl Handler {
         }
         if subject.event != "route_fact" {
             return Ok(false);
-        }
-        if let Ok(mut cache) = self.quota_cache.lock() {
-            cache.consumer.route_facts.oldest_unapplied_at_ms = published_at_ms;
         }
         let started = std::time::Instant::now();
         let result = async {
@@ -362,9 +374,6 @@ impl Handler {
                 } else {
                     cursor.ack().await.map_err(|e| e.to_string())?;
                 }
-                if let Ok(mut cache) = self.quota_cache.lock() {
-                    cache.consumer.route_facts.oldest_unapplied_at_ms = None;
-                }
                 return Ok(true);
             }
         }
@@ -412,7 +421,6 @@ impl Handler {
         if let Ok(cache) = self.quota_cache.lock() {
             let health = &cache.consumer;
             tracing::warn!(module, id, attached = health.attached, pending = ?health.lag,
-                oldest_age_ms = ?health.route_facts.oldest_unapplied_at_ms.map(|at| crate::now_ms().saturating_sub(at)),
                 "slow route fact");
         }
     }

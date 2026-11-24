@@ -200,6 +200,10 @@ pub struct DecodedEnvelope {
 pub fn decode_usage_envelope(bytes: &[u8]) -> Result<DecodedEnvelope, String> {
     let value: Value =
         serde_json::from_slice(bytes).map_err(|error| format!("reply is not JSON: {error}"))?;
+    decode_usage_envelope_value(&value)
+}
+
+pub(super) fn decode_usage_envelope_value(value: &Value) -> Result<DecodedEnvelope, String> {
     let result = value
         .get("result")
         .and_then(Value::as_array)
@@ -1809,7 +1813,21 @@ pub fn apply_usage_reply(
     ),
     String,
 > {
-    let mut envelope = decode_usage_envelope(body)?;
+    Ok(apply_decoded_usage_reply(
+        state,
+        decode_usage_envelope(body)?,
+        received_at_ms,
+    ))
+}
+
+pub(super) fn apply_decoded_usage_reply(
+    state: &mut AccountQuotaState,
+    mut envelope: DecodedEnvelope,
+    received_at_ms: i64,
+) -> (
+    Vec<PersistedAccountReading>,
+    Vec<PersistedProviderCompleteness>,
+) {
     resolve_credential_refs(&mut envelope, &state.credential_identities);
     let providers: BTreeSet<_> = envelope
         .entries
@@ -1834,7 +1852,7 @@ pub fn apply_usage_reply(
         rows.extend(provider_rows);
         completeness.extend(provider_completeness);
     }
-    Ok((rows, completeness))
+    (rows, completeness)
 }
 
 fn now_ms() -> i64 {
@@ -1998,7 +2016,6 @@ pub async fn account_quota_loop(
     resolver: Arc<dyn CredentialResolver>,
     broca_credentials: crate::broca_credentials::SharedBrocaCredentials,
     routing_config_path: PathBuf,
-    quota_cache: crate::SharedQuotaCache,
 ) {
     let project_root =
         std::env::temp_dir().join(format!("{}-account-quota", crate::DEFAULT_MODULE_ID));
@@ -2066,7 +2083,6 @@ pub async fn account_quota_loop(
                 &state,
                 listing.as_ref(),
                 &broca_credentials,
-                &quota_cache,
             )
             .await;
             tokio::select! {

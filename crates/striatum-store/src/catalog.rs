@@ -281,6 +281,14 @@ pub struct CatalogFactsSnapshot {
     pub facts: Vec<ModelFact>,
     pub providers: BTreeSet<String>,
     pub efforts: Arc<BTreeMap<String, crate::CatalogEfforts>>,
+    quota_capacities: std::sync::OnceLock<striatum_core::quota::QuotaCapacityIndex>,
+}
+
+impl CatalogFactsSnapshot {
+    pub fn quota_capacities(&self) -> &striatum_core::quota::QuotaCapacityIndex {
+        self.quota_capacities
+            .get_or_init(|| striatum_core::quota::QuotaCapacityIndex::new(&self.facts))
+    }
 }
 
 pub(super) fn next_catalog_cache_identity() -> u64 {
@@ -512,6 +520,7 @@ impl SqliteRouteStateStore {
             .map_err(err)?;
         let snapshot = Arc::new(CatalogFactsSnapshot {
             generation,
+            quota_capacities: Default::default(),
             efforts: Arc::new(efforts),
             providers: rows
                 .iter()
@@ -552,6 +561,7 @@ impl SqliteRouteStateStore {
             .map(|(fact, _)| fact.provider_id.clone())
             .collect();
         Ok(CatalogFactsSnapshot {
+            quota_capacities: Default::default(),
             generation,
             providers,
             efforts,

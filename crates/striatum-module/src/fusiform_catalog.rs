@@ -19,7 +19,7 @@
 //! fixture at Fusiform `245826d`.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -406,6 +406,7 @@ enum CatalogRate {
 pub(crate) struct CatalogSnapshot {
     cursor: FusiformCatalogCursor,
     facts: Vec<FusiformFactUpdate>,
+    model_index: HashMap<String, usize>,
     rates: BTreeMap<String, Arc<ModelRates>>,
     pub(crate) wire_apis: BTreeMap<String, String>,
     /// Rows serving an endpoint in `wire.api`, distinct from `wire_apis`' wire families.
@@ -531,9 +532,13 @@ impl CatalogSnapshot {
     }
 
     pub(crate) fn model(&self, model: &str) -> Option<&FusiformFactUpdate> {
-        self.facts
-            .iter()
-            .find(|fact| model == format!("{}/{}", fact.provider_id, fact.model_id))
+        #[cfg(test)]
+        allocation_tests::MODEL_LOOKUP_PROBES.with(|count| count.set(count.get() + 1));
+        self.model_index.get(model).map(|&index| &self.facts[index])
+    }
+
+    pub(crate) fn version(&self) -> i64 {
+        self.cursor.catalog_version
     }
 
     /// Keep the provider index tied to the version of the catalog that supplied it.
@@ -1368,6 +1373,11 @@ fn decode_catalog_get_legacy(bytes: &[u8]) -> Result<CatalogSnapshot, FusiformCa
             catalog_version: reply.catalog_version,
             resolved_at_ms: reply.resolved_at_ms,
         },
+        model_index: facts
+            .iter()
+            .enumerate()
+            .map(|(index, fact)| (format!("{}/{}", fact.provider_id, fact.model_id), index))
+            .collect(),
         facts,
         rates,
         retained,
@@ -2222,9 +2232,22 @@ async fn poll_cycle<C: CatalogWire>(
             .map_err(|reason| error(format!("read Fusiform cursor: {reason}")))
     })
     .await?;
-    let should_get = cursor
-        .map(|cursor| status.catalog_version != cursor.catalog_version)
-        .unwrap_or(true);
+    let credentials = client.credentials();
+    let published_differs = match &credentials {
+        Some(cache) => cache
+            .lock()
+            .map_err(|_| error("credential cache poisoned"))?
+            .catalog_snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.version() != status.catalog_version),
+        None => false,
+    };
+    // The facts transaction advances the cursor before operator grades are
+    // committed and the catalog used by request handlers is published.
+    let should_get = published_differs
+        || cursor
+            .map(|cursor| status.catalog_version != cursor.catalog_version)
+            .unwrap_or(true);
     let get_calls = if should_get {
         let snapshot = media_grades::refresh_snapshot(client).await?;
         striatum_store::job_timing::run(
@@ -2244,6 +2267,7 @@ async fn poll_cycle<C: CatalogWire>(
         .await?;
         1
     } else {
+        media_grades::retry_if_due(client, credentials.as_ref()).await?;
         striatum_store::job_timing::run("billing_plane_refresh", client.refresh_planes(None))
             .await?;
         if let (Some(path), Some(cursor)) = (config_path, cursor) {
@@ -2323,10 +2347,20 @@ pub async fn catalog_refresh_loop(
                 if let Ok(mut health) = health.lock() {
                     health.set_poll_ms(cadence);
                 }
-                let retry = credentials
-                    .lock()
-                    .ok()
-                    .and_then(|guard| guard.billing_catalog.retry_at.values().min().copied());
+                let retry = credentials.lock().ok().and_then(|guard| {
+                    guard
+                        .billing_catalog
+                        .retry_at
+                        .values()
+                        .copied()
+                        .chain(
+                            guard
+                                .catalog_snapshot
+                                .as_ref()
+                                .and_then(|snapshot| snapshot.local_grades.retry_at),
+                        )
+                        .min()
+                });
                 let delay = retry.map_or(Duration::from_millis(cadence), |due| {
                     Duration::from_millis(cadence)
                         .min(due.saturating_duration_since(tokio::time::Instant::now()))

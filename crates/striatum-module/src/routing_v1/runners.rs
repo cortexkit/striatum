@@ -1116,7 +1116,9 @@ pub(crate) async fn refresh_loop(
     }
 }
 
-const WATCH_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+// Leave time for the catalog read and serialized describes before views expire.
+const WATCH_BACKSTOP: std::time::Duration =
+    std::time::Duration::from_millis(describe_cache::LAST_GOOD_MS as u64 / 2);
 const WATCH_FALLBACK: std::time::Duration = std::time::Duration::from_secs(30);
 const WATCH_RETRY_MIN: std::time::Duration = std::time::Duration::from_secs(1);
 const WATCH_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(30);
