@@ -899,6 +899,7 @@ impl AdmissionState {
         let open = self.open.get(&id).expect("checked above");
         let mut row = open.row.clone();
         let from = row.state.to_string();
+        let was_charged = row.charged;
         let was_started = row.started_at.is_some();
         let was_state_started = row.state == "started";
         change(&mut row);
@@ -916,6 +917,18 @@ impl AdmissionState {
                     started: true,
                 },
                 1,
+            );
+        }
+        if was_charged && !row.charged {
+            self.set_demand(
+                &row.provider,
+                &row.account_id,
+                (
+                    row.committed_at,
+                    row.principal.clone(),
+                    row.admission_id.clone(),
+                ),
+                None,
             );
         }
         self.restate(&row);
@@ -1014,6 +1027,9 @@ impl AdmissionState {
             |row| {
                 row.state = "finished".into();
                 row.finished_at = Some(at);
+                if row.started_at.is_none() && row.run_id.is_none() {
+                    row.charged = false;
+                }
             },
         )
     }

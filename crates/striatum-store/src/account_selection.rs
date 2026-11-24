@@ -1952,7 +1952,7 @@ impl AccountTx<'_> {
             .map_err(err)
     }
 
-    /// The runner reported the run's end. Its demand keeps counting until a
+    /// The runner reported the run's end. Started demand keeps counting until a
     /// quota reading reflects it; affinity is untouched.
     pub fn mark_admission_finished(
         &self,
@@ -1966,7 +1966,8 @@ impl AccountTx<'_> {
         );
         self.conn
             .execute(
-                "UPDATE account_admission SET state = 'finished', finished_at = ?3 \
+                "UPDATE account_admission SET state = 'finished', finished_at = ?3, \
+                   charged = CASE WHEN started_at IS NULL AND run_id IS NULL THEN 0 ELSE charged END \
                  WHERE principal = ?1 AND admission_id = ?2 \
                    AND state IN ('reserved', 'expired', 'started')",
                 params![principal, admission_id, at],

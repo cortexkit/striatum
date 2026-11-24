@@ -51,6 +51,58 @@ async fn observe(route: &Route, id: &str, kind: &str, extra: Value) -> Value {
     value["result"].clone()
 }
 
+#[tokio::test]
+async fn finished_unsent_admission_removes_demand_but_started_admission_keeps_it() {
+    for started in [false, true] {
+        let harness = providers(false, false);
+        let route = harness.bind(reserved("colliculus"), None).await;
+        let decision = selected(&route, &request()).await;
+        let params = json!({"admission_id":"demand", "conversation_key":"demand",
+            "provider":decision["engine"]["provider"], "model":decision["engine"]["model"],
+            "decision_id":decision["decision_id"], "hold_wait_max_s":0,
+            "initial_input_bytes":32768, "initial_input_estimated":true});
+        let (kind, reply) = route.call("route.account_for", &params).await;
+        assert_eq!(kind, FrameType::Response, "{reply}");
+        let account = reply["result"]["account"]["account_id"].as_str().unwrap();
+        let demand = || {
+            crate::account_state::snapshot(harness.store())
+                .unwrap()
+                .admissions
+                .demand("openai", account, None)
+        };
+        assert_eq!(
+            demand().iter().map(|row| row.request_bytes).sum::<u64>(),
+            32768
+        );
+        if started {
+            observe(
+                &route,
+                "demand",
+                "admission_started",
+                json!({"run_id":"run"}),
+            )
+            .await;
+        }
+        let finished = observe(&route, "demand", "run_finished", json!({})).await;
+        assert!(effects(&finished)
+            .iter()
+            .any(|effect| effect["effect"] == "admission_finished"));
+        assert_eq!(
+            demand().iter().map(|row| row.request_bytes).sum::<u64>(),
+            if started { 32768 } else { 0 }
+        );
+        let persisted = harness
+            .store()
+            .account_read(|tx| tx.demand("openai", account, None))
+            .unwrap();
+        assert_eq!(demand(), persisted);
+        crate::account_state::assert_published_equals_fresh_load(
+            harness.store(),
+            "after run_finished",
+        );
+    }
+}
+
 fn effects(reply: &Value) -> Vec<Value> {
     reply["observation"]["effects"]
         .as_array()
