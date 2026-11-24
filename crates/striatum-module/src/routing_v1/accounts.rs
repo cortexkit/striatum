@@ -517,7 +517,7 @@ fn account_for_inner(
         match account_selection::admission::account_for_parsed(
             parsed,
             &authority.principal,
-            &ctx,
+            ctx,
             Some(record),
         ) {
             OpReply::Result(result) => Ok(result),

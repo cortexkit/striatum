@@ -739,13 +739,26 @@ pub(super) fn account_for(
         Err(reply) => return reply,
     };
     parsed.call = call;
+    // Legacy callers keep their context; admission sets this request's probe
+    // owner on its own copy.
+    let ctx = Ctx {
+        store: ctx.store,
+        accounts: ctx.accounts,
+        flags: ctx.flags.clone(),
+        policy: ctx.policy,
+        now_ms: ctx.now_ms,
+        classes: ctx.classes.clone(),
+    };
     account_for_parsed(parsed, principal, ctx, None)
 }
 
+/// Takes the request's context by value: it was built for this one request,
+/// so setting the probe owner in place avoids copying the whole class context
+/// (and losing the lazily built indexes a copy starts without).
 pub(crate) fn account_for_parsed(
     parsed: AccountForParams,
     principal: &str,
-    ctx: &Ctx<'_>,
+    mut ctx: Ctx<'_>,
     finish: Option<crate::routing_v1::accounts::AdmissionRecord>,
 ) -> OpReply {
     if !ctx.flags.enabled {
@@ -758,18 +771,10 @@ pub(crate) fn account_for_parsed(
         );
     }
     let provider = normalize(&parsed.provider);
-    let mut classes = ctx.classes.clone();
-    if let Some(classes) = &mut classes {
+    if let Some(classes) = &mut ctx.classes {
         classes.probe_owner = parsed.model_decision_id.clone();
     }
-    let ctx = &Ctx {
-        store: ctx.store,
-        accounts: ctx.accounts,
-        flags: ctx.flags.clone(),
-        policy: ctx.policy,
-        now_ms: ctx.now_ms,
-        classes,
-    };
+    let ctx = &ctx;
     let request_fingerprint = fingerprint(&parsed);
     checking("admission_replay");
     let admission_id = parsed.admission_id.clone();
@@ -1915,7 +1920,13 @@ fn serve_with_pin_diagnostic(
         match claimed {
             striatum_store::CredentialProbeClaim::Claimed => break decision,
             striatum_store::CredentialProbeClaim::Unfenced => {
-                inputs.credential_probe_notes.remove(&credential);
+                // The claim above only answers `Claimed` or `Blocked`. Nothing
+                // here would change the allocator's next pick, so retrying
+                // would spin inside the account writer; fail the command.
+                return Err(RouteStateStoreError(
+                    "credential probe claim answered `Unfenced`, which admission cannot act on"
+                        .into(),
+                ));
             }
             striatum_store::CredentialProbeClaim::Blocked => {
                 // Another request can claim the probe after scoring prepared

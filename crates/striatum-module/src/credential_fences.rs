@@ -542,17 +542,37 @@ pub(crate) fn live_with_eligibility(
         .map_err(|e| e.to_string())?;
     let (lookups, listings) = match credentials.lock() {
         Ok(guard) => {
+            // One pass over the listing: each id's first row, and the ids with
+            // any inactive row. Looking each one up again by a linear scan
+            // made this quadratic in the listing size, under the shared lock.
+            let mut first_rows = std::collections::HashMap::new();
+            let mut inactive_ids = HashSet::new();
+            for row in guard.listed_credentials() {
+                first_rows.entry(row.id.as_str()).or_insert(row);
+                if row.state != "active" {
+                    inactive_ids.insert(row.id.as_str());
+                }
+            }
+            // `Unknown` only when no vault listing has been read at all.
+            let listed = !matches!(guard.listing_fingerprint(""), ListingLookup::Unknown);
             let lookups: Vec<_> = fences
                 .iter()
                 .map(|fence| {
                     if fence.code == striatum_core::route_state_store::SIGNED_OUT_FENCE_CODE {
-                        let inactive = guard
-                            .listed_credentials()
-                            .iter()
-                            .any(|row| row.id == fence.credential_id && row.state != "active");
+                        let inactive = inactive_ids.contains(fence.credential_id.as_str());
                         (guard.signed_out_fingerprint(&fence.credential_id), inactive)
+                    } else if !listed {
+                        (ListingLookup::Unknown, false)
                     } else {
-                        (guard.listing_fingerprint(&fence.credential_id), false)
+                        let lookup = first_rows.get(fence.credential_id.as_str()).map_or(
+                            ListingLookup::Absent,
+                            |row| {
+                                ListingLookup::Listed(
+                                    crate::broca_credentials::listing_fingerprint_of(row),
+                                )
+                            },
+                        );
+                        (lookup, false)
                     }
                 })
                 .collect();
@@ -561,11 +581,13 @@ pub(crate) fn live_with_eligibility(
                     guard
                         .listed_credentials()
                         .iter()
-                        .filter_map(|row| match guard.listing_fingerprint(&row.id) {
-                            ListingLookup::Listed(fingerprint) => {
-                                Some((row.id.clone(), fingerprint))
-                            }
-                            _ => None,
+                        .map(|row| {
+                            (
+                                row.id.clone(),
+                                crate::broca_credentials::listing_fingerprint_of(
+                                    first_rows[row.id.as_str()],
+                                ),
+                            )
                         })
                         .collect::<Vec<_>>()
                 });
