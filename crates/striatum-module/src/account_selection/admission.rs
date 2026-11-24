@@ -151,14 +151,17 @@ pub(super) fn load_demand(
         |provider, account, floor| tx.demand(provider, account, floor),
         provider,
         roster,
+        roster,
         policy,
         context,
     )
 }
 
 /// [`load_demand`] over any source of `ACCOUNT_DEMAND_SQL` rows: SQL, or the
-/// account state, which keeps the same rows in memory.
-fn demand_with(
+/// account state, which keeps the same rows in memory. `allocator_roster` is
+/// the roster the allocator will score, whose quota readings may have been
+/// set aside for a due probe.
+pub(super) fn demand_with(
     mut read: impl FnMut(
         &str,
         &str,
@@ -166,13 +169,22 @@ fn demand_with(
     ) -> RouteStateResult<Vec<striatum_store::AccountDemandRow>>,
     provider: &str,
     roster: Option<&Roster>,
+    allocator_roster: Option<&Roster>,
     policy: &AllocatorPolicy,
     context: &striatum_core::accounts::AllocationContext,
 ) -> RouteStateResult<Vec<AdmissionDemand>> {
     // One read per account; a repeated account keeps its lowest floor.
     let mut floors: BTreeMap<&str, Option<EpochMs>> = BTreeMap::new();
     for view in roster.map_or(&[][..], |roster| &roster.accounts) {
-        let floor = demand_floor(view, policy, context);
+        let scored = allocator_roster
+            .and_then(|roster| {
+                roster
+                    .accounts
+                    .iter()
+                    .find(|scored| scored.account_id == view.account_id)
+            })
+            .unwrap_or(view);
+        let floor = demand_floor(view, scored, policy, context);
         floors
             .entry(view.account_id.as_str())
             .and_modify(|kept| *kept = kept.zip(floor).map(|(a, b)| a.min(b)))
@@ -184,7 +196,14 @@ fn demand_with(
             read(provider, account_id, floor)?
                 .into_iter()
                 .filter_map(|row| {
-                    let state: AdmissionState = serde_json::from_value(json!(row.state)).ok()?;
+                    let state = match row.state.as_str() {
+                        "reserved" => AdmissionState::Reserved,
+                        "started" => AdmissionState::Started,
+                        "released" => AdmissionState::Released,
+                        "expired" => AdmissionState::Expired,
+                        "finished" => AdmissionState::Finished,
+                        _ => return None,
+                    };
                     Some(AdmissionDemand {
                         account_id: row.account_id,
                         state,
@@ -201,37 +220,42 @@ fn demand_with(
 /// count in the allocator, or `None` when one of any age counts.
 ///
 /// The allocator charges an account's non-released admissions committed
-/// after its quota reading less `reflection_lag_ms`: an older one is already
-/// reflected in the reading. With no reading (or no reading time) it charges
-/// every one. It also charges every one to an account it places on paid
-/// credits, because it then sets the reading aside. Credit placement needs
-/// `paid_credits` and a spendable credit reading for the account; when both
-/// hold, the whole history is kept, without repeating the allocator's further
-/// conditions for credit mode. The round-robin and hybrid strategies order
-/// accounts by how many admissions each holds, whatever their age, so they
-/// need the whole history too.
+/// after its observation point less `reflection_lag_ms`: an older one is
+/// already reflected in the reading. The observation point is the quota
+/// reading's time, or, for an account it places on paid credits, the credit
+/// reading's time, because it then sets the quota reading aside. Credit
+/// placement needs `paid_credits` and a spendable credit reading; when both
+/// hold, the earlier of the two times bounds the read, without repeating the
+/// allocator's further conditions for credit mode. `scored` is the view the
+/// allocator scores: when it carries no quota reading time, every admission
+/// can count. The round-robin and hybrid strategies order accounts by how many
+/// admissions each holds, whatever their age, so they need the whole history.
 fn demand_floor(
     view: &AccountView,
+    scored: &AccountView,
     policy: &AllocatorPolicy,
     context: &striatum_core::accounts::AllocationContext,
 ) -> Option<EpochMs> {
-    let may_use_credits = policy.paid_credits
-        && context
-            .credits
-            .get(&view.account_id)
-            .is_some_and(|credit| credit.spendable);
-    if may_use_credits
-        || matches!(
-            policy.strategy,
-            AccountStrategy::RoundRobin | AccountStrategy::Hybrid
-        )
-    {
+    if matches!(
+        policy.strategy,
+        AccountStrategy::RoundRobin | AccountStrategy::Hybrid
+    ) {
         return None;
     }
-    let observed_at = view.quota.as_ref()?.observed_at_ms?;
+    let credit = context
+        .credits
+        .get(&view.account_id)
+        .filter(|credit| policy.paid_credits && credit.spendable);
+    let observed_at = match credit {
+        Some(credit) => scored
+            .quota
+            .as_ref()?
+            .observed_at_ms?
+            .min(credit.observed_at_ms),
+        None => view.quota.as_ref()?.observed_at_ms?,
+    };
     Some(observed_at.saturating_sub(policy.reflection_lag_ms))
 }
-
 fn load_exclusions(
     tx: &(impl BlockReads + ?Sized),
     principal: &str,
@@ -1331,6 +1355,7 @@ pub(crate) fn preflight_model_for_class_with_reset(
             |provider, account, floor| Ok(state.admissions.demand(provider, account, floor)),
             provider,
             roster.roster.as_ref(),
+            roster.roster.as_ref(),
             &policy,
             &inputs,
         ),
@@ -1338,6 +1363,7 @@ pub(crate) fn preflight_model_for_class_with_reset(
             demand_with(
                 |provider, account, floor| tx.demand(provider, account, floor),
                 provider,
+                roster.roster.as_ref(),
                 roster.roster.as_ref(),
                 &policy,
                 &inputs,
@@ -1582,17 +1608,6 @@ fn serve_with_pin_diagnostic(
         let hash = conversation_hash(&salt, principal, parent);
         inputs.parent_account_id = tx.parent_used_account(principal, &hash, provider, now)?;
     }
-    let admissions = if params.fork_of.is_some() {
-        Vec::new()
-    } else {
-        demand_with(
-            |provider, account, floor| tx.demand(provider, account, floor),
-            provider,
-            roster.roster.as_ref(),
-            &policy,
-            &inputs,
-        )?
-    };
     let blocks = load_blocks(tx, provider)?;
     let bound_pool = request_pool(params.pool.as_deref(), provider, &params.model);
     let mut origins = tx.admission_fence_rechecks(provider)?;
@@ -1704,6 +1719,20 @@ fn serve_with_pin_diagnostic(
             }
         }
     }
+    // Read after the probe roster: an account whose reading is set aside for
+    // a due probe is scored without that reading's time.
+    let admissions = if params.fork_of.is_some() {
+        Vec::new()
+    } else {
+        demand_with(
+            |provider, account, floor| tx.demand(provider, account, floor),
+            provider,
+            roster.roster.as_ref(),
+            probe_roster.as_ref(),
+            &policy,
+            &inputs,
+        )?
+    };
     let mut fences = load_fences(tx, provider)?;
     fences.retain(|fence| {
         params.fork_of.is_some() || {
