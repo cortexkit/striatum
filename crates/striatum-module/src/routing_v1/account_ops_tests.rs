@@ -42,6 +42,109 @@ fn response(reply: &(FrameType, Value)) -> &Value {
 }
 
 #[tokio::test]
+async fn runner_not_sent_observe_reader_check() {
+    for ordinary_duplicate in [false, true] {
+        let _clock = crate::InjectedClock::set(NOW);
+        let (harness, _) = setup("synthetic", false);
+        harness.edit_config(|config| {
+            config["runners"] = json!([{"module":"thalamus-harness","via_vault":true}]);
+        });
+        let route = harness.bind(reserved("thalamus-harness"), None).await;
+        let mut params = request("reader-check");
+        params["initial_input_bytes"] = json!(32768);
+        params["initial_input_estimated"] = json!(true);
+        let admitted_reply = route.call("route.account_for", &params).await;
+        let admitted = response(&admitted_reply).clone();
+        let account = admitted["account"]["account_id"].as_str().unwrap();
+        let demand = || {
+            harness
+                .store()
+                .account_read(|tx| tx.demand("synthetic", account, None))
+                .unwrap()
+        };
+        assert_eq!(
+            demand().iter().map(|row| row.request_bytes).sum::<u64>(),
+            32768
+        );
+
+        let body = json!({"kind":"run_finished", "admission_id":"reader-check",
+            "event_id":"reader-check:end:run_finished", "run_id":"reader-run",
+            "terminal_reason":"not_sent", "caller":{"runner":"thalamus-harness"}});
+        let first = route.call("route.account_observe", &body).await;
+        let observation = &response(&first)["observation"];
+        assert_eq!(observation["bound"], true);
+        assert_eq!(observation["duplicate"], false);
+        assert_eq!(
+            observation["effects"],
+            json!([
+                {"effect":"admission_finished"}, {"effect":"lease_ended", "lease_ended":true}
+            ])
+        );
+        let row = || {
+            harness
+                .store()
+                .account_read(|tx| tx.admission("reserved:thalamus-harness", "reader-check"))
+                .unwrap()
+                .unwrap()
+        };
+        let finished = row();
+        assert_eq!(finished.state, "finished");
+        assert!(!finished.charged);
+        assert_eq!(finished.run_id, None);
+        assert_eq!(finished.started_at, None);
+        assert!(demand().is_empty());
+        assert_eq!(
+            crate::account_state::snapshot(harness.store())
+                .unwrap()
+                .admissions
+                .demand("synthetic", account, None),
+            demand()
+        );
+
+        let conn = rusqlite::Connection::open(harness.store_path()).unwrap();
+        let raw: String = conn
+            .query_row(
+                "SELECT observation_json FROM account_observation WHERE event_id=?1",
+                ["reader-check:end:run_finished"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&raw).unwrap(), body);
+        conn.execute_batch("CREATE TABLE reader_check_writes (kind TEXT);
+            CREATE TRIGGER reader_check_admission AFTER UPDATE ON account_admission BEGIN INSERT INTO reader_check_writes VALUES ('admission'); END;
+            CREATE TRIGGER reader_check_affinity AFTER UPDATE ON account_affinity BEGIN INSERT INTO reader_check_writes VALUES ('affinity'); END;
+            CREATE TRIGGER reader_check_observation AFTER INSERT ON account_observation BEGIN INSERT INTO reader_check_writes VALUES ('observation'); END;").unwrap();
+        let mut duplicate = body.clone();
+        if ordinary_duplicate {
+            duplicate.as_object_mut().unwrap().remove("terminal_reason");
+        }
+        let _later = crate::InjectedClock::set(NOW + 1000);
+        let second = route.call("route.account_observe", &duplicate).await;
+        let second = &response(&second)["observation"];
+        assert_eq!(second["duplicate"], true);
+        assert_eq!(second["bound"], true);
+        assert_eq!(second["id"], observation["id"]);
+        assert_eq!(second["effects"], observation["effects"]);
+        assert_eq!(row(), finished);
+        assert!(demand().is_empty());
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM reader_check_writes", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+
+        let next = route
+            .call("route.account_for", &request("reader-next"))
+            .await;
+        let next = response(&next);
+        assert_eq!(next["reason"]["code"], "sticky_hit");
+        assert_eq!(next["account"], admitted["account"]);
+        assert_eq!(next["pin"]["id"], admitted["pin"]["id"]);
+    }
+}
+
+#[tokio::test]
 async fn prefrontal_rename_head_session_keeps_its_old_owner_account_pin_and_replay() {
     let _clock = crate::InjectedClock::set(NOW);
     let (harness, _) = setup("synthetic", false);
