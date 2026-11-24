@@ -10,6 +10,7 @@ use super::conformance_tests::{reserved, Harness, Route};
 
 mod enforcement_tests;
 mod fork_tests;
+mod session_continue_tests;
 mod shadow_lines_tests;
 mod sticky_full_tests;
 

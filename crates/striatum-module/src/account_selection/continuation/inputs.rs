@@ -42,6 +42,22 @@ pub(crate) struct Inputs {
     request_input_tokens: Option<u64>,
 }
 
+/// The module that owns an admission made without a routing decision, from
+/// the authenticated principal: a runner's own `reserved:<module>`, or the
+/// owner module of a head session scope (`session-owner:"reserved:<module>"`).
+/// Continue compares it with the module calling, so a session head's own run
+/// must name its owner module here, not the session principal.
+fn principal_harness(principal: &str) -> String {
+    let owner = principal
+        .strip_prefix("session-owner:")
+        .and_then(|owner| serde_json::from_str::<String>(owner).ok());
+    let principal = owner.as_deref().unwrap_or(principal);
+    principal
+        .strip_prefix("reserved:")
+        .unwrap_or(principal)
+        .to_owned()
+}
+
 impl Inputs {
     pub(crate) fn prepare(
         params: &AccountForParams,
@@ -76,15 +92,8 @@ impl Inputs {
             requested_account: params.requested_account.clone(),
             candidates: params.candidates.clone(),
             model_decision_id: params.model_decision_id.clone(),
-            harness: selection.map_or_else(
-                || {
-                    principal
-                        .strip_prefix("reserved:")
-                        .unwrap_or(principal)
-                        .to_owned()
-                },
-                |s| s.runner_module.clone(),
-            ),
+            harness: selection
+                .map_or_else(|| principal_harness(principal), |s| s.runner_module.clone()),
             owner_scope: json!({
                 "owner":selection.map_or(principal, |s| s.principal.as_str()),
                 "project_id":selection.and_then(|s|s.project_id.as_deref()),
