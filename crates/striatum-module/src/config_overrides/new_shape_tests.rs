@@ -282,12 +282,15 @@ fn old_shape_is_refused_even_when_empty_or_null() {
         json!({"model_routing": {}}),
         json!({"model_routing": null}),
         json!({"account_selection": {"enabled": false}}),
-        json!({"pins": {}}),
         json!({"score_alias": {}}),
     ] {
         let error = parse_config(&value.to_string()).unwrap_err();
         assert!(error.contains(crate::config_convert::COMMAND), "{error}");
     }
+    // The converter cannot convert a top-level pins object, so the loader
+    // names the manual move instead of sending the operator to it.
+    let error = parse_config(&json!({"pins": {}}).to_string()).unwrap_err();
+    assert!(error.contains("config_key_moved: pins"), "{error}");
 }
 
 #[test]
@@ -853,4 +856,161 @@ fn converter_dropped_scoped_policy_entry_changes_v1_document_and_policy() {
     assert_ne!(converted["models"], converted_without["models"]);
     assert!(converted_without["models"].get("p/m").is_none());
     assert!(config(converted_without).route_allowed(consumer, "p/m", true));
+}
+
+#[test]
+fn consumer_exclusion_groups_agree_with_the_route_rule_for_nested_model_entries() {
+    use striatum_core::provider_model_spec::{parse_spec_list, resolve_spec};
+    let mason = "prefrontal-core.mason";
+    let sidekick = "prefrontal-core.sidekick";
+    let models = [
+        // Mason may not use model m, except its v variant.
+        json!({"p/m": {"not_for": [mason]}, "p/m/v": {"not_for": []}}),
+        json!({"p/m": {"only_for": [sidekick]}, "p/m/v": {"only_for": [mason]}}),
+        // The variant's only_for admits Mason, but it inherits m's not_for.
+        json!({"p/m": {"not_for": [mason]}, "p/m/v": {"only_for": [mason]}}),
+        json!({"p/m": {"only_for": [mason]}, "p/m/v": {"not_for": [sidekick]}}),
+    ];
+    let providers = [
+        json!({}),
+        json!({"p": {"not_for": [mason]}}),
+        json!({"p": {"only_for": [sidekick]}}),
+    ];
+    for models in &models {
+        for providers in &providers {
+            let config = config(json!({"providers": providers, "models": models}));
+            for consumer in [mason, "prefrontal-core.mason.review", sidekick] {
+                let exclusions = config.consumer_exclusions(consumer);
+                let specs = parse_spec_list(&exclusions);
+                for route in ["p/m", "p/m/v", "p/m/v/x", "p/m/w", "p/n"] {
+                    assert_eq!(
+                        resolve_spec(&specs, route, false),
+                        !config.route_allowed(consumer, route, true),
+                        "{consumer} on {route}: providers {providers} models {models} group {exclusions:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// The per-model consumer scan the tier resolver replaced: it copied every
+/// consumer entry, merged scoped route tiers over user ones, then kept the
+/// entries matching `consumer`, most specific first.
+fn scanned_service_tier(
+    config: &LiveConfig,
+    consumer: &str,
+    provider: &str,
+    model: &str,
+    project: Option<&BTreeMap<String, crate::tier_settings::Consumer>>,
+) -> Option<cortexkit_role_routing::service_tier::ServiceTier> {
+    use crate::config_policy::{consumer_matches, consumer_specificity};
+    let mut entries: Vec<(String, Option<_>, BTreeMap<String, _>)> = config
+        .config
+        .consumers
+        .iter()
+        .map(|(id, policy)| {
+            let scoped = project.and_then(|entries| entries.get(id));
+            let mut tiers = policy.service_tiers.clone().unwrap_or_default();
+            if let Some(scoped) = scoped.and_then(|entry| entry.service_tiers.as_ref()) {
+                tiers.extend(scoped.iter().map(|(route, tier)| (route.clone(), *tier)));
+            }
+            let tier = scoped
+                .and_then(|entry| entry.service_tier)
+                .or(policy.service_tier);
+            (id.clone(), tier, tiers)
+        })
+        .chain(
+            project
+                .into_iter()
+                .flatten()
+                .filter(|(id, _)| !config.config.consumers.contains_key(*id))
+                .map(|(id, entry)| {
+                    let tiers = entry.service_tiers.clone().unwrap_or_default();
+                    (id.clone(), entry.service_tier, tiers)
+                }),
+        )
+        .filter(|(name, _, _)| consumer_matches(name, consumer))
+        .collect();
+    entries.sort_by_key(|(name, _, _)| std::cmp::Reverse(consumer_specificity(name)));
+    let route = format!("{provider}/{model}");
+    entries
+        .iter()
+        .find_map(|(_, _, tiers)| tiers.get(&route).copied())
+        .or_else(|| {
+            entries
+                .iter()
+                .find_map(|(_, _, tiers)| tiers.get(provider).copied())
+        })
+        .or_else(|| entries.iter().find_map(|(_, tier, _)| *tier))
+        .or(config
+            .config
+            .model_routing
+            .models
+            .get(&route)
+            .and_then(|model| model.rules.service_tier))
+        .or(config
+            .config
+            .providers
+            .get(provider)
+            .and_then(|provider| provider.rules.service_tier))
+        .map(crate::tier_settings::Tier::value)
+}
+
+#[test]
+fn tier_resolver_matches_the_per_model_consumer_scan_it_replaced() {
+    let config = config(json!({
+        "consumers": {
+            "prefrontal": {"service_tiers": {"google": "fast"}},
+            "prefrontal.sidekick": {
+                "service_tier": "standard",
+                "service_tiers": {"openai": "fast", "openai/m1": "ultrafast"}
+            },
+            "prefrontal.sidekick.review": {"service_tier": "ultrafast"},
+            "other": {"service_tier": "fast"}
+        },
+        "models": {"openai/m2": {"service_tier": "standard"}, "xai/z": {"service_tier": "fast"}},
+        "providers": {"anthropic": {"service_tier": "fast"}, "xai": {"service_tier": "ultrafast"}}
+    }));
+    let project: BTreeMap<String, crate::tier_settings::Consumer> = serde_json::from_value(json!({
+        "prefrontal.sidekick": {"service_tiers": {"openai": "standard"}},
+        "prefrontal.sidekick.review": {"service_tiers": {"anthropic": "ultrafast"}},
+        "prefrontal.lab": {"service_tier": "fast"},
+        "prefrontal.lab.deep": {"service_tiers": {"openai/m1": "standard"}}
+    }))
+    .unwrap();
+    let mut compared = 0;
+    for project in [None, Some(&project)] {
+        for consumer in [
+            "prefrontal",
+            "prefrontal.sidekick",
+            "prefrontal.sidekick.review",
+            "prefrontal.sidekick.review.deep",
+            "prefrontal.lab",
+            "prefrontal.lab.deep",
+            "other",
+            "nobody",
+        ] {
+            let resolver = config.tier_resolver(consumer, project);
+            for (provider, model) in [
+                ("openai", "m1"),
+                ("openai", "m2"),
+                ("openai", "m3"),
+                ("google", "x"),
+                ("anthropic", "y"),
+                ("xai", "z"),
+                ("xai", "w"),
+                ("unlisted", "v"),
+            ] {
+                assert_eq!(
+                    resolver.resolve(provider, model),
+                    scanned_service_tier(&config, consumer, provider, model, project),
+                    "{consumer} on {provider}/{model} with project {}",
+                    project.is_some()
+                );
+                compared += 1;
+            }
+        }
+    }
+    assert_eq!(compared, 128);
 }

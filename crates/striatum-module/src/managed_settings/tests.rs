@@ -761,3 +761,380 @@ async fn failed_project_refresh_keeps_cached_runners_and_tiers_until_a_successfu
     );
     assert_eq!(daemon.gets(ID), 4);
 }
+
+async fn wait_for_new_global(path: &Path, before: &Arc<config_overrides::LiveConfig>) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while Arc::ptr_eq(before, &config_overrides::live_config(path)) {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("routing did not apply the new user settings");
+}
+
+fn project_tier(
+    path: &Path,
+    view: &crate::project_settings::Overrides,
+    consumer: &str,
+    provider: &str,
+) -> Option<cortexkit_role_routing::service_tier::ServiceTier> {
+    let config = config_overrides::live_config(path);
+    crate::tier_settings::Layers::new(view.consumers.clone(), None)
+        .resolve(&config, consumer, provider, "model", None)
+}
+
+#[tokio::test]
+async fn user_tier_edit_reaches_a_cached_project_that_only_adds_its_own_tier() {
+    use super::test_daemon::{Advertise, Daemon, ID};
+    use crate::tier_settings::Tier;
+    use crate::DEFAULT_MODULE_ID;
+
+    let dir = ScratchDir::new("project-inherited-tiers");
+    let path = dir.join("striatum.jsonc");
+    let consumer = "prefrontal.sidekick";
+    let user = |tier| json!({"consumers":{consumer:{"service_tiers":{"openai":tier}}}});
+    std::fs::write(&path, user("fast").to_string()).unwrap();
+    let (daemon, _connection) = Daemon::connect(&path, user("fast"), Advertise::Hello).await;
+    daemon.set(
+        ID,
+        json!({"consumers":{consumer:{"service_tiers":{"anthropic":"standard"}}}}),
+    );
+    let view = project_view(&path, ID).await.unwrap();
+    assert_eq!(
+        project_tier(&path, &view, consumer, "openai"),
+        Some(Tier::Fast.value())
+    );
+    assert_eq!(
+        project_tier(&path, &view, consumer, "anthropic"),
+        Some(Tier::Standard.value())
+    );
+
+    // The operator changes the user tier; the daemon sends only a global notice.
+    let before = config_overrides::live_config(&path);
+    std::fs::write(&path, user("standard").to_string()).unwrap();
+    daemon.reload_user_file(DEFAULT_MODULE_ID).await.unwrap();
+    wait_for_new_global(&path, &before).await;
+    let view = project_view(&path, ID).await.unwrap();
+    assert_eq!(daemon.gets(ID), 1, "the project view stays cached");
+    assert_eq!(
+        project_tier(&path, &view, consumer, "openai"),
+        Some(Tier::Standard.value()),
+        "no scoped layer set the openai tier"
+    );
+    assert_eq!(
+        project_tier(&path, &view, consumer, "anthropic"),
+        Some(Tier::Standard.value())
+    );
+}
+
+#[tokio::test]
+async fn project_view_built_on_another_user_layer_keeps_routings_user_values() {
+    use super::test_daemon::{self, Advertise, Daemon, ID};
+    use crate::tier_settings::Tier;
+    use subc_protocol::config::ConfigGetReply;
+
+    let dir = ScratchDir::new("project-user-skew");
+    let path = dir.join("striatum.jsonc");
+    let applied = json!({"consumers":{"prefrontal.sidekick":{"service_tier":"standard"}}});
+    let (daemon, _connection) = Daemon::connect(&path, applied, Advertise::Hello).await;
+    // The daemon merged this project over a user layer routing has not applied.
+    let skewed = json!({"consumers":{"prefrontal.sidekick":{"service_tier":"fast"}}});
+    let layer = json!({"consumers":{"prefrontal.lab":{"service_tier":"ultrafast"}}});
+    daemon.deliver(
+        ID,
+        ConfigGetReply::new(Some(test_daemon::project_view(&skewed, ID, &layer)), None),
+    );
+    let view = project_view(&path, ID).await.unwrap();
+    assert_eq!(
+        view.consumers.keys().collect::<Vec<_>>(),
+        ["prefrontal.lab"],
+        "only the project's own consumer is a project override"
+    );
+    assert_eq!(
+        project_tier(&path, &view, "prefrontal.sidekick", "openai"),
+        Some(Tier::Standard.value())
+    );
+    assert_eq!(
+        project_tier(&path, &view, "prefrontal.lab", "openai"),
+        Some(Tier::Ultrafast.value())
+    );
+}
+
+#[tokio::test]
+async fn project_tiers_resolve_as_before_when_the_user_layers_agree() {
+    use super::test_daemon::{Advertise, Daemon, ID};
+    use crate::tier_settings::Tier;
+
+    let dir = ScratchDir::new("project-tiers-unchanged");
+    let path = dir.join("striatum.jsonc");
+    let user = json!({"consumers":{"prefrontal.sidekick":{
+        "service_tier":"standard",
+        "service_tiers":{"openai":"standard","openai/model":"fast","google":"standard"}
+    }}});
+    let (daemon, _connection) = Daemon::connect(&path, user, Advertise::Hello).await;
+    daemon.set(
+        ID,
+        json!({"consumers":{
+            "prefrontal.sidekick":{"service_tier":"fast","service_tiers":{"openai":"ultrafast"}},
+            "prefrontal.sidekick.review":{"service_tiers":{"google":"fast"}}
+        }}),
+    );
+    let view = project_view(&path, ID).await.unwrap();
+    for (consumer, provider, tier) in [
+        // The user's model entry outranks the project's provider entry.
+        ("prefrontal.sidekick", "openai", Tier::Fast),
+        ("prefrontal.sidekick", "google", Tier::Standard),
+        ("prefrontal.sidekick", "anthropic", Tier::Fast),
+        ("prefrontal.sidekick.review", "openai", Tier::Fast),
+        ("prefrontal.sidekick.review", "google", Tier::Fast),
+        ("prefrontal.sidekick.review", "anthropic", Tier::Fast),
+    ] {
+        assert_eq!(
+            project_tier(&path, &view, consumer, provider),
+            Some(tier.value()),
+            "{consumer} on {provider}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn queued_project_refreshes_do_not_discard_the_cached_view_for_a_request() {
+    use super::test_daemon::{Advertise, Daemon, ID};
+    use crate::tier_settings::Tier;
+
+    let dir = ScratchDir::new("project-refresh-queue");
+    let path = dir.join("striatum.jsonc");
+    let consumer = "prefrontal.sidekick";
+    let user = json!({"consumers":{consumer:{"service_tier":"standard"}}});
+    let (daemon, _connection) = Daemon::connect(&path, user, Advertise::Hello).await;
+    daemon.set(ID, json!({"consumers":{consumer:{"service_tier":"fast"}}}));
+    let view = project_view(&path, ID).await.unwrap();
+    assert_eq!(
+        project_tier(&path, &view, consumer, "openai"),
+        Some(Tier::Fast.value())
+    );
+
+    tokio::time::pause();
+    daemon.delay(ID);
+    for _ in 0..3 {
+        daemon.notify_changed(ID);
+    }
+    // Wait until the first refresh is fetching; the other two queue behind it.
+    while daemon.gets(ID) < 2 {
+        tokio::task::yield_now().await;
+    }
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    let view = project_view(&path, ID)
+        .await
+        .expect("the request falls back to the last delivered project view");
+    assert_eq!(
+        project_tier(&path, &view, consumer, "openai"),
+        Some(Tier::Fast.value())
+    );
+}
+
+#[test]
+fn consumer_iq_and_eq_outside_0_to_100_are_refused_by_review_and_check_config() {
+    let scratch = ScratchDir::new("consumer-demand-range");
+    let path = scratch.join("striatum.jsonc");
+    for (document, field) in [
+        (r#"{"consumers":{"work":{"iq":101}}}"#, "/consumers/work/iq"),
+        (
+            r#"{"consumers":{"work":{"eq":-0.5}}}"#,
+            "/consumers/work/eq",
+        ),
+    ] {
+        let refusal = review_refusal(document);
+        assert_eq!(refusal.paths, [field], "{document}");
+        std::fs::write(&path, document).unwrap();
+        let error = config_overrides::check_config_offline(&path, "striatum", None).unwrap_err();
+        assert!(error.contains("from 0 to 100"), "{document}: {error}");
+    }
+    for document in [
+        r#"{"consumers":{"work":{"iq":0,"eq":100}}}"#,
+        r#"{"consumers":{"work":{"iq":37.5}}}"#,
+    ] {
+        let reply = review(
+            &review_schema(),
+            "striatum",
+            ConfigReviewRequest::new(0, vec![snapshot(document)], None),
+        );
+        assert!(
+            reply.refusals.is_empty(),
+            "{document}: {:?}",
+            reply.refusals
+        );
+        std::fs::write(&path, document).unwrap();
+        config_overrides::check_config_offline(&path, "striatum", None).unwrap();
+    }
+}
+
+#[test]
+fn project_pin_schema_matches_what_loading_accepts() {
+    let schema = emitted_schema();
+    let project = &schema["$defs"]["ProjectPolicy"];
+    assert_eq!(project["required"], json!(["pin"]));
+    let pin = &project["properties"]["pin"];
+    assert!(pin.get("default").is_none(), "{pin}");
+    assert_eq!(pin["x-ck-required"], json!(true));
+    assert!(
+        !pin["description"].as_str().unwrap().contains("Leave empty"),
+        "{pin}"
+    );
+    for document in [
+        r#"{"consumers":{"mc":{"projects":{"p1":{}}}}}"#,
+        r#"{"consumers":{"mc":{"projects":{"p1":{"pin":""}}}}}"#,
+    ] {
+        review_refusal(document);
+        assert!(
+            config_overrides::validate_document(document).is_err(),
+            "{document}"
+        );
+    }
+    let pinned = r#"{"consumers":{"mc":{"projects":{"p1":{"pin":"p/m"}}}}}"#;
+    config_overrides::validate_document(pinned).unwrap();
+}
+
+fn scoped_review(project_layer: &str) -> ConfigReviewReply {
+    let mut user = snapshot(r#"{"runners":[{"module":"runner-a"}]}"#);
+    user.project_id = Some("pj-review".into());
+    let mut project = ConfigLayerSnapshot::file(
+        "striatum",
+        ConfigLayer::Project,
+        "/isolated/project/striatum.jsonc",
+        Some(project_layer.as_bytes().to_vec()),
+    );
+    project.project_id = user.project_id.clone();
+    review(
+        &review_schema(),
+        "striatum",
+        ConfigReviewRequest::new(0, vec![user, project], None),
+    )
+}
+
+#[test]
+fn project_runner_lists_follow_the_user_runner_list_rules() {
+    for (layer, reason) in [
+        (
+            r#"{"consumers":{"work":{"runners":[{"module":"runner-a","routes":["p/"]}]}}}"#,
+            "route \"p/\"",
+        ),
+        (
+            r#"{"consumers":{"work":{"runners":[{"module":"runner-a","routes":["-p"]}]}}}"#,
+            "route \"-p\"",
+        ),
+        (
+            r#"{"consumers":{"work":{"runners":[{"module":"runner-a","harness":" "}]}}}"#,
+            "non-empty words",
+        ),
+        (
+            r#"{"consumers":{"work":{"runners":[{"module":"runner-a"},{"module":"runner-a"}]}}}"#,
+            "listed once",
+        ),
+    ] {
+        let reply = scoped_review(layer);
+        assert!(reply.fields.is_empty(), "{layer}");
+        assert_eq!(reply.refusals.len(), 1, "{layer}: {:?}", reply.refusals);
+        let refusal = &reply.refusals[0];
+        assert_eq!(refusal.paths, ["/consumers/work/runners"], "{layer}");
+        assert_eq!(refusal.project_id.as_deref(), Some("pj-review"));
+        assert!(
+            refusal.reasons[0].contains(reason),
+            "{layer}: {:?}",
+            refusal.reasons
+        );
+    }
+    // An unenrolled runner is still a well-formed choice; enrollment narrows it per request.
+    let reply = scoped_review(
+        r#"{"consumers":{"work":{"runners":[{"module":"not-enrolled","harness":"h","routes":["p","p/m"]}]}}}"#,
+    );
+    assert!(reply.refusals.is_empty(), "{:?}", reply.refusals);
+}
+
+#[tokio::test]
+async fn delivered_project_runner_list_with_a_malformed_route_is_refused() {
+    use super::test_daemon::{self, Advertise, Daemon, ID};
+    use subc_protocol::config::{ConfigApplyResult, ConfigGetReply};
+
+    let dir = ScratchDir::new("project-runner-route");
+    let path = dir.join("striatum.jsonc");
+    let user = json!({"runners":[{"module":"runner-a"}]});
+    let (daemon, _connection) = Daemon::connect(&path, user.clone(), Advertise::Hello).await;
+    let layer = json!({"consumers":{"work":{"runners":[{"module":"runner-a","routes":["p/"]}]}}});
+    let mut view = test_daemon::project_view(&user, ID, &layer);
+    view.generation = 2;
+    view.attempt = Some(4);
+    view.status = ConfigStatus::Pending;
+    daemon.deliver(ID, ConfigGetReply::new(None, Some(view)));
+    assert!(project_view(&path, ID).await.is_none());
+    let reports = daemon.reports();
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].result, ConfigApplyResult::Nack);
+    assert!(
+        reports[0]
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("route \"p/\"")),
+        "{:?}",
+        reports[0].reasons
+    );
+}
+
+#[tokio::test]
+async fn failed_report_retry_still_fetches_the_change_that_triggered_it() {
+    use super::test_daemon::{Advertise, Daemon};
+    use crate::tier_settings::Tier;
+    use std::time::Duration;
+
+    let dir = ScratchDir::new("report-failure-refresh");
+    let path = dir.join("striatum.jsonc");
+    let (daemon, _connection) = Daemon::connect(&path, json!({}), Advertise::Hello).await;
+    let tier = |path: &Path| {
+        config_overrides::live_config(path).service_tier("prefrontal.sidekick", "openai", "model")
+    };
+    let stamped = |generation, attempt, tier: &str| {
+        let mut view = ConfigView::new(
+            generation,
+            json!({"consumers":{"prefrontal.sidekick":{"service_tier":tier}}}),
+            BTreeMap::new(),
+            vec![],
+            ConfigStatus::Active,
+        );
+        view.attempt = Some(attempt);
+        view
+    };
+    async fn wait(what: &str, mut condition: impl FnMut() -> bool) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !condition() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{what}"));
+    }
+
+    // The daemon defers the first report, so routing keeps it for a retry.
+    daemon.refuse_reports(Some("anchor_pending"));
+    daemon.set_global(stamped(2, 1, "standard"));
+    daemon.global_changed().await;
+    wait("routing did not report generation 2", || {
+        daemon.report_attempts() == 1
+    })
+    .await;
+    assert_eq!(tier(&path), Some(Tier::Standard.value()));
+
+    // A new generation arrives while the retried report fails differently.
+    daemon.refuse_reports(Some("unavailable"));
+    daemon.set_global(stamped(3, 2, "fast"));
+    daemon.notify_global_changed();
+    wait("the change notice was lost after the report failed", || {
+        tier(&path) == Some(Tier::Fast.value())
+    })
+    .await;
+    wait("routing did not report generation 3", || {
+        daemon.report_attempts() == 3
+    })
+    .await;
+}

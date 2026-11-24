@@ -49,10 +49,21 @@ pub(crate) fn reject_removed_variants(value: &Value) -> Result<(), String> {
     Ok(())
 }
 
+/// A top-level `pins` object is not a spelling either the loader or the
+/// converter understands; only `model_routing.pins` converts. Both refuse it,
+/// with the manual move, so conversion can never drop the pins silently.
+pub(crate) fn reject_flat_pins(value: &Value) -> Result<(), String> {
+    if value.get("pins").is_some() {
+        return Err("config_key_moved: pins; move each pin to consumers.<slot>.pin (for example consumers.spec_designer.pin), then delete pins".into());
+    }
+    Ok(())
+}
+
 /// Convert a parsed document, retaining operational tuning not replaced by the
 /// entity policy. Earlier entity-policy documents lose the retired account flag.
 pub fn convert_value(value: Value) -> Result<Value, String> {
     reject_removed_variants(&value)?;
+    reject_flat_pins(&value)?;
     let mut root = value
         .as_object()
         .cloned()
@@ -287,7 +298,6 @@ pub fn convert_value(value: Value) -> Result<Value, String> {
         }
     }
     old.remove("score_alias");
-    root.remove("pins");
     root.remove("score_alias");
     root.extend(old);
     root.remove("model_families");
