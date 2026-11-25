@@ -112,6 +112,20 @@ impl RunnerDeclaration {
                 .is_some_and(|capabilities| capabilities.contains(capability))
     }
 
+    pub(super) fn has_harness_exclusions(&self) -> bool {
+        self.facts
+            .as_ref()
+            .and_then(|facts| facts.as_ref().ok())
+            .is_some_and(|facts| {
+                facts.values().any(|limits| {
+                    limits
+                        .exclude
+                        .as_ref()
+                        .is_some_and(|specs| !specs.is_empty())
+                })
+            })
+    }
+
     pub(crate) fn harness_excludes(&self, harness: &str, route: &str) -> bool {
         self.limits_for_harness(Some(harness))
             .ok()

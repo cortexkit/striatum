@@ -430,3 +430,38 @@ async fn broca_completion_slot_excludes_pinned_opencode_routes() {
         }
     }
 }
+
+#[tokio::test]
+async fn broca_head_choices_excludes_opencode_routes_from_catalog_slot() {
+    let _clock = crate::InjectedClock::set(NOW);
+    const MODEL: &str = "deepseek-v4-flash";
+    let facts = [
+        model("anthropic", METERED_MODEL, "apikey", "upstream"),
+        model("opencode", MODEL, "apikey", "upstream"),
+        model("opencode-go", MODEL, "apikey", "upstream"),
+    ];
+    let harness = setup_with_models("broca-head-choices-exclude", &facts);
+    let route = harness.bind(reserved("broca"), None).await;
+    let ordinary = ("anthropic", METERED_MODEL);
+    let all = [ordinary, ("opencode", MODEL), ("opencode-go", MODEL)];
+
+    for (slot, expected) in [(QUICK, all.as_slice()), (QUICK_WITH_EXCLUDE, &all[..1])] {
+        publish_broca_catalog_slot(&harness, slot);
+        let (ty, answer) = route
+            .call("route.head_choices", &json!({"runner_module":"broca"}))
+            .await;
+        assert_eq!(ty, FrameType::Response, "{answer}");
+        let offered: Vec<_> = answer["result"]["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                (
+                    row["provider"].as_str().unwrap(),
+                    row["model"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(offered, expected);
+    }
+}

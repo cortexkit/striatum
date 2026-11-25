@@ -160,11 +160,12 @@ pub(crate) fn choices_for_harness_with_effort_detail(
     striatum_core::score_alias::append_alias_rows(&mut facts, &aliases);
     facts.retain(|fact| fact.mode_of.is_none());
     config.apply(&mut facts);
+    let now_ms = now_ms();
     let registry = routing_v1::runners::Registry::build_for_harness(
         config,
         credentials,
         &facts,
-        now_ms(),
+        now_ms,
         harness,
     );
     if let Some(harness) = harness.filter(|harness| {
@@ -184,6 +185,7 @@ pub(crate) fn choices_for_harness_with_effort_detail(
         );
     };
     let reasoning = serving_catalog.reasoning.as_deref().ok_or_else(not_ready)?;
+    let harness_reach = runner.picker_harness_reach(config, credentials, &facts, now_ms, harness);
     let providers = facts.iter().collect();
     let subscription_specs = &config.compiled_routing_policy().subscription;
     let mut grouped: BTreeMap<(&str, &str), Vec<&ModelFact>> = BTreeMap::new();
@@ -253,6 +255,7 @@ pub(crate) fn choices_for_harness_with_effort_detail(
             let route = striatum_core::make_route_key(provider, model, variant);
             config.route_allowed_with_default("head", &route, pinned, !class.subscription)
                 && registry.runs(module, &route, &capacity)
+                && harness_reach.allows(&route, &capacity)
         };
         let published = variant_policy::published(reasoning, &aliases, provider, model);
         let mut variants = match published {

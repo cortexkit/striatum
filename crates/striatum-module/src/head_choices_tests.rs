@@ -446,6 +446,60 @@ fn declare_harness_limits(credentials: &mut BrocaCredentials, limits: Value) {
 }
 
 #[tokio::test]
+async fn harness_choices_keep_routes_only_if_a_serving_harness_allows_them() {
+    let (harness, mut credentials) = fixture();
+    declare_harness_limits(
+        &mut credentials,
+        json!({
+            "claude-code": {"exclude":["openai/a-head","anthropic/claude"]},
+            "codex": {"pairs":[{"wire_api":WIRE,"auth_method":"oauth"}]}
+        }),
+    );
+    harness.set_credentials(credentials);
+
+    let offered = ids(&query(&harness, RUNNER).await);
+    assert!(
+        offered.iter().any(|id| id == "openai/a-head"),
+        "{offered:?}"
+    );
+    assert!(
+        !offered.iter().any(|id| id == "anthropic/claude"),
+        "{offered:?}"
+    );
+}
+
+#[tokio::test]
+async fn harness_choices_use_only_the_requested_harness_exclusions() {
+    let (harness, mut credentials) = fixture();
+    declare_harness_limits(
+        &mut credentials,
+        json!({"claude-code": {"exclude":["openai/a-head"]}}),
+    );
+    harness.set_credentials(credentials);
+    let route = harness.bind(reserved("occipital"), None).await;
+
+    for (harness_name, lists_a_head) in [("codex", true), ("claude-code", false)] {
+        let (ty, reply) = route
+            .call(
+                "route.head_choices",
+                &json!({"runner_module":RUNNER,"harness":harness_name}),
+            )
+            .await;
+        assert_eq!(ty, FrameType::Response, "{reply}");
+        let offered = ids(&reply["result"]);
+        assert!(
+            offered.iter().any(|id| id == "anthropic/claude"),
+            "{offered:?}"
+        );
+        assert_eq!(
+            offered.iter().any(|id| id == "openai/a-head"),
+            lists_a_head,
+            "{harness_name}: {offered:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn harness_choices_narrow_pairs_and_absent_harness_keeps_runner_union() {
     let (harness, mut credentials) = fixture();
     declare_harness_limits(
