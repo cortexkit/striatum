@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use cortexkit_claustrum_client::{ListedCredential, ScopedCredentialListing};
+use cortexkit_role_routing::capabilities::SELECT_WORKLOAD;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use striatum_core::accounts::AllowedAccountClass;
@@ -9,8 +10,9 @@ use striatum_core::{ModelFact, RouteStateStore};
 use subc_protocol::FrameType;
 
 use super::conformance_tests::{reserved, Harness, Route};
+use super::consumers;
 use super::effort_preview::{seed_for_test, test_graded};
-use super::runners::declarations_from_catalog;
+use super::runners::{declarations_from_catalog, DescribeCache};
 use crate::broca_credentials::BrocaCredentials;
 use crate::fusiform_catalog::{decode_catalog_get, PlaneCatalog};
 
@@ -29,6 +31,11 @@ const PROPOSED: Slot = Slot {
     size: 2191,
     sha256: "168755640c483cbd479e915a103a8f335d39f0d4cc8ab4579da1140c6d6b9987",
 };
+const QUICK: &[u8] =
+    include_bytes!("../../fixtures/broca-routing-consumer-quick-1125/routing-slot.json");
+const QUICK_WITH_EXCLUDE: &[u8] = include_bytes!(
+    "../../fixtures/broca-routing-consumer-quick-1125/routing-slot-with-exclude.json"
+);
 const BASAL: &[u8] = br#"{"consumer":"broca.complete.basal.run","requirements":{"iq":30,"max_output_tokens":16,"input_tokens":200,"max_cost_usd":0.01},"runners":["broca"]}"#;
 
 struct Slot {
@@ -75,7 +82,15 @@ fn model(provider: &str, model: &str, method: &str, kind: &str) -> ModelFact {
 }
 
 fn setup(include_metered: bool) -> Arc<Harness> {
-    let harness = Harness::new("broca-output-cap-harness");
+    let mut facts = vec![model("openai", CHATGPT_MODEL, "chatgpt", "subscription")];
+    if include_metered {
+        facts.push(model("anthropic", METERED_MODEL, "apikey", "upstream"));
+    }
+    setup_with_models("broca-output-cap-harness", &facts)
+}
+
+fn setup_with_models(label: &str, facts: &[ModelFact]) -> Arc<Harness> {
+    let harness = Harness::new(label);
     // Migrations seed unrelated models; only the fixture routes should be present.
     for fact in harness.store().get_facts().unwrap() {
         harness
@@ -83,26 +98,30 @@ fn setup(include_metered: bool) -> Arc<Harness> {
             .delete_fact(&striatum_core::fact_to_route(&fact).route_key)
             .unwrap();
     }
-    let mut facts = vec![model("openai", CHATGPT_MODEL, "chatgpt", "subscription")];
-    if include_metered {
-        facts.push(model("anthropic", METERED_MODEL, "apikey", "upstream"));
-    }
-    harness.install_facts(&facts);
+    harness.install_facts(facts);
     let models: serde_json::Map<String, Value> = facts
         .iter()
         .map(|fact| {
-            let wire = if fact.provider_id == "openai" {
-                "openai.chatgpt_responses"
-            } else {
-                "anthropic.messages"
+            let (wire, endpoint) = match fact.provider_id.as_str() {
+                "openai" => ("openai.chatgpt_responses", None),
+                "anthropic" => ("anthropic.messages", Some("https://api.anthropic.com")),
+                "opencode" => (
+                    "openai.chat_completions",
+                    Some("https://opencode.ai/zen/v1"),
+                ),
+                "opencode-go" => (
+                    "openai.chat_completions",
+                    Some("https://opencode.ai/zen/go/v1"),
+                ),
+                other => panic!("missing test catalog wire family for {other}"),
             };
             let mut entry = json!({
                 "existence":"present", "capability.tool_call":true, "wire.family":wire,
                 "rate.input":{"state":"priced","currency":"USD","units":4,"exponent":0},
                 "rate.output":{"state":"priced","currency":"USD","units":20,"exponent":0}
             });
-            if fact.provider_id == "anthropic" {
-                entry["wire.api"] = json!({"value":"https://api.anthropic.com","from":"curated"});
+            if let Some(endpoint) = endpoint {
+                entry["wire.api"] = json!({"value":endpoint,"from":"curated"});
             }
             (format!("{}/{}", fact.provider_id, fact.model_id), entry)
         })
@@ -117,9 +136,18 @@ fn setup(include_metered: bool) -> Arc<Harness> {
                 .iter()
                 .map(|fact| {
                     let method = &fact.auth_methods.as_ref().unwrap()[0];
+                    let (id, account_id) =
+                        if matches!(fact.provider_id.as_str(), "opencode" | "opencode-go") {
+                            (
+                                format!("{method}:{}", fact.provider_id),
+                                format!("{}-{method}-account", fact.provider_id),
+                            )
+                        } else {
+                            (format!("{method}:test"), format!("{method}-account"))
+                        };
                     ListedCredential {
-                        id: format!("{method}:test"),
-                        account_id: Some(format!("{method}-account")),
+                        id,
+                        account_id: Some(account_id),
                         categories: vec!["llm-provider".into()],
                         state: "active".into(),
                         credential_type: if method == "chatgpt" {
@@ -139,9 +167,9 @@ fn setup(include_metered: bool) -> Arc<Harness> {
         },
         NOW,
     );
-    credentials.refresh_serving_methods(&Default::default(), &facts, NOW as i64, &[]);
+    credentials.refresh_serving_methods(&Default::default(), facts, NOW as i64, &[]);
     credentials.publish_billing_catalog(
-        PlaneCatalog::ordinary_test_catalog(&facts)
+        PlaneCatalog::ordinary_test_catalog(facts)
             .with_test_catalog(catalog.as_bytes())
             .with_wire_apis(&snapshot.wire_apis)
             .with_wire_api_models(&snapshot.wire_api_models),
@@ -283,6 +311,121 @@ async fn split_names_the_uncapped_harness_without_changing_sidekick_or_mason_rou
                 assert_eq!(&identity, before, "{consumer}: {result}");
             } else {
                 before = Some(identity);
+            }
+        }
+    }
+}
+
+fn publish_broca_catalog_slot(harness: &Harness, bytes: &[u8]) {
+    let slot: Value = serde_json::from_slice(bytes).unwrap();
+    // Decode the daemon's module entry before handing it to both catalog readers.
+    let catalog: subc_client_rs::CatalogList = serde_json::from_value(json!({
+        "op":"catalog.list", "generation":1, "subc_ops":[], "modules":[{
+            "module_id":"broca", "nonce_verified":true, "roles":[], "control_ops":[],
+            "role_declarations":{"routing/v1":slot}
+        }]
+    }))
+    .unwrap();
+    let modules = serde_json::to_value(catalog.modules).unwrap();
+    crate::take_operator_warnings();
+    consumers::replace_catalog(&modules);
+    DescribeCache::default().catalog(
+        &modules,
+        &harness.operator_config().v1_runners(),
+        &mut harness.credentials().lock().unwrap(),
+        NOW as i64,
+    );
+    let health = consumers::health();
+    assert_eq!(health["issues"], json!([]), "{health}");
+    let warnings = crate::take_operator_warnings();
+    assert!(warnings.is_empty(), "{warnings:?}");
+}
+
+#[tokio::test]
+async fn broca_completion_slot_declares_quick_for_both_basal_children() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let harness = setup(true);
+    let mut efforts = test_graded("high", &["low", "high"]);
+    // Only quick picks low instead of the model's graded effort.
+    efforts.workloads.entry("quick".into()).or_default().default = Some("low".into());
+    seed_for_test(
+        harness.store_path(),
+        &format!("anthropic/{METERED_MODEL}"),
+        efforts,
+    );
+
+    let route = harness.bind(reserved("broca"), None).await;
+    let (ty, description) = route.call("role.describe", &json!({})).await;
+    assert_eq!(ty, FrameType::Response, "{description}");
+    assert!(
+        description["result"]["capabilities"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(SELECT_WORKLOAD)),
+        "{description}"
+    );
+
+    publish_broca_catalog_slot(&harness, QUICK);
+    let registry = consumers::effective(&harness.operator_config());
+    let mut request: Value = serde_json::from_slice(BASAL).unwrap();
+    request["detail"] = json!(true);
+    for consumer in ["broca.complete.basal.run", "broca.complete.basal.flow"] {
+        assert_eq!(
+            registry.defaults_for(consumer).workload.as_deref(),
+            Some("quick"),
+            "{consumer}"
+        );
+        request["consumer"] = json!(consumer);
+        let result = selected(
+            consumer,
+            route.call("route.select", &request).await,
+            "broca",
+        );
+        assert_eq!(result["route"]["variant"], "low", "{consumer}: {result}");
+        let reasoning = &result["detail"]["reasoning"];
+        assert_eq!(
+            reasoning["effort_source"], "workload_default",
+            "{consumer}: {result}"
+        );
+        assert_eq!(
+            reasoning["workload_source"], "declaration",
+            "{consumer}: {result}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn broca_completion_slot_excludes_pinned_opencode_routes() {
+    let _clock = crate::InjectedClock::set(NOW);
+    const PROVIDERS: [&str; 2] = ["opencode-go", "opencode"];
+    const MODEL: &str = "deepseek-v4-flash";
+    let facts = PROVIDERS.map(|provider| model(provider, MODEL, "apikey", "upstream"));
+    let harness = setup_with_models("broca-completion-exclude", &facts);
+    harness.edit_config(|config| {
+        config["consumers"]["broca.complete"]["runners"] = json!([{"module":"broca"}]);
+    });
+    let route = harness.bind(reserved("broca"), None).await;
+
+    for (slot, excludes_opencode) in [(QUICK, false), (QUICK_WITH_EXCLUDE, true)] {
+        publish_broca_catalog_slot(&harness, slot);
+        for provider in PROVIDERS {
+            let pin = format!("{provider}/{MODEL}");
+            let request = json!({
+                "consumer":"broca.complete.basal.run",
+                "requirements":{"iq":0}, "runners":["broca"], "pin":pin
+            });
+            let (ty, answer) = route.call("route.select", &request).await;
+            if excludes_opencode {
+                assert_eq!(ty, FrameType::Error, "{pin}: {answer}");
+                assert_eq!(answer["code"], "pin_unavailable", "{pin}: {answer}");
+                assert_eq!(
+                    answer["detail"]["reason"], "not_available",
+                    "{pin}: {answer}"
+                );
+            } else {
+                // The same route and account must be selectable without the exclusion.
+                let result = selected(&pin, (ty, answer), "broca");
+                assert_eq!(result["route"], json!({"provider":provider,"model":MODEL}));
             }
         }
     }

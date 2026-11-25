@@ -190,6 +190,18 @@ prefixes before import.
 | `broca-output-cap-harness-1124/routing-slot.json` | 2191 | `168755640c483cbd479e915a103a8f335d39f0d4cc8ab4579da1140c6d6b9987` |
 | `broca-output-cap-harness-1124/current-live-routing-slot.json` | 1277 | `6c54624ca04c67c6a6d295849837ccbff28ac0cc9fe840f0298cc51a46a1fa5d` |
 
+## Broca completion workload declaration
+
+`broca-routing-consumer-quick-1125/` preserves the slots supplied by BROCA on
+25 November 2026, byte for byte from
+`.cortexkit/internal-docs/samples/broca-routing-consumer-quick-1125/`.
+Both were verified against the supplied `SHA256SUMS`.
+
+| Imported path | SHA-256 |
+| --- | --- |
+| `broca-routing-consumer-quick-1125/routing-slot.json` | `34c635f021e83df3ddb4509757bcfa3a2cbee53e1c113c38ac449f699e330158` |
+| `broca-routing-consumer-quick-1125/routing-slot-with-exclude.json` | `f484398f92aed37e95cec7854bbbf53c2e8eb33538c9c782bd5233b10948e510` |
+
 ## Thalamus Claude Fable limit refusal
 
 `route-limit-fable-v1/` copies both route-fact bodies byte for byte from
