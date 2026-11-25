@@ -158,9 +158,83 @@ impl TaskRunnerDiagnostics {
                 row
             })
             .collect();
+        let message = if rows
+            .iter()
+            .all(|row| row["reason"] == "capabilities_missing")
+        {
+            capability_message(&rows)
+        } else if !rows.is_empty()
+            && rows.iter().all(|row| {
+                row["reason"] == "excluded_by_policy" && row["filter"] == "harness_routes"
+            })
+        {
+            self.model_route_message(request, registry)
+        } else {
+            None
+        };
+        if let Some(message) = message {
+            refusal.message = message;
+        }
         refusal.detail.insert("runners".into(), json!(rows));
         refusal
     }
+
+    fn model_route_message(&self, request: &SelectRequest, registry: &Registry) -> Option<String> {
+        let mut pairs = BTreeSet::new();
+        for entry in &self.candidates {
+            let policy = &entry.policy;
+            let runner = registry.get(policy)?;
+            if request
+                .requirements
+                .tool_capabilities
+                .as_ref()
+                .is_some_and(|tags| {
+                    tags.iter()
+                        .any(|tag| !runner.policy.tool_capabilities.contains(tag))
+                })
+            {
+                return None;
+            }
+            let requested = request.harness.as_deref().or(policy.harness.as_deref());
+            if let Some(choices) = &runner.harness_choices {
+                // A runner's row can report no matching models even when some
+                // of its harnesses were stopped or lacked required capabilities.
+                if choices.len() != runner.task_harnesses(requested).len() {
+                    return None;
+                }
+                pairs.extend(
+                    choices
+                        .iter()
+                        .map(|choice| (&policy.module, Some(choice.harness.clone()))),
+                );
+            } else {
+                pairs.insert((&policy.module, runner.selection_harness(requested)));
+            }
+        }
+        let subject = "No model this request may use runs on";
+        if let (1, Some((module, Some(harness)))) = (pairs.len(), pairs.first()) {
+            Some(format!("{subject} {module}/{harness}"))
+        } else {
+            Some(format!("{subject} any eligible runner/harness pair"))
+        }
+    }
+}
+
+fn capability_message(rows: &[Value]) -> Option<String> {
+    let gaps: BTreeSet<_> = rows
+        .iter()
+        .filter_map(|row| row["missing"].as_object())
+        .flatten()
+        .filter_map(|(pair, missing)| {
+            let names: Vec<_> = missing
+                .as_array()?
+                .iter()
+                .filter_map(Value::as_str)
+                .collect();
+            (!names.is_empty()).then(|| format!("{pair} lacks {}", names.join(", ")))
+        })
+        .collect();
+    (!gaps.is_empty()).then(|| gaps.into_iter().collect::<Vec<_>>().join("; "))
 }
 
 fn configured(policy: &ConsumerPolicy, enrolled: &[RunnerPolicy]) -> Vec<Candidate> {

@@ -406,12 +406,35 @@ async fn harness_refusals_route_exclusions_preserve_cooldowns_and_policy() {
             "{}",
             excluded.1
         );
+        assert_eq!(
+            excluded.1["message"],
+            "No model this request may use runs on any eligible runner/harness pair"
+        );
         refused(excluded, "harness_unavailable");
         only["exclude"] = json!([key, other]);
         refused(
             route.call("route.select", &only).await,
             "no_available_model",
         );
+
+        only.as_object_mut().unwrap().remove("exclude");
+        only["requirements"]["harness_capabilities"] = json!(["plans"]);
+        install(
+            &harness,
+            "declaring",
+            &slot(json!({
+                "primary":{"capabilities":["plans"], "exclude":[key, other]},
+                "secondary":{"capabilities":["one_off"]},
+                "inherited":{"capabilities":["one_off"]}
+            })),
+        );
+        let mixed = route.call("route.select", &only).await;
+        assert_eq!(mixed.1["detail"]["runners"][0]["filter"], "harness_routes");
+        assert_eq!(
+            mixed.1["message"],
+            "no route meets the request: harness_unavailable"
+        );
+        refused(mixed, "harness_unavailable");
     })
     .await;
 }

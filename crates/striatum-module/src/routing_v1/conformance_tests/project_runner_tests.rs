@@ -124,6 +124,97 @@ async fn more_specific_user_runner_list_beats_project_parent() {
 }
 
 #[tokio::test]
+async fn project_runner_refusal_names_claude_code_when_no_sidekick_model_runs_on_it() {
+    let consumer = "prefrontal.sidekick.explore";
+    let harness = Harness::new("sidekick-runner-refusal");
+    let mut catalog = fixture::catalog();
+    catalog.accounts.clear();
+    for model in &mut catalog.models {
+        model.provider = match model.model.as_str() {
+            "model-a" | "model-b" => "anthropic",
+            _ => "example-provider",
+        }
+        .into();
+        model.priced_per_token = true;
+    }
+    catalog.runners.truncate(1);
+    catalog.runners[0].module = AGENT.into();
+    catalog.runners[0].route_keys = catalog
+        .models
+        .iter()
+        .map(|model| model.route_key())
+        .collect();
+    install_catalog(&harness, &catalog);
+    let models: serde_json::Map<_, _> = catalog
+        .models
+        .iter()
+        .map(|model| {
+            (
+                model.route_key(),
+                json!({
+                    "existence":"present", "capability.tool_call":true,
+                    "workload.lookup.excluded":model.route_key() == "anthropic/model-b"
+                }),
+            )
+        })
+        .collect();
+    let snapshot = crate::fusiform_catalog::decode_catalog_get(
+        serde_json::to_vec(&json!({"catalog_version":42,"resolved_at_ms":123,"models":models}))
+            .unwrap(),
+    )
+    .unwrap();
+    crate::fusiform_catalog::apply_mapped_catalog(
+        harness.store(),
+        &snapshot,
+        Some(&harness.credentials()),
+        None,
+    )
+    .unwrap();
+    let declaration = super::super::runners::parse_declaration(&json!({"runner":{
+        "pairs":[{"wire_api":"anthropic.messages", "auth_method":"apikey"}],
+        "harnesses":["opencode2", "claude-code"], "starts_sessions":true,
+        "harness_limits":{
+            "opencode2":{},
+            "claude-code":{"explicit_providers":["anthropic"],
+                "capabilities":["plans","fork_answer","submit_tool","final_text","output_cap","one_off"]}
+        }
+    }})).unwrap().unwrap();
+    harness
+        .credentials()
+        .lock()
+        .unwrap()
+        .runner_declarations
+        .insert(AGENT.into(), declaration);
+    harness.edit_config(|config| {
+        config["consumers"][consumer] = json!({
+            "owner":fixture::CONSUMER.trim_start_matches("reserved:"), "workload":"lookup"
+        });
+        config["models"][MODEL]["not_for"] = json!([consumer]);
+    });
+    let daemon = harness.project_daemon().await;
+    daemon.set(ID, runner_layer(consumer, json!([agent("claude-code")])));
+    let caller = harness.bind(reserved(fixture::CONSUMER), Some(ID)).await;
+    let (frame, reply) = caller
+        .call(
+            "route.select",
+            &json!({"consumer":consumer,"requirements":{"iq":0}}),
+        )
+        .await;
+    assert_eq!(frame, FrameType::Error, "{reply}");
+    assert_eq!(reply["code"], "no_route", "{reply}");
+    assert_eq!(
+        reply["detail"],
+        json!({"reason":"harness_unavailable", "runners":[{
+            "module":AGENT, "harness":"claude-code", "reason":"excluded_by_policy", "filter":"harness_routes"
+        }]})
+    );
+    assert_eq!(
+        reply["message"],
+        "No model this request may use runs on thalamus-harness/claude-code"
+    );
+}
+
+#[tokio::test]
 async fn request_runner_filter_cannot_add_an_enrolled_runner_left_out_of_the_project() {
     let harness = fixture_with_runners(&HARNESSES);
     let daemon = harness.project_daemon().await;

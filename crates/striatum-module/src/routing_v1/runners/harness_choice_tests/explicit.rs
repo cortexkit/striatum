@@ -89,6 +89,7 @@ async fn harness_refusal_names_capability_gap_with_legacy_missing_unchanged() {
              "missing":{"runner/primary":["plans"]}}
         ])
     );
+    assert_eq!(reply.1["message"], "runner/primary lacks plans");
 }
 
 #[tokio::test]
