@@ -62,6 +62,19 @@ Core reads the panel result's `shortfall.detail.causes[i].reset_at_ms` and
 to each cause, not directly to the shortfall. Both panel replies preserve
 `1800000060000`, twelve seconds after the sample clock, for every rejected cause.
 
+## Replacement when all candidates are full
+
+`replace-all-full.request.json` / `replace-all-full.reply.json` capture a
+replacement through `route.select_panel` with a `replace` parameter. A two-seat
+panel is selected first; then all three synthetic accounts are filled through
+real admissions. The response is an unseated `PanelReplacement` with cause
+`no_candidate`. Each concurrency rejection carries `reset_at_ms` at
+`result.detail.causes[i].reset_at_ms` and again in the nested refusal at
+`result.detail.causes[i].detail.detail.reset_at_ms`. The refusal's
+`blockingCauses[0].routes[0].detail` and `rejected[0].detail` also contain
+JSON-encoded account diagnostics with `reset_at_ms`. Other causes describe
+candidates excluded by panel history or family diversity.
+
 ## Regeneration and verification
 
 From the worktree root, with writable sources:
@@ -71,13 +84,13 @@ UPDATE_CONCURRENCY_FULL_SAMPLES=1 cargo nextest run --locked -p striatum-module 
 ```
 
 For remote builds with read-only synced sources, regenerate in a writable scratch
-copy and return the ten JSON files and `SHA256SUMS`, then install them locally.
+copy and return the twelve JSON files and `SHA256SUMS`, then install them locally.
 The environment variable enables writes only for generated files, not this README.
 Without it, regeneration happens in memory and any byte difference, missing file,
-unexpected file or manifest drift fails the test. The five additional handler tests
+unexpected file or manifest drift fails the test. The additional handler tests
 check refusal and panel-shortfall semantics independently of the recorded files.
 
-`SHA256SUMS` covers the ten JSON files and this README, in bytewise filename
+`SHA256SUMS` covers the twelve JSON files and this README, in bytewise filename
 order, excluding the manifest itself. Independently verify from the worktree root:
 
 ```sh

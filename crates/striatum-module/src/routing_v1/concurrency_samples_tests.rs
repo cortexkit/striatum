@@ -130,7 +130,7 @@ async fn capture(stem: &str) -> Sample {
     }
 }
 
-async fn capture_panel(all_full: bool) -> Sample {
+async fn capture_panel(all_full: bool, replacement: bool) -> Sample {
     let _clock = crate::InjectedClock::set(START);
     let _ids = striatum_store::replay::Inputs::new(START as i64).install();
     let harness = Harness::new("concurrency-panel-samples");
@@ -171,7 +171,8 @@ async fn capture_panel(all_full: bool) -> Sample {
     harness.edit_config(|config| {
         config["consumers"] = json!({"prefrontal-core.athena":{
             "owner":"prefrontal-core","pay_per_token":true}});
-        config["panels"]["audit"] = json!({"top_k":3,"by":"iq","extra":0,"floor":0});
+        config["panels"]["audit"] =
+            json!({"top_k":if replacement { 2 } else { 3 },"by":"iq","extra":0,"floor":0});
         config["runners"] = json!([{"module":"broca","via_vault":true}]);
         config["concurrency"] = json!({"enforcement_enabled":true,"providers":{
             "synthetic-0":{"limit":1},"synthetic-1":{"limit":1},
@@ -179,6 +180,16 @@ async fn capture_panel(all_full: bool) -> Sample {
     });
     let runner = harness.bind(reserved("broca"), None).await;
     let consumer = harness.bind(reserved("prefrontal-core"), None).await;
+    let select_params = json!({"class":"audit","consumer":"prefrontal-core.athena",
+        "available_routes":routes,"runners":["broca"],"seed":"fixed"});
+    let replacement_params = if replacement {
+        let selected = consumer.call("route.select_panel", &select_params).await;
+        assert_eq!(selected.0, FrameType::Response, "{}", selected.1);
+        assert_eq!(selected.1["result"]["seats"].as_array().unwrap().len(), 2);
+        Some(json!({"replace":{"panel_id":selected.1["result"]["panel_id"],"slot":0}}))
+    } else {
+        None
+    };
     // Each provider has one eligible API-key account. Leave only the final
     // provider free for the partial panel, without fabricating reservations.
     for model in catalog.models.iter().take(if all_full { 3 } else { 2 }) {
@@ -196,8 +207,7 @@ async fn capture_panel(all_full: bool) -> Sample {
     let _refusal_clock = crate::InjectedClock::set(REFUSED_AT);
     let frame = consumer.request_frame(
         "route.select_panel",
-        &json!({"class":"audit","consumer":"prefrontal-core.athena",
-            "available_routes":routes,"runners":["broca"],"seed":"fixed"}),
+        replacement_params.as_ref().unwrap_or(&select_params),
     );
     let request = frame.body.clone();
     let reply = harness.handle(frame).await;
@@ -243,12 +253,52 @@ fn panel_shortfall(sample: &Sample, seats: usize) {
 
 #[tokio::test]
 async fn panel_all_full_answers_with_zero_seats_and_concurrency_shortfall() {
-    panel_shortfall(&capture_panel(true).await, 0);
+    panel_shortfall(&capture_panel(true, false).await, 0);
 }
 
 #[tokio::test]
 async fn panel_partial_answers_with_one_seat_and_concurrency_shortfall() {
-    panel_shortfall(&capture_panel(false).await, 1);
+    panel_shortfall(&capture_panel(false, false).await, 1);
+}
+
+fn replacement_shortfall(sample: &Sample) {
+    assert_eq!(sample.frame_type, FrameType::Response);
+    let body: Value = serde_json::from_slice(&sample.reply).unwrap();
+    let result = &body["result"];
+    assert_eq!(result["cause"], "no_candidate", "{body}");
+    assert!(result.get("seat").is_none(), "{body}");
+    let causes = result["detail"]["causes"].as_array().unwrap();
+    let full: Vec<_> = causes
+        .iter()
+        .filter(|cause| cause["reason"] == "no_route")
+        .collect();
+    assert_eq!(full.len(), 1, "{body}");
+    for cause in full {
+        assert_eq!(cause["model"], "synthetic-2/panel-model", "{body}");
+        assert_eq!(cause["reset_at_ms"], RESET, "{body}");
+        assert_eq!(cause["detail"]["code"], "no_route", "{body}");
+        assert_eq!(
+            cause["detail"]["detail"]["reason"], "concurrency_full",
+            "{body}"
+        );
+        assert_eq!(cause["detail"]["detail"]["reset_at_ms"], RESET, "{body}");
+    }
+}
+
+#[tokio::test]
+async fn replace_all_full_sample_regenerates_byte_for_byte() {
+    let sample = capture_panel(true, true).await;
+    replacement_shortfall(&sample);
+    let directory =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test-vectors/route-concurrency-full-v1");
+    assert_eq!(
+        sample.request,
+        std::fs::read(directory.join("replace-all-full.request.json")).unwrap()
+    );
+    assert_eq!(
+        sample.reply,
+        std::fs::read(directory.join("replace-all-full.reply.json")).unwrap()
+    );
 }
 
 #[tokio::test]
@@ -365,7 +415,7 @@ async fn handler_samples_regenerate_byte_for_byte() {
             .is_none());
     }
     for (stem, all_full, seats) in [("panel-all-full", true, 0), ("panel-partial", false, 1)] {
-        let sample = capture_panel(all_full).await;
+        let sample = capture_panel(all_full, false).await;
         panel_shortfall(&sample, seats);
         assert!(samples
             .insert(format!("{stem}.request.json"), sample.request)
@@ -374,5 +424,9 @@ async fn handler_samples_regenerate_byte_for_byte() {
             .insert(format!("{stem}.reply.json"), sample.reply)
             .is_none());
     }
+    let replacement = capture_panel(true, true).await;
+    replacement_shortfall(&replacement);
+    samples.insert("replace-all-full.request.json".into(), replacement.request);
+    samples.insert("replace-all-full.reply.json".into(), replacement.reply);
     verify(samples);
 }
