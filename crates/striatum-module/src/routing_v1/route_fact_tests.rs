@@ -13,6 +13,7 @@ const NOW: u64 = 1_800_000_000_000;
 const OWNER: DurableOwner<'_> = DurableOwner::Module("striatum");
 
 mod digest_tests;
+mod fable_limit_tests;
 mod health_tests;
 mod order_tests;
 #[path = "route_fact_tests/transport_cpu_tests.rs"]

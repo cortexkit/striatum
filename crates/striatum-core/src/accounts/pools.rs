@@ -4,9 +4,10 @@
 //! A pool key is (window length in minutes, model scope, pool name). The only
 //! cross-source equivalences are the unnamed keys: a report's `five_hour` and
 //! `seven_day`, a header's `5h` and `7d`, and a reading's aggregate window of
-//! 300 or 10080 minutes all key as `(300 | 10080, every model, no name)`. Two
-//! named pools are distinct whenever their names differ, even at equal length
-//! and scope, and a name whose length nobody stated keys with an unknown length.
+//! 300 or 10080 minutes all key as `(300 | 10080, every model, no name)`.
+//! A report naming its model family's producer scope keys as an unnamed family
+//! window, like the corresponding reading. Named pools remain distinct when
+//! their names differ, even at equal length and scope.
 //!
 //! A block is keyed by (account, pool key); a block with no pool key covers
 //! the whole account and carries a recovery set. Readings are ordered by their
@@ -17,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use super::eligibility::age_band;
 use super::types::{
     AllocatorPolicy, EpochMs, Fence, FenceScope, GeneralWindow, ModelFamily, QuotaReading,
-    ScopedList,
+    ScopedList, PRODUCER_SCOPE_IDS,
 };
 use super::AgeBand;
 
@@ -135,10 +136,10 @@ impl PoolKey {
     /// The key an exhaustion report names, or `None` when it names no pool,
     /// which blocks the whole account. `pool` is the report's pool member and
     /// `limit_window` the window it names: `five_hour` and `seven_day` give a
-    /// length, and any other value is itself the pool's name, of unknown
-    /// length. A named pool is scoped to the reported model's family. A value
-    /// that is not a well-formed pool name is ignored, so a report naming
-    /// nothing routing can key blocks the whole account.
+    /// length, and any other value is a fallback pool name of unknown length.
+    /// A `pool` matching the admitted family's producer scope ID names the
+    /// same unnamed family window as the reading. Other named pools stay
+    /// distinct. A report naming nothing routing can key blocks the account.
     pub fn for_report(
         limit_window: Option<&str>,
         pool: Option<&str>,
@@ -150,6 +151,19 @@ impl PoolKey {
             _ => None,
         };
         let pool = pool.filter(|name| validate_pool_name(name).is_ok());
+        if pool.is_some_and(|name| {
+            PRODUCER_SCOPE_IDS
+                .iter()
+                .any(|&(scope_id, _, scope_family)| {
+                    scope_family == family && scope_id.eq_ignore_ascii_case(name)
+                })
+        }) {
+            return Some(Self {
+                window_minutes: length,
+                scope: PoolScope::Family(family),
+                name: None,
+            });
+        }
         let named_window = limit_window
             .filter(|_| length.is_none())
             .filter(|name| validate_pool_name(name).is_ok());
@@ -663,6 +677,44 @@ mod tests {
         );
         assert_eq!(PoolKey::for_report(None, None, opus), None);
         assert_eq!(PoolKey::for_report(Some("Not A Pool"), None, opus), None);
+    }
+
+    #[test]
+    fn report_pool_matching_its_producer_scope_is_unnamed() {
+        let fable = ModelFamily::Fable;
+        for (window, minutes) in [
+            (Some("seven_day"), Some(10_080)),
+            (Some("five_hour"), Some(300)),
+            (None, None),
+        ] {
+            assert_eq!(
+                PoolKey::for_report(window, Some("fable"), fable),
+                Some(key(minutes, PoolScope::Family(fable), None))
+            );
+        }
+    }
+
+    #[test]
+    fn report_pool_not_matching_its_producer_scope_stays_named() {
+        assert_eq!(
+            PoolKey::for_report(Some("seven_day"), Some("fable"), ModelFamily::Opus),
+            Some(key(
+                Some(10_080),
+                PoolScope::Family(ModelFamily::Opus),
+                Some("fable")
+            ))
+        );
+
+        let gemini = PoolKey::for_report(Some("seven_day"), Some("gemini"), ModelFamily::Other);
+        assert_eq!(
+            gemini,
+            Some(key(Some(10_080), PoolScope::EveryModel, Some("gemini")))
+        );
+        let fence = block(gemini, ResetTime::Missing);
+        let other_pool = reading(NOW - MINUTE, &[(Some("3p"), 10_080, 10.0)]);
+        assert_eq!(ends(&fence, &other_pool), None);
+        let same_pool = reading(NOW - MINUTE, &[(Some("gemini"), 10_080, 10.0)]);
+        assert_eq!(ends(&fence, &same_pool), Some(BlockEnd::Reading));
     }
 
     #[test]

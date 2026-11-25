@@ -189,3 +189,19 @@ prefixes before import.
 | --- | ---: | --- |
 | `broca-output-cap-harness-1124/routing-slot.json` | 2191 | `168755640c483cbd479e915a103a8f335d39f0d4cc8ab4579da1140c6d6b9987` |
 | `broca-output-cap-harness-1124/current-live-routing-slot.json` | 1277 | `6c54624ca04c67c6a6d295849837ccbff28ac0cc9fe840f0298cc51a46a1fa5d` |
+
+## Thalamus Claude Fable limit refusal
+
+`route-limit-fable-v1/` copies both route-fact bodies byte for byte from
+`.cortexkit/internal-docs/samples/route-limit-fable-v1/`. The supplied README
+identifies Thalamus commit `913828d41` as the relay source and
+`routing::tests::record_route_fact_limit_samples` as the recorder. The source
+`SHA256SUMS` (`13f4f22650476d2bcf51e752b2273ce7a32a5c5afa8c7d49cfa95c9db2aac217`)
+was verified before import. The admission ID is synthetic and the reader test
+uses it for the real harness admission. The test sends the original bodies and
+also exercises a copy of the exhaustion body without the two reset members.
+
+| Imported path | SHA-256 |
+| --- | --- |
+| `route-limit-fable-v1/admission_started.json` | `6c5cde0c334d0e1781b52f7025c116afe40f9ec815626aaa126f6a8bb5bd4f9a` |
+| `route-limit-fable-v1/account_limit_exhausted.json` | `e340131fd015890770c01c77d4d7fe91d9eb06138d67ae6c6346506112a4955d` |

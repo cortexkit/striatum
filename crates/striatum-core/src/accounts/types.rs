@@ -454,6 +454,11 @@ pub struct ScopeIdMapping {
     pub family: ModelFamily,
 }
 
+// Insula uses the upstream `limits[].scope.model.id` when available, and the
+// display name otherwise. Keep the producer's spelling here for reading IDs.
+pub(super) const PRODUCER_SCOPE_IDS: &[(&str, u32, ModelFamily)] =
+    &[("Fable", 10_080, ModelFamily::Fable)];
+
 /// Routing policy for account selection. `Default` carries the design's
 /// initial values.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -573,14 +578,14 @@ impl Default for AllocatorPolicy {
             pool_retry_margin_s: 60,
             pool_retry_fallback_s: 300,
             model_pools: Vec::new(),
-            // Insula publishes the Fable window's id as upstream
-            // `limits[].scope.model.id` when available, else the display name,
-            // which today is `Fable`.
-            scope_ids: vec![ScopeIdMapping {
-                scope_id: "Fable".to_string(),
-                window_minutes: 10_080,
-                family: ModelFamily::Fable,
-            }],
+            scope_ids: PRODUCER_SCOPE_IDS
+                .iter()
+                .map(|&(scope_id, window_minutes, family)| ScopeIdMapping {
+                    scope_id: scope_id.into(),
+                    window_minutes,
+                    family,
+                })
+                .collect(),
         }
     }
 }

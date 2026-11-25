@@ -3,7 +3,7 @@ use super::*;
 const DIGEST_HEADER: &str = "Ck-Content-Digest";
 const BROCA_SUBJECT: &str = "ck.box_test.event.broca.route_fact.v1";
 
-async fn consume_notice(
+pub(super) async fn consume_notice(
     handler: &Handler,
     bus: &InMemoryBus,
     cursor: &mut Cursor,
