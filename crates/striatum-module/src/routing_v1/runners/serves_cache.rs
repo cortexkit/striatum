@@ -1,9 +1,11 @@
 //! Last good, complete lists are retained independently for each harness.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
-use cortexkit_role_llm_runner::serves::{decode_serves, ServesEntry, ServesError};
+use cortexkit_role_llm_runner::serves::{
+    decode_serves, ServesEntry, ServesError, ServesLogin, ServesModels,
+};
 use serde_json::Value;
 
 use super::describe_cache::LAST_GOOD_MS;
@@ -17,8 +19,39 @@ pub(crate) struct RunnerServes {
 #[derive(Clone, Debug)]
 struct List {
     at_ms: i64,
-    entries: Arc<[ServesEntry]>,
+    entries: Arc<[IndexedEntry]>,
     in_last_answer: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct IndexedEntry {
+    pub(super) provider: String,
+    pub(super) keyless: bool,
+    all: bool,
+    ids: HashSet<String>,
+}
+
+impl From<ServesEntry> for IndexedEntry {
+    fn from(entry: ServesEntry) -> Self {
+        let (all, ids) = match entry.models {
+            ServesModels::All => (true, entry.except.unwrap_or_default()),
+            ServesModels::List(ids) => (false, ids),
+        };
+        Self {
+            provider: entry.provider,
+            keyless: entry.login == Some(ServesLogin::None),
+            all,
+            ids: ids.into_iter().collect(),
+        }
+    }
+}
+
+impl IndexedEntry {
+    /// The caller has already resolved this model against the catalog. For an
+    /// all-models entry the indexed IDs are exclusions, not inclusions.
+    pub(super) fn placement(&self, catalog_model: &str) -> Option<bool> {
+        (self.all != self.ids.contains(catalog_model)).then_some(self.keyless)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -57,7 +90,7 @@ impl RunnerServes {
                     harness,
                     List {
                         at_ms: now,
-                        entries: entries.into(),
+                        entries: entries.into_iter().map(IndexedEntry::from).collect(),
                         in_last_answer: true,
                     },
                 );
@@ -67,7 +100,7 @@ impl RunnerServes {
         Ok(())
     }
 
-    pub(super) fn lists(&self, now: i64) -> impl Iterator<Item = (Option<&str>, &[ServesEntry])> {
+    pub(super) fn lists(&self, now: i64) -> impl Iterator<Item = (Option<&str>, &[IndexedEntry])> {
         self.lists.iter().filter_map(move |(harness, list)| {
             fresh(list, now).then_some((harness.as_deref(), list.entries.as_ref()))
         })
@@ -83,6 +116,22 @@ impl RunnerServes {
             Some(_) => ListStatus::Expired,
             None => ListStatus::Missing,
         }
+    }
+
+    pub(super) fn includes(
+        &self,
+        harness: Option<&str>,
+        provider: &str,
+        model: &str,
+        now: i64,
+    ) -> bool {
+        self.lists(now)
+            .find(|(name, _)| *name == harness)
+            .is_some_and(|(_, entries)| {
+                entries
+                    .iter()
+                    .any(|entry| entry.provider == provider && entry.placement(model).is_some())
+            })
     }
 }
 

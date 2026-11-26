@@ -49,7 +49,7 @@ mod declared_samples_tests;
 mod eligible_routes;
 #[cfg(test)]
 mod eligible_routes_tests;
-mod keyless;
+pub(super) mod keyless;
 mod price_answer;
 #[cfg(test)]
 mod price_answer_tests;
@@ -1453,14 +1453,19 @@ async fn select_at_tier_attempt(
         &runs,
     );
     keyless::clear_account_state(&keyless_routes, &mut facts, &mut snapshot);
-    let reachable: Vec<&ModelFact> = facts
-        .iter()
-        .filter(|fact| eligible_routes::includes_model(request.eligible_routes.as_deref(), fact))
-        .filter(|fact| {
-            request.available_routes.as_ref().is_none_or(|routes| {
-                routes.contains(&format!("{}/{}", fact.provider_id, fact.model_id))
+    let available_facts = || {
+        facts
+            .iter()
+            .filter(|fact| {
+                eligible_routes::includes_model(request.eligible_routes.as_deref(), fact)
             })
-        })
+            .filter(|fact| {
+                request.available_routes.as_ref().is_none_or(|routes| {
+                    routes.contains(&format!("{}/{}", fact.provider_id, fact.model_id))
+                })
+            })
+    };
+    let reachable: Vec<&ModelFact> = available_facts()
         .filter(|fact| {
             let route = fact_to_route(fact);
             runners.iter().any(|runner| {
@@ -1551,20 +1556,21 @@ async fn select_at_tier_attempt(
         return Err(Refusal::no_route(NoRouteReason::MissingCapability, None));
     }
     if capable.is_empty() && runner_rejections.is_empty() && !eligible_catalog_empty {
-        if request.pin_fallback != Some(PinFallback::Route)
-            && runners.iter().any(|policy| {
-                registry
-                    .get(policy)
-                    .is_some_and(|runner| runner.wire_declaration().is_some())
-            })
-        {
-            if let Some(pin) = request.pin.as_deref().or(inputs.slot_pin.as_deref()) {
-                return Err(Refusal::pin_unavailable(
-                    pin,
-                    PinUnavailableReason::NotAvailable,
-                    None,
-                ));
-            }
+        if !classifier && !unconfirmable && requirements.questions.is_none() {
+            let credentials = deps
+                .broca_credentials
+                .lock()
+                .map_err(store_refusal)?
+                .snapshot();
+            return Err(super::runners::empty_reachable(
+                request,
+                request.pin.as_deref().or(inputs.slot_pin.as_deref()),
+                registry,
+                runners,
+                &available_facts().collect::<Vec<_>>(),
+                &credentials,
+                now as u64,
+            ));
         }
         return Err(Refusal::no_route(NoRouteReason::MissingCapability, None));
     }
@@ -3748,9 +3754,7 @@ impl<'a> Selection<'a> {
     }
 
     fn account_check(&self, selected: &SelectedModelRoute) -> Result<(), Refusal> {
-        if self.keyless_routes.contains(&selected.route_key)
-            || self.keyless_routes.contains(&selected.capacity_key)
-        {
+        if self.keyless_routes.contains(&selected.route_key) {
             return Ok(());
         }
         let policy = self

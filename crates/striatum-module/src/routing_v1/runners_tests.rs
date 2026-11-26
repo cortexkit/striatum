@@ -273,22 +273,24 @@ fn runner_reach_uses_resolved_account_membership_across_manifest_changes() {
             "fixture-runner",
             &["vendor-a", "vendor-b"],
         );
-        for declared in [false, true] {
-            if declared {
-                credentials
-                    .runner_declarations
-                    .insert("fixture-runner".into(), declaration());
-            }
-            assert_eq!(
-                routes(Registry::build(
-                    vec![policy(None)],
-                    &credentials,
-                    &facts,
-                    NOW
-                )),
-                expected
-            );
-        }
+        assert_eq!(
+            routes(Registry::build(
+                vec![policy(None)],
+                &credentials,
+                &facts,
+                NOW
+            )),
+            expected
+        );
+        let mut undeclared = credentials.clone();
+        undeclared.runner_declarations.clear();
+        assert!(routes(Registry::build(
+            vec![policy(None)],
+            &undeclared,
+            &facts,
+            NOW
+        ))
+        .is_empty());
         assert!(routes(Registry::build(
             vec![policy(None)],
             &credentials,

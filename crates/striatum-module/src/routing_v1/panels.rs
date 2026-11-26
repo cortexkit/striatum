@@ -804,7 +804,7 @@ async fn candidates(
         deps.broca_credentials,
         true,
         metered,
-        dry.is_none(),
+        false,
         dry.map(|dry| dry.accounts),
     )
     .map_err(store_refusal)?;
@@ -837,11 +837,32 @@ async fn candidates(
                 })
         })
         .collect();
+    let keyless = super::select::keyless::routes(
+        &prepared.facts,
+        &registry,
+        &runners,
+        policy.runner.as_deref(),
+        |runner, route, capacity| registry.runs(runner, route, capacity),
+    );
+    if let Some(classes) = priced.classes.as_mut().filter(|_| dry.is_none()) {
+        let without_logins =
+            super::select::keyless::models_without_logins(&prepared.facts, &registry, &runners);
+        classes
+            .reserve_selection_probes_where(deps.store, deps.broca_credentials, |fact| {
+                !without_logins.contains(&(fact.provider_id.as_str(), fact.model_id.as_str()))
+            })
+            .map_err(store_refusal)?;
+    }
     let tier_consumer = request
         .settings
         .as_ref()
         .and_then(|s| s.tier_consumer.as_deref())
         .unwrap_or(&request.consumer);
+    super::select::keyless::clear_account_state(
+        &keyless,
+        &mut prepared.facts,
+        &mut prepared.snapshot,
+    );
     let unprojected_snapshot = prepared.snapshot.clone();
     if let Some(classes) = &mut priced.classes {
         let tiers = layers.tier_resolver(&config, tier_consumer);
@@ -856,8 +877,13 @@ async fn candidates(
             &registry,
             metered,
         );
-        classes.apply_eligibility(&mut prepared.snapshot, &prepared.facts, metered, false);
-        classes.apply_legacy_route_fences(&mut prepared.snapshot, &prepared.facts, metered, false);
+        let credentialed = || {
+            prepared.facts.iter().filter(|fact| {
+                keyless.is_empty() || !keyless.contains(&fact_to_route(fact).route_key)
+            })
+        };
+        classes.apply_eligibility(&mut prepared.snapshot, credentialed(), metered, false);
+        classes.apply_legacy_route_fences(&mut prepared.snapshot, credentialed(), metered, false);
     }
     let required = request.requirements.as_ref();
     let mut facts = prepared.facts;
@@ -1120,7 +1146,8 @@ async fn candidates(
         });
         for admitted in admission.admitted {
             let route = admitted.route;
-            if bar.is_some_and(|bar| route.fact.scores.elo < bar)
+            if keyless.contains(&route.route_key)
+                || bar.is_some_and(|bar| route.fact.scores.elo < bar)
                 || request.package_tokens.is_some_and(|tokens| {
                     let fit = package_fit(tokens, &route.fact);
                     fit.package_tokens > fit.budget_tokens

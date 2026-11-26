@@ -1,6 +1,7 @@
 //! Structural serving answers shared by requests on one published input view.
-//! Billing planes, requested runner wire/auth pairs and provider limits, listing
-//! age and probe ownership stay dynamic.
+//! Each request still checks live prices, the selected harness's model list,
+//! the age of the vault listing, and whether another request holds the next
+//! recovery attempt for a blocked account.
 
 use crate::{
     broca_credentials::{AuthCatalog, BrocaCredentials},

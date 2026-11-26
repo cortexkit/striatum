@@ -268,6 +268,7 @@ pub struct CredentialData {
         BTreeMap<String, cortexkit_role_llm_runner::service_tier::ServiceTiers>,
     pub(crate) runner_routed_accounts: BTreeMap<String, Vec<String>>,
     pub(crate) runner_serves: BTreeMap<String, crate::routing_v1::runners::RunnerServes>,
+    pub(crate) runner_describe_connected: BTreeSet<String>,
     /// Successful describes, including explicit withdrawals of tier support.
     /// Shared timestamps let admission-time refreshes renew the poller's view.
     pub(crate) runner_describe_observed: BTreeMap<String, i64>,

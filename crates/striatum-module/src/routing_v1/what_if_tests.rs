@@ -380,9 +380,9 @@ async fn what_if_refuses_invalid_runner_slots_with_the_catalog_parser_error() {
     let before = rows(&harness);
     let credentials = credential_state(&harness);
     for slot in [
-        json!({"runner":{"pairs":"not-an-array"}}),
-        json!({"runner":{"pairs":[{"wire_api":"anthropic.messages"}]}}),
-        json!({"runner":{"pairs":[], "follows_account_choice":"yes"}}),
+        json!({"runner":{"harnesses":"not-an-array"}}),
+        json!({"runner":{"harnesses":[false]}}),
+        json!({"runner":{"follows_account_choice":"yes"}}),
         json!({"runner":{}, "consumers":"not-an-array"}),
     ] {
         let error = super::runners::parse_declaration(&slot).unwrap_err();

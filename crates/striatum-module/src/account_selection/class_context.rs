@@ -2915,10 +2915,10 @@ impl ClassContext {
     /// allocator preflight. V1 must keep these walls at account preflight: a
     /// capacity wall would hide an adequate route and lose `accounts_blocked`
     /// and the reset that lets the caller wait.
-    pub(crate) fn apply_legacy_route_fences(
+    pub(crate) fn apply_legacy_route_fences<'a>(
         &self,
         snapshot: &mut striatum_core::ModelRouteStateSnapshot,
-        facts: &[striatum_core::ModelFact],
+        facts: impl IntoIterator<Item = &'a striatum_core::ModelFact>,
         priced: bool,
         defer_pool_pin: bool,
     ) {

@@ -321,6 +321,7 @@ pub(crate) fn overlay(
         now,
         by_route,
         by_capacity,
+        ..Default::default()
     })
 }
 

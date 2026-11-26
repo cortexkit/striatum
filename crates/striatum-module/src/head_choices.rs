@@ -102,6 +102,9 @@ pub(crate) fn choices_for_harness_with_effort_detail(
     harness: Option<&str>,
     effort_detail: bool,
 ) -> Result<serde_json::Value, ErrorBody> {
+    if credentials.listing_version().is_none() {
+        return Err(not_ready());
+    }
     let snapshot = credentials
         .catalog_snapshot
         .as_ref()
@@ -293,9 +296,6 @@ pub(crate) fn choices_for_harness_with_effort_detail(
             catalog_choice.append_to(&mut choice);
         }
         models.push(choice);
-    }
-    if models.is_empty() && credentials.listing_version().is_none() {
-        return Err(not_ready());
     }
     Ok(json!({"catalog_version": catalog_version, "runner_module": module, "models": models}))
 }

@@ -80,7 +80,7 @@ pub struct CredentialRefusalMark {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RouteRuntimeState {
     /// Request-local reachability independent of runtime availability. A known
-    /// credential/transport match still anchors quality when its accounts cannot
+    /// runner and catalog match still anchors quality when its accounts cannot
     /// send; missing credentials do not. None uses the caller's availability set/map.
     /// This affects quality normalization only, never candidate admission.
     pub statically_routable: Option<bool>,
@@ -125,6 +125,9 @@ pub struct ModelRouteStateSnapshot {
     pub by_route: HashMap<String, RouteRuntimeState>,
     /// Keyed by capacityKey for shared provider/model state.
     pub by_capacity: HashMap<String, RouteRuntimeState>,
+    /// Keyless routes sharing a capacity with a login-requiring sibling.
+    /// The shared account state remains available for those siblings only.
+    pub keyless_mixed_routes: HashSet<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -807,7 +810,22 @@ pub(crate) fn merged_runtime_state(
             merged.latency_ema_ms = route_state.latency_ema_ms;
         }
     }
+    if snapshot.is_some_and(|snapshot| snapshot.keyless_mixed_routes.contains(&route.route_key)) {
+        merged.clear_account_state();
+    }
     merged
+}
+
+impl RouteRuntimeState {
+    pub fn clear_account_state(&mut self) {
+        self.credential_refusal = None;
+        self.quota_exhausted_until = None;
+        self.quota_pressure = None;
+        self.quota_window_model = None;
+        self.quota_abundance = None;
+        self.quota_abundance_window = None;
+        self.subscription_pool = None;
+    }
 }
 
 /// When a route that admission rejects for a timed wall (`cooldown_active`,
@@ -822,6 +840,7 @@ pub fn route_wall_until(
 ) -> Option<f64> {
     let by_route = snapshot.by_route.get(route_key);
     let by_capacity = snapshot.by_capacity.get(capacity_key);
+    let keyless = snapshot.keyless_mixed_routes.contains(route_key);
     // Admission composes the hard walls of both scopes and reads the failure
     // backoff from the route when it has state (see `merged_runtime_state`).
     let backoff = match by_route {
@@ -834,7 +853,7 @@ pub fn route_wall_until(
         .flat_map(|state| {
             [
                 state.cooldown_until,
-                state.quota_exhausted_until,
+                (!keyless).then_some(state.quota_exhausted_until).flatten(),
                 state.provider_reset_until,
             ]
         })
@@ -3738,6 +3757,7 @@ mod abundance_tests {
                     now: 1_000.0,
                     by_route: HashMap::new(),
                     by_capacity,
+                    ..Default::default()
                 }),
                 exclude_route_keys: options.exclude_route_keys,
                 operator_exclude_keys: Vec::new(),
@@ -4277,6 +4297,7 @@ mod availability_credential_tests {
                         ..Default::default()
                     },
                 )]),
+                ..Default::default()
             }),
             exclude_route_keys: Vec::new(),
             operator_exclude_keys: Vec::new(),

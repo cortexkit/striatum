@@ -372,6 +372,12 @@ fn documented_login_rules_do_not_depend_on_runner_or_transport_discovery() {
         &credentials
     ));
     credentials.runner_declarations.clear();
+    assert!(credential_serves_fact(
+        &key,
+        &facts[0],
+        &catalog,
+        &credentials
+    ));
     assert!(!credential_serves_fact(
         &login,
         &facts[0],
@@ -381,6 +387,12 @@ fn documented_login_rules_do_not_depend_on_runner_or_transport_discovery() {
     let (_, mut credentials, _) = setup();
     credentials.wire_apis.clear();
     credentials.publish_billing_catalog(Default::default());
+    assert!(credential_serves_fact(
+        &key,
+        &facts[0],
+        &catalog,
+        &credentials
+    ));
     assert!(!credential_serves_fact(
         &login,
         &facts[0],

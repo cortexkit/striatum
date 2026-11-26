@@ -959,6 +959,7 @@ fn undefined_route_telemetry_does_not_erase_capacity_quota_blocks() {
         now,
         by_route,
         by_capacity,
+        ..Default::default()
     };
     let r = select_model_route(input(
         vec![strong_25(), weak_cheap()],
@@ -997,6 +998,7 @@ fn expired_route_deadlines_do_not_mask_live_capacity_blocks() {
                 ..Default::default()
             },
         )]),
+        ..Default::default()
     };
 
     let selected = select_model_route(input(
@@ -1870,6 +1872,7 @@ fn snapshot_with_quota_exhausted(route_key: &str, until: f64) -> ModelRouteState
         now: 1000.0,
         by_route,
         by_capacity: HashMap::new(),
+        ..Default::default()
     }
 }
 
@@ -4090,6 +4093,7 @@ fn live_band_extra<'a>() -> Extra<'a> {
                 ("anthropic/claude-opus-5-5".to_string(), abundance(0.9)),
                 ("openai/gpt-6.1-sol".to_string(), abundance(0.3)),
             ]),
+            ..Default::default()
         }),
         is_subscription_route: Some(Box::new(|r: &ModelRoute| r.provider_id != "xai")),
         ..Default::default()
@@ -5164,6 +5168,7 @@ fn blocking_causes_identify_only_adequate_routes_and_effective_wall_expiries() {
             ),
         ]),
         by_capacity: HashMap::new(),
+        ..Default::default()
     };
     let mut selection = input(
         facts,

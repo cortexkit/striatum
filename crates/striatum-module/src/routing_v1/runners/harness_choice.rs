@@ -8,6 +8,7 @@ use super::{EffectiveRunner, Registry, RunnerKey, RunnerPolicies};
 
 #[path = "task_refusal.rs"]
 mod task_refusal;
+pub(crate) use task_refusal::empty_reachable;
 pub(crate) use task_refusal::TaskRunnerDiagnostics;
 
 #[derive(Clone, Debug)]
@@ -105,6 +106,7 @@ impl Registry {
         requirements: &Requirements,
     ) -> Self {
         let source = policies.into();
+        let catalog = facts.iter().collect();
         let config = source.config;
         let original = source.enrolled(credentials, now_ms);
         let source_policies = original.clone();
@@ -115,7 +117,7 @@ impl Registry {
             entries: original
                 .iter()
                 .flat_map(|policy| {
-                    Self::build_for_selection(
+                    Self::build_resolved(
                         RunnerPolicies {
                             policies: vec![policy.clone()],
                             config,
@@ -126,6 +128,8 @@ impl Registry {
                         facts,
                         now_ms,
                         requested.or(policy.harness.as_deref()),
+                        true,
+                        &catalog,
                     )
                     .entries
                 })
@@ -172,7 +176,7 @@ impl Registry {
                         })
                 })
                 .map(|harness| Candidate {
-                    runner: Self::build_for_harness(
+                    runner: Self::build_resolved(
                         RunnerPolicies {
                             policies: vec![policy.clone()],
                             config,
@@ -183,6 +187,8 @@ impl Registry {
                         facts,
                         now_ms,
                         Some(harness),
+                        false,
+                        &catalog,
                     )
                     .entries
                     .remove(0),
@@ -192,7 +198,7 @@ impl Registry {
             // The parent retains runner-wide credential metadata for account
             // selection. Route admission uses each candidate's own permitted
             // served models, never a union for a single selected harness.
-            let mut parent = Self::build_for_harness(
+            let mut parent = Self::build_resolved(
                 RunnerPolicies {
                     policies: vec![policy.clone()],
                     config,
@@ -203,6 +209,8 @@ impl Registry {
                 facts,
                 now_ms,
                 None,
+                false,
+                &catalog,
             )
             .entries
             .remove(0);
@@ -230,7 +238,7 @@ impl Registry {
         }
         for (entry, policy) in registry.entries.iter_mut().zip(&source_policies) {
             if requested.is_some() || policy.harness.is_some() || !explicit.is_empty() {
-                entry.placement_baseline = Self::build_for_harness(
+                entry.placement_baseline = Self::build_resolved(
                     RunnerPolicies {
                         policies: vec![policy.clone()],
                         config,
@@ -241,6 +249,8 @@ impl Registry {
                     facts,
                     now_ms,
                     None,
+                    false,
+                    &catalog,
                 )
                 .entries
                 .pop()

@@ -3,7 +3,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use cortexkit_role_llm_runner::serves::{placement, ServesEntry};
 use serde::Serialize;
 use striatum_core::RouteStateStore;
 use striatum_core::{make_route_key, provider_model_spec::CompiledSpecs, ModelFact};
@@ -18,6 +17,7 @@ mod describe_cache;
 pub(crate) mod enrollment;
 mod harness_choice;
 mod serves_cache;
+pub(crate) use harness_choice::empty_reachable;
 pub(crate) use harness_choice::TaskRunnerDiagnostics;
 mod harness_facts;
 #[cfg(test)]
@@ -33,8 +33,8 @@ pub(crate) use admission::fetch_describe;
 pub(crate) use admission::{refresh_admission_tiers, tier_view_unknown, AdmissionDescribes};
 pub(crate) use describe_cache::DescribeCache;
 pub(crate) use harness_facts::RunnerDeclaration;
-use serves_cache::ListStatus;
 pub(crate) use serves_cache::RunnerServes;
+use serves_cache::{IndexedEntry, ListStatus};
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct EffectiveRunner {
@@ -165,13 +165,17 @@ fn placement_routes(
         })
 }
 
+/// Collect fresh lists for the selected harness, or for all starting harnesses
+/// when the caller has not selected one. Account admission without a decision
+/// also uses harnesses that attach to an existing session rather than starting one.
 fn serving_entries<'a>(
     credentials: &'a BrocaCredentials,
     module: &str,
     declaration: Option<&RunnerDeclaration>,
     selected: Option<&str>,
     now_ms: u64,
-) -> BTreeMap<&'a str, Vec<&'a ServesEntry>> {
+    include_non_starting: bool,
+) -> BTreeMap<&'a str, Vec<&'a IndexedEntry>> {
     let mut by_provider = BTreeMap::<_, Vec<_>>::new();
     if let (Some(declaration), Some(serves)) = (declaration, credentials.runner_serves.get(module))
     {
@@ -186,7 +190,8 @@ fn serving_entries<'a>(
             if selected.is_some_and(|selected| Some(selected) != harness) {
                 continue;
             }
-            if selected.is_none()
+            if !include_non_starting
+                && selected.is_none()
                 && harness.is_some()
                 && declaration
                     .limits_for_harness(harness)
@@ -423,7 +428,15 @@ impl Registry {
         facts: &[ModelFact],
         now_ms: u64,
     ) -> Self {
-        Self::build_resolved(policies.into(), credentials, facts, now_ms, None, false)
+        Self::build_resolved(
+            policies.into(),
+            credentials,
+            facts,
+            now_ms,
+            None,
+            false,
+            &facts.iter().collect(),
+        )
     }
 
     pub(crate) fn build_for_harness<'a>(
@@ -433,11 +446,20 @@ impl Registry {
         now_ms: u64,
         harness: Option<&str>,
     ) -> Self {
-        Self::build_resolved(policies.into(), credentials, facts, now_ms, harness, false)
+        Self::build_resolved(
+            policies.into(),
+            credentials,
+            facts,
+            now_ms,
+            harness,
+            false,
+            &facts.iter().collect(),
+        )
     }
 
     /// Session selection resolves defaults; a picker without a harness sees
     /// the union of the runner's starting harnesses.
+    #[cfg(test)]
     pub(crate) fn build_for_selection<'a>(
         policies: impl Into<RunnerPolicies<'a>>,
         credentials: &BrocaCredentials,
@@ -445,7 +467,15 @@ impl Registry {
         now_ms: u64,
         harness: Option<&str>,
     ) -> Self {
-        Self::build_resolved(policies.into(), credentials, facts, now_ms, harness, true)
+        Self::build_resolved(
+            policies.into(),
+            credentials,
+            facts,
+            now_ms,
+            harness,
+            true,
+            &facts.iter().collect(),
+        )
     }
 
     fn build_resolved(
@@ -455,17 +485,8 @@ impl Registry {
         now_ms: u64,
         harness: Option<&str>,
         resolve_default: bool,
+        catalog: &AuthCatalog,
     ) -> Self {
-        let catalog = facts
-            .iter()
-            .collect::<crate::broca_credentials::AuthCatalog>();
-        let mut catalog_models = BTreeMap::<String, BTreeSet<String>>::new();
-        for fact in facts {
-            catalog_models
-                .entry(fact.provider_id.clone())
-                .or_default()
-                .insert(fact.model_id.clone());
-        }
         let entries = source
             .enrolled(credentials, now_ms)
             .into_iter()
@@ -511,6 +532,7 @@ impl Registry {
                     wire_declaration,
                     selected,
                     now_ms,
+                    false,
                 );
                 let mut statically_reachable_models = BTreeSet::new();
                 let mut reachable_models = BTreeSet::new();
@@ -521,15 +543,11 @@ impl Registry {
                     .filter(|fact| entries.contains_key(fact.provider_id.as_str()))
                 {
                     let entries = &entries[fact.provider_id.as_str()];
-                    let models = &catalog_models[&fact.provider_id];
+                    // The current fact is already a catalog member, including
+                    // when it was expanded from a vault provider alias.
                     let (mut keyless, mut needs_login) = (false, false);
                     for entry in entries {
-                        match placement(
-                            std::slice::from_ref(*entry),
-                            &fact.provider_id,
-                            &fact.model_id,
-                            models,
-                        ) {
+                        match entry.placement(&fact.model_id) {
                             Some(true) => keyless = true,
                             Some(false) => needs_login = true,
                             None => {}
@@ -548,7 +566,7 @@ impl Registry {
                         && has_usable_login(
                             source.config,
                             credentials,
-                            &catalog,
+                            catalog,
                             &policy.module,
                             follows_account_choice,
                             fact,
@@ -710,45 +728,57 @@ pub(super) fn unbound_route_is_keyless(
     provider: &str,
     model: &str,
 ) -> bool {
-    use cortexkit_role_llm_runner::serves::ServesLogin;
+    unbound_route_is_keyless_with(
+        &deps.broca_credentials,
+        module,
+        provider,
+        model,
+        crate::now_ms(),
+        || deps.store.get_facts().ok(),
+    )
+}
 
-    let now = crate::now_ms();
-    let Ok(credentials) = deps.broca_credentials.lock() else {
+fn unbound_route_is_keyless_with(
+    shared: &crate::SharedBrocaCredentials,
+    module: &str,
+    provider: &str,
+    model: &str,
+    now: u64,
+    read_facts: impl FnOnce() -> Option<Vec<ModelFact>>,
+) -> bool {
+    let Ok(credentials) = shared.lock().map(|guard| guard.snapshot()) else {
         return false;
     };
-    let credentials = credentials.snapshot();
     let entries = serving_entries(
         &credentials,
         module,
         credentials.runner_declarations.get(module),
         None,
         now,
+        true,
     );
-    let Some(entries) = entries.get(provider).filter(|entries| {
-        entries
-            .iter()
-            .any(|entry| entry.login == Some(ServesLogin::None))
-    }) else {
+    let Some(entries) = entries
+        .get(provider)
+        .filter(|entries| entries.iter().any(|entry| entry.keyless))
+    else {
         return false;
     };
-    let Ok(facts) = deps.store.get_facts() else {
+    let Some(facts) = read_facts() else {
         return false;
     };
     let aliases = credentials.catalog_targets(&facts);
     let catalog_provider = aliases.get(provider).map_or(provider, String::as_str);
-    let models: BTreeSet<_> = facts
+    if !facts
         .iter()
-        .filter(|fact| fact.provider_id == catalog_provider)
-        .map(|fact| fact.model_id.clone())
-        .collect();
-    if !models.contains(model) {
+        .any(|fact| fact.provider_id == catalog_provider && fact.model_id == model)
+    {
         return false;
     }
     // An unbound request names no harness. Only refuse if every serving
     // harness agrees the model needs no login. A bound request uses its decision.
     let mut found_keyless = false;
     for entry in entries {
-        match placement(std::slice::from_ref(*entry), provider, model, &models) {
+        match entry.placement(model) {
             Some(false) => return false,
             Some(true) => found_keyless = true,
             None => {}

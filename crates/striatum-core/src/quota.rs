@@ -977,6 +977,7 @@ mod tests {
             now: NOW_MS,
             by_route: HashMap::new(),
             by_capacity: HashMap::new(),
+            ..Default::default()
         };
         merge_quota_overlay_with(
             &mut snapshot,
@@ -1235,6 +1236,7 @@ mod tests {
             now: NOW_MS,
             by_route: HashMap::new(),
             by_capacity: HashMap::new(),
+            ..Default::default()
         };
         merge_quota_overlay_with(
             &mut snapshot,
@@ -1663,6 +1665,7 @@ mod tests {
                     ..Default::default()
                 },
             )]),
+            ..Default::default()
         };
         merge_quota_overlay_with(
             &mut snapshot,

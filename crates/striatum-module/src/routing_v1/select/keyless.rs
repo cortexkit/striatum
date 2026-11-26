@@ -7,9 +7,10 @@ use striatum_core::{fact_to_route, ModelFact, ModelRouteStateSnapshot};
 use crate::config_policy::RunnerPolicy;
 use crate::routing_v1::runners::Registry;
 
-/// Do not reserve a credential's next recovery attempt when no runnable
-/// placement uses a login. Another variant can still need that credential.
-pub(super) fn models_without_logins<'a>(
+/// Identify models that need no account test. A test holds the next attempt
+/// to see whether a blocked credential can send again. Keep account tests
+/// enabled if any runnable placement of this model or variant needs a login.
+pub(in crate::routing_v1) fn models_without_logins<'a>(
     facts: &'a [ModelFact],
     registry: &Registry,
     policies: &[RunnerPolicy],
@@ -39,7 +40,7 @@ pub(super) fn models_without_logins<'a>(
     keyless
 }
 
-pub(super) fn routes(
+pub(in crate::routing_v1) fn routes(
     facts: &[ModelFact],
     registry: &Registry,
     policies: &[RunnerPolicy],
@@ -67,7 +68,7 @@ pub(super) fn routes(
         .collect()
 }
 
-pub(super) fn clear_account_state(
+pub(in crate::routing_v1) fn clear_account_state(
     routes: &HashSet<String>,
     facts: &mut [ModelFact],
     snapshot: &mut ModelRouteStateSnapshot,
@@ -75,6 +76,12 @@ pub(super) fn clear_account_state(
     if routes.is_empty() {
         return;
     }
+    let shared: HashSet<_> = facts
+        .iter()
+        .map(fact_to_route)
+        .filter(|route| !routes.contains(&route.route_key))
+        .map(|route| route.capacity_key)
+        .collect();
     for fact in facts {
         let route = fact_to_route(fact);
         if !routes.contains(&route.route_key) {
@@ -82,17 +89,13 @@ pub(super) fn clear_account_state(
         }
         fact.billing_plane = None;
         fact.subscription_multiplier = None;
-        for state in [
-            snapshot.by_route.get_mut(&route.route_key),
-            snapshot.by_capacity.get_mut(&route.capacity_key),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            state.credential_refusal = None;
-            state.quota_exhausted_until = None;
-            state.quota_pressure = None;
-            state.subscription_pool = None;
+        if let Some(state) = snapshot.by_route.get_mut(&route.route_key) {
+            state.clear_account_state();
+        }
+        if shared.contains(&route.capacity_key) {
+            snapshot.keyless_mixed_routes.insert(route.route_key);
+        } else if let Some(state) = snapshot.by_capacity.get_mut(&route.capacity_key) {
+            state.clear_account_state();
         }
     }
 }
