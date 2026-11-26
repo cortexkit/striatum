@@ -7,6 +7,11 @@ use striatum_core::subscription::free_before_reset::{WindowReading, HOUR_MS};
 use super::{parse_rfc3339_ms, AccountReadings, MergeOutcome, StoredReading};
 
 const HISTORY_MS: i64 = 6 * HOUR_MS;
+const RESET_JITTER_MS: u64 = 120_000;
+
+fn same_reset(previous: i64, current: i64) -> bool {
+    previous.abs_diff(current) <= RESET_JITTER_MS
+}
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RecentPace(Arc<BTreeMap<(String, String), AccountPace>>);
@@ -23,12 +28,16 @@ struct Series {
 impl Series {
     fn observe(&mut self, at: i64, reset_ms: i64, used: f64) {
         if let Some(&(previous_at, previous_used)) = self.samples.back() {
-            if at < previous_at
-                || (at == previous_at && reset_ms == self.reset_ms && used == previous_used)
-            {
+            if at < previous_at {
                 return;
             }
-            if reset_ms != self.reset_ms || used < previous_used || at == previous_at {
+            let same_window = same_reset(self.reset_ms, reset_ms);
+            if at == previous_at && same_window && used == previous_used {
+                // Updating a jittered reset estimate is not a new usage sample.
+                self.reset_ms = reset_ms;
+                return;
+            }
+            if !same_window || used < previous_used || at == previous_at {
                 self.samples.clear();
             }
         }
@@ -117,7 +126,7 @@ impl RecentPace {
                 .get(&(account.provider.clone(), account.account_id.clone()))
                 .and_then(|windows| windows.get(&(name.to_owned(), window_minutes)))
                 .filter(|series| {
-                    series.reset_ms == resets_at_ms
+                    same_reset(series.reset_ms, resets_at_ms)
                         && series.samples.back().is_some_and(|&(at, used)| {
                             Some(at) == fetched_at && used == used_percent
                         })
@@ -149,6 +158,81 @@ fn window_fields(raw: &Value) -> Option<(i64, i64, f64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::account_quota::{apply_provider_reply, AccountQuotaState};
+    use crate::account_selection::rfc3339;
+    use serde_json::json;
+
+    const POLL_NOW: i64 = 1_900_000_000_000;
+
+    fn window(reset: &str, used: f64) -> Value {
+        json!({"usedPercent":used,"windowMinutes":10080,"resetsAt":reset})
+    }
+
+    fn poll(state: &mut AccountQuotaState, at: i64, primary: Value) {
+        let body = json!({"result":[{
+            "provider":"claude", "apiProvider":"anthropic", "account":"work",
+            "source":"vault", "fetchedAt":rfc3339(at), "usage":{"primary":primary}
+        }], "completeProviders":["claude"]});
+        apply_provider_reply(state, "claude", &serde_json::to_vec(&body).unwrap(), at).unwrap();
+    }
+
+    #[test]
+    fn provider_poll_builds_pace_with_subsecond_reset_jitter() {
+        let mut state = AccountQuotaState::default();
+        let reset = rfc3339(POLL_NOW + HOUR_MS);
+        let reset = reset.strip_suffix('Z').unwrap();
+        poll(
+            &mut state,
+            POLL_NOW - 5 * HOUR_MS / 4,
+            window(&format!("{reset}.729890+00:00"), 20.0),
+        );
+        for (at, offset, used) in [
+            (POLL_NOW, 0, 25.0),
+            (POLL_NOW, 120_000, 25.0),
+            (POLL_NOW + HOUR_MS / 4, 240_000, 26.0),
+        ] {
+            let reset_ms = POLL_NOW + HOUR_MS + offset;
+            let reset = rfc3339(reset_ms);
+            let reset = reset.strip_suffix('Z').unwrap();
+            poll(
+                &mut state,
+                at,
+                window(&format!("{reset}.117982+00:00"), used),
+            );
+            let account = &state.readings.readings[&("claude".into(), "work".into())];
+            let reading = state
+                .recent_pace
+                .reading(account, "primary", &account.entry["usage"]["primary"])
+                .unwrap();
+            assert_eq!(reading.resets_at_ms, reset_ms + 117);
+            assert_eq!(
+                reading.pace_points_per_hour,
+                Some(4.0),
+                "offset {offset} ms"
+            );
+        }
+    }
+
+    #[test]
+    fn reading_matches_pace_only_within_two_minutes_of_the_tracked_reset() {
+        let mut state = AccountQuotaState::default();
+        let reset = POLL_NOW + HOUR_MS;
+        poll(
+            &mut state,
+            POLL_NOW - HOUR_MS,
+            window(&rfc3339(reset), 20.0),
+        );
+        poll(&mut state, POLL_NOW, window(&rfc3339(reset), 25.0));
+        let account = &state.readings.readings[&("claude".into(), "work".into())];
+        for (offset, pace) in [(-120_000, Some(5.0)), (120_000, Some(5.0)), (121_000, None)] {
+            let reading = state
+                .recent_pace
+                .reading(account, "primary", &window(&rfc3339(reset + offset), 25.0))
+                .unwrap();
+            assert_eq!(reading.resets_at_ms, reset + offset);
+            assert_eq!(reading.pace_points_per_hour, pace, "offset {offset} ms");
+        }
+    }
 
     #[test]
     fn pace_uses_oldest_reading_inside_six_hours_and_restarts_on_reset_or_correction() {

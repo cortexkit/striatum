@@ -90,6 +90,7 @@ struct LiveQuota {
 struct CommittedQuota {
     cache: crate::QuotaCache,
     readings: account_quota::AccountReadings,
+    recent_pace: account_quota::recent_pace::RecentPace,
     baseline: Option<InventoryCoverage>,
     updated: Option<ReadingKey>,
 }
@@ -151,19 +152,15 @@ impl LiveQuota {
             .lock()
             .map_err(|_| "quota cache poisoned")?
             .clone();
-        let (readings, credential_identities) = {
+        // Stage readings and pace together so neither is published on a store failure.
+        let mut accounts = {
             let accounts = self.accounts.lock().map_err(|_| "account cache poisoned")?;
-            (
-                accounts.readings.clone(),
-                accounts.credential_identities.clone(),
-            )
-        };
-        // Usage merges only readings; the independently refreshed vault roster
-        // need not be copied or restored by an Insula event.
-        let mut accounts = account_quota::AccountQuotaState {
-            readings,
-            credential_identities,
-            ..Default::default()
+            account_quota::AccountQuotaState {
+                readings: accounts.readings.clone(),
+                recent_pace: accounts.recent_pace.clone(),
+                credential_identities: accounts.credential_identities.clone(),
+                ..Default::default()
+            }
         };
         let at_ms = crate::now_ms();
         // A single account event cannot replace the entire restored snapshot.
@@ -204,6 +201,7 @@ impl LiveQuota {
         Ok(CommittedQuota {
             cache,
             readings: accounts.readings,
+            recent_pace: accounts.recent_pace,
             baseline,
             updated,
         })
@@ -228,6 +226,7 @@ impl LiveQuota {
         cache.snapshot_persistence = persistence;
         // Roster refresh has its own writer; do not overwrite its concurrent result.
         guard.readings = committed.readings;
+        guard.recent_pace = committed.recent_pace;
         guard.last_insula_error = None;
         if let Some(coverage) = committed.baseline {
             *baseline = coverage;
@@ -365,6 +364,24 @@ impl LiveQuota {
 trait SampleSource {
     async fn fetch(&mut self, key: &str) -> Result<Vec<u8>, String>;
     async fn snapshot(&mut self) -> Result<Vec<u8>, String>;
+}
+
+#[cfg(test)]
+pub(crate) fn store_test_samples(
+    store: SharedStore,
+    accounts: account_quota::SharedAccountQuota,
+    samples: impl IntoIterator<Item = (i64, Value)>,
+) {
+    let live = LiveQuota {
+        cache: Default::default(),
+        accounts,
+        store,
+        snapshot_baseline: Default::default(),
+    };
+    for (at, sample) in samples {
+        let _clock = crate::InjectedClock::set(at as u64);
+        live.store_sample(sample).unwrap();
+    }
 }
 
 #[async_trait::async_trait]

@@ -86,6 +86,47 @@ async fn sweep(
 }
 
 #[tokio::test]
+async fn quota_events_with_reset_jitter_show_pace_in_what_if_preview() {
+    let _clock = crate::InjectedClock::set(KIMI_NOW as u64);
+    let (harness, scenario, fixture) = setup(false);
+    install_grok(&harness);
+    let listing = install_key_only_kimi(&harness);
+    harness.edit_config(|config| {
+        config["consumers"]["prefrontal.mason"]["mode"] = json!("demand");
+    });
+    drop(scenario);
+
+    let accounts = std::sync::Arc::new(std::sync::Mutex::new(kimi_state(&listing, false)));
+    let minute = 60_000;
+    let reset = KIMI_NOW + HOUR_MS;
+    let samples = [
+        (KIMI_NOW - 75 * minute, reset, 15.0),
+        (KIMI_NOW - 30 * minute, reset + 1_000, 18.0),
+        (KIMI_NOW, reset + 2_000, 20.0),
+    ];
+    crate::quota_events::store_test_samples(
+        harness.store().clone(),
+        accounts.clone(),
+        samples
+            .into_iter()
+            .enumerate()
+            .map(|(index, (at, reset, used))| {
+                let mut sample = grok_reading(at, reset, used, None);
+                sample["epoch"] = json!("grok-epoch");
+                sample["seq"] = json!(index + 1);
+                (at, sample)
+            }),
+    );
+
+    let state = accounts.lock().unwrap().clone();
+    let row = sweep(&harness, &fixture, state).await;
+    let price = &candidate(&row, GROK_ROUTE)["free_before_reset_preview"];
+    assert_eq!(price["pace_points_per_hour"], 4.0, "{price}");
+    assert_eq!(price["free_before_reset"], true);
+    assert_eq!(price["final_cost_usd"], 0.0);
+}
+
+#[tokio::test]
 async fn grok_overtakes_a_cheaper_route_and_free_ties_spend_the_soonest_reset() {
     let _clock = crate::InjectedClock::set(KIMI_NOW as u64);
     let (harness, scenario, fixture) = setup(false);

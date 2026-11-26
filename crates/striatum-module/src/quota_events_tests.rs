@@ -784,6 +784,48 @@ fn snapshot_body(body: &str) -> Vec<u8> {
     format!(r#"{{"result":[{body}]}}"#).into_bytes()
 }
 
+#[test]
+fn quota_event_pace_restarts_after_a_real_reset() {
+    use crate::account_selection::rfc3339;
+    use striatum_core::subscription::free_before_reset::HOUR_MS;
+
+    let (_scratch, live) = fixture();
+    let reset = 1_900_000_000_000;
+    let next_reset = reset + 7 * 24 * HOUR_MS;
+    let publish_sample = |seq, at: i64, resets_at, used| {
+        let _clock = crate::InjectedClock::set(at as u64);
+        let sample = json!({
+            "provider":"codex", "account":"work", "apiProvider":"openai",
+            "source":"vault", "fetchedAt":rfc3339(at), "epoch":"epoch", "seq":seq,
+            "usage":{"primary":{
+                "usedPercent":used, "windowMinutes":10080, "resetsAt":rfc3339(resets_at)
+            }}
+        });
+        live.store_sample(sample).unwrap();
+    };
+    let window = || {
+        let accounts = live.accounts.lock().unwrap();
+        let row = &accounts.readings.readings[&("codex".into(), "work".into())];
+        accounts
+            .recent_pace
+            .reading(row, "primary", &row.entry["usage"]["primary"])
+            .unwrap()
+    };
+
+    publish_sample(1, reset - 2 * HOUR_MS, reset, 30);
+    publish_sample(2, reset - HOUR_MS / 2, reset, 36);
+    assert_eq!(window().pace_points_per_hour, Some(4.0), "before reset");
+
+    publish_sample(3, reset + HOUR_MS / 2, next_reset, 1);
+    let restarted = window();
+    assert_eq!(restarted.resets_at_ms, next_reset);
+    assert_eq!(restarted.used_percent, 1.0);
+    assert_eq!(restarted.pace_points_per_hour, None, "after reset");
+
+    publish_sample(4, reset + 3 * HOUR_MS / 2, next_reset, 3);
+    assert_eq!(window().pace_points_per_hour, Some(2.0), "new window only");
+}
+
 async fn publish(bus: &InMemoryBus, source: &mut Source, body: &str) -> String {
     let identity: SampleIdentity = serde_json::from_str(body).unwrap();
     let mut key = BTreeMap::from([
