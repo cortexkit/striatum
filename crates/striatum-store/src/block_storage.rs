@@ -743,13 +743,21 @@ pub(crate) struct WallSource<'a> {
     pub error: Option<&'a str>,
     pub class: Option<&'a str>,
     pub unscoped: bool,
-    pub provider_retry: bool,
-    pub new_wall: bool,
 }
 
+#[cfg(test)]
 pub(crate) fn wall_source(
     conn: &Connection,
     wall: WallSource<'_>,
+) -> rusqlite::Result<Option<StoredBlock>> {
+    wall_source_with_retry(conn, wall, false, false)
+}
+
+pub(crate) fn wall_source_with_retry(
+    conn: &Connection,
+    wall: WallSource<'_>,
+    provider_retry: bool,
+    new_wall: bool,
 ) -> rusqlite::Result<Option<StoredBlock>> {
     if wall.cooldown.is_none() && wall.exhausted.is_none() {
         return Ok(None);
@@ -774,7 +782,7 @@ pub(crate) fn wall_source(
         evidence_at: wall.observed_at,
         quota: Some(false),
         deadline: Some(deadline.as_f64()),
-        rate_limit_retry: wall.provider_retry,
+        rate_limit_retry: provider_retry,
         ..Default::default()
     })?;
     row.deadline = Some(deadline);
@@ -784,8 +792,8 @@ pub(crate) fn wall_source(
     row.scope_error = wall.error.map(str::to_owned);
     row.wall_class = wall.class.map(str::to_owned);
     row.wall_unscoped = wall.unscoped;
-    if wall.new_wall {
-        row.reason = Some(if wall.provider_retry {
+    if new_wall {
+        row.reason = Some(if provider_retry {
             PROVIDER_RETRY_REASON.into()
         } else {
             String::new()
