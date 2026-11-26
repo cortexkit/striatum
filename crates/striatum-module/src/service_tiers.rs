@@ -82,14 +82,7 @@ pub(crate) fn runner_supports(
     else {
         return false;
     };
-    if !runner.follows_account_choice
-        || !runner.pairs.as_ref().is_none_or(|pairs| {
-            pairs.iter().any(|pair| {
-                pair.wire_api == wire
-                    && Some(pair.auth_method.as_str()) == row.auth_method.as_deref()
-            })
-        })
-    {
+    if !runner.follows_account_choice {
         return false;
     }
     credentials

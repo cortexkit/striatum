@@ -94,7 +94,7 @@ impl DescribePeer {
                 DescribeReply::Plans(_) | DescribeReply::PlansStall => {
                     json!({"name":"plan.prices", "arguments":{}})
                 }
-                _ => json!({"method":"role.describe", "params":{}}),
+                _ => json!({"method":"role.describe", "params":{"serves":true}}),
             };
             assert_eq!(
                 serde_json::from_slice::<Value>(&request.body).unwrap(),
@@ -244,7 +244,7 @@ fn live_describe() -> Value {
         "../../../fixtures/contracts/broca-service-tiers-v1/role-describe-live.json"
     ))
     .unwrap();
-    reply["result"].clone()
+    with_broca_serves(reply["result"].clone())
 }
 
 fn assert_candidate_detail(reply: &Value, request: &Value, reason: &str) {
@@ -471,12 +471,7 @@ async fn draining_runner_failed_fresh_describe_open_and_catalog_gap_keep_fast_ad
     )
     .unwrap();
     let mut cache = runners::DescribeCache::default();
-    cache.catalog(
-        &json!([{"module_id":"broca","nonce_verified":true}]),
-        &policies,
-        &mut credentials,
-        NOW as i64,
-    );
+    cache.catalog(&broca_modules(), &policies, &mut credentials, NOW as i64);
     cache.reply(
         "broca",
         Some(&live_describe()),

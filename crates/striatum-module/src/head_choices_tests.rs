@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 use striatum_core::{make_route_key, RouteStateStore};
 use subc_protocol::FrameType;
 
-use super::conformance_tests::{reserved, Harness, Route};
+use super::conformance_tests::{publish_runner_serves, reserved, Harness, Route};
 use crate::{broca_credentials::BrocaCredentials, fusiform_catalog, tests::fact};
 
 const RUNNER: &str = "thalamus-harness";
@@ -13,6 +13,23 @@ const LEGACY: &str = "legacy-runner";
 const NO_TIERS: &str = "no-tiers-runner";
 const API_KEY_RUNNER: &str = "api-key-runner";
 const WIRE: &str = "openai.responses";
+
+fn declare_picker_runner(credentials: &mut BrocaCredentials, module: &str, providers: &[&str]) {
+    credentials.runner_declarations.insert(
+        module.into(),
+        super::runners::parse_declaration(&json!({"runner":{"follows_account_choice":true}}))
+            .unwrap()
+            .unwrap(),
+    );
+    publish_runner_serves(
+        credentials,
+        module,
+        &json!({
+            "generation":"picker-fixture",
+            "entries": providers.iter().map(|provider| json!({"provider":provider,"models":"all"})).collect::<Vec<_>>()
+        }),
+    );
+}
 
 fn fixture() -> (Arc<Harness>, BrocaCredentials) {
     let harness = Harness::new("head-choices");
@@ -41,6 +58,7 @@ fn fixture() -> (Arc<Harness>, BrocaCredentials) {
     .chain([
         fact("anthropic", "claude"),
         fact("unmapped", "absent-account"),
+        fact("xai", "metered"),
     ])
     .collect();
     facts
@@ -96,11 +114,11 @@ fn fixture() -> (Arc<Harness>, BrocaCredentials) {
                     ..Default::default()
                 })
                 .chain([ListedCredential {
-                    id: "openai-key".into(),
+                    id: "xai-key".into(),
                     state: "active".into(),
                     categories: vec!["llm-provider".into()],
-                    provider_ids: vec!["openai".into()],
-                    serves: vec!["openai".into()],
+                    provider_ids: vec!["xai".into()],
+                    serves: vec!["xai".into()],
                     credential_type: "apikey".into(),
                     auth_method: Some("apikey".into()),
                     ..Default::default()
@@ -139,18 +157,11 @@ fn fixture() -> (Arc<Harness>, BrocaCredentials) {
         }
     }]}));
     for runner in [RUNNER, NO_TIERS, "policy-runner", "pin-runner"] {
-        credentials.runner_declarations.insert(runner.into(), super::runners::parse_declaration(
-            &json!({"runner":{"pairs":[{"wire_api":WIRE,"auth_method":"oauth"}],"follows_account_choice":true}})
-        ).unwrap().unwrap());
+        declare_picker_runner(&mut credentials, runner, &["openai"]);
     }
-    credentials.runner_declarations.insert(API_KEY_RUNNER.into(), super::runners::parse_declaration(
-        &json!({"runner":{"pairs":[{"wire_api":WIRE,"auth_method":"apikey"}],"follows_account_choice":true}})
-    ).unwrap().unwrap());
-    // The catalog's Anthropic row also needs a declared serving pair, even
-    // though the legacy picker itself has no runner declaration.
-    credentials.runner_declarations.insert("anthropic-wire-support".into(), super::runners::parse_declaration(
-        &json!({"runner":{"pairs":[{"wire_api":"anthropic.messages","auth_method":"oauth"}],"follows_account_choice":true}})
-    ).unwrap().unwrap());
+    declare_picker_runner(&mut credentials, API_KEY_RUNNER, &["xai"]);
+    declare_picker_runner(&mut credentials, LEGACY, &["openai", "anthropic"]);
+    declare_picker_runner(&mut credentials, "anthropic-wire-support", &["anthropic"]);
     credentials.runner_service_tiers.insert(RUNNER.into(), super::runners::service_tiers_from_describe(
         &json!({"capabilities":["service_tier"],"service_tiers":{WIRE:{"levels":["fast"],"served":"reported"}}})
     ).unwrap());
@@ -160,7 +171,7 @@ fn fixture() -> (Arc<Harness>, BrocaCredentials) {
             {"module":LEGACY,"via_vault":true},
             {"module":"policy-runner","routes":["openai/a-head","openai/blocked"]},
             {"module":"pin-runner","routes":["openai/pinned"]},
-            {"module":API_KEY_RUNNER,"via_vault":true,"routes":["openai/pinned"]}
+            {"module":API_KEY_RUNNER,"via_vault":true,"routes":["xai/metered"]}
         ]);
         config["providers"] = json!({"openai":{"models":["a-head","pinned","blocked","only-mason","no-tools","deprecated","unscored"]}});
         config["models"] = json!({"openai/pinned":{"pin_only":true},
@@ -171,7 +182,10 @@ fn fixture() -> (Arc<Harness>, BrocaCredentials) {
     (harness, credentials)
 }
 
-fn broca_live_catalog_fixture(mark_speed_twin: bool) -> Arc<Harness> {
+fn broca_live_catalog_fixture(
+    mark_speed_twin: bool,
+    antigravity_login_methods: bool,
+) -> Arc<Harness> {
     let input: Value = serde_json::from_str(include_str!(
         "../fixtures/head-choices-broca-live-inputs-20261114.json"
     ))
@@ -218,6 +232,32 @@ fn broca_live_catalog_fixture(mark_speed_twin: bool) -> Arc<Harness> {
         "quality_scores": {"graded_by":"operator", "graded_at_ms":1794404263000_i64},
         "models": input["catalog_models"]
     });
+    if antigravity_login_methods {
+        let current: Value =
+            serde_json::from_slice(include_bytes!("../fixtures/served-payloads-dd928ca5.json"))
+                .unwrap();
+        let aliases: std::collections::BTreeSet<_> = current
+            .as_object()
+            .unwrap()
+            .values()
+            .filter_map(|case| case["response"]["login_methods"].as_array())
+            .flatten()
+            .filter_map(|row| {
+                row["model"]
+                    .as_str()
+                    .filter(|model| model.starts_with("google/antigravity-"))
+                    .map(|model| {
+                        assert_eq!(row["auth_methods"], json!(["antigravity"]));
+                        model
+                    })
+            })
+            .collect();
+        assert_eq!(aliases.len(), 7);
+        catalog["login_methods"] = json!(aliases
+            .into_iter()
+            .map(|model| { json!({"model":model,"auth_methods":["antigravity"]}) })
+            .collect::<Vec<_>>());
+    }
     if mark_speed_twin {
         let served: Value = serde_json::from_str(include_str!(
             "../fixtures/service-tier-v1/kimi-served-payloads.json"
@@ -338,9 +378,28 @@ fn broca_live_catalog_fixture(mark_speed_twin: bool) -> Arc<Harness> {
     credentials.publish_plan_prices(&plan_prices);
     credentials.runner_declarations.insert(
         "broca".into(),
-        super::runners::parse_declaration(&input["runner_declaration"])
-            .unwrap()
-            .unwrap(),
+        super::runners::parse_declaration(&json!({"runner": {
+            "follows_account_choice":true, "harnesses":["broca"],
+            "harness_limits":{"broca":{"capabilities":["one_off","fork_answer"]}}
+        }}))
+        .unwrap()
+        .unwrap(),
+    );
+    // Every provider in this bounded capture had a matching transport and
+    // login under the then-current Broca declaration. Its complete catalog
+    // rows are the sample's effective served set; speed twins are still
+    // filtered independently by the picker.
+    publish_runner_serves(
+        &mut credentials,
+        "broca",
+        &json!({
+            "generation":"nov-14-capture", "harnesses":{"broca":[
+                {"provider":"anthropic","models":"all"}, {"provider":"deepseek","models":"all"},
+                {"provider":"google","models":"all"}, {"provider":"kimi-code-plan-global","models":"all"},
+                {"provider":"openai","models":"all"}, {"provider":"opencode","models":"all"},
+                {"provider":"xai","models":"all"}
+            ]}
+        }),
     );
     credentials.runner_service_tiers.insert(
         "broca".into(),
@@ -400,7 +459,7 @@ fn ids(reply: &Value) -> Vec<String> {
 
 #[tokio::test]
 async fn broca_head_choices_lists_speed_twin_only_as_base_fast_tier() {
-    let harness = broca_live_catalog_fixture(true);
+    let harness = broca_live_catalog_fixture(true, true);
     let reply = query(&harness, "broca").await;
     assert!(
         !ids(&reply).contains(&"kimi-code-plan-global/k3.1-pro-highspeed".into()),
@@ -429,12 +488,10 @@ async fn decommissioned_models_are_absent_from_head_choices() {
     assert!(!ids(&query(&harness, RUNNER).await).contains(&"openai/a-head".into()));
 }
 
-fn declare_harness_limits(credentials: &mut BrocaCredentials, limits: Value) {
+fn declare_harness_lists(credentials: &mut BrocaCredentials, limits: Value, lists: Value) {
     credentials.runner_declarations.insert(
         RUNNER.into(),
         super::runners::parse_declaration(&json!({"runner": {
-            "pairs":[{"wire_api":WIRE,"auth_method":"oauth"},
-                {"wire_api":"anthropic.messages","auth_method":"oauth"}],
             "follows_account_choice":true,
             "harnesses":["claude-code","codex"],
             "default_harness":"claude-code",
@@ -443,16 +500,22 @@ fn declare_harness_limits(credentials: &mut BrocaCredentials, limits: Value) {
         .unwrap()
         .unwrap(),
     );
+    publish_runner_serves(
+        credentials,
+        RUNNER,
+        &json!({"generation":"harness-lists","harnesses":lists}),
+    );
 }
 
 #[tokio::test]
 async fn harness_choices_keep_routes_only_if_a_serving_harness_allows_them() {
     let (harness, mut credentials) = fixture();
-    declare_harness_limits(
+    declare_harness_lists(
         &mut credentials,
+        json!({}),
         json!({
-            "claude-code": {"exclude":["openai/a-head","anthropic/claude"]},
-            "codex": {"pairs":[{"wire_api":WIRE,"auth_method":"oauth"}]}
+            "claude-code":[{"provider":"openai","models":"all","except":["a-head"]}],
+            "codex":[{"provider":"openai","models":"all"}]
         }),
     );
     harness.set_credentials(credentials);
@@ -469,11 +532,15 @@ async fn harness_choices_keep_routes_only_if_a_serving_harness_allows_them() {
 }
 
 #[tokio::test]
-async fn harness_choices_use_only_the_requested_harness_exclusions() {
+async fn harness_choices_use_only_the_requested_harness_list() {
     let (harness, mut credentials) = fixture();
-    declare_harness_limits(
+    declare_harness_lists(
         &mut credentials,
-        json!({"claude-code": {"exclude":["openai/a-head"]}}),
+        json!({}),
+        json!({
+            "claude-code":[{"provider":"anthropic","models":"all"},{"provider":"openai","models":"all","except":["a-head"]}],
+            "codex":[{"provider":"anthropic","models":"all"},{"provider":"openai","models":"all"}]
+        }),
     );
     harness.set_credentials(credentials);
     let route = harness.bind(reserved("occipital"), None).await;
@@ -500,13 +567,15 @@ async fn harness_choices_use_only_the_requested_harness_exclusions() {
 }
 
 #[tokio::test]
-async fn harness_choices_narrow_pairs_and_absent_harness_keeps_runner_union() {
+async fn harness_choices_use_the_runner_union_when_no_harness_is_requested() {
     let (harness, mut credentials) = fixture();
-    declare_harness_limits(
+    declare_harness_lists(
         &mut credentials,
-        json!({"claude-code": {
-            "pairs":[{"wire_api":"anthropic.messages","auth_method":"oauth"}]
-        }}),
+        json!({}),
+        json!({
+            "claude-code":[{"provider":"anthropic","models":"all"}],
+            "codex":[{"provider":"anthropic","models":"all"},{"provider":"openai","models":"all"}]
+        }),
     );
     harness.set_credentials(credentials);
     let route = harness.bind(reserved("occipital"), None).await;
@@ -549,13 +618,15 @@ async fn harness_choices_narrow_pairs_and_absent_harness_keeps_runner_union() {
 }
 
 #[tokio::test]
-async fn harness_choices_narrow_providers_and_malformed_map_falls_back_for_every_harness() {
+async fn harness_choices_keep_serves_lists_when_capability_map_is_malformed() {
     let (harness, mut credentials) = fixture();
-    declare_harness_limits(
+    declare_harness_lists(
         &mut credentials,
-        json!({"claude-code": {
-            "explicit_providers":["anthropic"]
-        }}),
+        json!({}),
+        json!({
+            "claude-code":[{"provider":"anthropic","models":"all"}],
+            "codex":[{"provider":"anthropic","models":"all"},{"provider":"openai","models":"all"}]
+        }),
     );
     let narrowed = crate::head_choices::choices_for_harness(
         harness.store(),
@@ -566,11 +637,13 @@ async fn harness_choices_narrow_providers_and_malformed_map_falls_back_for_every
     )
     .unwrap();
     assert_eq!(ids(&narrowed), vec!["anthropic/claude"]);
-    declare_harness_limits(
+    let entries =
+        json!([{"provider":"anthropic","models":"all"},{"provider":"openai","models":"all"}]);
+    declare_harness_lists(
         &mut credentials,
+        json!({"codex":{"capabilities":["not a token"]}}),
         json!({
-            "claude-code":{"explicit_providers":["anthropic"]},
-            "codex":{"pairs":[]}
+            "claude-code":entries,"codex":entries
         }),
     );
     crate::take_operator_warnings();
@@ -594,15 +667,16 @@ async fn harness_choices_narrow_providers_and_malformed_map_falls_back_for_every
     }
     let warnings = crate::take_operator_warnings();
     assert!(
-        warnings.iter().any(|warning| warning
-            .contains("runner.harness_limits.codex.pairs is empty")
-            && warning.contains("using runner-level limits")),
+        warnings.iter().any(
+            |warning| warning.contains("runner.harness_limits.codex.capabilities")
+                && warning.contains("using runner-level limits")
+        ),
         "{warnings:?}"
     );
 }
 
 #[tokio::test]
-async fn reachability_uses_declared_pairs_and_vault_fallback() {
+async fn reachability_uses_declared_lists() {
     let (harness, _) = fixture();
     assert_eq!(
         ids(&query(&harness, RUNNER).await),
@@ -630,17 +704,7 @@ async fn head_choices_hide_api_key_pool_aliases_on_every_runner() {
         },
         crate::now_ms(),
     );
-    credentials.runner_declarations.insert(
-        "broca".into(),
-        super::runners::parse_declaration(&json!({"runner":{"pairs":[
-            {"wire_api":WIRE,"auth_method":"oauth"},
-            {"wire_api":WIRE,"auth_method":"apikey"},
-            {"wire_api":"anthropic.messages","auth_method":"oauth"},
-            {"wire_api":"anthropic.messages","auth_method":"apikey"}
-        ],"follows_account_choice":true}}))
-        .unwrap()
-        .unwrap(),
-    );
+    declare_picker_runner(&mut credentials, "broca", &["openai", "anthropic"]);
     harness.edit_config(|config| {
         config["runners"].as_array_mut().unwrap().push(json!({
             "module":"broca", "via_vault":true
@@ -773,7 +837,7 @@ async fn billing_distinguishes_reachable_subscriptions_from_per_token_keys() {
     assert_eq!(subscription["models"][1]["billing"], "subscription");
 
     let metered = query(&harness, API_KEY_RUNNER).await;
-    assert_eq!(ids(&metered), ["openai/pinned"]);
+    assert_eq!(ids(&metered), ["xai/metered"]);
     assert_eq!(metered["models"][0]["billing"], "per_token");
     assert_eq!(metered["models"][0]["pin_only"], true);
 
@@ -790,53 +854,11 @@ async fn billing_distinguishes_reachable_subscriptions_from_per_token_keys() {
 }
 
 #[tokio::test]
-async fn pair_wire_requirements_filter_choices_and_keep_matching_subscription_accounts() {
-    let (harness, mut credentials) = fixture();
-    for limit_requirement in [json!(false), json!(true)] {
-        credentials.runner_declarations.insert(RUNNER.into(), super::runners::parse_declaration(&json!({"runner": {
-            "requires_wire_api":true, "follows_account_choice":true,
-            "pairs":[
-                {"wire_api":"anthropic.messages", "auth_method":"oauth", "requires_wire_api":true},
-                {"wire_api":WIRE, "auth_method":"oauth", "requires_wire_api":false}
-            ],
-            "harnesses":["codex"], "default_harness":"codex",
-            "harness_limits":{"codex":{"pairs":[
-                {"wire_api":"anthropic.messages", "auth_method":"oauth", "requires_wire_api":limit_requirement},
-                {"wire_api":WIRE, "auth_method":"oauth", "requires_wire_api":limit_requirement}
-            ]}}
-        }})).unwrap().unwrap());
-        harness.set_credentials(credentials.clone());
-        let route = harness.bind(reserved("occipital"), None).await;
-        let (ty, reply) = route
-            .call(
-                "route.head_choices",
-                &json!({"runner_module":RUNNER, "harness":"codex"}),
-            )
-            .await;
-        assert_eq!(ty, FrameType::Response, "{reply}");
-        check_contract(RUNNER, &reply["result"]);
-        assert_eq!(
-            ids(&reply["result"]),
-            ["openai/a-head", "openai/pinned"],
-            "{reply}"
-        );
-        assert!(
-            reply["result"]["models"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .all(|model| model["billing"] == "subscription"),
-            "{reply}"
-        );
-    }
-}
-
-#[tokio::test]
 async fn billing_uses_account_selection_subscription_settings() {
     let (harness, mut credentials) = fixture();
     let mut rows = credentials.listed_credentials().to_vec();
     rows.iter_mut()
-        .find(|row| row.id == "openai-key")
+        .find(|row| row.id == "xai-key")
         .unwrap()
         .plan_tier = Some("go".into());
     credentials.apply_listing(
@@ -849,22 +871,22 @@ async fn billing_uses_account_selection_subscription_settings() {
     );
     harness.set_credentials(credentials);
     harness.edit_config(|config| {
-        config["providers"]["openai"]["subscription"] = json!(true);
+        config["providers"]["xai"]["subscription"] = json!(true);
     });
     assert_eq!(
         query(&harness, API_KEY_RUNNER).await["models"][0]["billing"],
         "subscription"
     );
     harness.edit_config(|config| {
-        config["models"]["openai/pinned"]["subscription"] = json!(false);
+        config["models"]["xai/metered"]["subscription"] = json!(false);
     });
     assert_eq!(
         query(&harness, API_KEY_RUNNER).await["models"][0]["billing"],
         "per_token"
     );
     harness.edit_config(|config| {
-        config["providers"]["openai"]["subscription"] = json!(false);
-        config["models"]["openai/pinned"]["subscription"] = json!(true);
+        config["providers"]["xai"]["subscription"] = json!(false);
+        config["models"]["xai/metered"]["subscription"] = json!(true);
     });
     assert_eq!(
         query(&harness, API_KEY_RUNNER).await["models"][0]["billing"],
@@ -1145,21 +1167,18 @@ async fn serving_bytes_match_tagged_vectors() {
     credentials
         .runner_declarations
         .insert(non_starting_runner.into(), declaration);
-    credentials.runner_declarations.insert(
-        harness_runner.into(),
-        super::runners::parse_declaration(&json!({"runner": {
-            "pairs":[{"wire_api":WIRE,"auth_method":"oauth"},
-                {"wire_api":"anthropic.messages","auth_method":"oauth"}],
-            "follows_account_choice":true,
-            "harnesses":["opencode2","claude-code"],
-            "default_harness":"opencode2",
-            "harness_limits":{"claude-code": {
-                "pairs":[{"wire_api":"anthropic.messages","auth_method":"oauth"}],
-                "explicit_providers":["anthropic"]
-            }}
-        }}))
-        .unwrap()
-        .unwrap(),
+    credentials.runner_declarations.insert(harness_runner.into(), super::runners::parse_declaration(&json!({"runner":{
+        "follows_account_choice":true,"harnesses":["opencode2","claude-code"],"default_harness":"opencode2"
+    }})).unwrap().unwrap());
+    let anthropic = json!({"provider":"anthropic","models":"all"});
+    publish_runner_serves(
+        &mut credentials,
+        harness_runner,
+        &json!({
+            "generation":"picker-vectors","harnesses":{
+                "opencode2":[anthropic,{"provider":"openai","models":"all"}], "claude-code":[anthropic]
+            }
+        }),
     );
     harness.set_credentials(credentials);
     harness.edit_config(|config| {
@@ -1169,7 +1188,7 @@ async fn serving_bytes_match_tagged_vectors() {
         ]);
     });
     let route = harness.bind(reserved("occipital"), None).await;
-    let live_harness = broca_live_catalog_fixture(false);
+    let live_harness = broca_live_catalog_fixture(false, true);
     let live_route = live_harness.bind(reserved("occipital"), None).await;
     let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../test-vectors/route-head-choices-v1");
@@ -1180,7 +1199,11 @@ async fn serving_bytes_match_tagged_vectors() {
         ("without-tiers.json", NO_TIERS, None),
         ("policy-excluded.json", "policy-runner", None),
         ("pin-only.json", "pin-runner", None),
-        ("pin-only-pay-per-token.json", API_KEY_RUNNER, None),
+        (
+            "pin-only-direct-metered-provider.json",
+            API_KEY_RUNNER,
+            None,
+        ),
         ("unknown-runner.json", "missing", None),
         ("non-starting-runner.json", non_starting_runner, None),
         ("harness-narrowed.json", harness_runner, Some("claude-code")),
@@ -1248,6 +1271,11 @@ async fn serving_bytes_match_tagged_vectors() {
             }
             serde_json::to_vec(&json!({"request":request,"reply":body})).unwrap()
         };
+        if name == "pin-only-direct-metered-provider.json" {
+            let historical = "pin-only-pay-per-token.json";
+            let bytes = std::fs::read(directory.join(historical)).unwrap();
+            sums.push_str(&format!("{:x}  {historical}\n", Sha256::digest(bytes)));
+        }
         let path = directory.join(name);
         if update {
             std::fs::write(&path, &bytes).unwrap();
@@ -1260,6 +1288,23 @@ async fn serving_bytes_match_tagged_vectors() {
         std::fs::write(&path, &sums).unwrap();
     }
     assert_eq!(std::fs::read_to_string(path).unwrap(), sums);
+
+    let no_login_facts = broca_live_catalog_fixture(false, false);
+    let mut control = query(&no_login_facts, "broca").await;
+    let mut affected = Vec::new();
+    for model in control["models"].as_array_mut().unwrap() {
+        if model["provider"] == "google" && model["model"].as_str().unwrap().starts_with("gemini-")
+        {
+            assert_eq!(model["billing"], "subscription");
+            affected.push(model["model"].as_str().unwrap().to_owned());
+            model["billing"] = json!("per_token");
+        }
+    }
+    assert_eq!(
+        affected,
+        ["gemini-3.8-flash", "gemini-4-carbon", "gemini-4-hydrogen"]
+    );
+    assert_eq!(control, query(&live_harness, "broca").await);
 }
 
 #[tokio::test]
@@ -1369,6 +1414,11 @@ async fn golden_login_policy_narrows_picks_panels_picker_and_account_admission()
     );
     let operator = harness.bind(json!({"kind":"direct"}), None).await;
     let owner = harness.bind(reserved("prefrontal"), None).await;
+    declare_picker_runner(
+        &mut credentials,
+        "broca",
+        &["openai", "anthropic", "google", "meta"],
+    );
     let policy = catalog["login_methods"].clone();
     let mut measurements = Vec::new();
     for (version, policies) in [(1, json!([])), (2, policy), (3, json!([]))] {

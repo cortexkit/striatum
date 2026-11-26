@@ -1,6 +1,7 @@
 //! Structural serving answers shared by requests on one published input view.
-//! Billing planes, requested runner wire/auth pairs and provider limits, listing
-//! age and probe ownership stay dynamic.
+//! Each request still checks live prices, the selected harness's model list,
+//! the age of the vault listing, and whether another request holds the next
+//! recovery attempt for a blocked account.
 
 use crate::{
     broca_credentials::{AuthCatalog, BrocaCredentials},
@@ -130,8 +131,6 @@ pub(crate) struct ServingRow {
     pub index: usize,
     pub covered: bool,
     pub metered: bool,
-    pub wire_api: Option<String>,
-    pub has_endpoint: bool,
 }
 
 pub(crate) struct FactServing {
@@ -248,8 +247,6 @@ impl ServingIndex {
                                 .subscription
                                 .resolve(&key, row.credential_type == "oauth"),
                         metered: striatum_core::billing::is_api_metered_auth_method(method),
-                        wire_api: credentials.wire_api(fact, method).map(str::to_owned),
-                        has_endpoint: credentials.row_serves_wire_api(fact, method),
                     }
                 })
                 .collect()

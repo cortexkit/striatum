@@ -93,6 +93,12 @@ pub(super) fn rig(
         &mut credentials,
         crate::now_ms() as i64,
     );
+    super::conformance_tests::publish_fixture_models(
+        &mut credentials,
+        "chat-runner",
+        &facts,
+        false,
+    );
     harness.set_credentials(credentials);
     harness.edit_config(|config| {
         config["consumers"][CONSUMER] = json!({"owner":"broca"});
@@ -361,9 +367,8 @@ async fn broca_unpinned_llm_classify_select_sample_with_v2_decision_type() {
 async fn check_broca_unpinned_llm_classify_select_sample(model_type: Option<&str>) {
     const SAMPLE: &str =
         include_str!("../../fixtures/broca-llm-classify-unpinned-1126/routing-select.json");
-    const SLOT: &[u8] = include_bytes!(
-        "../../fixtures/broca-output-cap-harness-1124/current-live-routing-slot.json"
-    );
+    const SLOT: &[u8] =
+        include_bytes!("../../fixtures/broca-runner-serves-1126/hello-routing-slot.json");
     const JEV_114: &str = "typesafe/jev-1.14.0";
     const LUNA: &str = "openai/gpt-6-luna-decisions";
     let harness = rig(

@@ -113,6 +113,7 @@ fn harness_of(route_keys: &[&str], plan_prices: Value) -> Arc<Harness> {
     }
     let mut credentials = BrocaCredentials::api_test_credentials(&facts);
     credentials.publish_plan_prices(&plan_prices);
+    super::conformance_tests::publish_fixture_models(&mut credentials, "runner-one", &facts, false);
     harness.set_credentials(credentials);
     harness.edit_config(|config| {
         config["runners"] = json!([{ "module": "runner-one" }]);
@@ -164,6 +165,13 @@ fn broca_fence_harness() -> Arc<Harness> {
         },
         FENCE_NOW,
     );
+    credentials.set_watch_confirmed(Some("broca-loadable-api-keys"));
+    super::conformance_tests::publish_fixture_models(
+        &mut credentials,
+        "broca",
+        &facts(BROCA_ROUTES),
+        false,
+    );
     harness.set_credentials(credentials);
     harness.edit_config(|config| {
         config["runners"] = json!([{"module":"broca"}]);
@@ -206,6 +214,12 @@ fn fence_inception(harness: &Harness, observed: i64) {
 }
 
 async fn broca_select(harness: &Arc<Harness>, legacy: bool) -> (FrameType, Value) {
+    super::conformance_tests::publish_fixture_models(
+        &mut harness.credentials().lock().unwrap(),
+        "broca",
+        &facts(BROCA_ROUTES),
+        false,
+    );
     let route = harness.bind(reserved("example-consumer"), None).await;
     let mut params = select("mason");
     params["detail"] = json!(true);

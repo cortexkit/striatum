@@ -23,6 +23,7 @@ fn quota_provenance_records_the_pacing_window_model() {
                 ..Default::default()
             },
         )]),
+        ..Default::default()
     };
     let windows: Vec<ProviderUsage> = serde_json::from_value(json!([{
         "provider": "codex",

@@ -433,7 +433,6 @@ fn harness_with_pool_keys(
         credentials.runner_declarations.insert(
             "zeta-runner".into(),
             super::runners::parse_declaration(&json!({"runner": {
-                "pairs": [{"wire_api":"anthropic.messages", "auth_method":"apikey"}],
                 "follows_account_choice": true
             }}))
             .unwrap()
@@ -457,6 +456,12 @@ fn harness_with_pool_keys(
                 .with_wire_apis(&credentials.wire_apis),
         );
     }
+    super::conformance_tests::publish_fixture_providers(
+        &mut credentials,
+        "zeta-runner",
+        &[BORROWED, POOL, POOL_VENDOR],
+        false,
+    );
     harness.set_credentials(credentials);
     harness.edit_config(|config| {
         config["runners"] = json!([{ "module": "zeta-runner" }]);
@@ -558,6 +563,7 @@ async fn key_pool_public_cases_keep_route_auth_pin_and_admission_contracts() {
             request["pin"] = json!(pool_route);
         }
         let selected = owner.call("route.select", &request).await;
+        assert_eq!(selected.0, FrameType::Response, "{name}: {selected:?}");
         assert_eq!(answered_route(&selected), pool_route, "{name}");
         let answer: SelectAnswer = serde_json::from_value(selected.1["result"].clone()).unwrap();
         check_answer(&parse_select_request(&request).unwrap(), &answer).unwrap();
@@ -621,6 +627,12 @@ async fn key_pool_public_cases_keep_route_auth_pin_and_admission_contracts() {
         let mut fact = crate::tests::fact(POOL_VENDOR, "model");
         fact.auth_methods = Some(vec!["oauth".into(), "apikey".into()]);
         credentials.refresh_serving_methods(&Default::default(), &[fact], NOW, &[]);
+        super::conformance_tests::publish_fixture_providers(
+            &mut credentials,
+            "class-runner",
+            &[POOL_VENDOR, POOL],
+            true,
+        );
         harness.set_credentials(credentials);
         let owner = harness.bind(reserved("class-owner"), None).await;
         let runner = harness.bind(reserved("class-runner"), None).await;

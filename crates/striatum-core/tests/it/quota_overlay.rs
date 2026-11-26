@@ -71,6 +71,7 @@ fn overlay(windows: &[ProviderUsage], facts: &[ModelFact]) -> ModelRouteStateSna
         now: NOW,
         by_route: HashMap::new(),
         by_capacity: HashMap::new(),
+        ..Default::default()
     };
     merge_quota_overlay_with(
         &mut snap,
@@ -358,6 +359,7 @@ fn fresh_soft_pressure_lowers_stale_pressure() {
                 ..Default::default()
             },
         )]),
+        ..Default::default()
     };
     merge_quota_overlay_with(
         &mut snap,
@@ -406,6 +408,7 @@ fn hard_exhaustion_retained_until_future_reset_passes() {
                 ..Default::default()
             },
         )]),
+        ..Default::default()
     };
     merge_quota_overlay_with(
         &mut snap,

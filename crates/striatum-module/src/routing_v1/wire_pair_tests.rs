@@ -25,8 +25,10 @@ fn setup() -> (Arc<Harness>, BrocaCredentials, Vec<ModelFact>) {
         .into_iter()
         .map(|(model, method, rate)| {
             let mut fact = crate::tests::fact("google", model);
-            // Upstream rows do not publish an auth allowlist.
-            fact.auth_methods = None;
+            // The alias documents its exclusive sign-in; the ordinary row
+            // inherits the catalog's rule for undocumented rows.
+            fact.auth_methods = (method == "antigravity").then(|| vec![method.into()]);
+            fact.login_methods_documented = method == "antigravity";
             fact.cost_per_m_tok_out = Some(rate);
             fact.billing_plane = (method == "apikey").then(|| BillingPlane {
                 provider_id: "google".into(),
@@ -39,7 +41,8 @@ fn setup() -> (Arc<Harness>, BrocaCredentials, Vec<ModelFact>) {
         })
         .collect();
     harness.install_facts(&facts);
-    let catalog = json!({"catalog_version":1,"resolved_at_ms":NOW,"models":{
+    let catalog = json!({"catalog_version":1,"resolved_at_ms":NOW,
+        "login_methods":[{"model":format!("google/{ALIAS}"), "auth_methods":["antigravity"]}], "models":{
         format!("google/{API}"): {"existence":"present","capability.tool_call":true},
         format!("google/{ALIAS}"): {"existence":"present","capability.tool_call":true,
             "rate.output":{"state":"priced","currency":"USD","units":9,"exponent":0,
@@ -87,13 +90,17 @@ fn setup() -> (Arc<Harness>, BrocaCredentials, Vec<ModelFact>) {
     credentials.runner_declarations.insert(
         RUNNER.into(),
         super::runners::parse_declaration(&json!({
-            "runner":{"pairs":[
-                {"wire_api":"google.generate_content","auth_method":"apikey"},
-                {"wire_api":"google.code_assist","auth_method":"antigravity"}
-            ],"follows_account_choice":true}
+            "runner":{"follows_account_choice":true}
         }))
         .unwrap()
         .unwrap(),
+    );
+    super::conformance_tests::publish_runner_serves(
+        &mut credentials,
+        RUNNER,
+        &json!({
+            "generation":"google-login-fixture", "entries":[{"provider":"google","models":"all"}]
+        }),
     );
     let fixtures: serde_json::Value =
         serde_json::from_str(include_str!("../../fixtures/served-payloads.json")).unwrap();
@@ -334,7 +341,7 @@ async fn login_condition_refuses_a_pin_with_no_unmarked_login() {
 }
 
 #[test]
-fn single_method_and_discovery_gaps_keep_existing_reachability() {
+fn documented_login_rules_do_not_depend_on_runner_or_transport_discovery() {
     let _clock = crate::InjectedClock::set(NOW);
     let (_, mut credentials, facts) = setup();
     let catalog = facts.iter().collect();
@@ -366,6 +373,12 @@ fn single_method_and_discovery_gaps_keep_existing_reachability() {
     ));
     credentials.runner_declarations.clear();
     assert!(credential_serves_fact(
+        &key,
+        &facts[0],
+        &catalog,
+        &credentials
+    ));
+    assert!(!credential_serves_fact(
         &login,
         &facts[0],
         &catalog,
@@ -375,6 +388,12 @@ fn single_method_and_discovery_gaps_keep_existing_reachability() {
     credentials.wire_apis.clear();
     credentials.publish_billing_catalog(Default::default());
     assert!(credential_serves_fact(
+        &key,
+        &facts[0],
+        &catalog,
+        &credentials
+    ));
+    assert!(!credential_serves_fact(
         &login,
         &facts[0],
         &catalog,
@@ -391,7 +410,7 @@ fn single_method_and_discovery_gaps_keep_existing_reachability() {
 }
 
 #[test]
-fn borrowed_rows_use_catalog_wire_family_without_changing_provider_membership() {
+fn borrowed_rows_use_catalog_login_facts_without_changing_provider_membership() {
     let _clock = crate::InjectedClock::set(NOW);
     let (_, mut credentials, facts) = setup();
     let rows = [
@@ -419,7 +438,8 @@ fn borrowed_rows_use_catalog_wire_family_without_changing_provider_membership() 
     credentials.refresh_serving_methods(&Default::default(), &facts, NOW as i64, &[]);
     let mut borrowed = facts[0].clone();
     borrowed.provider_id = "company-google".into();
-    let catalog = facts.iter().collect();
+    let mut catalog: crate::broca_credentials::AuthCatalog = facts.iter().collect();
+    catalog.inherit_aliases(&credentials.catalog_targets(&facts));
     assert!(credential_serves_fact(
         &rows[0],
         &borrowed,
@@ -438,40 +458,4 @@ fn borrowed_rows_use_catalog_wire_family_without_changing_provider_membership() 
         &catalog,
         &credentials
     ));
-}
-
-#[test]
-fn matching_pair_does_not_bypass_the_selected_runners_endpoint_requirement() {
-    let _clock = crate::InjectedClock::set(NOW);
-    let (_, mut credentials, facts) = setup();
-    let catalog = facts.iter().collect();
-    credentials.wire_api_models.clear();
-    credentials.runner_declarations.insert(
-        RUNNER.into(),
-        super::runners::parse_declaration(&json!({
-            "runner":{"pairs":[{"wire_api":"google.generate_content","auth_method":"apikey"}],
-                "follows_account_choice":true,"requires_wire_api":true}
-        }))
-        .unwrap()
-        .unwrap(),
-    );
-    assert!(credential_serves_fact(
-        &credentials.listed_credentials()[1],
-        &facts[0],
-        &catalog,
-        &credentials
-    ));
-    let registry = super::runners::Registry::build(
-        vec![crate::config_policy::RunnerPolicy {
-            harness: None,
-            module: RUNNER.into(),
-            via_vault: true,
-            routes: None,
-            tool_capabilities: vec![],
-        }],
-        &credentials,
-        &facts,
-        NOW,
-    );
-    assert!(!registry.runs(RUNNER, &format!("google/{API}"), &format!("google/{API}")));
 }

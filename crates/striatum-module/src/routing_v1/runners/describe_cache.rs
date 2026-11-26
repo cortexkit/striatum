@@ -52,6 +52,16 @@ impl DescribeCache {
         // clock as tiers and accounts. A present replacement or removed policy
         // is not a gap, so neither may borrow an old declaration.
         for (module, declaration) in previous {
+            if let Some(current) = credentials.runner_declarations.get(&module) {
+                let names = |harnesses: &Option<Vec<String>>| {
+                    harnesses
+                        .as_ref()
+                        .map(|names| names.iter().cloned().collect::<BTreeSet<_>>())
+                };
+                if names(&current.harnesses) != names(&declaration.harnesses) {
+                    credentials.runner_serves.remove(&module);
+                }
+            }
             if !present.contains(module.as_str())
                 && policies.iter().any(|policy| policy.module == module)
                 && fresh_observation(credentials, &module, now)
@@ -80,6 +90,11 @@ impl DescribeCache {
         let policies = policies.as_slice();
         self.modules =
             super::tier_discovery_modules(modules, &credentials.runner_declarations, policies);
+        if credentials.runner_describe_connected != self.modules {
+            credentials
+                .runner_describe_connected
+                .clone_from(&self.modules);
+        }
         self.expire(credentials, now);
         // The catalog lists live connections, so a configured runner can vanish
         // during a restart without losing tier support. Keep its last answer
@@ -113,6 +128,11 @@ impl DescribeCache {
                 || (!present.contains(module.as_str())
                     && policies.iter().any(|policy| policy.module == *module))
         });
+        credentials.runner_serves.retain(|module, _| {
+            self.modules.contains(module)
+                || (!present.contains(module.as_str())
+                    && policies.iter().any(|policy| policy.module == *module))
+        });
         self.failed.retain(|module| {
             self.modules.contains(module)
                 || credentials.runner_describe_observed.contains_key(module)
@@ -131,19 +151,55 @@ impl DescribeCache {
         // A late describe can refresh tiers, but cannot revive an already
         // expired routing declaration without a new trusted catalog row.
         self.expire(credentials, now);
-        let Some(describe) = describe.filter(|describe| {
-            let describe = describe.get("result").unwrap_or(describe);
-            describe["capabilities"].as_array().is_some_and(|groups| {
-                (!groups.iter().any(|group| group == "service_tier")
-                    || super::service_tiers_from_describe(describe).is_some())
-                    && (!groups.iter().any(|group| group == "routed_accounts")
-                        || super::routed_accounts_from_describe(describe).is_some())
-            })
-        }) else {
+        let Some(describe) = describe else {
             self.missed(module, "describe", credentials, now);
             self.expire(credentials, now);
             return false;
         };
+        let describe = describe.get("result").unwrap_or(describe);
+        let Some(groups) = describe
+            .get("capabilities")
+            .and_then(Value::as_array)
+            .filter(|groups| groups.iter().all(Value::is_string))
+        else {
+            // A malformed answer cannot renew any observation. Keep the last
+            // good lists only until their original deadlines.
+            self.failed.insert(module.to_owned());
+            warn_invalid_capabilities_once(module);
+            return false;
+        };
+        let has = |capability: &str| groups.iter().any(|group| group == capability);
+        let accepts_serves = if has(cortexkit_role_llm_runner::capabilities::SERVES) {
+            describe.get("serves").is_some_and(|raw| {
+                let credentials = &mut **credentials;
+                let declared = credentials
+                    .runner_declarations
+                    .get(module)
+                    .and_then(|declaration| declaration.harnesses.as_deref());
+                match credentials
+                    .runner_serves
+                    .entry(module.to_owned())
+                    .or_default()
+                    .apply(raw, declared, now)
+                {
+                    Ok(()) => true,
+                    Err(error) => {
+                        warn_serves_error_once(module, error);
+                        false
+                    }
+                }
+            })
+        } else {
+            credentials.runner_serves.remove(module);
+            true
+        };
+        if (has("service_tier") && super::service_tiers_from_describe(describe).is_none())
+            || (has("routed_accounts") && super::routed_accounts_from_describe(describe).is_none())
+        {
+            self.missed(module, "describe", credentials, now);
+            self.expire(credentials, now);
+            return false;
+        }
         let previous = credentials.runner_service_tiers.get(module).cloned();
         let had_observation = credentials.runner_describe_observed.contains_key(module);
         credentials
@@ -175,7 +231,7 @@ impl DescribeCache {
             };
             view_event(credentials, module, cause, now);
         }
-        true
+        accepts_serves
     }
 
     pub(crate) fn missed_all(&mut self, credentials: &mut BrocaCredentials, now: i64) {
@@ -238,6 +294,30 @@ impl DescribeCache {
     }
 }
 
+fn warn_invalid_capabilities_once(module: &str) {
+    static WARNED: std::sync::Mutex<BTreeSet<String>> = std::sync::Mutex::new(BTreeSet::new());
+    if WARNED
+        .lock()
+        .is_ok_and(|mut warned| warned.insert(module.to_owned()))
+    {
+        crate::warn_operator(format!(
+            "runner {module:?} role.describe has missing or invalid capabilities; keeping last good lists until they expire"
+        ));
+    }
+}
+
+fn warn_serves_error_once(module: &str, error: cortexkit_role_llm_runner::serves::ServesError) {
+    static WARNED: std::sync::Mutex<BTreeSet<(String, String)>> =
+        std::sync::Mutex::new(BTreeSet::new());
+    let error = error.to_string();
+    if WARNED
+        .lock()
+        .is_ok_and(|mut warned| warned.insert((module.to_owned(), error.clone())))
+    {
+        crate::warn_operator(format!("runner {module:?} serves answer refused: {error}"));
+    }
+}
+
 fn view_event(credentials: &mut BrocaCredentials, module: &str, cause: &str, now: i64) {
     if let Some(suppressed) = credentials.runner_describe_logs.admit(module, cause, now) {
         let last_observed_at_ms = credentials.runner_describe_observed.get(module);
@@ -270,10 +350,122 @@ mod tests {
     fn declared_modules() -> Value {
         json!([{"module_id":"runner-a","nonce_verified":true,
         "role_declarations":{"routing/v1":{"runner":{
-            "pairs":[{"wire_api":"anthropic.messages","auth_method":"apikey"}],
             "harnesses":["runner-a"],
             "harness_limits":{"runner-a":{"capabilities":["one_off"]}}
         }}}}])
+    }
+
+    #[test]
+    fn malformed_capabilities_keep_the_original_serves_deadline_and_warn_once() {
+        let module = "runner-with-invalid-capabilities";
+        let mut cache = DescribeCache::default();
+        let mut credentials = BrocaCredentials::default();
+        let serves =
+            json!({"generation":"ready","entries":[{"provider":"example","models":"all"}]});
+        let valid = json!({"capabilities":["serves"],"serves":serves});
+        crate::take_operator_warnings();
+        assert!(cache.reply(module, Some(&valid), &mut credentials, 0));
+        for malformed in [
+            json!({"serves":serves}),
+            json!({"result":{"capabilities":"x","serves":serves}}),
+            json!({"capabilities":["serves",false],"serves":serves}),
+        ] {
+            assert!(!cache.reply(module, Some(&malformed), &mut credentials, LAST_GOOD_MS - 1));
+            let serves = &credentials.runner_serves[module];
+            assert_eq!(
+                serves.lists(LAST_GOOD_MS - 1).count(),
+                1,
+                "malformed replies retain the last good list"
+            );
+            assert_eq!(
+                serves.lists(LAST_GOOD_MS).count(),
+                0,
+                "malformed replies do not renew the list"
+            );
+        }
+        let warnings = crate::take_operator_warnings();
+        assert_eq!(
+            warnings
+                .iter()
+                .filter(|line| line.contains("missing or invalid capabilities")
+                    && line.contains(module))
+                .count(),
+            1,
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn valid_serves_renews_when_tiers_or_routed_accounts_are_malformed() {
+        let module = "runner-a";
+        let (mut cache, mut credentials, _, _) = setup();
+        let serves =
+            json!({"generation":"ready","entries":[{"provider":"example","models":"all"}]});
+        assert!(cache.reply(
+            module,
+            Some(&json!({"capabilities":["serves"],"serves":serves})),
+            &mut credentials,
+            0
+        ));
+        for (capability, field, at) in [
+            ("service_tier", "service_tiers", LAST_GOOD_MS - 2),
+            ("routed_accounts", "routed_accounts", LAST_GOOD_MS - 1),
+        ] {
+            let mut body = json!({"capabilities":["serves",capability],"serves":serves});
+            body[field] = json!(false);
+            assert!(!cache.reply(module, Some(&body), &mut credentials, at));
+            let lists = &credentials.runner_serves[module];
+            assert_eq!(
+                lists.lists(at + LAST_GOOD_MS - 1).count(),
+                1,
+                "{field} must not prevent a valid list from renewing"
+            );
+            assert_eq!(lists.lists(at + LAST_GOOD_MS).count(), 0);
+            assert_eq!(credentials.runner_describe_observed[module], 0);
+        }
+    }
+
+    #[test]
+    fn reordered_harness_names_keep_serves_but_changed_names_drop_them() {
+        let module = "runner-a";
+        let (mut cache, mut credentials, policies, _) = setup();
+        let modules = |names: [&str; 2]| {
+            json!([{"module_id":module,"nonce_verified":true,
+            "role_declarations":{"routing/v1":{"runner":{"harnesses":names,"default_harness":"alpha"}}}}])
+        };
+        cache.catalog(&modules(["alpha", "beta"]), &policies, &mut credentials, 1);
+        let reply = json!({"capabilities":["serves"],"serves":{"generation":"ready","harnesses":{"alpha":[],"beta":[]}}});
+        assert!(cache.reply(module, Some(&reply), &mut credentials, 1));
+        cache.catalog(&modules(["beta", "alpha"]), &policies, &mut credentials, 2);
+        assert_eq!(
+            credentials
+                .runner_serves
+                .get(module)
+                .map(|lists| lists.lists(2).count()),
+            Some(2)
+        );
+        cache.catalog(&modules(["gamma", "alpha"]), &policies, &mut credentials, 3);
+        assert!(!credentials.runner_serves.contains_key(module));
+    }
+
+    #[test]
+    fn invalid_serves_warns_once_for_each_distinct_error() {
+        let module = "runner-with-refused-serves";
+        let mut cache = DescribeCache::default();
+        let mut credentials = BrocaCredentials::default();
+        crate::take_operator_warnings();
+        for raw in [json!(false), json!({"generation":"one","entries":false})] {
+            let body = json!({"capabilities":["serves"],"serves":raw});
+            for now in [0, LAST_GOOD_MS, 2 * LAST_GOOD_MS] {
+                assert!(!cache.reply(module, Some(&body), &mut credentials, now));
+            }
+        }
+        let warnings = crate::take_operator_warnings();
+        let warnings: Vec<_> = warnings
+            .iter()
+            .filter(|line| line.contains("serves answer refused") && line.contains(module))
+            .collect();
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
     }
 
     #[test]
@@ -432,12 +624,7 @@ mod tests {
         let (mut cache, mut credentials, _, _) = setup();
         crate::take_operator_warnings();
         cache.reply("runner-a", None, &mut credentials, 1);
-        cache.reply(
-            "runner-a",
-            Some(&json!({"code":"unavailable"})),
-            &mut credentials,
-            2,
-        );
+        cache.reply("runner-a", None, &mut credentials, 2);
         assert!(credentials.runner_service_tiers.contains_key("runner-a"));
         cache.reply(
             "runner-a",

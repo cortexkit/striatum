@@ -71,12 +71,16 @@ fn policy(routes: Option<Vec<&str>>) -> RunnerPolicy {
     }
 }
 
-fn declaration(pairs: Value) -> runners::RunnerDeclaration {
+fn declaration() -> runners::RunnerDeclaration {
     runners::parse_declaration(&json!({"runner": {
-        "pairs": pairs, "follows_account_choice": true, "tool_capabilities": ["test:declared/v1"]
+        "follows_account_choice": true, "tool_capabilities": ["test:declared/v1"]
     }}))
     .unwrap()
     .unwrap()
+}
+
+fn serve(credentials: &mut BrocaCredentials, module: &str, providers: &[&str]) {
+    super::conformance_tests::publish_fixture_providers(credentials, module, providers, true);
 }
 
 fn routes(registry: Registry) -> Vec<String> {
@@ -109,339 +113,6 @@ fn opus_wire_catalog() -> Value {
     catalog
 }
 
-fn wire_api_declaration(required: Option<bool>) -> runners::RunnerDeclaration {
-    let mut value = json!({"runner": {
-        "pairs":[{"wire_api":"anthropic.messages", "auth_method":"oauth"}],
-        "follows_account_choice":true
-    }});
-    if let Some(required) = required {
-        value["runner"]["requires_wire_api"] = json!(required);
-    }
-    runners::parse_declaration(&value).unwrap().unwrap()
-}
-
-#[test]
-fn requires_wire_api_is_runner_local_and_defaults_to_false() {
-    let facts = vec![fact("anthropic", "model", Some(&["oauth"]))];
-    let mut credentials = credentials(&facts, row(&["anthropic"], &[], Some("oauth")), NOW);
-    for required in [None, Some(false), Some(true)] {
-        credentials
-            .runner_declarations
-            .insert("fixture-runner".into(), wire_api_declaration(required));
-        let mut unrestricted = policy(None);
-        unrestricted.module = "unrestricted".into();
-        credentials
-            .runner_declarations
-            .insert("unrestricted".into(), wire_api_declaration(None));
-        let registry = Registry::build(vec![policy(None), unrestricted], &credentials, &facts, NOW);
-        assert_eq!(
-            registry.runs("fixture-runner", "anthropic/model", "anthropic/model"),
-            required != Some(true)
-        );
-        assert_eq!(
-            registry.requires_wire_api("fixture-runner", "anthropic/model", "anthropic/model"),
-            required == Some(true)
-        );
-        assert!(registry.runs("unrestricted", "anthropic/model", "anthropic/model"));
-    }
-}
-
-#[test]
-fn pair_wire_requirements_are_row_local_and_override_the_runner_default() {
-    let facts = vec![
-        fact("anthropic", "pair-a", Some(&["oauth"])),
-        fact("anthropic", "pair-b", Some(&["oauth"])),
-        fact("anthropic", "inherited", Some(&["oauth"])),
-    ];
-    let mut credentials = credentials(&facts, row(&["anthropic"], &[], Some("oauth")), NOW);
-    credentials
-        .wire_apis
-        .insert("anthropic/pair-b".into(), "openai.responses".into());
-    credentials.wire_apis.insert(
-        "anthropic/inherited".into(),
-        "openai.chat_completions".into(),
-    );
-    for required in [None, Some(false), Some(true)] {
-        let mut slot = json!({"runner": {
-            "follows_account_choice":true,
-            "pairs":[
-                {"wire_api":"anthropic.messages", "auth_method":"oauth", "requires_wire_api":true},
-                {"wire_api":"openai.responses", "auth_method":"oauth", "requires_wire_api":false},
-                {"wire_api":"openai.chat_completions", "auth_method":"oauth"}
-            ]
-        }});
-        if let Some(required) = required {
-            slot["runner"]["requires_wire_api"] = json!(required);
-        }
-        credentials.runner_declarations.insert(
-            "fixture-runner".into(),
-            runners::parse_declaration(&slot).unwrap().unwrap(),
-        );
-        let registry = Registry::build(vec![policy(None)], &credentials, &facts, NOW);
-        for (model, admitted) in [
-            ("pair-a", false),
-            ("pair-b", true),
-            ("inherited", required != Some(true)),
-        ] {
-            let key = format!("anthropic/{model}");
-            assert_eq!(
-                registry.runs("fixture-runner", &key, &key),
-                admitted,
-                "{slot}: {model}"
-            );
-            assert_eq!(
-                registry.requires_wire_api("fixture-runner", &key, &key),
-                !admitted,
-                "{slot}: {model}"
-            );
-        }
-    }
-}
-
-#[test]
-fn harness_pair_members_cannot_change_original_wire_requirements() {
-    let facts = vec![
-        fact("anthropic", "pair-a", Some(&["oauth"])),
-        fact("anthropic", "pair-b", Some(&["oauth"])),
-    ];
-    let mut credentials = credentials(&facts, row(&["anthropic"], &[], Some("oauth")), NOW);
-    credentials
-        .wire_apis
-        .insert("anthropic/pair-b".into(), "openai.responses".into());
-    for limit_requirement in [json!(true), json!(false), json!("ignored")] {
-        let slot = json!({"runner": {
-            "follows_account_choice":true, "requires_wire_api":true,
-            "pairs":[
-                {"wire_api":"anthropic.messages", "auth_method":"oauth", "requires_wire_api":true},
-                {"wire_api":"openai.responses", "auth_method":"oauth", "requires_wire_api":false}
-            ],
-            "harnesses":["codex"], "default_harness":"codex",
-            "harness_limits":{"codex":{"pairs":[
-                {"wire_api":"anthropic.messages", "auth_method":"oauth", "requires_wire_api":limit_requirement},
-                {"wire_api":"openai.responses", "auth_method":"oauth", "requires_wire_api":limit_requirement}
-            ]}}
-        }});
-        credentials.runner_declarations.insert(
-            "fixture-runner".into(),
-            runners::parse_declaration(&slot).unwrap().unwrap(),
-        );
-        let registry = Registry::build_for_harness(
-            vec![policy(None)],
-            &credentials,
-            &facts,
-            NOW,
-            Some("codex"),
-        );
-        assert!(
-            !registry.runs("fixture-runner", "anthropic/pair-a", "anthropic/pair-a"),
-            "{slot}"
-        );
-        assert!(
-            registry.requires_wire_api("fixture-runner", "anthropic/pair-a", "anthropic/pair-a"),
-            "{slot}"
-        );
-        assert!(
-            registry.runs("fixture-runner", "anthropic/pair-b", "anthropic/pair-b"),
-            "{slot}"
-        );
-        assert!(
-            !registry.requires_wire_api("fixture-runner", "anthropic/pair-b", "anthropic/pair-b"),
-            "{slot}"
-        );
-    }
-}
-
-#[test]
-fn requires_wire_api_uses_the_alias_targets_auth_specific_plane() {
-    let facts = vec![fact("anthropic", "model", Some(&["oauth", "apikey"]))];
-    let mut credentials = credentials(
-        &facts,
-        row(&["anthropic-platform"], &["anthropic"], Some("oauth")),
-        NOW,
-    );
-    credentials.refresh_serving_methods(&Default::default(), &facts, NOW as i64, &[]);
-    credentials.wire_api_models.insert("anthropic/model".into());
-    let mut borrowed = facts.clone();
-    striatum_core::score_alias::append_alias_rows(
-        &mut borrowed,
-        &credentials.catalog_targets(&facts),
-    );
-    let alias = borrowed
-        .iter()
-        .find(|fact| fact.provider_id == "anthropic-platform")
-        .unwrap();
-    assert!(credentials.row_serves_wire_api(alias, "oauth"));
-    for served in [false, true] {
-        let mut entry = json!({"wire.family":"anthropic.messages"});
-        if served {
-            entry["wire.api"] = json!({"value":"https://api.anthropic.com", "from":"curated"});
-        }
-        credentials.publish_billing_catalog(
-            crate::fusiform_catalog::PlaneCatalog::default().with_test_plane(
-                &serde_json::to_vec(&json!({
-                    "plane":{"provider_id":"anthropic", "auth_method":"oauth", "kind":"upstream"},
-                    "models":{"anthropic/model":entry}
-                }))
-                .unwrap(),
-            ),
-        );
-        assert_eq!(credentials.row_serves_wire_api(alias, "oauth"), served);
-        assert!(credentials.row_serves_wire_api(alias, "apikey"));
-        credentials
-            .runner_declarations
-            .insert("fixture-runner".into(), wire_api_declaration(Some(true)));
-        let registry = Registry::build(vec![policy(None)], &credentials, &borrowed, NOW);
-        assert_eq!(
-            registry.runs(
-                "fixture-runner",
-                "anthropic-platform/model",
-                "anthropic-platform/model"
-            ),
-            served
-        );
-    }
-}
-
-#[tokio::test]
-async fn requires_wire_api_filters_select_head_choices_panels_and_refreshes() {
-    let _clock = crate::InjectedClock::set(NOW);
-    let harness = Harness::new("requires-wire-api");
-    let facts = vec![
-        fact("anthropic", "claude-opus-5-5", Some(&["oauth"])),
-        fact("anthropic", "claude-sonnet-4-5", Some(&["oauth"])),
-    ];
-    harness.install_facts(&facts);
-    harness.edit_config(|config| {
-        config["runners"] = json!([{"module":"fixture-runner", "via_vault":true}]);
-        config["panels"]["audit"] = json!({"top_k":1,"by":"iq","extra":0,"floor":0});
-    });
-    let consumer = harness.bind(reserved("example-consumer"), None).await;
-    let operator = harness.bind(json!({"kind":"direct"}), None).await;
-    let head = harness.bind(reserved("occipital"), None).await;
-    let mut credentials = credentials(&facts, row(&["anthropic"], &[], Some("oauth")), NOW);
-    credentials
-        .runner_declarations
-        .insert("fixture-runner".into(), wire_api_declaration(Some(true)));
-    let shared = std::sync::Arc::new(std::sync::Mutex::new(credentials));
-    let mut catalog = opus_wire_catalog();
-    catalog["models"]["anthropic/claude-sonnet-4-5"] =
-        served_wire_example("catalog.get — one model, current")["models"]
-            ["anthropic/claude-sonnet-4-5"]
-            .clone();
-    for model in ["claude-opus-5-5", "claude-sonnet-4-5"] {
-        let entry = &mut catalog["models"][format!("anthropic/{model}")];
-        entry.as_object_mut().unwrap().remove("wire.api");
-        entry["model.lineage"] = json!("claude");
-    }
-    catalog["models"]["anthropic/claude-sonnet-4-5"]["wire.api"] =
-        json!("https://api.anthropic.com");
-    for (version, served, required) in [(1, false, true), (2, true, true), (3, false, false)] {
-        catalog["catalog_version"] = json!(version);
-        if served {
-            catalog["models"]["anthropic/claude-opus-5-5"]["wire.api"] =
-                json!({"value":"https://api.anthropic.com", "from":"curated"});
-        } else {
-            catalog["models"]["anthropic/claude-opus-5-5"]
-                .as_object_mut()
-                .unwrap()
-                .remove("wire.api");
-        }
-        shared.lock().unwrap().runner_declarations.insert(
-            "fixture-runner".into(),
-            wire_api_declaration(Some(required)),
-        );
-        let snapshot =
-            crate::fusiform_catalog::decode_catalog_get(&serde_json::to_vec(&catalog).unwrap())
-                .unwrap();
-        crate::fusiform_catalog::apply_mapped_catalog(
-            harness.store(),
-            &snapshot,
-            Some(&shared),
-            None,
-        )
-        .unwrap();
-        harness.set_credentials(shared.lock().unwrap().clone());
-        let admitted = served || !required;
-        let pinned = consumer
-            .call(
-                "route.select",
-                &json!({
-                    "consumer":"mason", "requirements":{"iq":0}, "pin":"anthropic/claude-opus-5-5"
-                }),
-            )
-            .await;
-        assert_eq!(
-            pinned.0,
-            if admitted {
-                FrameType::Response
-            } else {
-                FrameType::Error
-            },
-            "{pinned:?}"
-        );
-        if admitted {
-            assert_eq!(pinned.1["result"]["route"]["model"], "claude-opus-5-5");
-        } else {
-            assert_eq!(pinned.1["code"], "pin_unavailable", "{pinned:?}");
-            let selected = consumer
-                .call(
-                    "route.select",
-                    &json!({"consumer":"mason", "requirements":{"iq":0}, "detail":true}),
-                )
-                .await;
-            assert_eq!(selected.0, FrameType::Response, "{selected:?}");
-            assert_eq!(selected.1["result"]["route"]["model"], "claude-sonnet-4-5");
-            assert!(
-                selected.1["result"]["detail"]["rejected"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|row| row["routeKey"] == "anthropic/claude-opus-5-5"
-                        && row["reason"] == "runner_requires_wire_api"),
-                "{selected:?}"
-            );
-            let what_if = operator
-                .call("route.what_if", &json!({"consumer":"mason", "iqs":[0]}))
-                .await;
-            assert_eq!(what_if.0, FrameType::Response, "{what_if:?}");
-            assert!(
-                what_if.1["result"]["results"][0]["excluded"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|row| row["route"] == "anthropic/claude-opus-5-5"
-                        && row["reason"] == "runner_requires_wire_api"),
-                "{what_if:?}"
-            );
-        }
-        let choices = head
-            .call(
-                "route.head_choices",
-                &json!({"runner_module":"fixture-runner"}),
-            )
-            .await;
-        assert_eq!(choices.0, FrameType::Response, "{choices:?}");
-        assert_eq!(
-            choices.1["result"]["models"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|model| model["model"] == "claude-opus-5-5"),
-            admitted,
-            "{choices:?}"
-        );
-        let panel = consumer.call("route.select_panel", &json!({
-            "class":"audit", "consumer":"mason", "available_routes":["anthropic/claude-opus-5-5"], "seed":"wire-api"
-        })).await;
-        assert_eq!(panel.0, FrameType::Response, "{panel:?}");
-        assert_eq!(
-            panel.1["result"]["seats"].as_array().unwrap().len(),
-            usize::from(admitted),
-            "{panel:?}"
-        );
-    }
-}
-
 #[tokio::test]
 async fn thalamus_opencode_selects_anthropic_opus_through_oauth() {
     let _clock = crate::InjectedClock::set(NOW);
@@ -456,12 +127,12 @@ async fn thalamus_opencode_selects_anthropic_opus_through_oauth() {
     credentials.runner_declarations.insert(
         "thalamus".into(),
         runners::parse_declaration(&json!({
-            "runner": {"pairs":[{"wire_api":"anthropic.messages", "auth_method":"oauth"}],
-            "harnesses":["opencode"], "default_harness":"opencode", "follows_account_choice":true}
+            "runner": {"harnesses":["opencode"], "default_harness":"opencode", "follows_account_choice":true}
         }))
         .unwrap()
         .unwrap(),
     );
+    serve(&mut credentials, "thalamus", &["anthropic"]);
     let shared = std::sync::Arc::new(std::sync::Mutex::new(credentials));
     let snapshot = crate::fusiform_catalog::decode_catalog_get(
         &serde_json::to_vec(&opus_wire_catalog()).unwrap(),
@@ -480,81 +151,7 @@ async fn thalamus_opencode_selects_anthropic_opus_through_oauth() {
 }
 
 #[tokio::test]
-async fn missing_wire_family_is_named_in_selected_and_no_route_rejections() {
-    let _clock = crate::InjectedClock::set(NOW);
-    let harness = Harness::new("unverified-wire");
-    let facts = vec![
-        fact("anthropic", "claude-opus-5-5", None),
-        fact("anthropic", "claude-sonnet-4-5", None),
-    ];
-    harness.install_facts(&facts);
-    harness.edit_config(|config| {
-        config["runners"] = json!([{"module":"fixture-runner", "via_vault":true}])
-    });
-    let caller = harness.bind(reserved("example-consumer"), None).await;
-    let mut catalog = opus_wire_catalog();
-    let opus = catalog["models"]["anthropic/claude-opus-5-5"]
-        .as_object_mut()
-        .unwrap();
-    opus.remove("wire.family");
-    opus.insert("transport.wire_api".into(), json!("anthropic.messages"));
-    catalog["models"]["anthropic/claude-sonnet-4-5"] =
-        served_wire_example("catalog.get — one model, current")["models"]
-            ["anthropic/claude-sonnet-4-5"]
-            .clone();
-    for all_unverified in [false, true] {
-        if all_unverified {
-            catalog["models"]["anthropic/claude-sonnet-4-5"]
-                .as_object_mut()
-                .unwrap()
-                .remove("wire.family");
-        }
-        let mut credentials = credentials(&facts, row(&["anthropic"], &[], Some("oauth")), NOW);
-        credentials.runner_declarations.insert(
-            "fixture-runner".into(),
-            declaration(json!([{"wire_api":"anthropic.messages", "auth_method":"oauth"}])),
-        );
-        let shared = std::sync::Arc::new(std::sync::Mutex::new(credentials));
-        let snapshot =
-            crate::fusiform_catalog::decode_catalog_get(&serde_json::to_vec(&catalog).unwrap())
-                .unwrap();
-        crate::fusiform_catalog::apply_mapped_catalog(
-            harness.store(),
-            &snapshot,
-            Some(&shared),
-            None,
-        )
-        .unwrap();
-        harness.set_credentials(shared.lock().unwrap().clone());
-        let reply = caller
-            .call(
-                "route.select",
-                &json!({"consumer":"mason", "requirements":{"iq":0}, "detail":true}),
-            )
-            .await;
-        let rejected = if all_unverified {
-            assert_eq!(reply.0, FrameType::Error, "{reply:?}");
-            assert_eq!(reply.1["code"], "no_route", "{reply:?}");
-            &reply.1["detail"]["rejected"]
-        } else {
-            assert_eq!(reply.0, FrameType::Response, "{reply:?}");
-            assert_eq!(reply.1["result"]["route"]["model"], "claude-sonnet-4-5");
-            &reply.1["result"]["detail"]["rejected"]
-        };
-        assert!(
-            rejected
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|entry| entry["routeKey"] == "anthropic/claude-opus-5-5"
-                    && entry["reason"] == "runner_wire_family_unverified"),
-            "{reply:?}"
-        );
-    }
-}
-
-#[tokio::test]
-async fn broca_without_pairs_keeps_pick_and_rejected_bytes_when_wire_facts_change() {
+async fn broca_serves_keeps_pick_and_rejected_bytes_when_wire_facts_change() {
     let _clock = crate::InjectedClock::set(NOW);
     let harness = Harness::new("broca-wire-baseline");
     for seeded in harness.store().get_facts().unwrap() {
@@ -582,7 +179,7 @@ async fn broca_without_pairs_keeps_pick_and_rejected_bytes_when_wire_facts_chang
                 );
             }
         }
-        assert!(credentials.runner_declarations.is_empty());
+        serve(&mut credentials, "broca", &["anthropic"]);
         harness.set_credentials(credentials);
         let reply = caller.call("route.select", &json!({"consumer":"mason", "requirements":{"iq":0}, "exclude":["anthropic/claude-sonnet-4-5"], "detail":true})).await;
         assert_eq!(reply.0, FrameType::Response, "{reply:?}");
@@ -609,214 +206,7 @@ async fn broca_without_pairs_keeps_pick_and_rejected_bytes_when_wire_facts_chang
 }
 
 #[test]
-fn served_wire_family_requires_an_exact_known_wire_and_canonical_auth_pair() {
-    let facts = vec![fact("anthropic", "claude-sonnet-4-5", None)];
-    let mut row = row(&["anthropic"], &[], Some("oauth"));
-    row.id = "apikey:misleading-id".into();
-    row.credential_type = "apikey".into();
-    row.refresh_adapter = Some("chatgpt".into());
-    let mut credentials = credentials(&facts, row, NOW);
-    let snapshot = crate::fusiform_catalog::decode_catalog_get(
-        &serde_json::to_vec(&served_wire_example("catalog.get — one model, current")).unwrap(),
-    )
-    .unwrap();
-    credentials.wire_apis = snapshot.wire_apis.clone();
-    for (wire, auth, matches) in [
-        ("anthropic.messages", "oauth", true),
-        ("openai.responses", "oauth", false),
-        ("anthropic.messages", "apikey", false),
-        ("messages", "oauth", false),
-    ] {
-        credentials.runner_declarations.insert(
-            "fixture-runner".into(),
-            declaration(json!([{"wire_api":wire, "auth_method":auth}])),
-        );
-        let actual = routes(Registry::build(
-            vec![policy(None)],
-            &credentials,
-            &facts,
-            NOW,
-        ));
-        assert_eq!(
-            actual,
-            if matches {
-                vec!["anthropic/claude-sonnet-4-5"]
-            } else {
-                vec![]
-            },
-            "{wire}/{auth}"
-        );
-    }
-}
-
-#[test]
-fn served_billing_plane_wire_overrides_base_and_missing_plane_wire_fails_closed() {
-    let facts = vec![fact("openai", "gpt-5.6-luna", None)];
-    let mut credentials = credentials(&facts, row(&["openai"], &[], Some("chatgpt")), NOW);
-    let base = served_wire_example("apikey luna — published cache-write");
-    credentials.wire_apis =
-        crate::fusiform_catalog::decode_catalog_get(&serde_json::to_vec(&base).unwrap())
-            .unwrap()
-            .wire_apis
-            .clone();
-    let mut plane = served_wire_example("chatgpt luna — named, unfiltered");
-    credentials.billing_catalog = credentials
-        .billing_catalog
-        .clone()
-        .with_test_plane(&serde_json::to_vec(&plane).unwrap());
-    for (wire, matches) in [
-        ("openai.chatgpt_responses", true),
-        ("openai.responses", false),
-    ] {
-        credentials.runner_declarations.insert(
-            "fixture-runner".into(),
-            declaration(json!([{"wire_api":wire, "auth_method":"chatgpt"}])),
-        );
-        assert_eq!(
-            !routes(Registry::build(
-                vec![policy(None)],
-                &credentials,
-                &facts,
-                NOW
-            ))
-            .is_empty(),
-            matches
-        );
-    }
-    let mut selected_on_api = facts.clone();
-    selected_on_api[0].billing_plane = Some(credentials.billing_catalog.for_route(
-        "openai/gpt-5.6-luna",
-        &crate::broca_credentials::ServingMethod {
-            auth_method: Some("apikey".into()),
-            reason: "selected account class".into(),
-        },
-        false,
-    ));
-    credentials.runner_declarations.insert(
-        "fixture-runner".into(),
-        declaration(json!([{"wire_api":"openai.chatgpt_responses", "auth_method":"chatgpt"}])),
-    );
-    assert!(
-        routes(Registry::build(
-            vec![policy(None)],
-            &credentials,
-            &selected_on_api,
-            NOW
-        ))
-        .is_empty(),
-        "a different credential cannot lend its wire and method to the selected billing plane"
-    );
-    plane["models"]["openai/gpt-5.6-luna"]
-        .as_object_mut()
-        .unwrap()
-        .remove("wire.family");
-    credentials.billing_catalog = credentials
-        .billing_catalog
-        .clone()
-        .with_test_plane(&serde_json::to_vec(&plane).unwrap());
-    let registry = Registry::build(vec![policy(None)], &credentials, &facts, NOW);
-    assert!(registry.wire_family_unverified(
-        "fixture-runner",
-        "openai/gpt-5.6-luna",
-        "openai/gpt-5.6-luna"
-    ));
-    assert!(routes(registry).is_empty());
-
-    let facts = vec![fact("meta", "muse-wonder-full-1.0", Some(&["oauth"]))];
-    let mut credentials =
-        super::runners_tests::credentials(&facts, row(&["meta"], &[], Some("oauth")), NOW);
-    credentials.wire_apis.clear();
-    credentials.billing_catalog = credentials.billing_catalog.clone().with_test_plane(
-        &serde_json::to_vec(&served_wire_example(
-            "catalog.get — meta oauth serves the curated row",
-        ))
-        .unwrap(),
-    );
-    credentials.runner_declarations.insert(
-        "fixture-runner".into(),
-        declaration(json!([{"wire_api":"openai.responses", "auth_method":"oauth"}])),
-    );
-    assert_eq!(
-        routes(Registry::build(
-            vec![policy(None)],
-            &credentials,
-            &facts,
-            NOW
-        )),
-        ["meta/muse-wonder-full-1.0"]
-    );
-}
-
-#[test]
-fn unknown_pair_tokens_decode_but_never_match_and_warn_once_per_runner() {
-    let facts = vec![fact("vendor-a", "model", None)];
-    crate::take_operator_warnings();
-    for (wire, method, field, token) in [
-        ("future.wire", "oauth", "wire_api", "future.wire"),
-        (
-            "anthropic.messages",
-            "future_auth",
-            "auth_method",
-            "future_auth",
-        ),
-    ] {
-        let mut credentials = credentials(&facts, row(&["vendor-a"], &[], Some(method)), NOW);
-        credentials
-            .wire_apis
-            .insert("vendor-a/model".into(), wire.into());
-        let declaration = declaration(json!([{"wire_api":wire, "auth_method":method}]));
-        for suffix in ["a", "b"] {
-            let module = format!("unknown-{field}-runner-{suffix}");
-            credentials
-                .runner_declarations
-                .insert(module.clone(), declaration.clone());
-            let mut policy = policy(None);
-            policy.module = module.clone();
-            for _ in 0..2 {
-                assert!(routes(Registry::build(
-                    vec![policy.clone()],
-                    &credentials,
-                    &facts,
-                    NOW
-                ))
-                .is_empty());
-            }
-            let warnings = crate::take_operator_warnings();
-            assert_eq!(warnings.len(), 1, "{warnings:?}");
-            assert!(
-                warnings[0].contains(&module)
-                    && warnings[0].contains(field)
-                    && warnings[0].contains(token),
-                "{warnings:?}"
-            );
-        }
-    }
-}
-
-#[test]
-fn converted_via_vault_runner_matches_the_frozen_served_set_without_a_declaration() {
-    let facts = vec![
-        fact("vendor-a", "unrestricted", None),
-        fact("vendor-a", "allowed", Some(&["oauth"])),
-        fact("vendor-a", "wrong-method", Some(&["apikey"])),
-        fact("vendor-b", "uncredentialed", Some(&["oauth"])),
-    ];
-    let credentials = credentials(&facts, row(&["vendor-a"], &[], Some("oauth")), NOW);
-    let defaults: Value =
-        serde_json::from_str(include_str!("../../data/config_convert_defaults.json")).unwrap();
-    let mut converted: RunnerPolicy =
-        serde_json::from_value(defaults["runners"][0].clone()).unwrap();
-    assert!(converted.via_vault);
-    converted.module = "fixture-runner".into();
-    let actual = routes(Registry::build(vec![converted], &credentials, &facts, NOW));
-    assert_eq!(actual, ["vendor-a/unrestricted", "vendor-a/allowed"]);
-    let (previous, fallback) = credentials.served_routes(&facts, NOW);
-    assert_eq!(fallback, None);
-    assert_eq!(actual, previous);
-}
-
-#[test]
-fn declaration_pairs_intersect_routes_and_replace_interim_facts() {
+fn serves_intersects_routes_and_replaces_the_last_good_list() {
     let facts = vec![
         fact("vendor-a", "allowed", Some(&["oauth"])),
         fact("vendor-b", "outside", Some(&["oauth"])),
@@ -827,9 +217,14 @@ fn declaration_pairs_intersect_routes_and_replace_interim_facts() {
         NOW,
     );
     let policies = vec![policy(Some(vec!["vendor-a/allowed"]))];
-    credentials.runner_declarations.insert("fixture-runner".into(), declaration(json!([
-        {"wire_api": "anthropic.messages", "auth_method": "oauth"}, {"wire_api": "other", "auth_method": "apikey"}
-    ])));
+    credentials
+        .runner_declarations
+        .insert("fixture-runner".into(), declaration());
+    serve(
+        &mut credentials,
+        "fixture-runner",
+        &["vendor-a", "vendor-b"],
+    );
     let broad = Registry::build(policies.clone(), &credentials, &facts, NOW);
     assert_eq!(
         broad.entries[0].policy.routes.as_ref().unwrap(),
@@ -840,12 +235,7 @@ fn declaration_pairs_intersect_routes_and_replace_interim_facts() {
         ["test:declared/v1"]
     );
     assert!(broad.entries[0].follows_account_choice);
-    credentials.runner_declarations.insert(
-        "fixture-runner".into(),
-        declaration(json!([
-            {"wire_api": "other", "auth_method": "oauth"}
-        ])),
-    );
+    serve(&mut credentials, "fixture-runner", &["vendor-b"]);
     assert!(routes(Registry::build(policies, &credentials, &facts, NOW)).is_empty());
 }
 
@@ -856,19 +246,7 @@ fn missing_auth_method_never_inherits_a_refresh_adapter_method() {
         fact("vendor-a", "restricted", Some(&["oauth"])),
     ];
     let mut credentials = credentials(&facts, row(&["vendor-a"], &[], None), NOW);
-    assert_eq!(
-        routes(Registry::build(
-            vec![policy(None)],
-            &credentials,
-            &facts,
-            NOW
-        )),
-        ["vendor-a/open"]
-    );
-    credentials.runner_declarations.insert(
-        "fixture-runner".into(),
-        declaration(json!([{"wire_api":"anthropic.messages", "auth_method":"oauth"}])),
-    );
+    serve(&mut credentials, "fixture-runner", &["vendor-a"]);
     assert!(routes(Registry::build(
         vec![policy(None)],
         &credentials,
@@ -879,7 +257,7 @@ fn missing_auth_method_never_inherits_a_refresh_adapter_method() {
 }
 
 #[test]
-fn runner_reach_uses_resolved_account_membership_before_and_after_declaration() {
+fn runner_reach_uses_resolved_account_membership_across_manifest_changes() {
     let facts = vec![
         fact("vendor-a", "model", Some(&["oauth"])),
         fact("vendor-b", "model", Some(&["oauth"])),
@@ -890,23 +268,29 @@ fn runner_reach_uses_resolved_account_membership_before_and_after_declaration() 
         (vec![], vec!["vendor-a", "vendor-b"], vec![]),
     ] {
         let mut credentials = credentials(&facts, row(&providers, &serves, Some("oauth")), NOW);
-        for declared in [false, true] {
-            if declared {
-                credentials.runner_declarations.insert(
-                    "fixture-runner".into(),
-                    declaration(json!([{"wire_api":"anthropic.messages", "auth_method":"oauth"}])),
-                );
-            }
-            assert_eq!(
-                routes(Registry::build(
-                    vec![policy(None)],
-                    &credentials,
-                    &facts,
-                    NOW
-                )),
-                expected
-            );
-        }
+        serve(
+            &mut credentials,
+            "fixture-runner",
+            &["vendor-a", "vendor-b"],
+        );
+        assert_eq!(
+            routes(Registry::build(
+                vec![policy(None)],
+                &credentials,
+                &facts,
+                NOW
+            )),
+            expected
+        );
+        let mut undeclared = credentials.clone();
+        undeclared.runner_declarations.clear();
+        assert!(routes(Registry::build(
+            vec![policy(None)],
+            &undeclared,
+            &facts,
+            NOW
+        ))
+        .is_empty());
         assert!(routes(Registry::build(
             vec![policy(None)],
             &credentials,
@@ -918,9 +302,8 @@ fn runner_reach_uses_resolved_account_membership_before_and_after_declaration() 
 }
 
 #[test]
-fn standing_provider_limits_and_verified_catalog_replacement_are_enforced() {
-    let slot = json!({"runner": {"pairs": [{"wire_api":"anthropic.messages", "auth_method":"oauth"}],
-        "standing_limits": {"explicit_providers": ["vendor-a"]}}});
+fn only_verified_catalog_declarations_can_place_from_a_serves_list() {
+    let slot = json!({"runner": {}});
     let entry = |verified| {
         json!({"module_id":"fixture-runner", "nonce_verified": verified,
         "role_declarations": {"routing/v1": slot}})
@@ -936,6 +319,7 @@ fn standing_provider_limits_and_verified_catalog_replacement_are_enforced() {
         NOW,
     );
     credentials.runner_declarations = runners::declarations_from_catalog(&json!([entry(true)]));
+    serve(&mut credentials, "fixture-runner", &["vendor-a"]);
     let registry = Registry::build(vec![policy(None)], &credentials, &facts, NOW);
     assert_eq!(
         registry.entries[0].policy.routes.as_ref().unwrap(),
@@ -943,107 +327,18 @@ fn standing_provider_limits_and_verified_catalog_replacement_are_enforced() {
     );
     assert!(!registry.entries[0].follows_account_choice);
     credentials.runner_declarations = runners::declarations_from_catalog(&json!([entry(false)]));
-    assert_eq!(
-        routes(Registry::build(
-            vec![policy(None)],
-            &credentials,
-            &facts,
-            NOW
-        )),
-        ["vendor-a/model", "vendor-b/model"]
-    );
-}
-
-#[test]
-fn provider_limits_keep_apikey_and_oauth_provider_identity() {
-    let provider = "company-provider";
-    let route = format!("{provider}/claude-opus-5-5");
-    for method in ["apikey", "oauth"] {
-        for per_harness in [false, true] {
-            for providers in [
-                vec!["anthropic"],
-                vec![provider],
-                vec!["anthropic", provider],
-            ] {
-                let mut facts = vec![fact("anthropic", "claude-opus-5-5", None)];
-                let mut credentials =
-                    credentials(&facts, row(&[provider], &["anthropic"], Some(method)), NOW);
-                credentials.refresh_serving_methods(&Default::default(), &facts, NOW as i64, &[]);
-                let targets = credentials.catalog_targets(&facts);
-                assert_eq!(targets.get(provider).map(String::as_str), Some("anthropic"));
-                striatum_core::score_alias::append_alias_rows(&mut facts, &targets);
-                let mut slot = json!({"runner": {
-                    "pairs":[{"wire_api":"anthropic.messages", "auth_method":method}],
-                    "harnesses":["alpha", "beta"]
-                }});
-                if per_harness {
-                    slot["runner"]["harness_limits"] =
-                        json!({"alpha":{"explicit_providers":providers}});
-                } else {
-                    slot["runner"]["standing_limits"] = json!({"explicit_providers":providers});
-                }
-                credentials.runner_declarations.insert(
-                    "fixture-runner".into(),
-                    runners::parse_declaration(&slot).unwrap().unwrap(),
-                );
-                let registry = Registry::build_for_harness(
-                    vec![policy(None)],
-                    &credentials,
-                    &facts,
-                    NOW,
-                    Some("alpha"),
-                );
-                assert_eq!(
-                    registry.runs("fixture-runner", &route, &route),
-                    providers.contains(&provider),
-                    "method={method}, per_harness={per_harness}, providers={providers:?}"
-                );
-            }
-        }
-    }
-}
-
-#[test]
-fn gateway_provider_limits_use_catalog_targets_not_id_spelling() {
-    let provider = "acme-llm";
-    let route = format!("{provider}/claude-opus-5-5");
-    for serves in [vec!["anthropic"], vec![], vec!["anthropic", "openai"]] {
-        let mut facts = vec![
-            fact("anthropic", "claude-opus-5-5", None),
-            fact("openai", "model-example", None),
-        ];
-        let mut credentials = credentials(&facts, row(&[provider], &serves, Some("gateway")), NOW);
-        credentials.refresh_serving_methods(&Default::default(), &facts, NOW as i64, &[]);
-        let targets = credentials.catalog_targets(&facts);
-        striatum_core::score_alias::append_alias_rows(&mut facts, &targets);
-        for providers in [
-            vec!["anthropic"],
-            vec!["anthropic", provider],
-            vec![provider],
-        ] {
-            credentials.runner_declarations.insert(
-                "fixture-runner".into(),
-                runners::parse_declaration(&json!({"runner": {
-                    "pairs":[{"wire_api":"anthropic.messages", "auth_method":"gateway"}],
-                    "standing_limits":{"explicit_providers":providers}
-                }}))
-                .unwrap()
-                .unwrap(),
-            );
-            let registry = Registry::build(vec![policy(None)], &credentials, &facts, NOW);
-            assert_eq!(
-                registry.runs("fixture-runner", &route, &route),
-                serves == ["anthropic"] && providers.contains(&"anthropic"),
-                "serves={serves:?}, providers={providers:?}"
-            );
-        }
-    }
+    assert!(routes(Registry::build(
+        vec![policy(None)],
+        &credentials,
+        &facts,
+        NOW
+    ))
+    .is_empty());
 }
 
 #[test]
 fn runner_declaration_validation_matches_the_shared_contract_shape() {
-    let valid =
-        json!({"runner": {"pairs": [{"wire_api":"anthropic.messages", "auth_method":"oauth"}]}});
+    let valid = json!({"runner": {}});
     assert!(
         runners::parse_declaration(&valid)
             .unwrap()
@@ -1057,19 +352,15 @@ fn runner_declaration_validation_matches_the_shared_contract_shape() {
             .follows_account_choice
     );
     for invalid in [
-        json!({"runner": {"pairs": []}}),
-        json!({"runner": {"pairs": [{"wire_api":"Messages", "auth_method":"oauth"}]}}),
-        json!({"runner": {"pairs": [{"wire_api":"anthropic.messages", "auth_method":"oauth"}, {"wire_api":"anthropic.messages", "auth_method":"oauth"}]}}),
-        json!({"runner": {"pairs": [{"wire_api":"anthropic.messages", "auth_method":"oauth"}], "unknown": true}}),
-        json!({"runner": {"pairs": [{"wire_api":"anthropic.messages", "auth_method":"oauth", "unknown": true}]}}),
-        json!({"runner": {"pairs": [{"wire_api":"anthropic.messages", "auth_method":"oauth"}], "tool_capabilities": ["test:cap_0/v1", "test:cap_0/v1"]}}),
-        json!({"runner": {"pairs": [{"wire_api":"anthropic.messages", "auth_method":"oauth"}], "standing_limits": {"explicit_providers": []}}}),
-        json!({"runner": {"pairs": [{"wire_api":"anthropic.messages", "auth_method":"oauth"}], "standing_limits": {"unknown": true}}}),
-        json!({"runner": {"pairs": [{"wire_api":"anthropic.messages", "auth_method":"oauth"}], "harnesses": ["Not A Token"]}}),
-        json!({"runner": {"pairs": [{"wire_api":"anthropic.messages", "auth_method":"oauth"}], "harnesses": ["pi", "pi"]}}),
-        json!({"runner": {"pairs": [{"wire_api":"anthropic.messages", "auth_method":"oauth"}], "harnesses": ["pi"], "default_harness": "other"}}),
-        json!({"runner": {"pairs": vec![json!({"wire_api":"anthropic.messages", "auth_method":"oauth"}); 65]}}),
-        json!({"runner": {"pairs": [{"wire_api":"anthropic.messages", "auth_method":"oauth"}], "tool_capabilities": (0..65).map(|n| format!("test:cap_{n}/v1")).collect::<Vec<_>>()}}),
+        json!({"runner": {"pairs": [{"wire_api":"anthropic.messages", "auth_method":"oauth"}]}}),
+        json!({"runner": {"requires_wire_api": true}}),
+        json!({"runner": {"standing_limits": {}}}),
+        json!({"runner": {"unknown": true}}),
+        json!({"runner": {"tool_capabilities": ["test:cap_0/v1", "test:cap_0/v1"]}}),
+        json!({"runner": {"harnesses": ["Not A Token"]}}),
+        json!({"runner": {"harnesses": ["pi", "pi"]}}),
+        json!({"runner": {"harnesses": ["pi"], "default_harness": "other"}}),
+        json!({"runner": {"tool_capabilities": (0..65).map(|n| format!("test:cap_{n}/v1")).collect::<Vec<_>>()}}),
         json!({"unknown": true}),
     ] {
         assert!(runners::parse_declaration(&invalid).is_err(), "{invalid}");
@@ -1114,14 +405,14 @@ async fn select_then_account_for_keeps_resolved_membership_across_runner_declara
         })).unwrap(), NOW as i64).unwrap();
         *crate::ACCOUNT_QUOTA.get().unwrap().lock().unwrap() = state;
         let mut credentials = credentials(&facts, row, NOW);
+        serve(&mut credentials, "fixture-runner", &["anthropic"]);
         let caller = harness.bind(reserved("example-consumer"), None).await;
         let runner = harness.bind(reserved("fixture-runner"), None).await;
         for declared in [false, true] {
             if declared {
-                credentials.runner_declarations.insert(
-                    "fixture-runner".into(),
-                    declaration(json!([{"wire_api":"anthropic.messages", "auth_method":"oauth"}])),
-                );
+                credentials
+                    .runner_declarations
+                    .insert("fixture-runner".into(), declaration());
             }
             harness.set_credentials(credentials.clone());
             let selection = caller
@@ -1192,12 +483,12 @@ async fn consumer_ownership_never_grants_unscoped_account_operations() {
 fn variants_share_model_reach_but_never_bypass_operator_variant_rules() {
     let facts = vec![fact("vendor-a", "model", Some(&["oauth"]))];
     let mut credentials = credentials(&facts, row(&["vendor-a"], &[], Some("oauth")), NOW);
+    serve(&mut credentials, "fixture-runner", &["vendor-a"]);
     for declared in [false, true] {
         if declared {
-            credentials.runner_declarations.insert(
-                "fixture-runner".into(),
-                declaration(json!([{"wire_api":"anthropic.messages", "auth_method":"oauth"}])),
-            );
+            credentials
+                .runner_declarations
+                .insert("fixture-runner".into(), declaration());
         }
         let registry = Registry::build(
             vec![policy(Some(vec!["vendor-a/model/high"]))],
@@ -1208,50 +499,6 @@ fn variants_share_model_reach_but_never_bypass_operator_variant_rules() {
         assert!(registry.runs("fixture-runner", "vendor-a/model/high", "vendor-a/model"));
         assert!(!registry.runs("fixture-runner", "vendor-a/model/low", "vendor-a/model"));
         assert!(!registry.runs("fixture-runner", "vendor-a/model", "vendor-a/model"));
-    }
-}
-
-#[tokio::test]
-async fn catalog_wire_api_reaches_selection_without_provider_name_inference() {
-    let _clock = crate::InjectedClock::set(NOW);
-    let harness = Harness::new("runner-transport");
-    let facts = vec![fact("vendor-a", "model", Some(&["oauth"]))];
-    harness.install_facts(&facts);
-    harness.edit_config(|config| {
-        config["runners"] = json!([{"module":"fixture-runner", "via_vault":true}])
-    });
-    let caller = harness.bind(reserved("example-consumer"), None).await;
-    for (version, api, expected) in [
-        (1, "anthropic.messages", FrameType::Response),
-        (2, "different", FrameType::Error),
-    ] {
-        let mut credentials = credentials(&facts, row(&["vendor-a"], &[], Some("oauth")), NOW);
-        credentials.wire_apis.clear();
-        credentials.runner_declarations.insert(
-            "fixture-runner".into(),
-            declaration(json!([{"wire_api":"anthropic.messages", "auth_method":"oauth"}])),
-        );
-        let shared = std::sync::Arc::new(std::sync::Mutex::new(credentials));
-        let snapshot = crate::fusiform_catalog::decode_catalog_get(&serde_json::to_vec(&json!({
-            "catalog_version":version, "resolved_at_ms":NOW,
-            "models":{"vendor-a/model":{"existence":"present", "wire.family":api, "limit.context":200_000}},
-            "curated":[{"model":"vendor-a/model", "auth_methods":["oauth"]}]
-        })).unwrap()).unwrap();
-        crate::fusiform_catalog::apply_mapped_catalog(
-            harness.store(),
-            &snapshot,
-            Some(&shared),
-            None,
-        )
-        .unwrap();
-        harness.set_credentials(shared.lock().unwrap().clone());
-        let reply = caller
-            .call(
-                "route.select",
-                &json!({"consumer":"mason", "requirements":{"iq":0}}),
-            )
-            .await;
-        assert_eq!(reply.0, expected, "{reply:?}");
     }
 }
 
@@ -1406,10 +653,16 @@ async fn harness_comes_only_from_the_selected_runners_verified_declaration() {
     assert_eq!(reply.0, FrameType::Response, "{reply:?}");
     assert_eq!(reply.1["result"]["runner"]["harness"], "beta");
 
-    // Reset credentials to remove the verified runner declarations while
-    // keeping operator policy and models. Neither supplies a missing harness.
+    // The same runner now serves its models with no named session program.
+    // The served models and operator policy cannot supply a harness name.
     let facts = harness.store().get_facts().unwrap();
-    harness.set_credentials(BrocaCredentials::api_test_credentials(&facts));
+    let mut credentials = BrocaCredentials::api_test_credentials(&facts);
+    serve(
+        &mut credentials,
+        "runner-one",
+        &[fixture::PRICED_PROVIDER, fixture::SUBSCRIPTION_PROVIDER],
+    );
+    harness.set_credentials(credentials);
     let reply = caller.call("route.select", &request).await;
     assert_eq!(reply.0, FrameType::Response, "{reply:?}");
     assert!(
@@ -1418,41 +671,6 @@ async fn harness_comes_only_from_the_selected_runners_verified_declaration() {
     );
 }
 
-#[tokio::test]
-async fn undeclared_production_runners_keep_the_same_selection_envelope() {
-    let harness = Harness::new("legacy-program-absence");
-    let facts = vec![fact("vendor-a", "model", Some(&["oauth"]))];
-    harness.install_facts(&facts);
-    harness.edit_config(|config| {
-        config["runners"] = json!([{"module":"fixture-runner", "via_vault":true}]);
-    });
-    harness.set_credentials(credentials(
-        &facts,
-        row(&["vendor-a"], &[], Some("oauth")),
-        crate::now_ms(),
-    ));
-    let caller = harness.bind(reserved("example-consumer"), None).await;
-    for request in [json!({"consumer":"mason", "requirements":{"iq":0}})] {
-        let reply = caller.call("route.select", &request).await;
-        assert_eq!(reply.0, FrameType::Response, "{reply:?}");
-        if request.get("targetAgent").is_none() {
-            assert_eq!(
-                reply.1["result"]["runner"],
-                json!({
-                    "module":"fixture-runner", "model":{"provider":"vendor-a", "model":"model"}
-                })
-            );
-        } else {
-            assert_eq!(reply.1["result"]["runner"]["module"], "fixture-runner");
-            assert!(reply.1["result"]["runner"].get("harness").is_none());
-        }
-    }
-    let reply = caller.call("role.describe", &json!({})).await;
-    let runner = &reply.1["result"]["runners"][0];
-    for field in ["harnesses", "default_harness", "starts_sessions"] {
-        assert!(runner.get(field).is_none(), "{reply:?}");
-    }
-}
 #[test]
 fn broca_contract_0748_routing_tier_discovery() {
     for bytes in [
@@ -1501,8 +719,7 @@ fn routed_account_methods_require_follows_account_choice() {
         .routed_accounts
         .is_empty());
     for follows in [false, true] {
-        let mut declared =
-            declaration(json!([{"wire_api":"anthropic.messages", "auth_method":"apikey"}]));
+        let mut declared = declaration();
         declared.follows_account_choice = follows;
         credentials
             .runner_declarations
@@ -1561,8 +778,9 @@ fn broca_account_reach_uses_raw_vault_identity_but_api_keys_keep_their_fallback(
         let mut missing = row(&["xai"], &[], Some(method));
         missing.id = format!("{method}:xai");
         missing.account_id = None;
-        let credentials = credentials(&facts, missing.clone(), NOW);
+        let mut credentials = credentials(&facts, missing.clone(), NOW);
         for module in ["broca", "other-runner"] {
+            serve(&mut credentials, module, &["xai"]);
             let mut runner = policy(None);
             runner.module = module.into();
             let registry = Registry::build(vec![runner], &credentials, &facts, NOW);
@@ -1612,7 +830,9 @@ async fn broca_missing_provider_account_is_rejected_on_select_despite_insula_lin
     let mut missing = row(&["xai"], &[], Some("oauth"));
     missing.id = "oauth:xai".into();
     missing.account_id = None;
-    harness.set_credentials(credentials(&facts, missing, NOW));
+    let mut credentials = credentials(&facts, missing, NOW);
+    serve(&mut credentials, "broca", &["xai"]);
+    harness.set_credentials(credentials);
     let mut quota = crate::account_quota::AccountQuotaState::default();
     crate::account_quota::apply_usage_reply(
         &mut quota,
@@ -1649,7 +869,9 @@ async fn pin_availability_unknown_cause_is_untimed_and_keeps_its_detail() {
     let mut missing = row(&["xai"], &[], Some("oauth"));
     missing.id = "oauth:xai".into();
     missing.account_id = None;
-    harness.set_credentials(credentials(&facts, missing, NOW));
+    let mut credentials = credentials(&facts, missing, NOW);
+    serve(&mut credentials, "broca", &["xai"]);
+    harness.set_credentials(credentials);
     let caller = harness.bind(reserved("example-consumer"), None).await;
     let reply = caller
         .call(

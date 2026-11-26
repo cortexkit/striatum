@@ -152,9 +152,15 @@ fn setup(fixture: &Value, api: bool) -> (Arc<Harness>, impl Drop, SubscriptionPo
     );
     credentials.refresh_serving_methods(&state, &[fact.clone()], now, &[]);
     credentials.publish_billing_catalog(
-        crate::fusiform_catalog::PlaneCatalog::ordinary_test_catalog(&[fact]),
+        crate::fusiform_catalog::PlaneCatalog::ordinary_test_catalog(std::slice::from_ref(&fact)),
     );
     credentials.publish_plan_prices(&prices);
+    super::conformance_tests::publish_fixture_models(
+        &mut credentials,
+        "broca",
+        std::slice::from_ref(&fact),
+        true,
+    );
     harness.set_credentials(credentials);
     harness.edit_config(|config| {
         config["providers"]["anthropic"]["keep_free_percent"] =

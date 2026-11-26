@@ -1074,7 +1074,14 @@ fn install_client_catalog(harness: &Harness, client: &str) {
     // Record that each runner answered without service-tier support, so a fresh
     // fast request may fall back to standard instead of waiting for discovery.
     for runner in &catalog.runners {
-        harness.observe_runner_describe(&runner.module, &json!({"capabilities":[]}));
+        harness.publish_runner_serves(
+            &runner.module,
+            &super::conformance_tests::test_serves(
+                &runner.route_keys,
+                runner.harnesses.as_deref(),
+                "replay-client-fixture",
+            ),
+        );
     }
     if client == "ckdesk" {
         super::conformance_tests::install_head_snapshot(harness);

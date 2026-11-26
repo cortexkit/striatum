@@ -1,0 +1,1 @@
+{"consumers":[{"name":"broca.complete","workload":"quick"}],"runner":{"follows_account_choice":true,"harness_limits":{"broca":{"capabilities":["one_off","fork_answer","submit_tool","final_text","plans","output_cap"]},"broca-uncapped":{"capabilities":["one_off","fork_answer","submit_tool","final_text","plans"]}},"harnesses":["broca","broca-uncapped"]}}

@@ -59,6 +59,7 @@ fn one_account() -> Arc<Harness> {
         crate::fusiform_catalog::PlaneCatalog::ordinary_test_catalog(&facts),
     );
     credentials.publish_plan_prices(&json!({"prices":[]}));
+    publish_fixture_providers(&mut credentials, "broca", &["openai"], true);
     harness.set_credentials(credentials);
     harness.edit_config(|config| {
         config["runners"] = json!([{"module":"broca", "via_vault":true}]);

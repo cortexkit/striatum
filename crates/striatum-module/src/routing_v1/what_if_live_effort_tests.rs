@@ -60,7 +60,22 @@ async fn approved() -> (std::sync::Arc<Harness>, Route) {
             row["workload.code.effort_default"] = json!(graded);
         }
     });
-    harness.observe_runner_describe("broca", &broad_runner_slot());
+    let offered: Vec<_> = harness
+        .store()
+        .get_facts()
+        .unwrap()
+        .into_iter()
+        .filter(|fact| {
+            [fixture::PRICED_PROVIDER, fixture::SUBSCRIPTION_PROVIDER]
+                .contains(&fact.provider_id.as_str())
+        })
+        .collect();
+    crate::routing_v1::conformance_tests::publish_fixture_models(
+        &mut harness.credentials().lock().unwrap(),
+        "broca",
+        &offered,
+        true,
+    );
     harness.edit_config(|c| {
         for (id, workload) in [
             (SIDEKICK, "lookup"),

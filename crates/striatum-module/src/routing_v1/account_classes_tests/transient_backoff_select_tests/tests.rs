@@ -193,6 +193,7 @@ async fn in_flight_test_with_less_than_thirty_seconds_remaining_uses_its_clock()
         },
         clock - 10_000,
     );
+    publish_fixture_providers(&mut credentials, "broca", &["openai"], true);
     drop(credentials);
     let reply = owner.call("route.select", &select()).await;
     assert_eq!(reply.0, FrameType::Error, "{}", reply.1);
@@ -299,6 +300,12 @@ fn quota_route(harness: &Harness) {
     credentials.refresh_serving_methods(&Default::default(), &facts, NOW as i64 + 5_001, &[]);
     credentials.publish_billing_catalog(
         crate::fusiform_catalog::PlaneCatalog::ordinary_test_catalog(&facts),
+    );
+    publish_fixture_providers(
+        &mut credentials,
+        "broca",
+        &["openai", "quota-provider"],
+        true,
     );
     harness.set_credentials(credentials);
     harness

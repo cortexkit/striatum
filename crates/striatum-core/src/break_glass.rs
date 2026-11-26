@@ -23,9 +23,9 @@ pub struct RelaxedSnapshot {
     pub resets_at: Option<f64>,
 }
 
-fn earliest_future_reset(state: &RouteRuntimeState, now: f64) -> Option<f64> {
+fn earliest_future_reset(state: &RouteRuntimeState, now: f64, uses_quota: bool) -> Option<f64> {
     [
-        state.quota_exhausted_until,
+        state.quota_exhausted_until.filter(|_| uses_quota),
         state.cooldown_until,
         state.failure_backoff_until,
         state.provider_reset_until,
@@ -47,7 +47,13 @@ fn candidate_earliest_reset(
     ]
     .into_iter()
     .flatten()
-    .filter_map(|state| earliest_future_reset(state, snapshot.now))
+    .filter_map(|state| {
+        earliest_future_reset(
+            state,
+            snapshot.now,
+            !snapshot.keyless_mixed_routes.contains(&candidate.route_key),
+        )
+    })
     .min_by(f64::total_cmp)
 }
 
@@ -68,11 +74,16 @@ fn candidate_clearable_reset(
     .into_iter()
     .flatten()
     .filter_map(|state| {
-        [state.quota_exhausted_until, state.cooldown_until]
-            .into_iter()
-            .flatten()
-            .filter(|reset| *reset > snapshot.now)
-            .min_by(f64::total_cmp)
+        [
+            state
+                .quota_exhausted_until
+                .filter(|_| !snapshot.keyless_mixed_routes.contains(&candidate.route_key)),
+            state.cooldown_until,
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|reset| *reset > snapshot.now)
+        .min_by(f64::total_cmp)
     })
     .min_by(f64::total_cmp)
 }
@@ -121,9 +132,10 @@ pub fn live_billing_wall_error<'a>(
             && (state
                 .cooldown_until
                 .is_some_and(|until| until > snapshot.now)
-                || state
-                    .quota_exhausted_until
-                    .is_some_and(|until| until > snapshot.now))
+                || state.quota_exhausted_until.is_some_and(|until| {
+                    until > snapshot.now
+                        && !snapshot.keyless_mixed_routes.contains(&candidate.route_key)
+                }))
     })
     .map(|state| state.last_error.as_deref().unwrap_or("billing wall"))
 }
@@ -201,7 +213,9 @@ pub fn relax_earliest_reset(
     .into_iter()
     .flatten()
     {
-        state.quota_exhausted_until = None;
+        if !snapshot.keyless_mixed_routes.contains(&candidate.route_key) {
+            state.quota_exhausted_until = None;
+        }
         state.cooldown_until = None;
     }
 
@@ -239,6 +253,7 @@ mod tests {
             now: 1_000.0,
             by_route: HashMap::from([("p/a".into(), exhausted(Some(500.0), None))]),
             by_capacity: HashMap::new(),
+            ..Default::default()
         };
         let relaxed = relax_earliest_reset(&snap, &[candidate("p/a", "p/a")])
             .expect("an unknown-reset candidate remains eligible");
@@ -261,6 +276,7 @@ mod tests {
                 },
             )]),
             by_capacity: HashMap::new(),
+            ..Default::default()
         };
         let candidate = candidate("xai/grok-4.6", "xai/grok-4.6");
         assert_eq!(
@@ -281,6 +297,7 @@ mod tests {
                 ("p/not-a-candidate".into(), exhausted(Some(2_000.0), None)),
             ]),
             by_capacity: HashMap::new(),
+            ..Default::default()
         };
         let candidates = [
             candidate("p/a", "p/a"),
@@ -312,6 +329,7 @@ mod tests {
                 ("p/unknown".into(), exhausted(Some(500.0), None)),
             ]),
             by_capacity: HashMap::new(),
+            ..Default::default()
         };
         let candidates = [
             candidate("p/unknown", "p/unknown"),
@@ -338,6 +356,7 @@ mod tests {
             now: 1_000.0,
             by_route: HashMap::from([("p/a/high".into(), exhausted(Some(4_000.0), None))]),
             by_capacity: HashMap::from([("p/a".into(), exhausted(Some(4_000.0), Some(4_000.0)))]),
+            ..Default::default()
         };
 
         let relaxed = relax_earliest_reset(&snap, &[candidate("p/a/high", "p/a")])
@@ -360,6 +379,7 @@ mod tests {
             now: 1_000.0,
             by_route: HashMap::from([("p/a/high".into(), exhausted(Some(500.0), None))]),
             by_capacity: HashMap::from([("p/a".into(), exhausted(None, Some(4_000.0)))]),
+            ..Default::default()
         };
 
         let relaxed = relax_earliest_reset(&snap, &[candidate("p/a/high", "p/a")])
@@ -388,6 +408,7 @@ mod tests {
             now,
             by_route: HashMap::from([("a/opus".into(), opus), ("a/sonnet".into(), sonnet)]),
             by_capacity: HashMap::new(),
+            ..Default::default()
         };
         let relaxed = relax_earliest_reset(
             &snap,
@@ -424,6 +445,7 @@ mod tests {
                 },
             )]),
             by_capacity: HashMap::new(),
+            ..Default::default()
         };
         assert!(relax_earliest_reset(&only_backoff, &[candidate("a/opus", "a/opus")]).is_none());
     }

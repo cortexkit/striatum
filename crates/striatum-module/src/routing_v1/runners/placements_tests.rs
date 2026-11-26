@@ -133,7 +133,6 @@ async fn settings_placement_routes_harness_and_caller_intersect_in_list_order() 
 
 fn declaration(harnesses: Value, limits: Value) -> super::RunnerDeclaration {
     super::parse_declaration(&json!({"runner":{
-        "pairs":[{"wire_api":"anthropic.messages","auth_method":"apikey"}, {"wire_api":"anthropic.messages","auth_method":"oauth"}],
         "harnesses":harnesses,
         "harness_limits":limits,
         "follows_account_choice":true
@@ -278,102 +277,6 @@ async fn settings_placement_pending_declaration_is_kept_then_activated() {
 }
 
 #[tokio::test]
-async fn settings_placement_exclusion_is_warning_only_and_limits_explain_empty_routes() {
-    let harness = Harness::new("entry-exclude");
-    install(&harness);
-    harness
-        .credentials()
-        .lock()
-        .unwrap()
-        .runner_declarations
-        .insert(
-            "thalamus-harness".into(),
-            declaration(
-                json!(["claude-code"]),
-                json!({"claude-code":{"exclude":["anthropic","-openai"]}}),
-            ),
-        );
-    entries(
-        &harness,
-        json!([{ "module":"thalamus-harness","harness":"claude-code","routes":["anthropic"] }]),
-    );
-    let caller = harness.bind(reserved(fixture::CONSUMER), None).await;
-    let mut monitor = placements::Monitor::default();
-    let mut warnings = Vec::new();
-    monitor.declarations(
-        &harness.credentials().lock().unwrap().runner_declarations,
-        |warning| warnings.push(warning),
-    );
-    monitor.settings(harness.operator_config().v1_runners(), |warning| {
-        warnings.push(warning)
-    });
-    assert_eq!(warnings.len(), 1);
-    assert!(warnings[0].contains("all configured routes are excluded; kept"));
-    assert!(placements::usable(
-        &harness.operator_config().v1_runners()[0],
-        harness
-            .credentials()
-            .lock()
-            .unwrap()
-            .runner_declarations
-            .get("thalamus-harness")
-    ));
-    refused(
-        caller
-            .call(
-                "route.select",
-                &json!({"consumer":"mason","requirements":{"iq":0}}),
-            )
-            .await,
-        "harness_unavailable",
-    );
-    let pin = caller
-        .call("route.select", &request("anthropic/model-a"))
-        .await;
-    assert_eq!(pin.0, FrameType::Error, "{pin:?}");
-    assert_eq!(pin.1["code"], "pin_unavailable", "{pin:?}");
-    let reopened = declaration(
-        json!(["claude-code"]),
-        json!({"claude-code":{"exclude":["anthropic","-anthropic/model-a"]}}),
-    );
-    harness
-        .credentials()
-        .lock()
-        .unwrap()
-        .runner_declarations
-        .insert("thalamus-harness".into(), reopened);
-    let mut monitor = placements::Monitor::default();
-    let mut warnings = Vec::new();
-    monitor.declarations(
-        &harness.credentials().lock().unwrap().runner_declarations,
-        |warning| warnings.push(warning),
-    );
-    monitor.settings(harness.operator_config().v1_runners(), |warning| {
-        warnings.push(warning)
-    });
-    assert!(
-        warnings.is_empty(),
-        "an admitted descendant keeps the placement open"
-    );
-    let answer = selected(
-        caller
-            .call("route.select", &request("anthropic/model-a"))
-            .await,
-    );
-    assert_eq!(answer["runner"]["harness"], "claude-code");
-    harness.credentials().lock().unwrap().runner_declarations.insert("thalamus-harness".into(), declaration(json!(["claude-code"]), json!({"claude-code":{"pairs":[{"wire_api":"anthropic.messages","auth_method":"oauth"}]}})));
-    refused(
-        caller
-            .call(
-                "route.select",
-                &json!({"consumer":"mason","requirements":{"iq":0}}),
-            )
-            .await,
-        "harness_unavailable",
-    );
-}
-
-#[tokio::test]
 async fn settings_placement_describe_uses_first_entry_and_pickers_ignore_harness() {
     let harness = Harness::new("entry-describe");
     install(&harness);
@@ -394,16 +297,32 @@ async fn settings_placement_describe_uses_first_entry_and_pickers_ignore_harness
     )
     .unwrap();
     harness.credentials().lock().unwrap().catalog_snapshot = Some(snapshot);
+    {
+        let shared = harness.credentials();
+        let mut credentials = shared.lock().unwrap();
+        credentials.runner_declarations.insert(
+            "thalamus-harness".into(),
+            super::parse_declaration(&json!({"runner":{"tool_capabilities":["test:first/v1"]}}))
+                .unwrap()
+                .unwrap(),
+        );
+        crate::routing_v1::conformance_tests::publish_fixture_providers(
+            &mut credentials,
+            "thalamus-harness",
+            &["anthropic", "openai"],
+            false,
+        );
+    }
     entries(
         &harness,
-        json!([{ "module":"thalamus-harness","routes":["anthropic/model-a","anthropic/model-b"],"tool_capabilities":["first/v1"] }]),
+        json!([{ "module":"thalamus-harness","routes":["anthropic/model-a","anthropic/model-b"],"tool_capabilities":["test:first/v1"] }]),
     );
     let caller = harness.bind(reserved(fixture::CONSUMER), None).await;
     let baseline = caller.call("role.describe", &json!({})).await;
     let bytes = serde_json::to_string(&baseline.1["result"]["runners"]).unwrap();
     assert_eq!(
         bytes,
-        r#"[{"follows_account_choice":false,"module":"thalamus-harness","routes":["anthropic/model-a","anthropic/model-b"],"tool_capabilities":["first/v1"],"via_vault":false}]"#
+        r#"[{"follows_account_choice":false,"module":"thalamus-harness","routes":["anthropic/model-a","anthropic/model-b"],"tool_capabilities":["test:first/v1"],"via_vault":false}]"#
     );
     let head_params = json!({"runner_module":"thalamus-harness"});
     let before = caller.call("route.head_choices", &head_params).await;
@@ -411,8 +330,8 @@ async fn settings_placement_describe_uses_first_entry_and_pickers_ignore_harness
     entries(
         &harness,
         json!([
-            { "module":"thalamus-harness","harness":"claude-code","routes":["anthropic/model-a","anthropic/model-b"],"tool_capabilities":["first/v1"] },
-            { "module":"thalamus-harness","harness":"opencode2","routes":["openai"],"via_vault":true,"tool_capabilities":["second/v1"] }
+            { "module":"thalamus-harness","harness":"claude-code","routes":["anthropic/model-a","anthropic/model-b"],"tool_capabilities":["test:first/v1"] },
+            { "module":"thalamus-harness","harness":"opencode2","routes":["openai"],"via_vault":true,"tool_capabilities":["test:second/v1"] }
         ]),
     );
     let describe = caller.call("role.describe", &json!({})).await;
@@ -466,12 +385,21 @@ async fn settings_placement_later_entry_keeps_its_nonstandard_tier_reach() {
     credentials.runner_declarations.insert(
         "tier-runner".into(),
         super::parse_declaration(&json!({"runner":{
-            "pairs":[{"wire_api":"openai.responses","auth_method":"oauth"}],
             "harnesses":["early","later"], "follows_account_choice":true
         }}))
         .unwrap()
         .unwrap(),
     );
+    let served = json!([{"provider":"openai","models":["gpt-6.1-sol"]}]);
+    let previous_tiers = credentials.runner_service_tiers.clone();
+    crate::routing_v1::conformance_tests::publish_runner_serves(
+        &mut credentials,
+        "tier-runner",
+        &json!({
+            "generation":"tier-placement-fixture", "harnesses":{"early":served,"later":served}
+        }),
+    );
+    credentials.runner_service_tiers = previous_tiers;
     harness.set_credentials(credentials);
     entries(
         &harness,
@@ -721,6 +649,12 @@ async fn consumer_placements_empty_refused_and_pending_lists_never_fall_back() {
         assert_eq!(answer["runner"]["module"], module);
     }
     // Adding a global runner authorizes the already retained consumer entry.
+    crate::routing_v1::conformance_tests::publish_fixture_providers(
+        &mut harness.credentials().lock().unwrap(),
+        "not-global",
+        &["anthropic"],
+        false,
+    );
     harness.edit_config(|config| {
         config["runners"]
             .as_array_mut()

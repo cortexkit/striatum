@@ -491,6 +491,22 @@ pub(crate) fn representative_fixture(counts: FixtureCounts) -> RequestFixture {
         );
         let facts = fixture.harness.store().get_facts().unwrap();
         credentials.refresh_serving_methods(&Default::default(), &facts, FIXTURE_NOW as i64, &[]);
+        let runner = &fixture.catalog.runners[0];
+        let mut keys = runner.route_keys.clone();
+        keys.extend(
+            fixture
+                .catalog
+                .models
+                .iter()
+                .filter(|model| model.provider == "cpu-provider-0")
+                .map(|model| format!("cpu-pool-0/{}", model.model)),
+        );
+        let list = super::conformance_tests::test_serves(
+            &keys,
+            runner.harnesses.as_deref(),
+            "representative-with-pool",
+        );
+        super::conformance_tests::publish_runner_serves(&mut credentials, &runner.module, &list);
     }
     fixture
 }

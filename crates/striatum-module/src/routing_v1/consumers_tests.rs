@@ -73,6 +73,12 @@ fn placement_catalog(h: &Harness, declarations: Value) {
     credentials
         .runner_declarations
         .insert("broca".into(), runner);
+    super::conformance_tests::publish_fixture_providers(
+        &mut credentials,
+        "broca",
+        &[fixture::PRICED_PROVIDER, fixture::SUBSCRIPTION_PROVIDER],
+        false,
+    );
 }
 
 fn no_route(reply: &(FrameType, Value), reason: &str) {
@@ -1772,8 +1778,6 @@ async fn declared_names_mixed_runner_slot_and_preview_follow_serving_capabilitie
     let slot = json!({
         "consumers": [{"name":"broca.task", "iq":40}, {"name":"foreign-task", "iq":40}],
         "runner": {
-            "pairs":[{"wire_api":"anthropic.messages", "auth_method":"apikey"},
-                     {"wire_api":"anthropic.messages", "auth_method":"oauth"}],
             "harnesses":["name-test"], "default_harness":"name-test"
         }
     });
@@ -1794,6 +1798,12 @@ async fn declared_names_mixed_runner_slot_and_preview_follow_serving_capabilitie
             Some(["name-test".to_string()].as_slice())
         );
         h.credentials().lock().unwrap().runner_declarations = runners;
+        let offered = json!([{"provider":"example-provider","models":["model-a","model-b"]},
+            {"provider":"example-subscription","models":["model-c","model-d"]}]);
+        h.publish_runner_serves(
+            "broca",
+            &json!({"generation":"consumer-name-fixture", "harnesses":{"name-test":offered}}),
+        );
         let owner = h.bind(reserved("broca"), None).await;
         let live = owner.call("route.select", &select("broca.task")).await;
         assert_eq!(live.0, FrameType::Response, "{live:?}");
@@ -1813,18 +1823,24 @@ async fn declared_names_mixed_runner_slot_and_preview_follow_serving_capabilitie
                 .is_empty(),
             "{preview:?}"
         );
-        let unchanged = owner.call("route.select", &select("broca.task")).await;
-        assert_eq!(unchanged.0, FrameType::Response, "{unchanged:?}");
-        assert!(
-            unchanged.1["result"]["runner"].get("harness").is_none(),
-            "{unchanged:?}"
-        );
         assert!(h
             .credentials()
             .lock()
             .unwrap()
             .runner_declarations
             .is_empty());
+        super::conformance_tests::publish_fixture_providers(
+            &mut h.credentials().lock().unwrap(),
+            "broca",
+            &[fixture::PRICED_PROVIDER, fixture::SUBSCRIPTION_PROVIDER],
+            false,
+        );
+        let unchanged = owner.call("route.select", &select("broca.task")).await;
+        assert_eq!(unchanged.0, FrameType::Response, "{unchanged:?}");
+        assert!(
+            unchanged.1["result"]["runner"].get("harness").is_none(),
+            "{unchanged:?}"
+        );
     })
     .await;
     super::describe::without_capability("consumer_declarations", async {

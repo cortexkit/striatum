@@ -441,10 +441,22 @@ fn account_for_inner(
             {
                 let input: Value =
                     serde_json::from_str(&input.requirements_json).map_err(store_unavailable)?;
+                if input["login_not_required"] == true {
+                    return Err(login_not_required());
+                }
                 if let Some(cap) = input["hold_wait_max_s"].as_u64() {
                     hold_wait_max_s = hold_wait_max_s.min(cap);
                 }
             }
+        } else if !media_caller
+            && super::runners::unbound_route_is_keyless(
+                deps,
+                authority.module,
+                &request.provider,
+                &request.model,
+            )
+        {
+            return Err(login_not_required());
         }
 
         let mut parsed = account_selection::admission::AccountForParams::from_v1(
@@ -540,6 +552,14 @@ fn op_refusal(reply: OpReply) -> Refusal {
         } => account_refusal(&code, message, detail.as_ref()),
         OpReply::Result(_) => internal_unavailable("expected refusal"),
     }
+}
+
+fn login_not_required() -> Refusal {
+    Refusal::with(
+        RefusalCode::AccountUnservable,
+        "The selected runner serves this model without a login; there is no account to admit.",
+        &json!({"reason": "login_not_required"}),
+    )
 }
 
 /// Public replay data captured before enqueue; persisted atomically with the
