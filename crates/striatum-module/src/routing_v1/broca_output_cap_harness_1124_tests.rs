@@ -184,8 +184,8 @@ fn setup_with_models(label: &str, facts: &[ModelFact]) -> Arc<Harness> {
         config["runners"] = json!([{"module":"broca","via_vault":true}]);
         config["consumers"] = json!({
             "broca.complete":{"owner":"broca"},
-            "prefrontal.sidekick.review":{"owner":"prefrontal-core","mode":"demand"},
-            "prefrontal-core.mason":{"owner":"prefrontal-core","mode":"demand"}
+            "prefrontal.sidekick.review":{"owner":"prefrontal","mode":"demand"},
+            "prefrontal.mason":{"owner":"prefrontal","mode":"demand"}
         });
     });
     harness
@@ -265,15 +265,15 @@ async fn split_names_the_uncapped_harness_without_changing_sidekick_or_mason_rou
         efforts,
     );
     harness.edit_config(|config| {
-        for consumer in ["prefrontal.sidekick.review", "prefrontal-core.mason"] {
+        for consumer in ["prefrontal.sidekick.review", "prefrontal.mason"] {
             config["consumers"][consumer]["workload"] = json!("code");
             config["consumers"][consumer]["service_tier"] = json!("standard");
         }
     });
-    let route = harness.bind(reserved("prefrontal-core"), None).await;
+    let route = harness.bind(reserved("prefrontal"), None).await;
     for (consumer, needs) in [
         ("prefrontal.sidekick.review", ["final_text", "plans"]),
-        ("prefrontal-core.mason", ["submit_tool", "plans"]),
+        ("prefrontal.mason", ["submit_tool", "plans"]),
     ] {
         let request =
             json!({"consumer":consumer,"requirements":{"iq":30,"harness_capabilities":needs}});

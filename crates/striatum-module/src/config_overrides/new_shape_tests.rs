@@ -7,33 +7,41 @@ fn config(value: serde_json::Value) -> LiveConfig {
 }
 
 #[test]
-fn prefrontal_rename_slot_rules_use_new_consumer_roots() {
+fn athena_slot_rules_use_prefrontal_consumer_root() {
     let error = parse_config(r#"{"consumers":{"synthesizer":{"pin":{"model":"p/m"}}},"providers":{"p":{"not_for":["prefrontal.athena"]}}}"#).unwrap_err();
     assert!(error.contains("prefrontal.athena"), "{error}");
 }
 
 #[test]
-fn prefrontal_rename_both_consumer_spellings_are_refused_with_both_keys() {
-    let error = parse_config(r#"{"consumers":{"prefrontal-core.mason":{},"prefrontal.mason":{}}}"#)
-        .unwrap_err();
-    assert!(
-        error.contains("prefrontal-core.mason") && error.contains("prefrontal.mason"),
-        "{error}"
-    );
+fn old_consumer_key_is_independent_of_prefrontal_policy() {
+    let config = config(json!({"consumers": {
+        "prefrontal-core.mason": {"iq": 25},
+        "prefrontal.mason": {"iq": 70}
+    }}));
+    for (consumer, iq) in [("prefrontal-core.mason", 25.0), ("prefrontal.mason", 70.0)] {
+        assert_eq!(
+            config
+                .consumer_policy(consumer, &ConsumerPolicy::default(), &BTreeMap::new())
+                .iq,
+            Some(iq)
+        );
+    }
 }
 
 #[test]
-fn prefrontal_rename_explicit_enrollment_is_not_rewritten() {
+fn explicit_pin_origin_enrollment_matches_only_the_configured_principal() {
     let config = parse_config(r#"{"pin_origin_callers":["reserved:prefrontal-core"]}"#).unwrap();
     assert_eq!(config.pin_origin_callers, ["reserved:prefrontal-core"]);
-    assert!(LiveConfig::new(config, None).honours_pin_origin("reserved:prefrontal"));
+    let config = LiveConfig::new(config, None);
+    assert!(config.honours_pin_origin("reserved:prefrontal-core"));
+    assert!(!config.honours_pin_origin("reserved:prefrontal"));
     assert!(
         !self::config(json!({"pin_origin_callers":[]})).honours_pin_origin("reserved:prefrontal")
     );
 }
 
 #[test]
-fn prefrontal_rename_mason_defaults_and_explicit_pin_callers() {
+fn mason_defaults_and_explicit_pin_callers() {
     let config = config(json!({"pin_origin_callers":["reserved:operator"]}));
     assert_eq!(
         config
@@ -85,17 +93,17 @@ fn below_bar_policy_defaults_and_inherits_per_consumer_key() {
 #[test]
 fn dotted_consumers_resolve_name_rules_without_reusing_root_exclusions() {
     let config = config(json!({
-        "providers": {"p": {"not_for": ["prefrontal-core.athena"]}},
+        "providers": {"p": {"not_for": ["prefrontal.athena"]}},
         "models": {
-            "p/gather": {"not_for": [], "only_for": ["prefrontal-core.athena.gather"]},
-            "q/review": {"not_for": ["prefrontal-core.athena.gather"]},
+            "p/gather": {"not_for": [], "only_for": ["prefrontal.athena.gather"]},
+            "q/review": {"not_for": ["prefrontal.athena.gather"]},
             "q/manual": {"pin_only": true},
-            "q/athena-manual": {"pin_only_for": ["prefrontal-core.athena"]}
+            "q/athena-manual": {"pin_only_for": ["prefrontal.athena"]}
         }
     }));
     for consumer in [
-        "prefrontal-core.athena.gather",
-        "prefrontal-core.athena.gather.regather",
+        "prefrontal.athena.gather",
+        "prefrontal.athena.gather.regather",
     ] {
         let exclusions = config.consumer_exclusions(consumer);
         assert_eq!(exclusions, ["p", "-p/gather", "q/review"]);
@@ -108,15 +116,15 @@ fn dotted_consumers_resolve_name_rules_without_reusing_root_exclusions() {
         assert_eq!(config.exclude_groups().all, ["q/manual"]);
         assert_eq!(
             config.dotted_rule_refusal(consumer, "q/review").as_deref(),
-            Some("models[\"q/review\"].not_for lists \"prefrontal-core.athena.gather\"")
+            Some("models[\"q/review\"].not_for lists \"prefrontal.athena.gather\"")
         );
     }
     assert_eq!(
-        config.consumer_exclusions("prefrontal-core.athena"),
+        config.consumer_exclusions("prefrontal.athena"),
         ["p", "p/gather"]
     );
-    assert!(!config.route_allowed("prefrontal-core.athena", "p/gather", false));
-    assert!(config.route_allowed("prefrontal-core.athena", "q/review", false));
+    assert!(!config.route_allowed("prefrontal.athena", "p/gather", false));
+    assert!(config.route_allowed("prefrontal.athena", "q/review", false));
     for consumer in ["nosuch", "nosuch.gather"] {
         assert!(config.consumer_exclusions(consumer).is_empty());
         assert!(crate::select_policy::Consumer::from_id(consumer).is_none());
@@ -124,7 +132,7 @@ fn dotted_consumers_resolve_name_rules_without_reusing_root_exclusions() {
         assert!(config.route_allowed(consumer, "q/review", false));
     }
     assert!(matches!(
-        crate::select_policy::Consumer::from_id("prefrontal-core.athena.gather"),
+        crate::select_policy::Consumer::from_id("prefrontal.athena.gather"),
         Some(crate::select_policy::Consumer::Athena)
     ));
 }
@@ -583,7 +591,7 @@ fn config_convert_refuses_a_pin_the_converted_exclusions_would_refuse() {
     // to a route the athena exclusion names.
     let converted = crate::config_convert::convert(
         r#"{"model_routing": {
-            "exclude": {"prefrontal-core.athena": ["anthropic/claude-opus-5-5"]},
+            "exclude": {"prefrontal.athena": ["anthropic/claude-opus-5-5"]},
             "pins": {"synthesizer": {"model": "anthropic/claude-opus-5-5"}}
         }}"#,
     )
@@ -592,7 +600,7 @@ fn config_convert_refuses_a_pin_the_converted_exclusions_would_refuse() {
     assert!(
         error.contains("consumers.synthesizer.pin")
             && error.contains("anthropic/claude-opus-5-5")
-            && error.contains(r#"not_for lists "prefrontal-core.athena""#),
+            && error.contains(r#"not_for lists "prefrontal.athena""#),
         "{error}"
     );
 }
@@ -648,7 +656,7 @@ fn metered_defaults_follow_billing_planes_and_explicit_entity_overrides() {
 fn masons_refuse_below_bar_by_default_but_operator_policy_wins() {
     use crate::config_policy::BelowBarPolicy::{BestEffort, Refuse};
     let defaults = config(json!({}));
-    for consumer in ["prefrontal-core.mason", "prefrontal-core.mason.review.deep"] {
+    for consumer in ["prefrontal.mason", "prefrontal.mason.review.deep"] {
         assert_eq!(
             defaults
                 .consumer_policy(consumer, &Default::default(), &BTreeMap::new())
@@ -656,13 +664,7 @@ fn masons_refuse_below_bar_by_default_but_operator_policy_wins() {
             Some(Refuse)
         );
     }
-    for consumer in [
-        "sidekick",
-        "codemode",
-        "flow",
-        "prefrontal-core.masonry",
-        "head",
-    ] {
+    for consumer in ["sidekick", "codemode", "flow", "prefrontal.masonry", "head"] {
         assert_eq!(
             defaults
                 .consumer_policy(consumer, &Default::default(), &BTreeMap::new())
@@ -672,12 +674,12 @@ fn masons_refuse_below_bar_by_default_but_operator_policy_wins() {
         );
     }
     let overrides = config(
-        json!({"consumers":{"prefrontal-core.mason":{"below_bar":"best_effort"},"prefrontal-core.mason.strict":{"below_bar":"refuse"}}}),
+        json!({"consumers":{"prefrontal.mason":{"below_bar":"best_effort"},"prefrontal.mason.strict":{"below_bar":"refuse"}}}),
     );
     assert_eq!(
         overrides
             .consumer_policy(
-                "prefrontal-core.mason.review",
+                "prefrontal.mason.review",
                 &Default::default(),
                 &BTreeMap::new()
             )
@@ -687,7 +689,7 @@ fn masons_refuse_below_bar_by_default_but_operator_policy_wins() {
     assert_eq!(
         overrides
             .consumer_policy(
-                "prefrontal-core.mason.strict.child",
+                "prefrontal.mason.strict.child",
                 &Default::default(),
                 &BTreeMap::new()
             )
@@ -750,15 +752,15 @@ fn banked_reset_pricing_is_provider_scoped_and_defaults_to_emergency() {
 #[test]
 fn module_consumer_policy_inherits_without_legacy_aliases() {
     let config = config(json!({"consumers": {
-        "prefrontal-core.sidekick": {
+        "prefrontal.sidekick": {
             "iq":71, "eq":52, "below_bar":"refuse", "service_tier":"fast",
             "workload":"lookup", "pin":{"model":"p/model"},
             "projects":{"project":{"pin":"p/project"}}
         },
         "magic-context.dream": {"iq":71},
         "magic-context.dream.map-memories": {"iq":31}
-    }, "providers":{"p":{"only_for":["prefrontal-core.sidekick"]}}}));
-    let consumer = "prefrontal-core.sidekick.explore";
+    }, "providers":{"p":{"only_for":["prefrontal.sidekick"]}}}));
+    let consumer = "prefrontal.sidekick.explore";
     assert_eq!(config.consumer_workload(consumer), Some("lookup"));
     let policy = config.consumer_policy(consumer, &Default::default(), &BTreeMap::new());
     assert_eq!(policy.iq, Some(71.0));
@@ -844,7 +846,7 @@ fn removed_substrates_setting_is_a_clear_config_error() {
 
 #[test]
 fn converter_dropped_scoped_policy_entry_changes_v1_document_and_policy() {
-    let consumer = "prefrontal-core.mason";
+    let consumer = "prefrontal.mason";
     let source = json!({"model_routing":{"exclude":{consumer:["p/m"]}}});
     let converted = crate::config_convert::convert_value(source.clone()).unwrap();
     assert_eq!(converted["models"]["p/m"]["not_for"], json!([consumer]));
@@ -861,8 +863,8 @@ fn converter_dropped_scoped_policy_entry_changes_v1_document_and_policy() {
 #[test]
 fn consumer_exclusion_groups_agree_with_the_route_rule_for_nested_model_entries() {
     use striatum_core::provider_model_spec::{parse_spec_list, resolve_spec};
-    let mason = "prefrontal-core.mason";
-    let sidekick = "prefrontal-core.sidekick";
+    let mason = "prefrontal.mason";
+    let sidekick = "prefrontal.sidekick";
     let models = [
         // Mason may not use model m, except its v variant.
         json!({"p/m": {"not_for": [mason]}, "p/m/v": {"not_for": []}}),
@@ -879,7 +881,7 @@ fn consumer_exclusion_groups_agree_with_the_route_rule_for_nested_model_entries(
     for models in &models {
         for providers in &providers {
             let config = config(json!({"providers": providers, "models": models}));
-            for consumer in [mason, "prefrontal-core.mason.review", sidekick] {
+            for consumer in [mason, "prefrontal.mason.review", sidekick] {
                 let exclusions = config.consumer_exclusions(consumer);
                 let specs = parse_spec_list(&exclusions);
                 for route in ["p/m", "p/m/v", "p/m/v/x", "p/m/w", "p/n"] {

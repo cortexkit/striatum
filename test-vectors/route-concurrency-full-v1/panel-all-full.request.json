@@ -1,1 +1,1 @@
-{"method":"route.select_panel","params":{"available_routes":["synthetic-0/panel-model","synthetic-1/panel-model","synthetic-2/panel-model"],"class":"audit","consumer":"prefrontal-core.athena","runners":["broca"],"seed":"fixed"}}
+{"method":"route.select_panel","params":{"available_routes":["synthetic-0/panel-model","synthetic-1/panel-model","synthetic-2/panel-model"],"class":"audit","consumer":"prefrontal.athena","runners":["broca"],"seed":"fixed"}}

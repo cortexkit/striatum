@@ -252,8 +252,6 @@ impl Catalog {
             let Some(module) = entry.get("module_id").and_then(Value::as_str) else {
                 continue;
             };
-            let module = striatum_core::module_identity::canonical(module);
-            let module = module.as_ref();
             if let Some(slot) = entry
                 .get("role_declarations")
                 .and_then(|roles| roles.get("media-provider/v1"))
@@ -310,13 +308,7 @@ impl Catalog {
                                 declared::honor(module, declaration, &mut catalog.issues)
                             })
                             .filter(|declaration| !crate::config_policy::is_slot(&declaration.name))
-                            .map(|declaration| {
-                                (
-                                    striatum_core::module_identity::canonical(&declaration.name)
-                                        .into_owned(),
-                                    declaration.defaults,
-                                )
-                            })
+                            .map(|declaration| (declaration.name, declaration.defaults))
                             .collect(),
                     );
                 }
@@ -357,10 +349,7 @@ impl Catalog {
             priorities: config.consumer_priorities(),
         };
         for name in config.v1_consumers() {
-            registry
-                .owners
-                .entry(striatum_core::module_identity::canonical(&name).into_owned())
-                .or_default();
+            registry.owners.entry(name).or_default();
         }
         for (module, declarations) in &self.modules {
             for (name, defaults) in declarations {
@@ -383,11 +372,7 @@ impl Catalog {
             }
         }
         for (name, owner) in config.consumer_owners() {
-            registry
-                .owners
-                .entry(striatum_core::module_identity::canonical(&name).into_owned())
-                .or_default()
-                .insert(striatum_core::module_identity::canonical(&owner).into_owned());
+            registry.owners.entry(name).or_default().insert(owner);
         }
         // A settings child that inherits extended declaration policy also
         // inherits the declaration's admission restriction. Otherwise an
@@ -460,7 +445,7 @@ pub(crate) fn provides_agent_host(module: &str) -> bool {
         .read()
         .unwrap()
         .agent_hosts
-        .contains(striatum_core::module_identity::canonical(module).as_ref())
+        .contains(module)
 }
 
 impl Registry {
@@ -618,20 +603,13 @@ impl Registry {
                 .and_then(|(_, defaults)| defaults.selectors.as_ref());
             if caller
                 .attested_module()
-                .is_some_and(|module| striatum_core::module_identity::equal(module, owner))
+                .is_some_and(|module| module == owner)
                 || caller.attested_module().is_some_and(|module| {
-                    selectors.is_some_and(|selectors| {
-                        selectors
-                            .iter()
-                            .any(|id| striatum_core::module_identity::equal(id, module))
-                    })
+                    selectors.is_some_and(|selectors| selectors.iter().any(|id| id == module))
                 })
                 || caller.scope_authority.as_ref().is_some_and(|scope| {
                     scope.owner_authorized
-                        && striatum_core::module_identity::equal(
-                            &scope.owner,
-                            &format!("reserved:{owner}"),
-                        )
+                        && scope.owner.strip_prefix("reserved:") == Some(owner.as_str())
                 })
             {
                 return Ok(());

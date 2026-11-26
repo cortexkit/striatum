@@ -5,7 +5,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeMap;
 
-pub(crate) const ATHENA_SYNTHESIZER_CONSUMER: &str = "prefrontal-core.athena.synthesizer";
+pub(crate) const ATHENA_SYNTHESIZER_CONSUMER: &str = "prefrontal.athena.synthesizer";
 
 /// Operator spelling of the contract's consumer scheduling classes.
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema)]
@@ -357,21 +357,16 @@ fn dotted_prefix(prefix: &str, consumer: &str) -> bool {
 }
 
 pub fn consumer_specificity(name: &str) -> usize {
-    striatum_core::module_identity::canonical(name).len()
+    name.len()
 }
 
 pub fn consumer_entry<'a, T>(entries: &'a BTreeMap<String, T>, name: &str) -> Option<&'a T> {
-    striatum_core::module_identity::spellings(name)
-        .iter()
-        .find_map(|key| entries.get(key.as_ref()))
+    entries.get(name)
 }
 
 /// Match whole dotted segments, so children inherit their namespace's policy.
 pub fn consumer_matches(prefix: &str, consumer: &str) -> bool {
-    dotted_prefix(
-        &striatum_core::module_identity::canonical(prefix),
-        &striatum_core::module_identity::canonical(consumer),
-    )
+    dotted_prefix(prefix, consumer)
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
@@ -612,12 +607,11 @@ pub fn is_slot(name: &str) -> bool {
 /// The `route.select` consumer a pin slot is requested under, so the slot's
 /// pin is judged by that consumer's `only_for` / `not_for` rules. Core asks for
 /// the synthesizer pin and the Spec Campaigns designer's `spec_designer` slot as
-/// prefrontal's Athena consumer, and `lab_planner` as its Lab consumer. The old
-/// spelling remains the comparison representative during the rename window.
+/// prefrontal's Athena consumer, and `lab_planner` as its Lab consumer.
 pub fn slot_consumer(slot: &str) -> Option<&'static str> {
     match slot {
-        "synthesizer" | "spec_designer" => Some("prefrontal-core.athena"),
-        "lab_planner" => Some("prefrontal-core.lab"),
+        "synthesizer" | "spec_designer" => Some("prefrontal.athena"),
+        "lab_planner" => Some("prefrontal.lab"),
         _ => None,
     }
 }
@@ -646,7 +640,7 @@ pub fn resolve_consumer_policy(
     declared: &BTreeMap<String, ConsumerPolicy>,
 ) -> ConsumerPolicy {
     let mut result = serde_json::Map::new();
-    if consumer_matches("prefrontal-core.mason", consumer) {
+    if consumer_matches("prefrontal.mason", consumer) {
         result.insert("below_bar".into(), serde_json::json!("refuse"));
     }
     let mut ladder_source = None;

@@ -72,7 +72,7 @@ impl SelectionPolicyMemo {
         let mut entries = self.0.lock().unwrap();
         if let Some(entry) = entries.iter().find(|entry| {
             Arc::ptr_eq(&entry.settings, &config.compiled)
-                && striatum_core::module_identity::equal(&entry.consumer, consumer)
+                && entry.consumer == consumer
                 && entry.pinned == pinned
                 && entry.routes == routes
         }) {
@@ -305,12 +305,6 @@ impl RoutingConfigFile {
         self.derive_entity_lists()?;
         let mut pins = serde_json::Map::new();
         for (name, policy) in &self.consumers {
-            // Two spellings of one policy cannot be ordered without silently
-            // discarding an operator's intent, even when their values happen to agree.
-            let other = striatum_core::module_identity::alternate(name);
-            if other != *name && self.consumers.contains_key(other.as_ref()) {
-                return Err(format!("consumer keys {name:?} and {other:?} name the same consumer during prefrontal's rename window"));
-            }
             if name.is_empty() || name.chars().any(char::is_whitespace) {
                 return Err(format!("consumer id {name:?} must be one non-empty word"));
             }

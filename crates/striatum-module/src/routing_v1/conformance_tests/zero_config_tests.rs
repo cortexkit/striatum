@@ -35,9 +35,9 @@ async fn absent_settings_keeps_runners_unenrolled_but_installs_safe_billing_and_
     harness.install_facts(&facts);
 
     let modules = json!([
-        {"module_id":"prefrontal-core", "nonce_verified":true,
+        {"module_id":"prefrontal", "nonce_verified":true,
             "role_declarations":{"routing/v1":{"consumers":[
-                {"name":"prefrontal-core.mason"}, {"name":"prefrontal-core.sidekick"}
+                {"name":"prefrontal.mason"}, {"name":"prefrontal.sidekick"}
             ]}}},
         {"module_id":"basal", "nonce_verified":true,
             "role_declarations":{"routing/v1":{"consumers":[{"name":"basal.codemode"},{"name":"basal.flow"}]}}},
@@ -115,8 +115,8 @@ async fn absent_settings_keeps_runners_unenrolled_but_installs_safe_billing_and_
     let consumers = crate::routing_v1::consumers::effective(&config);
     for (owner, names) in [
         (
-            "prefrontal-core",
-            &["prefrontal-core.mason", "prefrontal-core.sidekick"][..],
+            "prefrontal",
+            &["prefrontal.mason", "prefrontal.sidekick"][..],
         ),
         ("basal", &["basal.codemode", "basal.flow"][..]),
         ("callosum", &["colliculus.voice_message"][..]),
@@ -195,8 +195,8 @@ async fn absent_settings_keeps_runners_unenrolled_but_installs_safe_billing_and_
     );
 
     for consumer in [
-        "prefrontal-core.mason",
-        "prefrontal-core.sidekick",
+        "prefrontal.mason",
+        "prefrontal.sidekick",
         "head",
         "magic-context.summary",
         "basal.codemode",
@@ -205,7 +205,7 @@ async fn absent_settings_keeps_runners_unenrolled_but_installs_safe_billing_and_
         let policy = config.consumer_policy(consumer, &Default::default(), &consumers.policies);
         assert_eq!(
             policy.below_bar.unwrap_or_default(),
-            if consumer == "prefrontal-core.mason" {
+            if consumer == "prefrontal.mason" {
                 crate::config_policy::BelowBarPolicy::Refuse
             } else {
                 crate::config_policy::BelowBarPolicy::BestEffort

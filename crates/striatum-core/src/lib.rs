@@ -23,7 +23,6 @@ pub mod launch_policy;
 pub mod model_facts;
 pub mod model_facts_seed;
 pub mod model_router;
-pub mod module_identity;
 pub mod package_ceiling;
 pub mod panel;
 pub mod price_rates;

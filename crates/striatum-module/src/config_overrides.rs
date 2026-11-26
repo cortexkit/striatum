@@ -1098,7 +1098,7 @@ impl LiveConfig {
         self.config
             .pin_origin_callers
             .iter()
-            .any(|caller| striatum_core::module_identity::equal(caller, principal))
+            .any(|caller| caller == principal)
     }
 
     /// Operator owners add exact-name claims too, so conflicting owners lock
@@ -1541,10 +1541,7 @@ struct RoutingConfigFile {
 }
 
 fn default_pin_origin_callers() -> Vec<String> {
-    striatum_core::module_identity::spellings("reserved:prefrontal-core")
-        .iter()
-        .map(ToString::to_string)
-        .collect()
+    vec!["reserved:prefrontal".to_owned()]
 }
 
 impl Default for RoutingConfigFile {

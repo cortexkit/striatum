@@ -23,7 +23,7 @@ async fn undecodable_control_request_is_refused_without_stopping_serving() {
     });
     let mut unknown_scope_field = bind.clone();
     unknown_scope_field["scope"] = json!({
-        "owner": { "kind": "reserved", "module_id": "prefrontal-core" },
+        "owner": { "kind": "reserved", "module_id": "prefrontal" },
         "ref": "head-scope",
         "scope_epoch": 3,
         "kind": "head",
@@ -159,7 +159,7 @@ async fn a_queued_frame_keeps_its_attested_flow_after_goodbye() {
         "target":{"kind":"management_surface", "module_id":DEFAULT_MODULE_ID},
         "identity":{"project_root":rig.dir, "harness":"test", "session":"1"},
         "principal":{"kind":"reserved", "module_id":"broca"},
-        "scope":{"owner":{"kind":"reserved", "module_id":"prefrontal-core"},
+        "scope":{"owner":{"kind":"reserved", "module_id":"prefrontal"},
             "ref":"routing-flow", "scope_epoch":1, "kind":"head", "owner_authorized":true,
             "attributes":{"flow_id":"routing-watch"}}
     });

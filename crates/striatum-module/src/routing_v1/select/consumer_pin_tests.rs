@@ -17,7 +17,7 @@ use super::super::describe;
 #[path = "consumer_pin_tests/tests.rs"]
 mod samples;
 
-const CHAIR: &str = "prefrontal-core.athena.synthesizer";
+const CHAIR: &str = "prefrontal.athena.synthesizer";
 const OPUS: &str = "anthropic/claude-opus-5-5";
 const FABLE: &str = "anthropic/claude-fable-5-2";
 
@@ -42,17 +42,17 @@ async fn configured(configured_consumer: &str) -> (Arc<Harness>, Route) {
     install_catalog(&harness, &catalog);
     install_panel_families(&harness, &catalog);
     harness.edit_config(|config| {
-        config["consumers"] = json!({"prefrontal-core.athena":{"owner":"prefrontal-core"}});
+        config["consumers"] = json!({"prefrontal.athena":{"owner":"prefrontal"}});
         config["consumers"][configured_consumer] = json!({
-            "owner":"prefrontal-core", "pin":{"model":OPUS,"variant":"medium"}
+            "owner":"prefrontal", "pin":{"model":OPUS,"variant":"medium"}
         });
-        config["consumers"]["prefrontal-core.athena"] = json!({"owner":"prefrontal-core"});
-        config["models"][OPUS]["pin_only_for"] = json!(["prefrontal-core.athena"]);
+        config["consumers"]["prefrontal.athena"] = json!({"owner":"prefrontal"});
+        config["models"][OPUS]["pin_only_for"] = json!(["prefrontal.athena"]);
         config["models"][OPUS]["subscription"] = json!(true);
         config["models"][FABLE]["subscription"] = json!(true);
         config["panels"]["audit"] = json!({"top_k":1,"by":"iq","extra":0,"floor":0});
     });
-    let route = harness.bind(reserved("prefrontal-core"), None).await;
+    let route = harness.bind(reserved("prefrontal"), None).await;
     (harness, route)
 }
 
@@ -89,14 +89,7 @@ fn assert_chair(answer: &Value) {
 }
 
 #[tokio::test]
-async fn prefrontal_rename_chair_pin_uses_new_consumer() {
-    let (harness, _) = configured(CHAIR).await;
-    let route = harness.bind(reserved("prefrontal"), None).await;
-    assert_chair(&answered(&route, &request("prefrontal.athena.synthesizer")).await);
-}
-
-#[tokio::test]
-async fn prefrontal_rename_new_chair_setting_reaches_legacy_panel_policy() {
+async fn chair_setting_reaches_legacy_panel_policy() {
     let (harness, _) = configured("prefrontal.athena.synthesizer").await;
     let route = harness.bind(reserved("prefrontal"), None).await;
     assert_chair(&answered(&route, &request("prefrontal.athena.synthesizer")).await);
@@ -133,7 +126,7 @@ async fn settings_pin_inherits_operator_ancestors() {
             .as_object_mut()
             .unwrap()
             .remove("pin");
-        config["consumers"]["prefrontal-core"]["pin"] = json!({"model":OPUS,"variant":"medium"});
+        config["consumers"]["prefrontal"]["pin"] = json!({"model":OPUS,"variant":"medium"});
     });
     assert_chair(&answered(&route, &request(CHAIR)).await);
 }
@@ -184,7 +177,7 @@ async fn unservable_settings_pin_refuses_without_substitution() {
 #[tokio::test]
 async fn opus_stays_out_of_automatic_athena_panel_seats() {
     let (_harness, route) = configured(CHAIR).await;
-    let params = json!({"class":"audit","consumer":"prefrontal-core.athena","available_routes":[OPUS,FABLE],"temperatures":[0.2],"seed":"fixed"});
+    let params = json!({"class":"audit","consumer":"prefrontal.athena","available_routes":[OPUS,FABLE],"temperatures":[0.2],"seed":"fixed"});
     let reply = route.call("route.select_panel", &params).await;
     assert_eq!(reply.0, FrameType::Response, "{reply:?}");
     let answer: cortexkit_role_routing::panel::SelectPanelAnswer =
@@ -205,7 +198,7 @@ async fn canonical_athena_chair_pin_reaches_panel_and_picker_policy_view() {
     let request = json!({"panelSpec":{"class":"AUDIT"}, "substrate":"broca",
         "availableModels":[OPUS,FABLE], "packageTokens":1000});
     for (caller, principal) in [
-        (&panel_caller, "reserved:prefrontal-core"),
+        (&panel_caller, "reserved:prefrontal"),
         (&picker, "reserved:occipital"),
     ] {
         crate::take_operator_infos();

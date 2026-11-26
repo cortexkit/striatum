@@ -4,7 +4,7 @@ use crate::routing_v1::conformance_tests::Route;
 async fn blocked(retry_at: u64) -> (Arc<Harness>, Route, Route) {
     let harness = one_account();
     let runner = harness.bind(reserved("broca"), None).await;
-    let owner = harness.bind(reserved("prefrontal-core"), None).await;
+    let owner = harness.bind(reserved("prefrontal"), None).await;
     assert_credential(
         &runner
             .call("route.account_for", &admission("older-run"))
@@ -25,7 +25,7 @@ async fn blocked(retry_at: u64) -> (Arc<Harness>, Route, Route) {
 }
 
 fn select() -> Value {
-    json!({"consumer":"prefrontal-core.sidekick.map", "requirements":{"iq":45,"eq":0}})
+    json!({"consumer":"prefrontal.sidekick.map", "requirements":{"iq":45,"eq":0}})
 }
 
 async fn claim(owner: &Route, runner: &Route, admitted: bool) {
@@ -33,7 +33,7 @@ async fn claim(owner: &Route, runner: &Route, admitted: bool) {
         .call(
             "route.select",
             &json!({
-                "consumer":"prefrontal-core.mason", "pin":format!("openai/{}", MODELS[0]),
+                "consumer":"prefrontal.mason", "pin":format!("openai/{}", MODELS[0]),
                 "requirements":{"iq":45,"eq":0}
             }),
         )
@@ -124,7 +124,7 @@ async fn claimed_non_quota_test_gives_panel_seats_a_short_check_time() {
         .call(
             "route.select",
             &json!({
-                "consumer":"prefrontal-core.sidekick.map", "pin":format!("openai/{}", MODELS[0]),
+                "consumer":"prefrontal.sidekick.map", "pin":format!("openai/{}", MODELS[0]),
                 "requirements":{"iq":45,"eq":0}
             }),
         )
@@ -145,7 +145,7 @@ async fn claimed_non_quota_test_gives_panel_seats_a_short_check_time() {
         .call(
             "route.select_panel",
             &json!({
-                "class":"audit", "consumer":"prefrontal-core.sidekick.map", "seed":"fixed",
+                "class":"audit", "consumer":"prefrontal.sidekick.map", "seed":"fixed",
                 "available_routes":MODELS.map(|model| format!("openai/{model}"))
             }),
         )

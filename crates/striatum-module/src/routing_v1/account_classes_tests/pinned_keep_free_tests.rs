@@ -1,6 +1,6 @@
 use super::*;
 
-const CONSUMER: &str = "prefrontal-core.mason";
+const CONSUMER: &str = "prefrontal.mason";
 const SETTINGS_CONSUMER: &str = "mason";
 const MODEL: &str = "synthetic/model";
 const EXEMPT: &str = "pinned: keep-free margin not applied";
@@ -148,14 +148,14 @@ async fn settings_slot_pin_spends_below_keep_free() {
     assert_below_margin(Origin::Slot, SETTINGS_CONSUMER).await;
 }
 
-// A request pin from the worker consumer (`prefrontal-core.mason`) is exempt
+// A request pin from the worker consumer (`prefrontal.mason`) is exempt
 // only when its sender, the prefrontal module, marks it
 // `pin_origin: "user"`; the pin-origin tests cover that path. An unmarked pin,
 // like any other caller's raw pin, keeps the reserve.
 #[tokio::test]
 async fn unmarked_mason_request_pins_keep_the_reserve() {
     let _clock = crate::InjectedClock::set(NOW);
-    for consumer in [CONSUMER, "prefrontal-core.mason.retry.launch"] {
+    for consumer in [CONSUMER, "prefrontal.mason.retry.launch"] {
         let (harness, _pools) = fixture(Origin::Request, 85.0);
         let caller = harness.bind(reserved(OWNER), None).await;
         let reply = caller
@@ -213,7 +213,7 @@ async fn non_mason_request_pins_and_demand_keep_the_reserve() {
     let _clock = crate::InjectedClock::set(NOW);
     for (consumer, pin) in [
         ("other.worker", true),
-        ("prefrontal-core.masonish", true),
+        ("prefrontal.masonish", true),
         (CONSUMER, false),
     ] {
         let (harness, _pools) = fixture(Origin::Request, 85.0);
@@ -340,11 +340,11 @@ async fn failed_pins_do_not_exempt_automatic_fallback() {
     );
 }
 
-const SYNTHESIZER: &str = "prefrontal-core.athena.synthesizer";
+const SYNTHESIZER: &str = "prefrontal.athena.synthesizer";
 const SYNTHESIZER_PIN: &str = "synthetic/model:medium";
 
 const USER_PIN_CONSUMER: &str = "pin-origin-test";
-const USER_PIN_CALLER: &str = "prefrontal-core";
+const USER_PIN_CALLER: &str = "prefrontal";
 
 fn user_pin_fixture(used: f64, module: &str) -> (Arc<Harness>, impl Drop) {
     let (harness, pools) = fixture(Origin::Request, used);
@@ -390,11 +390,7 @@ async fn enrolled_user_pin_spends_below_keep_free() {
 #[tokio::test]
 async fn unenrolled_user_pin_keeps_the_reserve() {
     let _clock = crate::InjectedClock::set(NOW);
-    for module in [
-        "prefrontal-core-other",
-        "other-prefrontal-core",
-        "prefrontal-core.child",
-    ] {
+    for module in ["prefrontal-other", "other-prefrontal", "prefrontal.child"] {
         let (harness, _pools) = user_pin_fixture(85.0, module);
         // A core-owned scope must not enroll its caller.
         let caller = harness
@@ -521,8 +517,8 @@ async fn null_pin_origin_is_absent_and_failed_user_pin_does_not_exempt_fallback(
 fn synthesizer_fixture(policy: Value) -> (Arc<Harness>, impl Drop) {
     let (harness, pools) = fixture(Origin::Request, 85.0);
     harness.edit_config(|config| {
-        config["consumers"]["prefrontal-core.athena"] = policy;
-        config["consumers"]["prefrontal-core.athena"]["owner"] = json!(OWNER);
+        config["consumers"]["prefrontal.athena"] = policy;
+        config["consumers"]["prefrontal.athena"]["owner"] = json!(OWNER);
     });
     harness.attach_reasoning_catalog(striatum_store::ReasoningCatalog {
         models: [(
