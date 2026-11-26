@@ -769,26 +769,26 @@ fn result(reply: (FrameType, Value)) -> Value {
 }
 
 #[tokio::test]
-async fn completed_report_heals_its_admission_probe_after_completed_run() {
-    assert_later_report_heals("completed", "unique").await;
+async fn expired_backoff_needs_no_report_recovery_after_completed_run() {
+    assert_expired_backoff_ignores_report_recovery("completed", "unique").await;
 }
 
 #[tokio::test]
-async fn completed_report_heals_its_admission_probe_after_interrupted_run() {
-    assert_later_report_heals("interrupted", "unique").await;
+async fn expired_backoff_needs_no_report_recovery_after_interrupted_run() {
+    assert_expired_backoff_ignores_report_recovery("interrupted", "unique").await;
 }
 
 #[tokio::test]
-async fn completed_report_with_ambiguous_admissions_heals_nothing() {
-    assert_later_report_heals("completed", "ambiguous").await;
+async fn expired_backoff_ignores_ambiguous_admission_reports() {
+    assert_expired_backoff_ignores_report_recovery("completed", "ambiguous").await;
 }
 
 #[tokio::test]
-async fn completed_report_with_another_login_heals_nothing() {
-    assert_later_report_heals("completed", "other-login").await;
+async fn expired_backoff_ignores_other_login_reports() {
+    assert_expired_backoff_ignores_report_recovery("completed", "other-login").await;
 }
 
-async fn assert_later_report_heals(earlier: &str, shape: &str) {
+async fn assert_expired_backoff_ignores_report_recovery(earlier: &str, shape: &str) {
     let _clock = crate::InjectedClock::set(NOW);
     let harness = paid_anthropic_harness();
     let owner = harness.bind(reserved(OWNER), None).await;
@@ -838,9 +838,7 @@ async fn assert_later_report_heals(earlier: &str, shape: &str) {
         .store()
         .account_read(|tx| {
             let rechecks = tx.fence_rechecks()?;
-            assert_eq!(rechecks.len(), 1);
-            assert_eq!(rechecks[0].kind, "observation");
-            assert_eq!(rechecks[0].last_claimed_at, Some(NOW as i64 + 3_000));
+            assert!(rechecks.is_empty(), "{rechecks:?}");
             Ok(())
         })
         .unwrap();
@@ -883,10 +881,9 @@ async fn assert_later_report_heals(earlier: &str, shape: &str) {
         .store()
         .account_read(|tx| {
             let remaining = tx.fence_rechecks()?;
-            assert_eq!(
-                remaining.iter().any(|origin| origin.kind == "observation"),
-                shape != "unique",
-                "only an unambiguous serving run can settle its admission probe after {earlier}"
+            assert!(
+                remaining.iter().all(|origin| origin.kind != "observation"),
+                "the expired backoff was already retired before the report after {earlier}"
             );
             assert_eq!(
                 tx.report_credential_refusals()?.len(),
