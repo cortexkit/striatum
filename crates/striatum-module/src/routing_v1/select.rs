@@ -627,6 +627,7 @@ pub(super) struct RequestInputs {
     pub(super) project_views: crate::managed_settings::RequestViews,
     pub(super) catalog_snapshot: std::sync::Arc<striatum_store::CatalogFactsSnapshot>,
     pub(super) efforts: effort_preview::Efforts,
+    pub(super) free_before_reset_preview: bool,
     facts: Vec<ModelFact>,
     pub(super) catalog_targets: std::collections::BTreeMap<String, String>,
     policy_memo: std::sync::Arc<config_overrides::SelectionPolicyMemo>,
@@ -671,6 +672,7 @@ impl RequestInputs {
             live_config,
             operator_config,
             project_views: Default::default(),
+            free_before_reset_preview: false,
             efforts: effort_preview::Efforts {
                 models: catalog_snapshot.efforts.clone(),
                 workloads: Default::default(),
@@ -725,7 +727,12 @@ impl RequestInputs {
                 self.live_config.quota_model_pools_ref(),
             );
         }
-        crate::subscription_economics::overlay(
+        let overlay = if self.free_before_reset_preview {
+            crate::subscription_economics::overlay_free_before_reset
+        } else {
+            crate::subscription_economics::overlay
+        };
+        overlay(
             &mut snapshot,
             &self.facts,
             now as i64,
