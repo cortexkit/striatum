@@ -343,7 +343,7 @@ async fn observe_success_quota_is_shared_by_credentials_but_not_accounts() {
 }
 
 #[tokio::test]
-async fn observe_success_backoff_probe_heals_exact_credential() {
+async fn expired_transient_backoff_reopens_all_credentials() {
     let _clock = crate::InjectedClock::set(NOW);
     let h = paid_anthropic_harness();
     for credential in KEYS {
@@ -366,12 +366,11 @@ async fn observe_success_backoff_probe_heals_exact_credential() {
     );
     let answer = observed(&route, &success_observation("backoff-probe", true)).await;
     assert!(
-        answer["effects"].to_string().contains("transient_route"),
+        !answer["effects"].to_string().contains("transient_route"),
         "{answer}"
     );
     let origins = h.store().fence_rechecks().unwrap();
-    assert_eq!(origins.len(), 1);
-    assert_eq!(origins[0].credential_id.as_deref(), Some(KEYS[1]));
+    assert!(origins.is_empty(), "{origins:?}");
 }
 
 async fn assert_sole_offered_block_is_timed(kind: &str) {
@@ -608,36 +607,11 @@ fn observation_rows(h: &Harness, table: &str, account: &str) -> i64 {
 }
 
 #[tokio::test]
-async fn observe_success_claimed_observation_retires_origin_and_authorizations() {
+async fn expired_observation_retires_origin_without_probe_authorizations() {
     let _clock = crate::InjectedClock::set(NOW);
     let h = paid_anthropic_harness();
     let evidence_at = NOW as i64 - 2 * 86_400_000;
     observation_backoff(&h, "live-shaped-backoff", KEYS[0], evidence_at);
-    // Older inconclusive tests leave both admission and decision copies, as
-    // in the live store. Only the final admission owns the current test.
-    for index in 0..2 {
-        let at = evidence_at + 6_000 + index * 3_600_001;
-        let decision = format!("dec_old_{index}");
-        let admission = json!([
-            "account_admission",
-            "reserved:broca",
-            format!("old-run-{index}")
-        ])
-        .to_string();
-        h.store()
-            .account_transaction(|tx| {
-                let origins = tx.fence_rechecks()?;
-                assert!(tx.grant_fence_rechecks(&origins, at, Some(&decision))?);
-                assert!(tx.claim_fence_rechecks_for_authorized_admission(
-                    &origins,
-                    at,
-                    Some(&decision),
-                    &admission
-                )?);
-                Ok(())
-            })
-            .unwrap();
-    }
     let route = h.bind(reserved("broca"), None).await;
     result(
         route
@@ -647,16 +621,16 @@ async fn observe_success_claimed_observation_retires_origin_and_authorizations()
             )
             .await,
     );
-    assert_eq!(observation_rows(&h, "probe_authorization", KEYS[0]), 5);
+    assert_eq!(observation_rows(&h, "probe_authorization", KEYS[0]), 0);
     let answer = observed(&route, &success_observation("observation-probe", true)).await;
     assert!(
-        answer["effects"].to_string().contains("block_cleared"),
+        !answer["effects"].to_string().contains("block_cleared"),
         "{answer}"
     );
     assert_eq!(
         observation_rows(&h, "block", KEYS[0]),
         0,
-        "success must retire the source, not just clear its clock"
+        "expiry retires the source, not just its clock"
     );
     assert_eq!(observation_rows(&h, "retirement_tombstone", KEYS[0]), 1);
     assert_eq!(observation_rows(&h, "probe_authorization", KEYS[0]), 0);
@@ -669,7 +643,7 @@ async fn observe_success_claimed_observation_retires_origin_and_authorizations()
 }
 
 #[tokio::test]
-async fn observe_success_observation_requires_claim_and_exact_credential() {
+async fn expired_observation_needs_no_claim_or_exact_credential() {
     let _clock = crate::InjectedClock::set(NOW);
     let h = paid_anthropic_harness();
     let route = h.bind(reserved("broca"), None).await;
@@ -698,8 +672,8 @@ async fn observe_success_observation_requires_claim_and_exact_credential() {
     sibling_success["credential_id"] = json!(KEYS[1]);
     observed(&route, &sibling_success).await;
     observed(&route, &success_observation("not-a-probe", true)).await;
-    assert_eq!(observation_rows(&h, "retirement_tombstone", KEYS[0]), 0);
-    assert_eq!(observation_rows(&h, "block", KEYS[0]), 1);
+    assert_eq!(observation_rows(&h, "retirement_tombstone", KEYS[0]), 1);
+    assert_eq!(observation_rows(&h, "block", KEYS[0]), 0);
     assert_eq!(
         h.store()
             .fence_rechecks()
@@ -707,7 +681,7 @@ async fn observe_success_observation_requires_claim_and_exact_credential() {
             .iter()
             .filter(|origin| origin.kind == "observation")
             .count(),
-        1
+        0
     );
     let mut valid = success_observation("actual-probe", true);
     valid["event_id"] = json!("actual-probe-valid");
@@ -728,7 +702,7 @@ async fn observe_success_observation_newer_than_admission_survives() {
     );
     observation_backoff(&h, "newer-backoff", KEYS[0], NOW as i64 + 1);
     observed(&route, &success_observation("older-probe", true)).await;
-    assert_eq!(observation_rows(&h, "retirement_tombstone", KEYS[0]), 0);
+    assert_eq!(observation_rows(&h, "retirement_tombstone", KEYS[0]), 1);
     assert_eq!(observation_rows(&h, "block", KEYS[0]), 1);
 }
 
