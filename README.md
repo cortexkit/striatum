@@ -1,5 +1,10 @@
 # Striatum (AI Model Routing)
 
+> [!WARNING]
+> **Alpha.** Striatum is in early development and is not yet released for general use.
+> Breaking changes will happen between versions, including changes to its settings,
+> stored data and interfaces. Pin an exact version if you depend on it.
+
 Striatum is CortexKit's AI model routing module. For each model call, it chooses the
 provider/model route and the account that should serve it, using the model
 catalog, configured policy, account availability, quota evidence, price and
