@@ -13,7 +13,7 @@ Striatum decides which model and which account serve each model call in the Cort
 
 Routing owns no model facts and no credentials. It reads them from the modules that do:
 
-- **Fusiform:** which models exist, their prices, limits and capabilities.
+- **Fusiform:** which models exist, their prices, limits, capabilities and published grades.
 - **Claustrum:** which credentials exist and which providers each serves (metadata only, never the secret).
 - **Insula:** quota readings for each account.
 - **Entorhinal:** which project a request belongs to, so per-project settings apply.

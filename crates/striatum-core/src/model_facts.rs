@@ -9,7 +9,8 @@
 //! Scales:
 //!   - `elo`  : open model-capability Elo scale (unbounded above).
 //!   - `eq`   : curated interpersonal/prose/judgment Elo-like score.
-//!   - `speed`: Artificial Analysis median output tokens per second.
+//!   - `speed`: output tokens per second, from recent usage where measured,
+//!     otherwise a stored placement or the fleet median when available.
 //!
 //! Elo placements are curated facts; routing never derives them from live min/max values.
 //!
@@ -167,9 +168,8 @@ pub enum Confidence {
 /// Closed score provenance on a catalog row.
 ///
 /// `curated` is a migration or operator seed (`source='seed'` in the store).
-/// `override` is `route.model_upsert` or config. `aa_inferred` is the provisional
-/// AA-index interpolation. `unscored` is a model known to the catalog with no
-/// score yet (the Fusiform consumer's target) and is not routable.
+/// `override` is `route.model_upsert` or config. `unscored` is a model known to
+/// the catalog with no score yet and is not eligible for automatic selection.
 /// `operator_grade` and `elo_override` are read-time overlays from Fusiform and
 /// live configuration, respectively; they never replace stored curated scores.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -180,7 +180,6 @@ pub enum ScoreProvenance {
     Override,
     OperatorGrade,
     EloOverride,
-    AaInferred,
     Unscored,
 }
 
@@ -191,7 +190,6 @@ impl ScoreProvenance {
             ScoreProvenance::Override => "override",
             ScoreProvenance::OperatorGrade => "operator_grade",
             ScoreProvenance::EloOverride => "override",
-            ScoreProvenance::AaInferred => "aa_inferred",
             ScoreProvenance::Unscored => "unscored",
         }
     }
@@ -418,14 +416,7 @@ pub struct ModelFact {
     /// Closed score provenance. Legacy rows and serde-defaulted facts are curated.
     #[serde(default, skip_serializing_if = "ScoreProvenance::is_curated")]
     pub score_provenance: ScoreProvenance,
-    /// Raw Artificial Analysis intelligence index used to infer this row's Elo.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub aa_index: Option<f64>,
-    /// Unix milliseconds after which an `aa_inferred` row is past due for hand review.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub review_by_ms: Option<i64>,
-    /// How EQ was chosen for an `aa_inferred` row (`aa_index` or `neighbor:<route>`),
-    /// or the read-time quality overlay (`operator_grade` or `override`).
+    /// Read-time EQ provenance: a Fusiform operator grade or a settings override.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub eq_source: Option<String>,
     /// Optional class vector computed at read time by `get_facts_with_observed_speed`.

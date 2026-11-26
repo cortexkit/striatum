@@ -10,7 +10,6 @@
 //! TS unit tests are preserved as Rust test-vectors (same inputs/outputs) so the
 //! port's behavioral parity is provable, not assumed.
 
-pub mod aa_infer;
 pub mod account_wall;
 pub mod accounts;
 pub mod billing;
@@ -44,10 +43,6 @@ pub mod subscription;
 pub mod task_profile;
 pub mod usage_facts;
 
-pub use aa_infer::{
-    aa_elo_curve, elo_floor, infer_elo_from_aa, infer_elo_from_aa_static, inferred_scores,
-    interpolate_elo, AA_INFERRED_DEFAULT_SPEED, AA_INFERRED_PENALTY,
-};
 pub use billing::{BillingPlane, BillingRate};
 pub use break_glass::{
     live_billing_wall_error, relax_earliest_reset, BreakGlassCandidate, RelaxedSnapshot,

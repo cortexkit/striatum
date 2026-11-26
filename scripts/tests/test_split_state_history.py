@@ -70,7 +70,7 @@ class SplitStateHistoryTest(unittest.TestCase):
             for table in sorted(STATE):
                 self.assertEqual(state.execute(f'SELECT * FROM {table}').fetchall(),
                                  original.execute(f'SELECT * FROM {table}').fetchall())
-            for db, namespace, version in ((state, 'route_state', 103), (history, 'route_history', 1)):
+            for db, namespace, version in ((state, 'route_state', 104), (history, 'route_history', 1)):
                 self.assertEqual(db.execute('SELECT max(version) FROM cortexkit_schema_version WHERE namespace=?', (namespace,)).fetchone(), (version,))
             bindings = [db.execute(f'SELECT split_identity, move_generation FROM {table}').fetchall()
                         for db, table in ((state, 'history_layout'), (history, 'history_binding'))]

@@ -2979,7 +2979,7 @@ mod tests {
             credentials: Vec::new(),
             grant_tuples: vec![ListedGrant {
                 selector_kind: "exact".into(),
-                selector: "apikey:artificial-analysis".into(),
+                selector: "apikey:example-service".into(),
                 operation: "read".into(),
             }],
             view: "view".into(),

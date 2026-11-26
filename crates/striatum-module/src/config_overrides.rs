@@ -561,11 +561,6 @@ fn parse_config_with_paths(
     let mut json = jsonc_to_json(document)?;
     let mut value: serde_json::Value =
         serde_json::from_str(&json).map_err(|error| error.to_string())?;
-    // Report the removed `aa` key with deletion guidance before checking unknown
-    // fields, including when its value is null.
-    if value.get("aa").is_some() {
-        return Err("config_key_removed: aa; delete this key".into());
-    }
     if value.get("substrates").is_some()
         || value
             .get("model_routing")
@@ -2676,8 +2671,6 @@ fn apply_overrides<S: RouteStateStore>(
                 speed_multiplier: None,
                 subscription_multiplier: None,
                 score_provenance: ScoreProvenance::Curated,
-                aa_index: None,
-                review_by_ms: None,
                 eq_source: None,
                 class_vector: None,
                 class_vector_is_overlay: false,
@@ -2800,8 +2793,6 @@ mod tests {
             speed_multiplier: None,
             subscription_multiplier: None,
             score_provenance: ScoreProvenance::Curated,
-            aa_index: None,
-            review_by_ms: None,
             eq_source: None,
             class_vector: None,
             class_vector_is_overlay: false,

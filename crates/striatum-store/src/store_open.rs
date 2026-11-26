@@ -150,7 +150,6 @@ impl SqliteRouteStateStore {
 pub(super) mod tests {
     use super::*;
     use crate::decision_ledger::short_id;
-    use striatum_core::ScoreProvenance;
 
     /// Insert one ledger row the way an older routing build left it: a
     /// `payload_bytes`-long score payload sits before the outcome columns, as
@@ -677,64 +676,6 @@ pub(super) mod tests {
             })
             .unwrap();
         assert_eq!(remaining, ("serve-admit,serve-refuse".to_string(), 1, 1, 1));
-        drop(migrated);
-
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
-        let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
-        let _ = std::fs::remove_file(path.with_extension("sqlite.lock"));
-    }
-
-    #[test]
-    fn migration_033_adds_aa_columns_without_rewriting_existing_scores() {
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path = cortexkit_test_support::scratch_root().join(format!(
-            "striatum-aa-inferred-migration-{}-{timestamp}.sqlite",
-            std::process::id()
-        ));
-        let descriptor = dev_descriptor("striatum-aa-inferred-migration", path.to_string_lossy());
-
-        let legacy = open_sqlite(&descriptor).unwrap();
-        let migrations = route_state_migrations();
-        legacy
-            .migrate(ROUTE_STATE_NAMESPACE, &migrations[..32])
-            .unwrap();
-        let (elo, source): (f64, String) = legacy
-            .with_conn(|connection| {
-                connection.query_row(
-                    "SELECT json_extract(scores_json, '$.elo'), source
-                     FROM model_facts WHERE route_key = 'openai/gpt-5.6-sol'",
-                    [],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-            })
-            .unwrap();
-        assert_eq!(elo, 1_838.0);
-        assert_eq!(source, "seed");
-        drop(legacy);
-
-        let migrated = SqliteRouteStateStore::open(&descriptor).unwrap();
-        let sol = migrated
-            .get_fact_by_route_key("openai/gpt-5.6-sol")
-            .unwrap()
-            .unwrap();
-        assert_eq!(sol.scores.elo, 1_838.0);
-        assert_eq!(sol.score_provenance, ScoreProvenance::Curated);
-        assert_eq!(sol.aa_index, None);
-        let columns: bool = migrated
-            .store
-            .with_conn(|connection| {
-                connection.query_row(
-                    "SELECT COUNT(*) > 0 FROM pragma_table_info('model_facts') WHERE name = 'aa_index'",
-                    [],
-                    |row| row.get(0),
-                )
-            })
-            .unwrap();
-        assert!(columns);
         drop(migrated);
 
         let _ = std::fs::remove_file(&path);

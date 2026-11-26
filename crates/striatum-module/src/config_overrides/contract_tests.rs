@@ -177,12 +177,6 @@ refusal_case!(
     r#"consumers.mason.projects.proj.pin pins p/m but this config refuses route p/m for consumer "mason": models["p/m"].only_for ["sidekick"] does not name "mason""#
 );
 refusal_case!(
-    removed_aa,
-    r#"{"aa":{"api_key":"never-read"},"unknown":true}"#,
-    "config_key_removed: aa"
-);
-refusal_case!(removed_aa_null, r#"{"aa":null}"#, "config_key_removed: aa");
-refusal_case!(
     removed_explicit_only_providers,
     r#"{"model_routing":{"explicit_only_providers":["anthropic-platform"],"exclude":{"all":["xai"]}}}"#,
     "unknown field `explicit_only_providers`"

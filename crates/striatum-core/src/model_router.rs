@@ -2664,9 +2664,6 @@ pub fn evaluate_model_route_with_concurrency(
         "route {} for agent {}",
         winner_admissible.route.route_key, input.target_agent
     ));
-    if fact.score_provenance == ScoreProvenance::AaInferred {
-        explanation.push("provenance=aa_inferred".to_string());
-    }
     explanation.extend(winner_admissible.adequacy.explanation.iter().cloned());
     explanation.push(format!(
         "{}: adequacy {:.2}, selection cost {:.2}",
@@ -3696,8 +3693,6 @@ mod abundance_tests {
             speed_multiplier: None,
             subscription_multiplier: None,
             score_provenance: ScoreProvenance::Curated,
-            aa_index: None,
-            review_by_ms: None,
             eq_source: None,
             class_vector: None,
             class_vector_is_overlay: false,

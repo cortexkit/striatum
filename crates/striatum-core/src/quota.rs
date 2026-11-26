@@ -958,8 +958,6 @@ mod tests {
             speed_multiplier: None,
             subscription_multiplier: None,
             score_provenance: ScoreProvenance::Curated,
-            aa_index: None,
-            review_by_ms: None,
             eq_source: None,
             class_vector: None,
             class_vector_is_overlay: false,

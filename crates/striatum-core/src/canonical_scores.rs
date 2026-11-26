@@ -17,8 +17,7 @@
 //! 1. the route's own operator score (a seed or override row with a positive Elo);
 //! 2. else an operator score from another route with the same canonical id and
 //!    the same variant;
-//! 3. else whatever the route already has (an AA-inferred estimate, or nothing,
-//!    in which case it stays unscored).
+//! 3. else keep the route's stored score state, including unscored rows.
 //!
 //! A route whose canonical id is null never borrows: null means the upstream
 //! states no identity, not that the route is unique, and names are never used
@@ -185,14 +184,11 @@ pub fn resolve_canonical_scores(
         fact.scores.elo = donor_fact.scores.elo;
         fact.scores.eq = donor_fact.scores.eq;
         // The borrowed score is the donor's placement, so the row is as
-        // routable and as trusted as the donor. Its AA-inference metadata
-        // described an estimate that is no longer in force.
+        // routable and as trusted as the donor.
         fact.score_provenance = donor_fact.score_provenance;
         if donor_fact.confidence == Confidence::Curated {
             fact.confidence = Confidence::Curated;
         }
-        fact.aa_index = None;
-        fact.review_by_ms = None;
         fact.eq_source = None;
         borrowed_from[index] = Some(route_key(&donor_fact));
     }
@@ -393,45 +389,5 @@ mod tests {
         resolve_canonical_scores(&mut facts, &ids(&[Some("meta/muse-spark-1.3"); 4]));
         assert_eq!(facts[2].scores.elo, 1850.0);
         assert_eq!(facts[3].scores.elo, 1800.0);
-    }
-
-    #[test]
-    fn an_inferred_estimate_yields_to_a_peer_placement_but_survives_without_one() {
-        let mut inferred = row(
-            "openrouter/meta/muse-spark-1.3",
-            1600.0,
-            1300.0,
-            ScoreProvenance::AaInferred,
-        );
-        inferred.aa_index = Some(61.0);
-        let lone = row(
-            "openrouter/acme/lone-1",
-            1500.0,
-            1200.0,
-            ScoreProvenance::AaInferred,
-        );
-        let mut facts = vec![
-            row(
-                "meta/muse-spark-1.3",
-                1800.0,
-                1500.0,
-                ScoreProvenance::Curated,
-            ),
-            inferred,
-            lone,
-        ];
-        resolve_canonical_scores(
-            &mut facts,
-            &ids(&[
-                Some("meta/muse-spark-1.3"),
-                Some("meta/muse-spark-1.3"),
-                Some("acme/lone-1"),
-            ]),
-        );
-        assert_eq!(facts[1].scores.elo, 1800.0);
-        assert_eq!(facts[1].score_provenance, ScoreProvenance::Curated);
-        assert_eq!(facts[1].aa_index, None);
-        assert_eq!(facts[2].scores.elo, 1500.0);
-        assert_eq!(facts[2].score_provenance, ScoreProvenance::AaInferred);
     }
 }

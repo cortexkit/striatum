@@ -3,7 +3,7 @@
 //! Fusiform supplies existence, rates, limits, capabilities, and operator-graded
 //! Elo/EQ. Routing policy and stored placements remain operator-owned. The fact merge boundary is fenced by
 //! [`FusiformFactUpdate`], which cannot represent scores, variants, exclusions,
-//! speed multipliers, prompt defaults, AA indices, aliases, or lifecycle dates.
+//! speed multipliers, prompt defaults, aliases, or lifecycle dates.
 //!
 //! | field group | default authority | operator override |
 //! | --- | --- | --- |

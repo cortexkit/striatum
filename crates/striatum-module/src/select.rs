@@ -805,9 +805,6 @@ pub(super) async fn handle_legacy_request(
             winner_ladder::LadderSources::live(routing_config_path, operator_config_path);
         return handle_model_upsert(frame, writer, store, &ladder_sources, broca_credentials).await;
     }
-    if envelope.method == ROUTE_LIST_INFERRED_OP {
-        return handle_list_inferred(frame, writer, store).await;
-    }
     if envelope.method == ROUTE_LIST_UNSCORED_OP {
         return handle_list_unscored(frame, writer, store).await;
     }
