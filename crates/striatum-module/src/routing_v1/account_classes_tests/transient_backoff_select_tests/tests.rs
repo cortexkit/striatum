@@ -55,6 +55,98 @@ async fn claim(owner: &Route, runner: &Route, admitted: bool) {
 }
 
 #[tokio::test]
+async fn account_for_refusal_while_route_recovery_test_is_running() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let harness = one_account();
+    // Set up the route-scoped effect by itself: an account-wide observation
+    // would refuse before admission reaches the route's probe-claim path.
+    harness
+        .store()
+        .record_transient_account_route_fence(&striatum_store::AccountRouteFence {
+            provider: "openai".into(),
+            model: MODELS[0].into(),
+            credential_id: CREDENTIAL.into(),
+            until_ms: NOW as i64 + 5_000,
+            decision_id: String::new(),
+            recorded_at: NOW as i64,
+        })
+        .unwrap();
+    assert_account_wait_for_running_test(&harness).await;
+}
+
+#[tokio::test]
+async fn account_for_refusal_while_shared_route_recovery_test_is_running() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let harness = one_account();
+    let route = format!("openai/{}", MODELS[0]);
+    harness
+        .store()
+        .update_route_state(
+            &route,
+            &route,
+            &striatum_core::RouteStateUpdate {
+                cooldown_until: Some((NOW + 5_000) as f64),
+                observed_at_ms: Some(NOW as i64),
+                unscoped_wall: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_account_wait_for_running_test(&harness).await;
+}
+
+async fn assert_account_wait_for_running_test(harness: &Arc<Harness>) {
+    let runner = harness.bind(reserved("broca"), None).await;
+    let claimed_at = NOW + 5_001;
+    let _due = crate::InjectedClock::set(claimed_at);
+    assert_credential(
+        &runner
+            .call("route.account_for", &admission("account-probe"))
+            .await,
+        CREDENTIAL,
+    );
+    let started = runner
+        .call(
+            "route.account_observe",
+            &json!({"event_id":"account-probe-start", "kind":"admission_started",
+                "admission_id":"account-probe", "run_id":"account-probe-run"}),
+        )
+        .await;
+    assert_eq!(started.0, FrameType::Response, "{}", started.1);
+
+    let refused_at = claimed_at + 10_000;
+    let _during = crate::InjectedClock::set(refused_at);
+    let before = harness.store().fence_rechecks().unwrap();
+    crate::take_operator_warnings();
+    let refused = runner
+        .call("route.account_for", &admission("waiting-account"))
+        .await;
+    assert_eq!(refused.0, FrameType::Error, "{}", refused.1);
+    assert_eq!(refused.1["code"], "account_pool_exhausted", "{}", refused.1);
+    let fields = crate::take_operator_warnings()
+        .iter()
+        .filter_map(|line| line.strip_prefix("routing refused an account call: "))
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|fields| fields["admission_id"] == "waiting-account")
+        .expect("account refusal log");
+    assert_eq!(
+        (
+            &refused.1["detail"]["reset_at_ms"],
+            &refused.1["detail"]["retry_after_s"],
+            &fields["reason"],
+        ),
+        (
+            &json!(refused_at + 30_000),
+            &json!(30),
+            &json!("recovery_test_in_progress")
+        ),
+        "refusal: {}; operator warning: {fields}",
+        refused.1,
+    );
+    assert_eq!(harness.store().fence_rechecks().unwrap(), before);
+}
+
+#[tokio::test]
 async fn unclaimed_non_quota_backoff_keeps_its_real_deadline() {
     let _clock = crate::InjectedClock::set(NOW);
     let (harness, owner, _) = blocked(NOW + 60_000).await;

@@ -209,8 +209,9 @@ async fn expired_transient_backoff_with_inflight_probe_refuses_fresh_sidekick_se
         account_wait.1
     );
     assert_eq!(
-        account_wait.1["detail"]["reset_at_ms"], origin.next_recheck_at,
-        "account_for retains its separate admission hint in this slice: {}",
+        account_wait.1["detail"]["reset_at_ms"],
+        select_at + 30_000,
+        "account_for gives the same check-again hint: {}",
         account_wait.1
     );
     let conn = rusqlite::Connection::open(harness.store_path()).unwrap();
