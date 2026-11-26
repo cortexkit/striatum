@@ -491,6 +491,17 @@ impl BlockState {
             .collect()
     }
 
+    /// Whether an expiring provider-supplied pause needs the writer's
+    /// retirement pass. Ordinary admissions avoid that work entirely.
+    pub fn has_expired_rate_limit(&self, now: i64) -> bool {
+        self.source_origins().into_iter().any(|origin| {
+            crate::fence_rechecks::reopens_at_deadline(&origin)
+                && origin
+                    .deadline
+                    .is_some_and(|deadline| deadline <= now as f64)
+        })
+    }
+
     fn scan_order<'a>(&'a self, rows: impl Iterator<Item = &'a StoredBlock>) -> Vec<ViewOrigin> {
         let mut rows = self.view_rows(rows);
         rows.sort_by_key(|(position, _)| *position);

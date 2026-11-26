@@ -642,7 +642,7 @@ pub(crate) fn view_origin(r: &rusqlite::Row<'_>, at: usize) -> rusqlite::Result<
 /// Whether this block's provider-supplied short pause ends in open admission
 /// rather than one request claiming a recovery test. Other transient-looking
 /// walls, including guessed and outage cooldowns, keep the recovery test.
-fn reopens_at_deadline(origin: &ViewOrigin) -> bool {
+pub(crate) fn reopens_at_deadline(origin: &ViewOrigin) -> bool {
     origin.quota == Some(false)
         && (matches!(
             origin.kind.as_str(),
