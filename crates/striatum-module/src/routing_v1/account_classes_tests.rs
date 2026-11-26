@@ -733,6 +733,12 @@ fn configure_harness(
         crate::fusiform_catalog::PlaneCatalog::ordinary_test_catalog(&[fact, subscription]),
     );
     credentials.publish_plan_prices(&json!({"prices":[]}));
+    super::conformance_tests::publish_fixture_providers(
+        &mut credentials,
+        RUNNER,
+        &[provider],
+        true,
+    );
     harness.set_credentials(credentials.clone());
     harness.edit_config(|config| {
         if converted_live {
@@ -934,8 +940,6 @@ async fn pinned_paid_pool_decision_requires_the_selected_provider_not_the_runner
     credentials.runner_declarations.insert(
         RUNNER.into(),
         super::runners::parse_declaration(&json!({"runner": {
-            "pairs":[{"wire_api":"anthropic.messages", "auth_method":"apikey"},
-                {"wire_api":"anthropic.messages", "auth_method":"oauth"}],
             "follows_account_choice":true
         }}))
         .unwrap()
@@ -1192,6 +1196,7 @@ fn demand_prices_only_the_class_that_account_for_may_serve() {
                 fences: &priced.entitlement_fences,
                 stale: &[],
                 defer_pool_pin: false,
+                keyless_routes: None,
             },
             false,
             Some(crate::select_policy::Consumer::Mason),

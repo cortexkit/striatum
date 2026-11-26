@@ -1,0 +1,1 @@
+{"default_harness":"opencode2","follows_account_choice":true,"harness_limits":{"opencode2":{"capabilities":["plans","fork_answer","submit_tool","final_text","output_cap","one_off"],"starts_sessions":true}},"harnesses":["opencode2"],"starts_sessions":true}

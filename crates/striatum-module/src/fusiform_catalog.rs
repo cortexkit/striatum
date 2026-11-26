@@ -2082,7 +2082,14 @@ pub(crate) fn apply_mapped_catalog(
             .map_err(|_| error("credential cache poisoned"))?;
         credentials.wire_apis = snapshot.wire_apis.clone();
         credentials.wire_api_models = snapshot.wire_api_models.clone();
+        let changed = credentials
+            .catalog_snapshot
+            .as_ref()
+            .is_none_or(|previous| previous.cursor != snapshot.cursor);
         credentials.catalog_snapshot = Some(Arc::clone(snapshot));
+        if changed {
+            credentials.runner_catalog_wake.notify_one();
+        }
     }
     Ok(())
 }

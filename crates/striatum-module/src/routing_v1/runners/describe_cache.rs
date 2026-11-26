@@ -52,6 +52,11 @@ impl DescribeCache {
         // clock as tiers and accounts. A present replacement or removed policy
         // is not a gap, so neither may borrow an old declaration.
         for (module, declaration) in previous {
+            if let Some(current) = credentials.runner_declarations.get(&module) {
+                if current.harnesses != declaration.harnesses {
+                    credentials.runner_serves.remove(&module);
+                }
+            }
             if !present.contains(module.as_str())
                 && policies.iter().any(|policy| policy.module == module)
                 && fresh_observation(credentials, &module, now)
@@ -113,6 +118,11 @@ impl DescribeCache {
                 || (!present.contains(module.as_str())
                     && policies.iter().any(|policy| policy.module == *module))
         });
+        credentials.runner_serves.retain(|module, _| {
+            self.modules.contains(module)
+                || (!present.contains(module.as_str())
+                    && policies.iter().any(|policy| policy.module == *module))
+        });
         self.failed.retain(|module| {
             self.modules.contains(module)
                 || credentials.runner_describe_observed.contains_key(module)
@@ -143,6 +153,36 @@ impl DescribeCache {
             self.missed(module, "describe", credentials, now);
             self.expire(credentials, now);
             return false;
+        };
+        let describe = describe.get("result").unwrap_or(describe);
+        let accepts_serves = if describe["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|group| group == cortexkit_role_llm_runner::capabilities::SERVES)
+        {
+            describe.get("serves").is_some_and(|raw| {
+                let credentials = &mut **credentials;
+                let declared = credentials
+                    .runner_declarations
+                    .get(module)
+                    .and_then(|declaration| declaration.harnesses.as_deref());
+                match credentials
+                    .runner_serves
+                    .entry(module.to_owned())
+                    .or_default()
+                    .apply(raw, declared, now)
+                {
+                    Ok(()) => true,
+                    Err(error) => {
+                        tracing::warn!(runner = module, %error, "runner serves answer refused");
+                        false
+                    }
+                }
+            })
+        } else {
+            credentials.runner_serves.remove(module);
+            true
         };
         let previous = credentials.runner_service_tiers.get(module).cloned();
         let had_observation = credentials.runner_describe_observed.contains_key(module);
@@ -175,7 +215,7 @@ impl DescribeCache {
             };
             view_event(credentials, module, cause, now);
         }
-        true
+        accepts_serves
     }
 
     pub(crate) fn missed_all(&mut self, credentials: &mut BrocaCredentials, now: i64) {

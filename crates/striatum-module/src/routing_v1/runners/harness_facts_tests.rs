@@ -22,11 +22,8 @@ fn slot(limits: Value) -> Value {
             .flat_map(|provider| provider.capabilities)
             .collect();
     json!({"runner": {
-        "pairs": [{"wire_api":"anthropic.messages", "auth_method":"apikey"},
-                  {"wire_api":"anthropic.messages", "auth_method":"oauth"}],
         "harnesses":["primary","secondary","inherited"], "default_harness":"primary",
         "tool_capabilities": tags,
-        "standing_limits":{"explicit_providers":["anthropic"]},
         "harness_limits": limits
     }})
 }
@@ -69,9 +66,7 @@ fn prepare_selects(harness: &crate::routing_v1::conformance_tests::Harness) {
 async fn candidate_harness_facts_decode_and_inherit_without_granting_unknown_tokens() {
     describe::with_candidate_capabilities(&[GROUP], async {
         let value = slot(json!({"primary": {
-            "starts_sessions":false, "capabilities":["one_off","fork_answer","future_token"],
-            "exclude":["anthropic", "-anthropic/allowed"],
-            "pairs":[{"wire_api":"anthropic.messages","auth_method":"apikey"}]
+            "starts_sessions":false, "capabilities":["one_off","fork_answer","future_token"]
         }}));
         let declaration = read(&value);
         assert!(declaration.declares_harness_facts());
@@ -92,15 +87,9 @@ async fn candidate_harness_facts_decode_and_inherit_without_granting_unknown_tok
         assert!(!declaration.harness_supports("primary", &OutputCap));
         let unknown: HarnessCapability = serde_json::from_value(json!("future_token")).unwrap();
         assert!(!declaration.harness_supports("primary", &unknown));
-        assert!(declaration.harness_excludes("primary", "anthropic/blocked/high"));
-        assert!(!declaration.harness_excludes("primary", "anthropic/allowed/high"));
-        assert!(!declaration.harness_excludes("primary", "anthropic-platform/blocked"));
         let inherited = declaration.limits_for_harness(Some("inherited")).unwrap();
         assert_eq!(inherited.starts_sessions, Some(true));
-        assert_eq!(inherited.pairs.as_ref().unwrap().len(), 2);
-        assert_eq!(inherited.explicit_providers, Some(vec!["anthropic".into()]));
         assert!(!declaration.harness_supports("inherited", &OneOff));
-        assert!(!declaration.harness_excludes("inherited", "anthropic/blocked"));
         let mut stopped = value.clone();
         stopped["runner"]["starts_sessions"] = json!(false);
         stopped["runner"]["harness_limits"]["primary"]["starts_sessions"] = json!(true);
@@ -127,7 +116,7 @@ async fn declaring_is_per_runner_and_non_null_empty_or_unknown_is_a_declaration(
     describe::with_candidate_capabilities(&[GROUP], async {
         for facts in [
             json!({}),
-            json!({"starts_sessions":null,"capabilities":null,"exclude":null}),
+            json!({"starts_sessions":null,"capabilities":null}),
         ] {
             let legacy = read(&slot(json!({"primary":facts})));
             assert!(!legacy.declares_harness_facts());
@@ -139,7 +128,6 @@ async fn declaring_is_per_runner_and_non_null_empty_or_unknown_is_a_declaration(
         for facts in [
             json!({"starts_sessions":true}),
             json!({"capabilities":[]}),
-            json!({"exclude":[]}),
             json!({"capabilities":["future_token"]}),
         ] {
             let declaring = read(&slot(
@@ -160,7 +148,6 @@ async fn declaring_is_per_runner_and_non_null_empty_or_unknown_is_a_declaration(
                         .starts_sessions,
                     Some(true)
                 );
-                assert!(!declaring.harness_excludes(harness, "anthropic/model"));
             }
             let legacy = read(&slot(json!({})));
             assert!(legacy.harness_supports("primary", &OutputCap));
@@ -172,7 +159,7 @@ async fn declaring_is_per_runner_and_non_null_empty_or_unknown_is_a_declaration(
 #[tokio::test]
 async fn refused_typed_map_is_wholly_legacy_and_warns_at_catalog_read() {
     describe::with_candidate_capabilities(&[GROUP], async {
-        let valid = slot(json!({"primary":{"capabilities":["one_off"],"exclude":["anthropic"]}}));
+        let valid = slot(json!({"primary":{"capabilities":["one_off"]}}));
         assert!(read(&valid).declares_harness_facts());
         for invalid in [
             json!({"exclude":["anthropic//model"]}),
@@ -188,22 +175,13 @@ async fn refused_typed_map_is_wholly_legacy_and_warns_at_catalog_read() {
             assert!(declaration.harness_limits_error().is_some());
             assert!(declaration.limits_for_harness(Some("primary")).is_err());
             assert!(declaration.harness_supports("primary", &OutputCap));
-            assert!(!declaration.harness_excludes("primary", "anthropic/model"));
             let mut credentials = crate::broca_credentials::BrocaCredentials::default();
             credentials.runner_declarations = declarations;
             for harness in [None, Some("primary"), Some("secondary"), Some("inherited")] {
                 let policies: Vec<crate::config_policy::RunnerPolicy> =
                     serde_json::from_value(json!([{"module":"invalid-harness-map"}])).unwrap();
                 let registry = Registry::build_for_harness(policies, &credentials, &[], 0, harness);
-                assert_eq!(registry.entries[0].pairs.as_ref().unwrap().len(), 2);
-                assert_eq!(
-                    registry.entries[0]
-                        .standing_limits
-                        .as_ref()
-                        .unwrap()
-                        .explicit_providers,
-                    Some(vec!["anthropic".into()])
-                );
+                assert!(registry.entries[0].starts_sessions);
             }
         }
         let warnings = crate::take_operator_warnings();
@@ -211,7 +189,7 @@ async fn refused_typed_map_is_wholly_legacy_and_warns_at_catalog_read() {
             warnings
                 .iter()
                 .any(|line| line.contains("invalid-harness-map")
-                    && line.contains("exclude")
+                    && line.contains("capabilities")
                     && line.contains("using runner-level limits for all harnesses")),
             "{warnings:?}"
         );
@@ -228,7 +206,7 @@ async fn held_group_refuses_entire_fact_map_and_preserves_runner_level_reach() {
         harness
             .edit_config(|config| config["runners"] = json!([{"module":"broca","via_vault":true}]));
         let value = slot(json!({"primary":{
-            "exclude":[], "pairs":[{"wire_api":"anthropic.messages","auth_method":"apikey"}]
+            "starts_sessions":false
         }}));
         let live = read(&value);
         assert!(!live.declares_harness_facts());
@@ -246,7 +224,7 @@ async fn held_group_refuses_entire_fact_map_and_preserves_runner_level_reach() {
             crate::now_ms(),
             None,
         );
-        assert_eq!(live_registry.entries[0].pairs.as_ref().unwrap().len(), 2);
+        assert!(live_registry.entries[0].starts_sessions);
         assert!(crate::take_operator_warnings()
             .iter()
             .any(|line| line.contains("runner broca:")
@@ -267,10 +245,7 @@ async fn held_group_refuses_entire_fact_map_and_preserves_runner_level_reach() {
                 crate::now_ms(),
                 None,
             );
-            assert_eq!(
-                candidate_registry.entries[0].pairs.as_ref().unwrap().len(),
-                1
-            );
+            assert!(!candidate_registry.entries[0].starts_sessions);
         })
         .await;
     })
@@ -285,7 +260,14 @@ async fn broca_after_fixture_is_verbatim_and_declares_no_output_capability() {
         "3066e75ce8c1d22fe1ee8b988e855365013bd31eefac2e47638d7a667f038755"
     );
     describe::with_candidate_capabilities(&[GROUP], async {
-        let declaration = read(&serde_json::from_slice(bytes).unwrap());
+        let historical = serde_json::from_slice(bytes).unwrap();
+        assert!(parse_declaration(&historical)
+            .unwrap_err()
+            .contains("runner.pairs"));
+        let declaration = read(&json!({"runner": {
+            "harnesses":["broca"],
+            "harness_limits":{"broca":{"capabilities":["one_off", "fork_answer"]}}
+        }}));
         assert!(declaration.declares_harness_facts());
         assert!(declaration.harness_supports("broca", &OneOff));
         assert!(declaration.harness_supports("broca", &ForkAnswer));
@@ -314,11 +296,7 @@ async fn repeated_selects_parse_no_harness_facts_and_refresh_invalidates_views()
         let snapshot = harness.store().get_facts_with_generation().unwrap();
         let shared = harness.credentials();
         let mut cache = DescribeCache::default();
-        let mut value = slot(json!({"primary":{"exclude":[]}}));
-        value["runner"]
-            .as_object_mut()
-            .unwrap()
-            .remove("standing_limits");
+        let value = slot(json!({"primary":{"capabilities":[]}}));
         let before = PARSES.load(Ordering::Relaxed);
         let old = {
             let mut credentials = shared.lock().unwrap();
@@ -328,6 +306,9 @@ async fn repeated_selects_parse_no_harness_facts_and_refresh_invalidates_views()
                 &mut credentials,
                 crate::now_ms() as i64,
             );
+            crate::routing_v1::conformance_tests::publish_runner_serves(&mut credentials, "broca", &json!({
+                "generation":"first","harnesses":{"primary":[{"provider":"example-provider","models":"all"}]}
+            }));
             assert!(credentials.runner_declarations["broca"].declares_harness_facts());
             credentials.snapshot()
         };
@@ -360,7 +341,7 @@ async fn repeated_selects_parse_no_harness_facts_and_refresh_invalidates_views()
             "select must not decode a declaration or its harness facts"
         );
         let mut changed = value.clone();
-        changed["runner"]["harness_limits"]["primary"]["exclude"] = json!(["anthropic"]);
+        changed["runner"]["harness_limits"]["primary"]["capabilities"] = json!(["one_off"]);
         let new = {
             let mut credentials = shared.lock().unwrap();
             cache.catalog(
@@ -369,6 +350,9 @@ async fn repeated_selects_parse_no_harness_facts_and_refresh_invalidates_views()
                 &mut credentials,
                 crate::now_ms() as i64,
             );
+            crate::routing_v1::conformance_tests::publish_runner_serves(&mut credentials, "broca", &json!({
+                "generation":"second","harnesses":{"primary":[]}
+            }));
             credentials.snapshot()
         };
         assert_eq!(PARSES.load(Ordering::Relaxed), parsed + 1);
@@ -386,16 +370,8 @@ async fn repeated_selects_parse_no_harness_facts_and_refresh_invalidates_views()
             crate::now_ms(),
             None,
         );
-        assert!(!old_registry.entries[0]
-            .wire_declaration
-            .as_ref()
-            .unwrap()
-            .harness_excludes("primary", "anthropic/model"));
-        assert!(new_registry.entries[0]
-            .wire_declaration
-            .as_ref()
-            .unwrap()
-            .harness_excludes("primary", "anthropic/model"));
+        assert!(old_registry.runs("broca", "example-provider/model-a", "example-provider/model-a"));
+        assert!(!new_registry.runs("broca", "example-provider/model-a", "example-provider/model-a"));
         assert_eq!(PARSES.load(Ordering::Relaxed), parsed + 1);
     })
     .await;
@@ -413,16 +389,14 @@ async fn what_if_overlay_facts_have_disposable_serving_and_registry_views() {
         let config = harness.operator_config();
         let snapshot = harness.store().get_facts_with_generation().unwrap();
         let shared = harness.credentials();
-        let mut value = slot(json!({"primary":{"capabilities":["output_cap"]}}));
-        value["runner"]
-            .as_object_mut()
-            .unwrap()
-            .remove("standing_limits");
-        shared
-            .lock()
-            .unwrap()
-            .runner_declarations
-            .insert("broca".into(), read(&value));
+        let value = slot(json!({"primary":{"capabilities":["output_cap"]}}));
+        {
+            let mut credentials = shared.lock().unwrap();
+            credentials.runner_declarations.insert("broca".into(), read(&value));
+            crate::routing_v1::conformance_tests::publish_runner_serves(&mut credentials, "broca", &json!({
+                "generation":"base","harnesses":{"primary":[{"provider":"example-provider","models":"all"}]}
+            }));
+        }
         let live = shared.lock().unwrap().snapshot();
         let live_index = crate::serving_index::ServingIndex::get(&config, &live, &snapshot);
         let live_registry = Registry::build_for_selection(
@@ -434,8 +408,7 @@ async fn what_if_overlay_facts_have_disposable_serving_and_registry_views() {
         );
         let mut overlay = value.clone();
         overlay["runner"]["harness_limits"]["primary"] = json!({
-            "exclude":["anthropic"], "capabilities":["one_off"],
-            "pairs":[{"wire_api":"anthropic.messages","auth_method":"apikey"}]
+            "capabilities":["one_off"]
         });
         let proposed = crate::routing_v1::what_if::overlay_runner_declarations(
             &live,
@@ -450,16 +423,12 @@ async fn what_if_overlay_facts_have_disposable_serving_and_registry_views() {
             crate::now_ms(),
             None,
         );
-        assert_eq!(
-            proposed_registry.entries[0].pairs.as_ref().unwrap().len(),
-            1
-        );
+        assert_eq!(proposed_registry.entries[0].policy.routes, live_registry.entries[0].policy.routes);
         let declaration = proposed_registry.entries[0]
             .wire_declaration
             .as_ref()
             .unwrap();
         assert!(declaration.declares_harness_facts());
-        assert!(declaration.harness_excludes("primary", "anthropic/model"));
         assert!(declaration.harness_supports("primary", &OneOff));
         assert!(!declaration.harness_supports("primary", &OutputCap));
         drop(proposed);
@@ -488,15 +457,7 @@ async fn what_if_overlay_facts_have_disposable_serving_and_registry_views() {
             crate::now_ms(),
             None,
         );
-        assert_eq!(
-            live_registry.entries[0].pairs,
-            still_live_registry.entries[0].pairs
-        );
-        assert!(!still_live_registry.entries[0]
-            .wire_declaration
-            .as_ref()
-            .unwrap()
-            .harness_excludes("primary", "anthropic/model"));
+        assert_eq!(live_registry.entries[0].policy.routes, still_live_registry.entries[0].policy.routes);
         assert!(still_live_registry.entries[0]
             .wire_declaration
             .as_ref()

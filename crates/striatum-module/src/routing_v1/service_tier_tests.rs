@@ -107,14 +107,11 @@ pub(super) fn setup_for_method(
     );
     credentials.wire_apis = wires;
     credentials.publish_plan_prices(&served()["plan.prices — every curated row"]["response"]);
-    credentials.runner_declarations.insert(
-        RUNNER.into(),
-        runners::parse_declaration(&json!({"runner":{
-            "pairs":[{"wire_api":wire,"auth_method":method}],
-            "follows_account_choice":true
-        }}))
-        .unwrap()
-        .unwrap(),
+    super::conformance_tests::publish_fixture_providers(
+        &mut credentials,
+        RUNNER,
+        &["openai"],
+        true,
     );
     let levels = if runner_ultrafast {
         json!(["fast", "ultrafast"])
@@ -976,13 +973,10 @@ fn live_broca_credentials(credentials: &mut BrocaCredentials) {
         "dd0ef1d533f267ea3422e508c7e16f7ece51239fcc93580924572c610bf8e581"
     );
     let reply: Value = serde_json::from_slice(bytes).unwrap();
-    credentials.runner_declarations.clear();
     credentials.runner_service_tiers.clear();
     let modules = json!([{"module_id":RUNNER,"nonce_verified":true,"role_declarations":null}]);
     let policies = vec![serde_json::from_value(json!({"module":RUNNER,"via_vault":true})).unwrap()];
-    for module in
-        runners::tier_discovery_modules(&modules, &credentials.runner_declarations, &policies)
-    {
+    for module in runners::tier_discovery_modules(&modules, &Default::default(), &policies) {
         if let Some(tiers) = runners::service_tiers_from_describe(&reply) {
             credentials.runner_service_tiers.insert(module, tiers);
         }
@@ -996,7 +990,7 @@ fn service_tier_discovery_polls_only_verified_declared_or_vault_runners() {
         {"module_id":"unverified","nonce_verified":false,"role_declarations":null},
         {"module_id":"not-vault","nonce_verified":true,"role_declarations":null},
         {"module_id":"declared","nonce_verified":true,"role_declarations":{"routing/v1":{
-            "runner":{"pairs":[{"wire_api":"anthropic.messages","auth_method":"oauth"}],"follows_account_choice":true}
+            "runner":{"follows_account_choice":true}
         }}}
     ]);
     let policies: Vec<crate::config_policy::RunnerPolicy> = serde_json::from_value(json!([

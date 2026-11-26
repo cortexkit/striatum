@@ -103,7 +103,7 @@ impl Monitor {
         }
     }
     fn check(&mut self, mut report: impl FnMut(String)) {
-        for (policy, routes) in self.policies.iter().zip(&self.routes) {
+        for policy in &self.policies {
             let Some(harness) = &policy.harness else {
                 continue;
             };
@@ -113,34 +113,7 @@ impl Monitor {
                 Status::Refused => {
                     Some("refused: harness is not hosted or does not start sessions")
                 }
-                Status::Ready => declaration
-                    .filter(|declaration| {
-                        policy.routes.as_ref().is_some_and(|routes| {
-                            !routes.is_empty()
-                                && routes
-                                    .iter()
-                                    .all(|route| declaration.harness_excludes(harness, route))
-                        }) && declaration
-                            .limits_for_harness(Some(harness))
-                            .ok()
-                            .and_then(|limits| limits.exclude)
-                            // Only an exception inside this placement can reopen
-                            // one of its routes; unrelated exceptions do not.
-                            .is_some_and(|specs| {
-                                !specs
-                                    .iter()
-                                    .filter_map(|spec| spec.trim().strip_prefix('-'))
-                                    .any(|route| {
-                                        routes
-                                            .as_ref()
-                                            .is_some_and(|routes| routes.resolve(route, false))
-                                            && !declaration.harness_excludes(harness, route)
-                                    })
-                            })
-                    })
-                    .map(|_| {
-                        "all configured routes are excluded; kept because the catalog can change"
-                    }),
+                Status::Ready => None,
             };
             if let Some(issue) = issue {
                 let warning = format!(

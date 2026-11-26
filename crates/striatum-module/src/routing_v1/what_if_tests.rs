@@ -178,23 +178,14 @@ pub(super) fn rows(harness: &Harness) -> BTreeMap<String, Vec<Vec<SqlValue>>> {
 fn runner_slot() -> Value {
     json!({"runner": {
         "follows_account_choice": true,
-        "requires_wire_api": true,
-        "pairs": [{"wire_api":"openai.responses", "auth_method":"apikey"}],
         "harnesses": ["codex"],
-        "default_harness": "codex",
-        "harness_limits": {"codex": {
-            "pairs": [{"wire_api":"openai.responses", "auth_method":"apikey"}]
-        }}
+        "default_harness": "codex"
     }})
 }
 
 fn broad_runner_slot() -> Value {
     json!({"runner": {
-        "follows_account_choice": true,
-        "pairs": [
-            {"wire_api":"anthropic.messages", "auth_method":"apikey"},
-            {"wire_api":"anthropic.messages", "auth_method":"oauth"}
-        ]
+        "follows_account_choice": true
     }})
 }
 
@@ -227,6 +218,12 @@ fn prepare_runner_preview(harness: &Harness) {
     let mut credentials = shared.lock().unwrap();
     credentials.catalog_snapshot = Some(snapshot);
     credentials.runner_declarations.clear();
+    super::conformance_tests::publish_fixture_providers(
+        &mut credentials,
+        "broca",
+        &[fixture::PRICED_PROVIDER, fixture::SUBSCRIPTION_PROVIDER],
+        true,
+    );
 }
 
 fn credential_state(harness: &Harness) -> String {
@@ -335,6 +332,7 @@ async fn what_if_head_choices_matches_installed_declaration_and_keeps_live_state
 
     let shared = harness.credentials();
     // Install through the same verified catalog parser used by catalog refreshes.
+    let original_declarations = shared.lock().unwrap().runner_declarations.clone();
     shared.lock().unwrap().runner_declarations = super::runners::declarations_from_catalog(
         &json!([{"module_id":"broca", "nonce_verified":true,
             "role_declarations":{"routing/v1":slot}}]),
@@ -370,7 +368,7 @@ async fn what_if_head_choices_matches_installed_declaration_and_keeps_live_state
         .await;
     assert_eq!(ty, FrameType::Response, "{still_installed}");
     assert_eq!(installed, still_installed);
-    shared.lock().unwrap().runner_declarations.clear();
+    shared.lock().unwrap().runner_declarations = original_declarations;
     assert_eq!(credentials, credential_state(&harness));
     assert_eq!(before, rows(&harness));
 }
@@ -400,32 +398,6 @@ async fn what_if_refuses_invalid_runner_slots_with_the_catalog_parser_error() {
         assert_eq!(body["code"], "invalid_request", "{body}");
         assert!(body.to_string().contains(&error), "{body}: {error}");
     }
-    assert_eq!(before, rows(&harness));
-    assert_eq!(credentials, credential_state(&harness));
-}
-
-#[tokio::test]
-async fn what_if_accepts_pair_wire_requirements_overriding_the_runner_default() {
-    let (harness, _) = configured().await;
-    prepare_runner_preview(&harness);
-    let operator = operator(&harness).await;
-    let baseline = evaluate(&operator, json!({"iqs":[0], "runner":"broca"})).await;
-    assert!(baseline["results"][0]["pick"].is_object(), "{baseline}");
-    let mut slot = broad_runner_slot();
-    slot["runner"]["requires_wire_api"] = json!(true);
-    for pair in slot["runner"]["pairs"].as_array_mut().unwrap() {
-        pair["requires_wire_api"] = json!(false);
-    }
-    let before = rows(&harness);
-    let credentials = credential_state(&harness);
-    let preview = evaluate(
-        &operator,
-        json!({
-            "iqs":[0], "runner":"broca", "runner_declarations":{"broca":slot}
-        }),
-    )
-    .await;
-    assert_eq!(preview["results"], baseline["results"], "{preview}");
     assert_eq!(before, rows(&harness));
     assert_eq!(credentials, credential_state(&harness));
 }

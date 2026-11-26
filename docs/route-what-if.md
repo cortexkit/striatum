@@ -67,10 +67,8 @@ picker under that declaration:
       "broca": {
         "runner": {
           "follows_account_choice": true,
-          "pairs": [
-            {"auth_method": "apikey", "wire_api": "anthropic.messages", "requires_wire_api": true},
-            {"auth_method": "oauth", "wire_api": "anthropic.messages"}
-          ]
+          "harnesses": ["broca"],
+          "harness_limits": {"broca": {"capabilities": ["one_off", "output_cap"]}}
         }
       }
     },
@@ -79,16 +77,15 @@ picker under that declaration:
 }
 ```
 
-The example deliberately admits only two pairs. To evaluate a runner's actual
-proposal, use its entire `role_declarations["routing/v1"]` object as the value
+To evaluate a runner's manifest proposal, use its entire
+`role_declarations["routing/v1"]` object as the value
 under its module name, not the surrounding catalog entry or just the inner
 `runner` object. Omit both new members for the live-policy baseline.
 
-`requires_wire_api` on a runner pair controls whether that pair needs a served
-`wire.api` endpoint in the model catalog. A pair's explicit value takes precedence
-over the runner-level value; if neither is supplied, the requirement is false.
-Members on `harness_limits` pairs do not change this requirement: harness limits
-only narrow the runner's admitted pairs.
+The manifest supplies the runner's harnesses and capabilities, not its model
+list. The preview still uses the list routing last read from the runner's
+`role.describe {"serves": true}`. A proposed harness without a fresh list
+doesn't place any models.
 
 ## Parameters
 

@@ -20,6 +20,7 @@
 #[path = "conformance_tests/whole_writer/tests.rs"]
 mod whole_writer;
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -295,6 +296,11 @@ impl Harness {
             &mut credentials.lock().unwrap(),
             crate::now_ms() as i64,
         );
+    }
+
+    pub(super) fn publish_runner_serves(&self, module: &str, list: &Value) {
+        let shared = self.credentials();
+        publish_runner_serves(&mut shared.lock().unwrap(), module, list);
     }
 
     /// Bind a new route as `principal`, scoped to `project_id` when given,
@@ -748,6 +754,75 @@ pub(super) fn install_catalog(harness: &Harness, catalog: &Catalog) {
     install_catalog_with(harness, catalog, Harness::install_facts);
 }
 
+pub(super) fn publish_runner_serves(
+    credentials: &mut BrocaCredentials,
+    module: &str,
+    list: &Value,
+) {
+    assert!(super::runners::DescribeCache::default().reply(
+        module,
+        Some(&json!({"capabilities": ["serves"], "serves": list})),
+        credentials,
+        crate::now_ms() as i64,
+    ));
+}
+
+/// Test runners for fixtures that own the entire small catalog of these providers.
+pub(super) fn publish_fixture_providers(
+    credentials: &mut BrocaCredentials,
+    module: &str,
+    providers: &[&str],
+    follows_account_choice: bool,
+) {
+    let declaration = credentials
+        .runner_declarations
+        .entry(module.to_owned())
+        .or_insert_with(|| {
+            super::runners::parse_declaration(
+                &json!({"runner":{"follows_account_choice":follows_account_choice}}),
+            )
+            .unwrap()
+            .unwrap()
+        });
+    let entries: Vec<_> = providers
+        .iter()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(|provider| json!({"provider":provider,"models":"all"}))
+        .collect();
+    let list = match declaration.harnesses.as_deref() {
+        Some(harnesses) => json!({"generation":"fixture-providers", "harnesses": harnesses
+            .iter().map(|name| (name, &entries)).collect::<BTreeMap<_, _>>()}),
+        None => json!({"generation":"fixture-providers", "entries": entries}),
+    };
+    publish_runner_serves(credentials, module, &list);
+}
+
+fn fixture_serves(runner: &cortexkit_role_routing_conformance::CatalogRunner) -> Value {
+    test_serves(&runner.route_keys, runner.harnesses.as_deref(), "fixture")
+}
+
+pub(super) fn test_serves(
+    keys: &[String],
+    harnesses: Option<&[String]>,
+    generation: &str,
+) -> Value {
+    let mut by_provider = BTreeMap::<&str, BTreeSet<&str>>::new();
+    for key in keys {
+        let (provider, model) = key.split_once('/').unwrap();
+        by_provider.entry(provider).or_default().insert(model);
+    }
+    let entries: Vec<_> = by_provider
+        .into_iter()
+        .map(|(provider, models)| json!({"provider": provider, "models": models}))
+        .collect();
+    match harnesses {
+        Some(harnesses) => json!({"generation":generation, "harnesses": harnesses
+            .iter().map(|name| (name, &entries)).collect::<BTreeMap<_, _>>()}),
+        None => json!({"generation":generation, "entries": entries}),
+    }
+}
+
 fn install_catalog_with(
     harness: &Harness,
     catalog: &Catalog,
@@ -770,15 +845,18 @@ fn install_catalog_with(
         .runners
         .iter()
         .map(|runner| {
-            json!({
+            let mut policy = json!({
                 "module": runner.module,
-                "routes": runner.route_keys,
                 "tool_capabilities": runner
                     .tool_providers
                     .iter()
                     .flat_map(|provider| provider.capabilities.clone())
                     .collect::<Vec<_>>(),
-            })
+            });
+            if !runner.route_keys.is_empty() {
+                policy["routes"] = json!(runner.route_keys);
+            }
+            policy
         })
         .collect();
     // CatalogRunner supplies runner-owned harness declarations separately from
@@ -789,17 +867,12 @@ fn install_catalog_with(
         .iter()
         .zip(&runners)
         .map(|(runner, policy)| {
-            let pairs = json!([
-                {"wire_api":"anthropic.messages", "auth_method":"apikey"},
-                {"wire_api":"anthropic.messages", "auth_method":"oauth"}
-            ]);
             // Pass the fixture's tags through unchanged, so an invalid fixture tag
             // fails here rather than being filtered out of the declaration.
             let capabilities = policy["tool_capabilities"].clone();
             json!({
                 "module_id": runner.module, "nonce_verified": true,
                 "role_declarations": {"routing/v1": {"runner": {
-                    "pairs": pairs,
                     "tool_capabilities": capabilities,
                     "harnesses": runner.harnesses,
                     "default_harness": runner.default_harness,
@@ -881,6 +954,11 @@ fn install_catalog_with(
         credentials.runner_declarations =
             super::runners::declarations_from_catalog(&json!(declarations));
         assert_eq!(credentials.runner_declarations.len(), catalog.runners.len());
+        for runner in &catalog.runners {
+            if !runner.route_keys.is_empty() {
+                publish_runner_serves(&mut credentials, &runner.module, &fixture_serves(runner));
+            }
+        }
         credentials.wire_apis = facts
             .iter()
             .map(|fact| {
@@ -1188,6 +1266,11 @@ async fn observe_success_fixture_arms_one_shared_quota_slot() {
 impl RoutingSubject for KitSubject {
     type Route = KitRoute;
 
+    async fn configure_runner_serves(&self, module: &str, list: &Value) -> Result<bool, String> {
+        self.harness().publish_runner_serves(module, list);
+        Ok(true)
+    }
+
     async fn reset(&self) -> Result<(), String> {
         *self.harness.lock().unwrap() = Harness::new("kit");
         *self.media.lock().unwrap() = Default::default();
@@ -1253,6 +1336,15 @@ impl RoutingSubject for KitSubject {
             .map_err(|e| e.to_string())?;
         }
         install_catalog(&harness, catalog);
+        if catalog.accounts.is_empty() {
+            harness.credentials().lock().unwrap().apply_listing(
+                &ScopedCredentialListing {
+                    view: "kit-no-accounts".into(),
+                    ..Default::default()
+                },
+                crate::now_ms(),
+            );
+        }
         install_panel_families(&harness, catalog);
         install_head_snapshot(&harness);
         Ok(())
@@ -1566,11 +1658,29 @@ impl RoutingSubject for KitSubject {
         super::consumers::replace_catalog(&catalog);
         // Engine fixtures need a metadata-only media key as well as the kit's
         // LLM accounts. Synthetic ids deliberately carry no auth-method prefix.
-        let shared = self.harness().broca_credentials.lock().unwrap().clone();
+        let harness = self.harness();
+        let policies = harness.operator_config().v1_runners();
+        let shared = harness.credentials();
         let mut credentials = shared.lock().unwrap();
-        credentials
-            .runner_declarations
-            .extend(super::runners::declarations_from_catalog(&catalog));
+        for (module, declaration) in super::runners::declarations_from_catalog(&catalog) {
+            let served = policies
+                .iter()
+                .find(|policy| policy.module == module)
+                .and_then(|policy| policy.routes.as_deref())
+                .map(|keys| {
+                    test_serves(
+                        keys,
+                        declaration.harnesses.as_deref(),
+                        "catalog-declaration",
+                    )
+                });
+            credentials
+                .runner_declarations
+                .insert(module.clone(), declaration);
+            if let Some(served) = served {
+                publish_runner_serves(&mut credentials, &module, &served);
+            }
+        }
         let mut rows = credentials.listed_credentials().to_vec();
         rows.retain(|row| !row.id.starts_with("synthetic-media-"));
         let providers: std::collections::BTreeSet<_> = super::consumers::engine_declarations()
@@ -2196,12 +2306,11 @@ async fn routing_v1_conformance_kit_matches_served_checks() {
         "credential_refused_blocks_credential",
         "credential_refused_retry_at_ms_refused",
         "account_observe_credit_without_reset_accepted",
-        "harness_limits_pairs_narrow",
-        "harness_limits_providers_narrow",
-        "harness_limits_invalid_falls_back",
-        "runner_requires_wire_api",
+        "runner_serves_absent_harness",
+        "runner_serves_empty_harness",
+        "runner_serves_except",
+        "runner_serves_login_none",
         "runner_gateway_credential",
-        "runner_gateway_explicit_providers",
         "warm_credential_fresh_honoured",
         "warm_credential_hard_filter_ignored",
         "warm_credential_unknown_ignored",

@@ -3,14 +3,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use cortexkit_role_routing::declarations::{RunnerPair, StandingLimits};
-use cortexkit_role_routing::spellings::{AUTH_METHODS, WIRE_APIS};
+use cortexkit_role_llm_runner::serves::{placement, ServesEntry};
 use serde::Serialize;
 use striatum_core::RouteStateStore;
 use striatum_core::{make_route_key, provider_model_spec::CompiledSpecs, ModelFact};
 
 use crate::{
-    broca_credentials::{credential_serves_fact, BrocaCredentials},
+    broca_credentials::{credential_serves_fact, AuthCatalog, BrocaCredentials},
     config_policy::RunnerPolicy,
 };
 
@@ -18,6 +17,7 @@ mod admission;
 mod describe_cache;
 pub(crate) mod enrollment;
 mod harness_choice;
+mod serves_cache;
 pub(crate) use harness_choice::TaskRunnerDiagnostics;
 mod harness_facts;
 #[cfg(test)]
@@ -33,6 +33,7 @@ pub(crate) use admission::fetch_describe;
 pub(crate) use admission::{refresh_admission_tiers, tier_view_unknown, AdmissionDescribes};
 pub(crate) use describe_cache::DescribeCache;
 pub(crate) use harness_facts::RunnerDeclaration;
+pub(crate) use serves_cache::RunnerServes;
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct EffectiveRunner {
@@ -41,18 +42,12 @@ pub(crate) struct EffectiveRunner {
     pub follows_account_choice: bool,
     #[serde(skip)]
     pub routed_accounts: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub standing_limits: Option<StandingLimits>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pairs: Option<Vec<RunnerPair>>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub harnesses: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_harness: Option<String>,
     #[serde(skip_serializing_if = "is_true")]
     pub starts_sessions: bool,
-    #[serde(skip_serializing_if = "is_false")]
-    pub requires_wire_api: bool,
     #[serde(skip)]
     wire_declaration: Option<RunnerDeclaration>,
     #[serde(skip)]
@@ -62,13 +57,9 @@ pub(crate) struct EffectiveRunner {
     #[serde(skip)]
     statically_reachable_models: BTreeSet<String>,
     #[serde(skip)]
-    unverified_wire_models: BTreeSet<String>,
-    #[serde(skip)]
-    missing_wire_api_models: BTreeSet<String>,
+    keyless_models: BTreeSet<String>,
     #[serde(skip)]
     no_account_models: BTreeSet<String>,
-    #[serde(skip)]
-    provider_limit_models: BTreeSet<String>,
     #[serde(skip)]
     harness_choices: Option<Vec<harness_choice::Candidate>>,
     #[serde(skip)]
@@ -100,20 +91,14 @@ fn is_true(value: &bool) -> bool {
     *value
 }
 
-fn is_false(value: &bool) -> bool {
-    !value
-}
-
 impl EffectiveRunner {
     pub(super) fn wire_declaration(&self) -> Option<&RunnerDeclaration> {
         self.wire_declaration.as_ref()
     }
-    pub(crate) fn requires_wire_api_for_pair(&self, pair: &RunnerPair) -> bool {
-        self.wire_declaration
-            .as_ref()
-            .is_some_and(|declaration| declaration.requires_wire_api_for_pair(pair))
-    }
 
+    pub(crate) fn has_keyless_model(&self, capacity: &str) -> bool {
+        self.keyless_models.contains(capacity)
+    }
     pub(crate) fn selection_harness(&self, requested: Option<&str>) -> Option<String> {
         if let Some(requested) = requested {
             return self
@@ -175,6 +160,83 @@ fn placement_routes(
                 .as_deref()
                 .map(|routes| Arc::new(placements::compile(routes)))
         })
+}
+
+fn serving_entries<'a>(
+    credentials: &'a BrocaCredentials,
+    module: &str,
+    declaration: Option<&RunnerDeclaration>,
+    selected: Option<&str>,
+    now_ms: u64,
+) -> BTreeMap<&'a str, Vec<&'a ServesEntry>> {
+    let mut by_provider = BTreeMap::<_, Vec<_>>::new();
+    if let (Some(declaration), Some(serves)) = (declaration, credentials.runner_serves.get(module))
+    {
+        for (harness, entries) in serves.lists(now_ms as i64) {
+            if !match (harness, declaration.harnesses.as_deref()) {
+                (Some(name), Some(names)) => names.iter().any(|known| known == name),
+                (None, None) => true,
+                _ => false,
+            } {
+                continue;
+            }
+            if selected.is_some_and(|selected| Some(selected) != harness) {
+                continue;
+            }
+            if selected.is_none()
+                && harness.is_some()
+                && declaration
+                    .limits_for_harness(harness)
+                    .is_ok_and(|limits| limits.starts_sessions == Some(false))
+            {
+                continue;
+            }
+            for entry in entries {
+                by_provider
+                    .entry(entry.provider.as_str())
+                    .or_default()
+                    .push(entry);
+            }
+        }
+    }
+    by_provider
+}
+
+fn has_usable_login(
+    config: Option<&crate::config_overrides::LiveConfig>,
+    credentials: &BrocaCredentials,
+    catalog: &AuthCatalog,
+    module: &str,
+    follows_account_choice: bool,
+    fact: &ModelFact,
+    unoffered: &mut bool,
+) -> bool {
+    let eligible = |row: &cortexkit_claustrum_client::ListedCredential| {
+        row.auth_method.as_deref().is_some_and(|method| {
+            fact.billing_plane
+                .as_ref()
+                .is_none_or(|plane| method == plane.auth_method)
+        })
+    };
+    let mut usable = |row: &cortexkit_claustrum_client::ListedCredential| {
+        if !eligible(row) {
+            return false;
+        }
+        let offers = can_offer_account(module, follows_account_choice, row);
+        *unoffered |= !offers;
+        offers
+    };
+    if let Some(config) = config {
+        return crate::serving_index::ServingIndex::runner_fact(config, credentials, fact, catalog)
+            .runner
+            .iter()
+            .any(|row| usable(&credentials.listed_credentials()[row.index]));
+    }
+    credentials
+        .listed_credentials()
+        .iter()
+        .filter(|row| credential_serves_fact(row, fact, catalog, credentials))
+        .any(usable)
 }
 
 pub(crate) struct RunnerPolicies<'a> {
@@ -246,6 +308,12 @@ impl From<Vec<RunnerPolicy>> for RunnerPolicies<'_> {
 }
 
 impl Registry {
+    pub(super) fn has_keyless_routes(&self) -> bool {
+        self.entries
+            .iter()
+            .any(|runner| !runner.keyless_models.is_empty())
+    }
+
     pub(crate) fn classifier_for_consumer(
         module: &str,
         config: &crate::config_overrides::LiveConfig,
@@ -329,20 +397,15 @@ impl Registry {
                 },
                 follows_account_choice: true,
                 routed_accounts: vec!["apikey".into()],
-                standing_limits: None,
-                pairs: None,
                 harnesses: Vec::new(),
                 default_harness: None,
                 starts_sessions: true,
-                requires_wire_api: false,
                 wire_declaration: None,
                 route_policy: None,
                 reachable_models: reachable,
                 statically_reachable_models: models,
-                unverified_wire_models: BTreeSet::new(),
-                missing_wire_api_models: BTreeSet::new(),
+                keyless_models: BTreeSet::new(),
                 no_account_models: BTreeSet::new(),
-                provider_limit_models: BTreeSet::new(),
                 harness_choices: None,
                 placement_baseline: None,
                 shared_placement_key: false,
@@ -369,9 +432,8 @@ impl Registry {
         Self::build_resolved(policies.into(), credentials, facts, now_ms, harness, false)
     }
 
-    /// Session selection resolves defaults; a picker without a harness instead
-    /// uses build() or build_for_harness(None) to keep every model allowed by
-    /// the runner's top-level pairs and provider limits.
+    /// Session selection resolves defaults; a picker without a harness sees
+    /// the union of the runner's starting harnesses.
     pub(crate) fn build_for_selection<'a>(
         policies: impl Into<RunnerPolicies<'a>>,
         credentials: &BrocaCredentials,
@@ -393,184 +455,101 @@ impl Registry {
         let catalog = facts
             .iter()
             .collect::<crate::broca_credentials::AuthCatalog>();
+        let mut catalog_models = BTreeMap::<String, BTreeSet<String>>::new();
+        for fact in facts {
+            catalog_models
+                .entry(fact.provider_id.clone())
+                .or_default()
+                .insert(fact.model_id.clone());
+        }
         let entries = source
             .enrolled(credentials, now_ms)
             .into_iter()
             .map(|mut policy| {
                 let wire_declaration = credentials.runner_declarations.get(&policy.module);
-                let resolved_declaration =
-                    credentials
-                        .runner_declarations
-                        .get(&policy.module)
-                        .map(|declaration| {
-                            let selected = harness.or_else(|| {
-                                resolve_default
-                                    .then(|| {
-                                        declaration.default_harness.as_deref().or_else(|| {
-                                            match declaration.harnesses.as_deref() {
-                                                Some([only]) => Some(only.as_str()),
-                                                _ => None,
-                                            }
-                                        })
-                                    })
-                                    .flatten()
-                            });
-                            let mut resolved = declaration.as_contract().clone();
-                            match declaration.limits_for_harness(selected) {
-                                Ok(limits) => {
-                                    resolved.pairs = limits.pairs.unwrap_or_default();
-                                    if let Some(providers) = limits.explicit_providers {
-                                        resolved
-                                            .standing_limits
-                                            .get_or_insert_with(Default::default)
-                                            .explicit_providers = Some(providers);
-                                    }
-                                }
-                                Err(error) => report_harness_limits_once(&policy.module, &error),
-                            }
-                            resolved
-                        });
-                let declaration = resolved_declaration.as_ref();
-                if let Some(declaration) = declaration {
-                    report_unknown_pair_tokens_once(&policy.module, declaration);
-                }
-                let needs_vault = declaration.is_some() || policy.via_vault;
+                let declaration = wire_declaration.map(RunnerDeclaration::as_contract);
+                let selected = harness.or_else(|| {
+                    let declaration = declaration.filter(|_| resolve_default)?;
+                    declaration.default_harness.as_deref().or_else(|| {
+                        match declaration.harnesses.as_deref() {
+                            Some([only]) => Some(only.as_str()),
+                            _ => None,
+                        }
+                    })
+                });
                 let follows_account_choice =
                     declaration.map_or(policy.via_vault, |d| d.follows_account_choice);
-                let mut unverified_wire_models = BTreeSet::new();
-                let mut missing_wire_api_models = BTreeSet::new();
+                let starts_sessions =
+                    wire_declaration.is_none_or(|d| match d.limits_for_harness(selected) {
+                        Ok(limits) => limits.starts_sessions == Some(true),
+                        Err(error) => {
+                            report_harness_limits_once(&policy.module, &error);
+                            d.starts_sessions
+                        }
+                    });
+                let listing_fresh = credentials.listing_is_fresh(now_ms);
+                let entries = serving_entries(
+                    credentials,
+                    &policy.module,
+                    wire_declaration,
+                    selected,
+                    now_ms,
+                );
+                let mut statically_reachable_models = BTreeSet::new();
+                let mut reachable_models = BTreeSet::new();
+                let mut keyless_models = BTreeSet::new();
                 let mut no_account_models = BTreeSet::new();
-                let mut provider_limit_models = BTreeSet::new();
-                let statically_reachable_models: BTreeSet<_> = facts
+                for fact in facts
                     .iter()
-                    .filter(|fact| {
-                        let indexed = source.config.map(|config| {
-                            crate::serving_index::ServingIndex::runner_fact(
-                                config,
-                                credentials,
-                                fact,
-                                &catalog,
-                            )
-                        });
-                        let serving_rows: Vec<_> = indexed.as_ref().map_or_else(
-                            || {
-                                credentials
-                                    .listed_credentials()
-                                    .iter()
-                                    .filter(|row| {
-                                        credential_serves_fact(row, fact, &catalog, credentials)
-                                    })
-                                    .map(|row| (row, None))
-                                    .collect()
-                            },
-                            |entry| {
-                                entry
-                                    .runner
-                                    .iter()
-                                    .map(|row| {
-                                        (&credentials.listed_credentials()[row.index], Some(row))
-                                    })
-                                    .collect()
-                            },
+                    .filter(|fact| entries.contains_key(fact.provider_id.as_str()))
+                {
+                    let entries = &entries[fact.provider_id.as_str()];
+                    let models = &catalog_models[&fact.provider_id];
+                    let (mut keyless, mut needs_login) = (false, false);
+                    for entry in entries {
+                        match placement(
+                            std::slice::from_ref(*entry),
+                            &fact.provider_id,
+                            &fact.model_id,
+                            models,
+                        ) {
+                            Some(true) => keyless = true,
+                            Some(false) => needs_login = true,
+                            None => {}
+                        }
+                    }
+                    if !keyless && !needs_login {
+                        continue;
+                    }
+                    let key = format!("{}/{}", fact.provider_id, fact.model_id);
+                    if keyless {
+                        keyless_models.insert(key.clone());
+                    }
+                    let mut unoffered = false;
+                    let has_login = needs_login
+                        && !keyless
+                        && has_usable_login(
+                            source.config,
+                            credentials,
+                            &catalog,
+                            &policy.module,
+                            follows_account_choice,
+                            fact,
+                            &mut unoffered,
                         );
-                        !needs_vault
-                            || serving_rows.into_iter().any(|(row, indexed_row)| {
-                                let provider_allowed = declaration
-                                    .and_then(|declaration| declaration.standing_limits.as_ref())
-                                    .and_then(|limits| limits.explicit_providers.as_ref())
-                                    .is_none_or(|providers| {
-                                        credentials.runner_allows_provider(fact, row, providers)
-                                    });
-                                // A provider limit is the cause only when the
-                                // runner could otherwise use this account and pair.
-                                let otherwise_allowed = declaration.is_none_or(|declaration| {
-                                    let method = row.auth_method.as_deref().unwrap_or("");
-                                    if fact
-                                        .billing_plane
-                                        .as_ref()
-                                        .is_some_and(|plane| plane.auth_method != method)
-                                    {
-                                        return false;
-                                    }
-                                    let Some(api) = indexed_row.map_or_else(
-                                        || credentials.wire_api(fact, method),
-                                        |row| row.wire_api.as_deref(),
-                                    ) else {
-                                        if provider_allowed {
-                                            unverified_wire_models.insert(format!(
-                                                "{}/{}",
-                                                fact.provider_id, fact.model_id
-                                            ));
-                                        }
-                                        return false;
-                                    };
-                                    declaration.pairs.iter().any(|pair| {
-                                        if !known_pair(pair)
-                                            || api != pair.wire_api
-                                            || row.auth_method.as_ref() != Some(&pair.auth_method)
-                                        {
-                                            return false;
-                                        }
-                                        // The narrowed declaration restricts pair
-                                        // membership; the original pair still determines
-                                        // whether an endpoint is required.
-                                        let admitted = wire_declaration
-                                            .map(RunnerDeclaration::as_contract)
-                                            .unwrap_or(declaration)
-                                            .admits_pair_row(
-                                                pair,
-                                                indexed_row.map_or_else(
-                                                    || {
-                                                        credentials
-                                                            .row_serves_wire_api(fact, method)
-                                                    },
-                                                    |row| row.has_endpoint,
-                                                ),
-                                            );
-                                        if !admitted && provider_allowed {
-                                            missing_wire_api_models.insert(format!(
-                                                "{}/{}",
-                                                fact.provider_id, fact.model_id
-                                            ));
-                                        }
-                                        admitted
-                                    })
-                                }) && {
-                                    let offers = can_offer_account(
-                                        &policy.module,
-                                        follows_account_choice,
-                                        row,
-                                    );
-                                    if !offers && provider_allowed {
-                                        no_account_models.insert(format!(
-                                            "{}/{}",
-                                            fact.provider_id, fact.model_id
-                                        ));
-                                    }
-                                    offers
-                                };
-                                if otherwise_allowed && !provider_allowed {
-                                    provider_limit_models
-                                        .insert(format!("{}/{}", fact.provider_id, fact.model_id));
-                                }
-                                otherwise_allowed && provider_allowed
-                            })
-                    })
-                    .map(|fact| format!("{}/{}", fact.provider_id, fact.model_id))
-                    .collect();
-                // Listing age can stop a send, but cannot change which model
-                // scores define IQ when the last listing still names its credential.
-                let reachable_models = if !needs_vault || credentials.listing_is_fresh(now_ms) {
-                    statically_reachable_models.clone()
-                } else {
-                    unverified_wire_models.clear();
-                    BTreeSet::new()
-                };
-                unverified_wire_models.retain(|model| !reachable_models.contains(model));
-                missing_wire_api_models
-                    .retain(|model| !statically_reachable_models.contains(model));
+                    if keyless || has_login {
+                        statically_reachable_models.insert(key.clone());
+                        // An old vault listing can still define the quality range
+                        // used for ranking, but cannot authorize a new send.
+                        // Keyless models don't use the listing.
+                        if keyless || listing_fresh {
+                            reachable_models.insert(key);
+                        }
+                    } else if unoffered {
+                        no_account_models.insert(key);
+                    }
+                }
                 no_account_models.retain(|model| !statically_reachable_models.contains(model));
-                provider_limit_models.retain(|model| !statically_reachable_models.contains(model));
                 let route_policy = placement_routes(source.config, &policy);
                 let routes = facts
                     .iter()
@@ -591,7 +570,6 @@ impl Registry {
                     })
                     .collect();
                 policy.routes = Some(routes);
-                let standing_limits = declaration.and_then(|d| d.standing_limits.clone());
                 let routed_accounts = credentials
                     .runner_routed_accounts
                     .get(&policy.module)
@@ -605,22 +583,17 @@ impl Registry {
                     policy,
                     follows_account_choice,
                     routed_accounts,
-                    standing_limits,
-                    pairs: declaration.map(|declaration| declaration.pairs.clone()),
                     harnesses: declaration
                         .and_then(|d| d.harnesses.clone())
                         .unwrap_or_default(),
                     default_harness: declaration.and_then(|d| d.default_harness.clone()),
-                    starts_sessions: declaration.is_none_or(|d| d.starts_sessions),
-                    requires_wire_api: declaration.is_some_and(|d| d.requires_wire_api()),
+                    starts_sessions,
                     wire_declaration: wire_declaration.cloned(),
                     route_policy,
                     reachable_models,
                     statically_reachable_models,
-                    unverified_wire_models,
-                    missing_wire_api_models,
+                    keyless_models,
                     no_account_models,
-                    provider_limit_models,
                     harness_choices: None,
                     placement_baseline: None,
                     shared_placement_key: false,
@@ -694,39 +667,6 @@ impl Registry {
             runner.matches_route(route, capacity, |runner| &runner.no_account_models)
         })
     }
-
-    pub(crate) fn provider_limit(
-        &self,
-        key: &(impl RunnerKey + ?Sized),
-        route: &str,
-        capacity: &str,
-    ) -> bool {
-        self.get(key).is_some_and(|runner| {
-            runner.matches_route(route, capacity, |runner| &runner.provider_limit_models)
-        })
-    }
-
-    pub(crate) fn wire_family_unverified(
-        &self,
-        key: &(impl RunnerKey + ?Sized),
-        route: &str,
-        capacity: &str,
-    ) -> bool {
-        self.get(key).is_some_and(|runner| {
-            runner.matches_route(route, capacity, |runner| &runner.unverified_wire_models)
-        })
-    }
-
-    pub(crate) fn requires_wire_api(
-        &self,
-        key: &(impl RunnerKey + ?Sized),
-        route: &str,
-        capacity: &str,
-    ) -> bool {
-        self.get(key).is_some_and(|runner| {
-            runner.matches_route(route, capacity, |runner| &runner.missing_wire_api_models)
-        })
-    }
 }
 
 pub(crate) fn effective(deps: &super::Deps<'_>) -> Registry {
@@ -744,6 +684,59 @@ pub(crate) fn effective(deps: &super::Deps<'_>) -> Registry {
             )
         })
         .unwrap_or_default()
+}
+
+pub(super) fn unbound_route_is_keyless(
+    deps: &super::Deps<'_>,
+    module: &str,
+    provider: &str,
+    model: &str,
+) -> bool {
+    use cortexkit_role_llm_runner::serves::ServesLogin;
+
+    let now = crate::now_ms();
+    let Ok(credentials) = deps.broca_credentials.lock() else {
+        return false;
+    };
+    let credentials = credentials.snapshot();
+    let entries = serving_entries(
+        &credentials,
+        module,
+        credentials.runner_declarations.get(module),
+        None,
+        now,
+    );
+    let Some(entries) = entries.get(provider).filter(|entries| {
+        entries
+            .iter()
+            .any(|entry| entry.login == Some(ServesLogin::None))
+    }) else {
+        return false;
+    };
+    let Ok(facts) = deps.store.get_facts() else {
+        return false;
+    };
+    let aliases = credentials.catalog_targets(&facts);
+    let catalog_provider = aliases.get(provider).map_or(provider, String::as_str);
+    let models: BTreeSet<_> = facts
+        .iter()
+        .filter(|fact| fact.provider_id == catalog_provider)
+        .map(|fact| fact.model_id.clone())
+        .collect();
+    if !models.contains(model) {
+        return false;
+    }
+    // An unbound request names no harness. Only refuse if every serving
+    // harness agrees the model needs no login. A bound request uses its decision.
+    let mut found_keyless = false;
+    for entry in entries {
+        match placement(std::slice::from_ref(*entry), provider, model, &models) {
+            Some(false) => return false,
+            Some(true) => found_keyless = true,
+            None => {}
+        }
+    }
+    found_keyless
 }
 
 #[cfg(test)]
@@ -846,24 +839,12 @@ mod compiled_registry_tests {
                                     from_vec.no_runner_account(&policy.module, &route, &capacity)
                                 );
                                 assert_eq!(
-                                    from_config.wire_family_unverified(
-                                        &policy.module,
-                                        &route,
-                                        &capacity
-                                    ),
-                                    from_vec.wire_family_unverified(
-                                        &policy.module,
-                                        &route,
-                                        &capacity
-                                    )
-                                );
-                                assert_eq!(
-                                    from_config.requires_wire_api(
-                                        &policy.module,
-                                        &route,
-                                        &capacity
-                                    ),
-                                    from_vec.requires_wire_api(&policy.module, &route, &capacity)
+                                    from_config
+                                        .get(&policy.module)
+                                        .map(|runner| runner.keyless(&route, &capacity)),
+                                    from_vec
+                                        .get(&policy.module)
+                                        .map(|runner| runner.keyless(&route, &capacity)),
                                 );
                             }
                         }
@@ -883,10 +864,6 @@ pub(crate) fn parse_declaration(
         .map_err(|error| error.to_string())
 }
 
-fn known_pair(pair: &RunnerPair) -> bool {
-    WIRE_APIS.contains(&pair.wire_api.as_str()) && AUTH_METHODS.contains(&pair.auth_method.as_str())
-}
-
 fn report_harness_limits_once(
     module: &str,
     error: &cortexkit_role_routing::declarations::HarnessLimitsError,
@@ -898,29 +875,6 @@ fn report_harness_limits_once(
             crate::warn_operator(format!(
                 "[striatum] runner {module}: {error}; using runner-level limits for all harnesses"
             ));
-        }
-    }
-}
-
-fn report_unknown_pair_tokens_once(
-    module: &str,
-    declaration: &cortexkit_role_routing::declarations::RunnerDeclaration,
-) {
-    use std::sync::Mutex;
-    static REPORTED: Mutex<BTreeSet<(String, &'static str, String)>> = Mutex::new(BTreeSet::new());
-    let Ok(mut reported) = REPORTED.lock() else {
-        return;
-    };
-    for pair in &declaration.pairs {
-        for (field, token, known) in [
-            ("wire_api", pair.wire_api.as_str(), WIRE_APIS),
-            ("auth_method", pair.auth_method.as_str(), AUTH_METHODS),
-        ] {
-            if !known.contains(&token) && reported.insert((module.into(), field, token.into())) {
-                crate::warn_operator(format!(
-                    "[striatum] runner {module}: unknown {field} token {token:?}; pair cannot match"
-                ));
-            }
         }
     }
 }
@@ -955,7 +909,6 @@ pub(crate) fn declarations_from_catalog(
                     if let Some(error) = declaration.harness_limits_error() {
                         report_harness_limits_once(module, error);
                     }
-                    report_unknown_pair_tokens_once(module, &declaration);
                     Some((module.to_owned(), declaration))
                 }
                 Ok(None) => None,

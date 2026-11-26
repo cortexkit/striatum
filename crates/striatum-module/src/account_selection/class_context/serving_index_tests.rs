@@ -464,7 +464,7 @@ fn serving_index_differential_all_facts_payments_probes_and_continuations() {
                 let shared = fixture.credentials();
                 let mut credentials = shared.lock().unwrap();
                 for declaration in credentials.runner_declarations.values_mut() {
-                    declaration.pairs.retain(|p| p.auth_method != "oauth");
+                    declaration.follows_account_choice = !declaration.follows_account_choice;
                 }
             }
             4 => fixture

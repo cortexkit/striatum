@@ -240,3 +240,33 @@ inputs.
 | Imported path | Source | SHA-256 |
 | --- | --- | --- |
 | `broca-llm-classify-unpinned-1126/routing-select.json` | BROCA `.cortexkit/internal-docs/samples/broca-llm-classify-unpinned-1126/routing-select.json` | `7c4ed39b6f639758aa040c53d6148154b57318f8e63fd3ee399e761715468978` |
+
+## Thalamus runner serves lists
+
+`thalamus-routing-runner-serves-v1/` copies the supplied HELLO runner manifests
+and opt-in `role.describe` reply byte for byte from
+`.cortexkit/internal-docs/samples/thalamus-routing-runner-serves-v1/`. Its README
+identifies the capture commits, the shipping HELLO writer, and the real OpenCode
+catalog test. All three inputs were verified against the supplied manifest.
+
+| Imported path | SHA-256 |
+| --- | --- |
+| `thalamus-routing-runner-serves-v1/all-harnesses.json` | `2ccb7b9d5041a4c5fe995151b809458624ac3d6220645eabc934b4b161a350e2` |
+| `thalamus-routing-runner-serves-v1/opencode2-only.json` | `45b8141f858ec34d9c53cb51ee1647ec07d6f2599b255aa4ac876ee3535ebf6f` |
+| `thalamus-routing-runner-serves-v1/describe-serves.json` | `48356960c5ced2483c6a2f93e46a5d4c9526cfbb530374cf9a95a655b9d23496` |
+| `thalamus-routing-runner-serves-v1/SHA256SUMS` | `0dc8f5cc0882e44b87a568e03c221461753d121dea0b9d8da8c57078931de768` |
+
+## Broca runner serves lists
+
+`broca-runner-serves-1126/` copies the supplied Broca HELLO slot and
+`role.describe` answers byte for byte. The README identifies their capture by
+Broca's real module connection against a synthetic catalog and vault. All four
+JSON samples were verified against the supplied manifest before import.
+
+| Imported path | SHA-256 |
+| --- | --- |
+| `broca-runner-serves-1126/hello-routing-slot.json` | `d11a7a6f00ef76fcf80f8b6e719b71f4417a7e992884c6c5247028979e9bc387` |
+| `broca-runner-serves-1126/role-describe-default-before.json` | `6adbe2f178d85bb257eccaba637bbd4eb20fc87fc5f233e6f7222a46947b7110` |
+| `broca-runner-serves-1126/role-describe-default-after.json` | `39fbc7fe630d8c3e5d5aed7e477ce1d1f6361d4329077f9a8ae75dc3b705e4e4` |
+| `broca-runner-serves-1126/role-describe-serves.json` | `ee737df8a5b7dac07983e1d10433cc62412a4469b5bfe896f64223d5a261bf31` |
+| `broca-runner-serves-1126/SHA256SUMS` | `086a261ba4217d9015b2d904d3ac0c892d4f8aa22898440149b9a8e171babb0d` |

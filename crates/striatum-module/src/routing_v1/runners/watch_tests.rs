@@ -89,11 +89,18 @@ fn modules(declared: bool) -> Value {
         "module_id":fixture::RUNNER_ONE, "nonce_verified":true, "first_party":true,
         "roles":[], "control_ops":[], "incarnation":"daemon-a", "spawn":7,
         "role_declarations":{"routing/v1":{"runner":{
-            "pairs":[{"wire_api":"anthropic.messages","auth_method":"apikey"},
-                {"wire_api":"anthropic.messages","auth_method":"oauth"}],
             "harnesses":["fixture"]
         }}}
     }])
+}
+
+fn runner_describe() -> Value {
+    json!({"result":{"capabilities":["serves"],"serves":{
+        "generation":"watch-fixture","harnesses":{"fixture":[
+            {"provider":fixture::PRICED_PROVIDER,"models":"all"},
+            {"provider":fixture::SUBSCRIPTION_PROVIDER,"models":"all"}
+        ]}
+    }}})
 }
 
 async fn serve(
@@ -186,12 +193,13 @@ async fn serve(
                         state.slow_describes.fetch_add(1, Ordering::SeqCst);
                     }
                     _ if body["method"] == "role.describe" => {
+                        assert_eq!(body["params"], json!({"serves":true}));
                         state.describes.fetch_add(1, Ordering::SeqCst);
                         if state.block_describe.load(Ordering::SeqCst) {
                             held_describe = Some(request);
                         } else {
                             reply(&mut stream, &request, FrameType::Response,
-                                json!({"result":{"capabilities":[]}})).await;
+                                runner_describe()).await;
                         }
                     }
                     _ => panic!("unexpected fake daemon request: {body}"),
@@ -212,7 +220,7 @@ async fn serve(
                 Command::Disconnect => return,
                 Command::Release => if let Some(request) = held_describe.take() {
                     reply(&mut stream, &request, FrameType::Response,
-                        json!({"result":{"capabilities":[]}})).await;
+                        runner_describe()).await;
                 },
             }
         }

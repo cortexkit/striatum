@@ -66,11 +66,9 @@ impl RunnerDeclaration {
             .as_ref()
             .and_then(|facts| facts.as_ref().ok())
             .is_some_and(|facts| {
-                facts.values().any(|limits| {
-                    limits.starts_sessions.is_some()
-                        || limits.capabilities.is_some()
-                        || limits.exclude.is_some()
-                })
+                facts
+                    .values()
+                    .any(|limits| limits.starts_sessions.is_some() || limits.capabilities.is_some())
             })
     }
 
@@ -88,12 +86,6 @@ impl RunnerDeclaration {
         let mut limits = entry.cloned().unwrap_or_default();
         limits.starts_sessions =
             Some(self.starts_sessions && limits.starts_sessions.unwrap_or(true));
-        limits.pairs = Some(limits.pairs.unwrap_or_else(|| self.pairs.clone()));
-        limits.explicit_providers = limits.explicit_providers.or_else(|| {
-            self.standing_limits
-                .as_ref()
-                .and_then(|limits| limits.explicit_providers.clone())
-        });
         Ok(limits)
     }
 
@@ -110,34 +102,6 @@ impl RunnerDeclaration {
                 .ok()
                 .and_then(|limits| limits.capabilities)
                 .is_some_and(|capabilities| capabilities.contains(capability))
-    }
-
-    pub(super) fn has_harness_exclusions(&self) -> bool {
-        self.facts
-            .as_ref()
-            .and_then(|facts| facts.as_ref().ok())
-            .is_some_and(|facts| {
-                facts.values().any(|limits| {
-                    limits
-                        .exclude
-                        .as_ref()
-                        .is_some_and(|specs| !specs.is_empty())
-                })
-            })
-    }
-
-    pub(crate) fn harness_excludes(&self, harness: &str, route: &str) -> bool {
-        self.limits_for_harness(Some(harness))
-            .ok()
-            .and_then(|limits| limits.exclude)
-            .is_some_and(|specs| {
-                cortexkit_role_routing::route_spec::resolve(
-                    specs.iter().map(String::as_str),
-                    route,
-                    true,
-                )
-                .unwrap_or(false)
-            })
     }
 }
 
