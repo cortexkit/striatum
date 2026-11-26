@@ -34,6 +34,14 @@ impl PlanMeasurements {
             last_eligible: None,
         }
     }
+
+    /// Use the pricing engine's freshness and historical fallback for this pool.
+    pub fn multiplier_at(&self, now_ms: i64) -> Option<f64> {
+        match resolve_measurement(None, Some(self), now_ms) {
+            ResolvedValue::Latest(row) | ResolvedValue::LastEligible(row) => Some(row.multiplier),
+            ResolvedValue::Operator(_) | ResolvedValue::Unmeasured => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]

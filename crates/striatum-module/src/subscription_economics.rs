@@ -11,7 +11,11 @@ use crate::{
 use serde_json::{json, Value};
 
 pub(crate) mod multiplier;
+#[cfg(test)]
+mod pool_value_tests;
+mod pool_values;
 mod saved_resets;
+use pool_values::{CatalogPools, PlanPools, ProviderValues, ReportPlans, FRESH_QUOTA_MS};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     path::Path,
@@ -31,16 +35,24 @@ use striatum_core::{
 #[derive(Clone, Default)]
 struct EconomicsCache {
     pools: HashMap<String, SubscriptionPool>,
+    plan_values: HashMap<String, ProviderValues>,
     recent_pace: HashMap<String, Arc<Vec<Vec<AccountWindows>>>>,
     unpriced_tiers: BTreeSet<String>,
     refreshed_at_ms: i64,
 }
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
 enum PlanGroup {
-    Joined(String),
+    Joined(String, Option<String>),
     // Without a report match, keep accounts grouped by roster tier and fee;
     // a tier identifies a quota budget but does not establish a measured plan.
     Unjoined(Option<String>, u64),
+}
+
+struct PlanBuilder {
+    plan: SubscriptionPlan,
+    values: Option<PlanPools>,
+    pace: Vec<AccountWindows>,
+    joined_accounts: usize,
 }
 #[derive(Default)]
 struct Runtime {
@@ -211,30 +223,15 @@ fn price_matches_login(price: &Value, account_id: &str, credential_ref: Option<&
     }
 }
 
-/// Join by login reference, not provider/tier spelling: Antigravity's quota
-/// provider can differ from the prefix in its Astrocyte plan name.
+#[cfg(test)]
 fn account_plan<'a>(
     report: &'a Value,
     account_id: &str,
     credential_ref: Option<&str>,
 ) -> Result<Option<&'a Value>, ()> {
-    let Some(rows) = report["latest"].as_array() else {
-        return Ok(None);
-    };
-    let mut matches = rows.iter().filter(|row| {
-        row["plan"].is_string()
-            && row["plan_prices"].as_array().is_some_and(|prices| {
-                prices
-                    .iter()
-                    .any(|price| price_matches_login(price, account_id, credential_ref))
-            })
-    });
-    let matched = matches.next();
-    if matches.next().is_some() {
-        Err(())
-    } else {
-        Ok(matched)
-    }
+    Ok(ReportPlans::new(report)
+        .account(account_id, credential_ref)?
+        .map(|plan| plan.rows[0]))
 }
 
 fn warn_ambiguous_account(account_id: &str) {
@@ -245,7 +242,7 @@ fn warn_ambiguous_account(account_id: &str) {
     if warned.insert(account_id.into()) {
         tracing::warn!(
             account_id,
-            "Astrocyte lists an account in multiple plan rows; ignoring its plan mapping"
+            "Astrocyte lists an account under multiple plans; ignoring its plan mapping"
         );
     }
 }
@@ -459,13 +456,29 @@ fn account(
     })
 }
 
+#[cfg(test)]
 fn build(state: &AccountQuotaState, report: &Value, prices: &Value, now: i64) -> EconomicsCache {
+    build_accounts(
+        state,
+        &ReportPlans::new(report),
+        prices,
+        &CatalogPools::new(prices),
+        now,
+    )
+}
+
+fn build_accounts(
+    state: &AccountQuotaState,
+    report: &ReportPlans<'_>,
+    prices: &Value,
+    catalog: &CatalogPools,
+    now: i64,
+) -> EconomicsCache {
     let mut out = EconomicsCache {
         refreshed_at_ms: now,
         ..Default::default()
     };
-    let mut plans: BTreeMap<(String, PlanGroup), (SubscriptionPlan, Vec<AccountWindows>)> =
-        BTreeMap::new();
+    let mut plans = BTreeMap::<(String, PlanGroup), PlanBuilder>::new();
     for reading in state.readings.readings.values() {
         if reading.tombstoned_at_ms.is_some() {
             continue;
@@ -476,17 +489,17 @@ fn build(state: &AccountQuotaState, report: &Value, prices: &Value, now: i64) ->
         // Share accounts::eligibility::assess_reading's last-good age limit so
         // the subscription budget does not drop capacity that account placement can use.
         // Stale is usable below 30 minutes of producer age with unchanged windows.
-        if entry.has_error()
-            || !entry.understood_stale()
-            || !matches!(entry.age(now).band, AgeBand::Full | AgeBand::Discounted)
-            || (entry.stale.is_none()
-                && entry
-                    .age(now)
-                    .age_ms
-                    .is_none_or(|age| !(0..=15 * 60_000).contains(&age)))
-        {
-            continue;
-        }
+        let age = entry.age(now);
+        let fresh_age = entry
+            .stale
+            .is_none()
+            .then_some(age.age_ms)
+            .flatten()
+            .filter(|age| (0..=FRESH_QUOTA_MS).contains(age));
+        let usable_quota = !entry.has_error()
+            && entry.understood_stale()
+            && matches!(age.band, AgeBand::Full | AgeBand::Discounted)
+            && (entry.stale.is_some() || fresh_age.is_some());
         let credential_identity = if entry.account.is_none() {
             let Some(identity) = entry
                 .credential_ref
@@ -516,16 +529,24 @@ fn build(state: &AccountQuotaState, report: &Value, prices: &Value, now: i64) ->
             tier.or_else(|| credential_identity.and_then(|identity| identity.plan_tier.as_deref()));
         let tier = tier.map(str::to_owned);
         let credential_ref = credential_identity.and(entry.credential_ref.as_deref());
-        let joined = match account_plan(report, &reading.account_id, credential_ref) {
+        // Join by login reference, not provider/tier spelling: Antigravity's
+        // quota provider can differ from the prefix of its catalog plan name.
+        let joined = match report.account(&reading.account_id, credential_ref) {
             Ok(row) => row,
             Err(()) => {
-                warn_ambiguous_account(&reading.account_id);
+                if usable_quota {
+                    warn_ambiguous_account(&reading.account_id);
+                }
                 None
             }
         };
-        let astro_plan = joined
-            .and_then(|row| row["plan"].as_str())
-            .map(str::to_string);
+        let quota_provider = joined.and_then(|plan| plan.quota_provider);
+        // A pool plan can have a value without a fresh reading or an aggregate
+        // weekly window. Its account budget still requires the old evidence.
+        if !usable_quota && quota_provider.is_none() {
+            continue;
+        }
+        let astro_plan = joined.map(|plan| plan.name.to_owned());
         let row = tier
             .as_deref()
             .and_then(|tier| price_row(prices, provider, tier));
@@ -536,7 +557,11 @@ fn build(state: &AccountQuotaState, report: &Value, prices: &Value, now: i64) ->
                     .flatten()
             })
             .or_else(|| {
-                joined.and_then(|row| astro_fee(row, &reading.account_id, credential_ref, now))
+                joined.and_then(|plan| {
+                    plan.rows
+                        .iter()
+                        .find_map(|row| astro_fee(row, &reading.account_id, credential_ref, now))
+                })
             })
             .unwrap_or(DEFAULT_PLAN_FEE_USD);
         out.pools
@@ -547,53 +572,78 @@ fn build(state: &AccountQuotaState, report: &Value, prices: &Value, now: i64) ->
                 ..Default::default()
             });
         let mut windows = AccountWindows::default();
-        let Some(account) = account(
-            &reading.entry,
-            now,
-            &reading.account_id,
-            |name, raw, scope, weekly| {
-                if let Some(sample) = state.recent_pace.reading(reading, name, raw) {
-                    if weekly {
-                        windows.weekly = Some(sample);
-                    } else if let Some(scope) = scope {
-                        windows.scoped.push((scope, sample));
-                    } else {
-                        windows.short.push(sample);
-                    }
-                }
-            },
-        ) else {
+        let account = usable_quota
+            .then(|| {
+                account(
+                    &reading.entry,
+                    now,
+                    &reading.account_id,
+                    |name, raw, scope, weekly| {
+                        if let Some(sample) = state.recent_pace.reading(reading, name, raw) {
+                            if weekly {
+                                windows.weekly = Some(sample);
+                            } else if let Some(scope) = scope {
+                                windows.scoped.push((scope, sample));
+                            } else {
+                                windows.short.push(sample);
+                            }
+                        }
+                    },
+                )
+            })
+            .flatten();
+        if account.is_none() && quota_provider.is_none() {
             continue;
-        };
+        }
         let group = astro_plan.as_ref().map_or_else(
             || PlanGroup::Unjoined(tier.clone(), fee.to_bits()),
-            |plan| PlanGroup::Joined(plan.clone()),
+            |plan| PlanGroup::Joined(plan.clone(), quota_provider.map(str::to_owned)),
         );
-        let (plan, pace) = plans.entry((provider.into(), group)).or_insert_with(|| {
-            (
-                SubscriptionPlan {
+        let build = plans.entry((provider.into(), group)).or_insert_with(|| {
+            let (measured, values) = joined.map(|plan| plan.values(catalog)).unwrap_or_default();
+            PlanBuilder {
+                plan: SubscriptionPlan {
                     tier: tier.clone(),
                     plan: astro_plan,
-                    measured: joined.and_then(measured),
+                    measured,
                     fee_usd: fee,
                     accounts: Vec::new(),
                 },
-                Vec::new(),
-            )
+                values,
+                pace: Vec::new(),
+                joined_accounts: 0,
+            }
         });
         // For report-joined accounts, fees are metadata rather than a grouping
         // key: capacity and value are pooled by report plan. Unjoined accounts
         // remain grouped by roster tier and fee.
-        plan.fee_usd += (fee - plan.fee_usd) / (plan.accounts.len() + 1) as f64;
-        if plan.tier != tier {
-            plan.tier = None;
+        build.joined_accounts += 1;
+        build.plan.fee_usd += (fee - build.plan.fee_usd) / build.joined_accounts as f64;
+        if build.plan.tier != tier {
+            build.plan.tier = None;
         }
-        plan.accounts.push(account);
-        pace.push(windows);
+        if usable_quota && quota_provider == Some(reading.provider.as_str()) {
+            if let (Some(values), Some(usage), Some(age)) =
+                (&mut build.values, &entry.usage, fresh_age)
+            {
+                values.observe(usage, now - age);
+            }
+        }
+        if let Some(account) = account {
+            build.plan.accounts.push(account);
+            build.pace.push(windows);
+        }
     }
-    for ((provider, _), (plan, pace)) in plans {
-        out.pools.get_mut(&provider).unwrap().plans.push(plan);
-        Arc::make_mut(out.recent_pace.entry(provider).or_default()).push(pace);
+    for ((provider, _), build) in plans {
+        let plans = &mut out.pools.get_mut(&provider).unwrap().plans;
+        if let Some(values) = build.values {
+            out.plan_values
+                .entry(provider.clone())
+                .or_default()
+                .insert(plans.len(), values);
+        }
+        plans.push(build.plan);
+        Arc::make_mut(out.recent_pace.entry(provider).or_default()).push(build.pace);
     }
     out
 }
@@ -608,19 +658,6 @@ fn fallback_plan() -> SubscriptionPlan {
     }
 }
 
-fn credential_plan<'a>(report: &'a Value, credential_id: &str) -> Option<&'a Value> {
-    let mut matches = report["latest"].as_array()?.iter().filter(|row| {
-        row["plan"].is_string()
-            && row["plan_prices"].as_array().is_some_and(|prices| {
-                prices
-                    .iter()
-                    .any(|price| price["credential_ref"] == credential_id)
-            })
-    });
-    let row = matches.next()?;
-    matches.next().is_none().then_some(row)
-}
-
 fn build_with_credentials(
     state: &AccountQuotaState,
     report: &Value,
@@ -628,7 +665,9 @@ fn build_with_credentials(
     now: i64,
     credentials: &BTreeMap<String, BTreeSet<String>>,
 ) -> EconomicsCache {
-    let mut out = build(state, report, prices, now);
+    let report = ReportPlans::new(report);
+    let catalog = CatalogPools::new(prices);
+    let mut out = build_accounts(state, &report, prices, &catalog, now);
     for (provider, ids) in credentials {
         // Leave pools created from account-quota readings unchanged, even if no
         // usable capacity was found. Credential-only providers use the existing
@@ -636,14 +675,21 @@ fn build_with_credentials(
         if out.pools.contains_key(provider) {
             continue;
         }
-        let mut rows = ids.iter().map(|id| credential_plan(report, id));
-        let Some(Some(row)) = rows.next() else {
+        let mut plans = ids.iter().map(|id| report.credential(id));
+        let Some(Some(plan)) = plans.next() else {
             continue;
         };
         // Without capacity observations there is no basis for weighting distinct
-        // plans. Every mapped API-key credential must identify the same unique row.
-        if !rows.all(|other| other.is_some_and(|other| std::ptr::eq(row, other))) {
+        // plans. Every mapped API-key credential must identify the same plan.
+        if !plans.all(|other| other.is_some_and(|other| std::ptr::eq(plan, other))) {
             continue;
+        }
+        let (measured, values) = plan.values(&catalog);
+        if let Some(values) = values {
+            out.plan_values
+                .entry(provider.clone())
+                .or_default()
+                .insert(0, values);
         }
         out.pools.insert(
             provider.clone(),
@@ -651,8 +697,8 @@ fn build_with_credentials(
                 provider: provider.clone(),
                 now_ms: now,
                 plans: vec![SubscriptionPlan {
-                    plan: row["plan"].as_str().map(str::to_string),
-                    measured: measured(row),
+                    plan: Some(plan.name.to_owned()),
+                    measured,
                     ..fallback_plan()
                 }],
                 ..Default::default()
@@ -819,8 +865,24 @@ pub(crate) fn overlay(
         .lock()
         .map(|c| Arc::clone(&c.economics))
         .unwrap_or_default();
-    let pools = economics.pools.clone();
-    overlay_pools(pools, snapshot, facts, now, pricing);
+    overlay_economics(&economics, snapshot, facts, now, pricing);
+}
+
+fn overlay_economics(
+    economics: &EconomicsCache,
+    snapshot: &mut ModelRouteStateSnapshot,
+    facts: &[ModelFact],
+    now: i64,
+    pricing: &RoutePricing,
+) {
+    overlay_pools_with_values(
+        economics.pools.clone(),
+        &economics.plan_values,
+        snapshot,
+        facts,
+        now,
+        pricing,
+    );
 }
 
 pub(crate) fn overlay_free_before_reset(
@@ -852,7 +914,7 @@ pub(crate) fn overlay_free_before_reset(
             });
         }
     }
-    overlay_pools(pools, snapshot, facts, now, pricing);
+    overlay_pools_with_values(pools, &economics.plan_values, snapshot, facts, now, pricing);
 }
 
 #[cfg(test)]
@@ -910,13 +972,25 @@ pub(crate) fn test_pools_with_recent_pace(
     ))
 }
 
+#[cfg(test)]
+fn overlay_pools(
+    pools: HashMap<String, SubscriptionPool>,
+    snapshot: &mut ModelRouteStateSnapshot,
+    facts: &[ModelFact],
+    now: i64,
+    pricing: &RoutePricing,
+) {
+    overlay_pools_with_values(pools, &HashMap::new(), snapshot, facts, now, pricing);
+}
+
 /// Attach the cached subscription pools to the selection's snapshot. Every
 /// pool takes its keep-free reserve from the selection's `pricing`, including a
 /// pool whose provider has no fact here: `set_banked_allowance` compares pools
 /// with each other, so one pool on a reserve read at an earlier refresh would
 /// change whether the others may spend banked resets.
-fn overlay_pools(
+fn overlay_pools_with_values(
     mut pools: HashMap<String, SubscriptionPool>,
+    values: &HashMap<String, ProviderValues>,
     snapshot: &mut ModelRouteStateSnapshot,
     facts: &[ModelFact],
     now: i64,
@@ -983,13 +1057,20 @@ fn overlay_pools(
             .entry(make_capacity_key(&fact.provider_id, &fact.model_id))
             .or_default();
         state.subscription_pool = shared.get(&fact.provider_id).map(|pool| {
-            let Some(scope) = scope_family_for_model(&fact.model_id) else {
-                return pool.clone();
-            };
-            scoped
-                .entry((fact.provider_id.as_str(), scope.family))
-                .or_insert_with(|| pool_for_scope(pool, scope.family))
-                .clone()
+            let pool = scope_family_for_model(&fact.model_id).map_or_else(
+                || Arc::clone(pool),
+                |scope| {
+                    Arc::clone(
+                        scoped
+                            .entry((fact.provider_id.as_str(), scope.family))
+                            .or_insert_with(|| pool_for_scope(pool, scope.family)),
+                    )
+                },
+            );
+            match values.get(&fact.provider_id) {
+                Some(values) => pool_values::project(pool, values, &fact.model_id, now),
+                None => pool,
+            }
         });
     }
 }

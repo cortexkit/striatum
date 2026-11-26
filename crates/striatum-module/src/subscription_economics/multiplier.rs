@@ -1,4 +1,4 @@
-//! Astrocyte's latest plan rows, read on the existing quota bus connection.
+//! Astrocyte's latest plan and pool rows, read on the existing quota bus connection.
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
@@ -53,12 +53,14 @@ impl PollSchedule {
 pub(super) struct State {
     connection: Option<async_nats::Client>,
     revisions: Option<tokio::sync::watch::Receiver<u64>>,
-    entries: BTreeMap<String, Arc<Value>>,
-    initial: Option<BTreeMap<String, Arc<Value>>>,
+    entries: Entries,
+    initial: Option<Entries>,
     warned: BTreeSet<String>,
     pub(super) ready: bool,
     pub(super) generation: u64,
 }
+
+type Entries = BTreeMap<String, Option<Arc<Value>>>;
 
 pub(super) enum Update {
     Put(String, Option<Arc<Value>>),
@@ -71,12 +73,52 @@ pub(super) enum Update {
 impl From<BucketItem> for Update {
     fn from(item: BucketItem) -> Self {
         match item {
-            BucketItem::Put { key, value, .. } => Self::Put(key, decode(&value).map(Arc::new)),
+            BucketItem::Put { key, value, .. } => {
+                let row = decode(&value).filter(|row| pool_key_matches(&key, row));
+                Self::Put(key, row.map(Arc::new))
+            }
             BucketItem::Delete { key, .. } => Self::Delete(key),
             BucketItem::CaughtUp => Self::CaughtUp,
             _ => Self::Other,
         }
     }
+}
+
+fn pool_key_prefix(key: &str) -> Option<&str> {
+    let (plan_key, pool) = key.rsplit_once('.')?;
+    let (provider, plan) = plan_key.split_once('.')?;
+    [provider, plan, pool]
+        .into_iter()
+        .all(|segment| {
+            segment.strip_prefix('x').is_some_and(|hex| {
+                hex.len() % 2 == 0
+                    && hex
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            })
+        })
+        .then_some(plan_key)
+}
+
+fn pool_key_matches(key: &str, row: &Value) -> bool {
+    if pool_key_prefix(key).is_none() {
+        // Legacy keys are opaque to the consumer.
+        return true;
+    }
+    const HEX: &[u8] = b"0123456789abcdef";
+    row["pool_scope"].is_string()
+        && key
+            .split('.')
+            .zip(["quota_provider", "plan", "pool_id"])
+            .all(|(segment, field)| {
+                row[field].as_str().is_some_and(|text| {
+                    let hex = &segment.as_bytes()[1..];
+                    hex.len() == text.len() * 2
+                        && hex.chunks_exact(2).zip(text.bytes()).all(|(pair, byte)| {
+                            pair == [HEX[(byte >> 4) as usize], HEX[(byte & 15) as usize]]
+                        })
+                })
+            })
 }
 
 fn parse_row(value: &[u8]) -> Option<Value> {
@@ -184,10 +226,13 @@ impl State {
                     self.initial
                         .as_ref()
                         .and_then(|rows| rows.get(&key))
-                        .or_else(|| self.entries.get(&key))
+                        .and_then(Option::as_ref)
+                        .or_else(|| self.entries.get(&key).and_then(Option::as_ref))
                         .cloned()
                 });
-                if let Some(row) = row {
+                // Seeing a pool key opts its plan out of the old plan-wide
+                // value, even when the first value under that key is invalid.
+                if row.is_some() || pool_key_prefix(&key).is_some() {
                     let rows = self.initial.as_mut().unwrap_or(&mut self.entries);
                     if rows.get(&key) == Some(&row) {
                         false
@@ -241,12 +286,25 @@ impl State {
     }
 
     pub(super) fn rows(&self) -> Arc<[Arc<Value>]> {
-        self.entries.values().cloned().collect()
+        let scoped: BTreeSet<_> = self
+            .entries
+            .keys()
+            .filter_map(|key| pool_key_prefix(key))
+            .collect();
+        self.entries
+            .iter()
+            .filter_map(|(key, row)| {
+                (!scoped.contains(key.as_str()))
+                    .then_some(row.as_ref())
+                    .flatten()
+                    .cloned()
+            })
+            .collect()
     }
 
     #[cfg(test)]
     pub(super) fn report(&self) -> Value {
-        json!({"latest": self.entries.values().map(Arc::as_ref).collect::<Vec<_>>()})
+        json!({"latest": self.rows().iter().map(Arc::as_ref).collect::<Vec<_>>()})
     }
 
     pub(super) fn health(&self) -> Value {
