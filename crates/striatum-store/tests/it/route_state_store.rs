@@ -90,8 +90,6 @@ fn fact(provider: &str, model: &str) -> ModelFact {
         speed_multiplier: None,
         subscription_multiplier: None,
         score_provenance: ScoreProvenance::Curated,
-        aa_index: None,
-        review_by_ms: None,
         eq_source: None,
         class_vector: None,
         class_vector_is_overlay: false,
@@ -2926,110 +2924,66 @@ fn migration_022_renames_every_capability_key_and_applies_resolved_elos() {
 }
 
 #[test]
-fn aa_inferred_does_not_overwrite_override_and_override_wins() {
-    let rig = Rig::new("aa-inferred-precedence");
-    let store = rig.open();
-    let mut override_fact = fact("custom", "override-probe");
-    override_fact.scores.elo = 1_500.0;
-    store
-        .upsert_fact(&override_fact, FactSource::Override)
-        .unwrap();
+fn migration_104_retires_inferred_scores_without_removing_catalog_facts() {
+    let rig = Rig::new("retire-inferred-scores");
+    let descriptor = dev_descriptor("striatum", rig.db_path());
+    drop(SqliteRouteStateStore::open_at_version_for_test(&descriptor, 103).unwrap());
 
-    let mut inferred = override_fact.clone();
-    inferred.scores.elo = 900.0;
-    inferred.score_provenance = ScoreProvenance::AaInferred;
-    inferred.aa_index = Some(40.0);
-    inferred.review_by_ms = Some(1);
-    let err = store
-        .upsert_fact(&inferred, FactSource::AaInferred)
-        .expect_err("aa_inferred must refuse to clobber an override");
-    assert!(
-        err.0.contains("aa_inferred does not overwrite"),
-        "got {err:?}"
-    );
-    let kept = store
-        .get_fact_by_route_key("custom/override-probe")
+    let connection = rusqlite::Connection::open(rig.db_path()).unwrap();
+    connection
+        .execute(
+            "INSERT INTO model_facts (
+                route_key, capacity_key, provider_id, model_id, scores_json,
+                context_window, confidence, source, updated_at,
+                aa_index, review_by_ms, eq_source, facts_source, fusiform_present
+             ) VALUES (
+                'custom/legacy', 'custom/legacy', 'custom', 'legacy',
+                '{\"elo\":1600.0,\"eq\":1300.0,\"speed\":100.0}',
+                123456, 'curated', 'aa_inferred', 0,
+                50.0, 1000, 'neighbor:p/m', 'fusiform', 1
+             )",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    let migrated = rig.open();
+    let legacy = migrated
+        .get_fact_by_route_key("custom/legacy")
         .unwrap()
         .unwrap();
-    assert_eq!(kept.scores.elo, 1_500.0);
-    assert_eq!(kept.score_provenance, ScoreProvenance::Override);
-    assert_eq!(kept.aa_index, None);
-
-    // Other direction: an aa_inferred row is replaced by an override.
-    let mut inferred_only = fact("custom", "inferred-probe");
-    inferred_only.scores.elo = 800.0;
-    inferred_only.score_provenance = ScoreProvenance::AaInferred;
-    inferred_only.aa_index = Some(30.0);
-    inferred_only.review_by_ms = Some(2);
-    store
-        .upsert_fact(&inferred_only, FactSource::AaInferred)
-        .unwrap();
-    let mut as_override = inferred_only.clone();
-    as_override.scores.elo = 1_600.0;
-    as_override.score_provenance = ScoreProvenance::Override;
-    store
-        .upsert_fact(&as_override, FactSource::Override)
-        .unwrap();
-    let won = store
-        .get_fact_by_route_key("custom/inferred-probe")
+    assert_eq!(legacy.score_provenance, ScoreProvenance::Unscored);
+    assert_eq!(legacy.scores, ModelScores::default());
+    assert_eq!(legacy.confidence, Confidence::Unknown);
+    assert_eq!(legacy.context_window, Some(123_456.0));
+    assert!(migrated
+        .list_unscored_rows()
         .unwrap()
-        .unwrap();
-    assert_eq!(won.scores.elo, 1_600.0);
-    assert_eq!(won.score_provenance, ScoreProvenance::Override);
-    assert_eq!(won.aa_index, None);
-}
+        .iter()
+        .any(|row| row.route_key == "custom/legacy"));
+    let refusal = select_model_route(route_input(vec![legacy]))
+        .expect_err("obsolete inferred scores must not authorize an automatic pick");
+    assert!(refusal.rejected.iter().any(|rejected| {
+        rejected.route_key == "custom/legacy" && rejected.reason == "unscored_awaiting_placement"
+    }));
 
-#[test]
-fn aa_inferred_does_not_overwrite_curated_seed() {
-    let rig = Rig::new("aa-inferred-seed-precedence");
-    let store = rig.open();
-    let mut inferred = store
+    let curated = migrated
         .get_fact_by_route_key("openai/gpt-5.6-sol")
         .unwrap()
         .unwrap();
-    let original_elo = inferred.scores.elo;
-    inferred.scores.elo = 12.0;
-    inferred.score_provenance = ScoreProvenance::AaInferred;
-    inferred.aa_index = Some(1.0);
-    store
-        .upsert_fact(&inferred, FactSource::AaInferred)
-        .expect_err("aa_inferred must refuse to clobber a curated seed row");
-    let kept = store
-        .get_fact_by_route_key("openai/gpt-5.6-sol")
-        .unwrap()
-        .unwrap();
-    assert_eq!(kept.scores.elo, original_elo);
-    assert_eq!(kept.score_provenance, ScoreProvenance::Curated);
-}
+    assert_eq!(curated.scores.elo, 1_838.0);
+    assert_eq!(curated.score_provenance, ScoreProvenance::Curated);
 
-#[test]
-fn list_inferred_flags_a_row_past_review_by() {
-    let rig = Rig::new("aa-inferred-review-by");
-    let store = rig.open();
-    let mut inferred = fact("custom", "stale-inferred");
-    inferred.scores.elo = 400.0;
-    inferred.score_provenance = ScoreProvenance::AaInferred;
-    inferred.aa_index = Some(20.0);
-    inferred.review_by_ms = Some(1_000);
-    store
-        .upsert_fact(&inferred, FactSource::AaInferred)
+    let connection = rusqlite::Connection::open(rig.db_path()).unwrap();
+    let remaining_columns: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('model_facts')
+             WHERE name IN ('aa_index', 'review_by_ms', 'eq_source')",
+            [],
+            |row| row.get(0),
+        )
         .unwrap();
-    let rows = store.list_inferred_rows(2_000).unwrap();
-    let row = rows
-        .iter()
-        .find(|row| row.route_key == "custom/stale-inferred")
-        .expect("inferred row listed");
-    assert_eq!(row.aa_index, Some(20.0));
-    assert!((row.elo - 400.0).abs() < 1e-9);
-    assert_eq!(row.review_by_ms, Some(1_000));
-    assert!(row.review_by_passed, "deadline 1000 is past now=2000");
-
-    let fresh = store.list_inferred_rows(500).unwrap();
-    let fresh_row = fresh
-        .iter()
-        .find(|row| row.route_key == "custom/stale-inferred")
-        .unwrap();
-    assert!(!fresh_row.review_by_passed);
+    assert_eq!(remaining_columns, 0);
 }
 
 #[test]

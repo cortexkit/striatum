@@ -92,13 +92,13 @@ class Jsonc:
 
 
 RENAMES = {
-    "mason": ("prefrontal-core.mason",),
-    "sidekick": ("prefrontal-core.sidekick",),
-    "athena": ("prefrontal-core.athena",),
-    "athena.gather": ("prefrontal-core.athena.gather",),
-    "synthesizer": ("prefrontal-core.athena.synthesizer",),
-    "lab": ("prefrontal-core.lab",),
-    "core": ("prefrontal-core.wake",),
+    "mason": ("prefrontal.mason",),
+    "sidekick": ("prefrontal.sidekick",),
+    "athena": ("prefrontal.athena",),
+    "athena.gather": ("prefrontal.athena.gather",),
+    "synthesizer": ("prefrontal.athena.synthesizer",),
+    "lab": ("prefrontal.lab",),
+    "core": ("prefrontal.wake",),
     "codemode": ("basal.codemode",),
     "flow": ("basal.flow",),
     "mc_summary": ("magic-context.summary",),

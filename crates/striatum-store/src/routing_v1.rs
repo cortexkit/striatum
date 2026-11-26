@@ -7,7 +7,6 @@
 //! ledger; this module only keeps what v1 adds to it.
 
 use rusqlite::{params, Connection, OptionalExtension};
-use striatum_core::module_identity::alternate;
 use striatum_core::{accounts::AllowedAccountClass, RouteStateResult};
 
 use super::{err, SqliteRouteStateStore};
@@ -19,12 +18,11 @@ pub(crate) const END_DECISION_AFFINITY_SQL: &str =
     "UPDATE routing_v1_affinity SET ended_at_ms=?2 WHERE decision_id=?1 AND ended_at_ms IS NULL";
 
 const PANEL_READ_SQL: &str =
-    "SELECT state_json FROM routing_v1_panel WHERE panel_id=?1 AND principal IN (?2, ?3)";
+    "SELECT state_json FROM routing_v1_panel WHERE panel_id=?1 AND principal=?2";
 const AFFINITY_READ_SQL: &str = "SELECT decision_id FROM routing_v1_affinity
-    WHERE principal IN (?1, ?4) AND consumer IN (?2, ?5) AND affinity = ?3
-    AND ended_at_ms IS NULL ORDER BY updated_at_ms DESC, (principal=?6) DESC, (consumer=?7) DESC, rowid DESC LIMIT 1";
+    WHERE principal=?1 AND consumer=?2 AND affinity=?3 AND ended_at_ms IS NULL";
 const ADMISSION_READ_SQL: &str = "SELECT body_json, answer_json FROM routing_v1_admission
-    WHERE principal IN (?1, ?3) AND admission_id = ?2";
+    WHERE principal=?1 AND admission_id=?2";
 const BOUND_ACCOUNT_DECISION_SQL: &str = "SELECT d.decision_json
     FROM account_admission AS a
     LEFT JOIN account_decision AS d ON d.decision_id = a.decision_id
@@ -80,12 +78,8 @@ impl SqliteRouteStateStore {
     pub fn v1_panel(&self, id: &str, principal: &str) -> RouteStateResult<Option<String>> {
         self.store
             .with_conn(|c: &Connection| {
-                c.query_row(
-                    PANEL_READ_SQL,
-                    params![id, principal, alternate(principal).as_ref()],
-                    |row| row.get(0),
-                )
-                .optional()
+                c.query_row(PANEL_READ_SQL, params![id, principal], |row| row.get(0))
+                    .optional()
             })
             .map_err(err)
     }
@@ -319,15 +313,7 @@ impl SqliteRouteStateStore {
             .with_conn(|c: &Connection| {
                 c.query_row(
                     AFFINITY_READ_SQL,
-                    params![
-                        principal,
-                        consumer,
-                        affinity,
-                        alternate(principal).as_ref(),
-                        alternate(consumer).as_ref(),
-                        striatum_core::module_identity::canonical(principal).as_ref(),
-                        striatum_core::module_identity::canonical(consumer).as_ref()
-                    ],
+                    params![principal, consumer, affinity],
                     |row| row.get(0),
                 )
                 .optional()
@@ -389,7 +375,7 @@ impl SqliteRouteStateStore {
             .with_read(|c: &Connection| {
                 c.query_row(
                     ADMISSION_READ_SQL,
-                    params![principal, admission_id, alternate(principal).as_ref()],
+                    params![principal, admission_id],
                     |row| {
                         Ok(V1Recorded {
                             body_json: row.get(0)?,
@@ -432,25 +418,6 @@ impl crate::AccountTx<'_> {
         #[cfg(any(test, feature = "test-support"))]
         let _writer_entry =
             crate::writer_entry_trace::enter("account_tx::routing_v1::v1_record_admission");
-        if alternate(principal) != principal {
-            if let Some(first) = self
-                .conn
-                .query_row(
-                    ADMISSION_READ_SQL,
-                    params![principal, admission_id, alternate(principal).as_ref()],
-                    |row| {
-                        Ok(V1Recorded {
-                            body_json: row.get(0)?,
-                            answer_json: row.get(1)?,
-                        })
-                    },
-                )
-                .optional()
-                .map_err(err)?
-            {
-                return Ok(first);
-            }
-        }
         self.conn
             .execute(
                 "INSERT INTO routing_v1_admission
@@ -568,7 +535,7 @@ mod tests {
     }
 
     #[test]
-    fn alias_principal_keyed_reads_keep_indexed_seeks() {
+    fn principal_keyed_reads_keep_indexed_seeks() {
         let store = store("rename-plans");
         for (sql, index) in [
             (PANEL_READ_SQL, "sqlite_autoindex_routing_v1_panel_1"),
@@ -634,181 +601,6 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-    }
-
-    #[test]
-    fn prefrontal_rename_decision_list_filter_reads_old_history() {
-        use striatum_core::RouteStateStore;
-        let store = store("rename-list");
-        store
-            .record_decision(&striatum_core::DecisionInput {
-                target_agent: "prefrontal-core.mason".into(),
-                ..Default::default()
-            })
-            .unwrap();
-        assert_eq!(
-            store
-                .list_decisions(&crate::DecisionListFilter {
-                    target_agent: Some("prefrontal.mason".into()),
-                    limit: 10,
-                    ..Default::default()
-                })
-                .unwrap()
-                .len(),
-            1
-        );
-    }
-
-    #[test]
-    fn prefrontal_rename_panel_is_owned_across_the_cut() {
-        let store = store("rename-panel");
-        store
-            .v1_create_panel("panel", "reserved:prefrontal-core", "{}", 1)
-            .unwrap();
-        assert_eq!(
-            store
-                .v1_panel("panel", "reserved:prefrontal")
-                .unwrap()
-                .as_deref(),
-            Some("{}")
-        );
-        assert!(store.v1_panel("panel", "reserved:other").unwrap().is_none());
-    }
-
-    #[test]
-    fn prefrontal_rename_affinity_reads_old_and_new_workload_and_newest_decision() {
-        let store = store("rename-affinity");
-        let mut old = decision("old", Some("same"));
-        old.principal = "reserved:prefrontal-core".into();
-        old.consumer = "prefrontal-core.mason".into();
-        store.v1_record_decision(&old).unwrap();
-        assert_eq!(
-            store
-                .v1_affinity_decision("reserved:prefrontal", "prefrontal.mason", "same")
-                .unwrap()
-                .unwrap()
-                .decision_id,
-            "old"
-        );
-        let mut new = old.clone();
-        new.decision_id = "new".into();
-        new.principal = "reserved:prefrontal".into();
-        new.consumer = "prefrontal.mason".into();
-        new.created_at_ms += 1;
-        store.v1_record_decision(&new).unwrap();
-        assert_eq!(
-            store
-                .v1_affinity_decision("reserved:prefrontal-core", "prefrontal-core.mason", "same")
-                .unwrap()
-                .unwrap()
-                .decision_id,
-            "new"
-        );
-        let raw: (i64, String, String) = store
-            .store
-            .with_conn(|c| {
-                c.query_row(
-                    "SELECT count(*),principal,consumer FROM routing_v1_affinity",
-                    [],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                )
-            })
-            .unwrap();
-        assert_eq!(
-            raw,
-            (
-                1,
-                "reserved:prefrontal-core".into(),
-                "prefrontal-core.mason".into()
-            )
-        );
-        store
-            .v1_record_report(
-                "new",
-                "failed",
-                &V1Recorded {
-                    body_json: "{}".into(),
-                    answer_json: "{}".into(),
-                },
-                true,
-                10,
-            )
-            .unwrap();
-        assert!(store
-            .v1_affinity_decision("reserved:prefrontal", "prefrontal.mason", "same")
-            .unwrap()
-            .is_none());
-    }
-
-    #[test]
-    fn prefrontal_rename_parallel_affinities_choose_newest_then_old_on_ties() {
-        for (new_at, chosen) in [(1, "reserved:prefrontal-core"), (2, "reserved:prefrontal")] {
-            let store = store("rename-parallel-affinity");
-            let mut old = decision("old", Some("same"));
-            old.principal = "reserved:prefrontal-core".into();
-            old.consumer = "prefrontal-core.mason".into();
-            store.v1_record_decision(&old).unwrap();
-            store.store.with_conn(|c| c.execute("INSERT INTO routing_v1_affinity(principal,consumer,affinity,decision_id,updated_at_ms) VALUES ('reserved:prefrontal','prefrontal.mason','same','old',?1)", [new_at])).unwrap();
-            let mut new = old;
-            new.principal = "reserved:prefrontal".into();
-            new.consumer = "prefrontal.mason".into();
-            new.decision_id = "new".into();
-            new.created_at_ms = 3;
-            store.v1_record_decision(&new).unwrap();
-            let live: String = store
-                .store
-                .with_conn(|c| {
-                    c.query_row(
-                        "SELECT principal FROM routing_v1_affinity WHERE ended_at_ms IS NULL",
-                        [],
-                        |r| r.get(0),
-                    )
-                })
-                .unwrap();
-            assert_eq!(live, chosen);
-            store
-                .v1_record_report(
-                    "new",
-                    "failed",
-                    &V1Recorded {
-                        body_json: "{}".into(),
-                        answer_json: "{}".into(),
-                    },
-                    true,
-                    10,
-                )
-                .unwrap();
-            assert!(store
-                .v1_affinity_decision("reserved:prefrontal", "prefrontal.mason", "same")
-                .unwrap()
-                .is_none());
-        }
-    }
-
-    #[test]
-    fn prefrontal_rename_admission_replay_keeps_first_answer() {
-        let store = store("rename-admission");
-        let first = V1Recorded {
-            body_json: "first".into(),
-            answer_json: "answer".into(),
-        };
-        store
-            .v1_record_admission("reserved:prefrontal-core", "same", &first, 1)
-            .unwrap();
-        assert_eq!(
-            store.v1_admission("reserved:prefrontal", "same").unwrap(),
-            Some(first.clone())
-        );
-        let second = V1Recorded {
-            body_json: "changed".into(),
-            answer_json: "changed".into(),
-        };
-        assert_eq!(
-            store
-                .v1_record_admission("reserved:prefrontal", "same", &second, 2)
-                .unwrap(),
-            first
-        );
     }
 
     #[test]
@@ -997,19 +789,6 @@ impl crate::AccountTx<'_> {
                         params![decision.decision_id, selection_json])?;
                 }
                 if let Some(affinity) = &decision.affinity {
-                    // Reuse the newest matching affinity row across principal
-                    // and consumer spellings. End the other matches before
-                    // updating the chosen row so only one binding stays active.
-                    let existing: Option<i64> = if alternate(&decision.principal) != decision.principal || alternate(&decision.consumer) != decision.consumer { tx.query_row(
-                        "SELECT rowid FROM routing_v1_affinity WHERE principal IN (?1,?4) AND consumer IN (?2,?5) AND affinity=?3 ORDER BY updated_at_ms DESC, (principal=?6) DESC, (consumer=?7) DESC, rowid DESC LIMIT 1",
-                        params![decision.principal, decision.consumer, affinity, alternate(&decision.principal).as_ref(), alternate(&decision.consumer).as_ref(), striatum_core::module_identity::canonical(&decision.principal).as_ref(), striatum_core::module_identity::canonical(&decision.consumer).as_ref()],
-                        |row| row.get(0),
-                    ).optional()? } else { None };
-                    if let Some(rowid) = existing {
-                        tx.execute("UPDATE routing_v1_affinity SET ended_at_ms=?6 WHERE principal IN (?1,?4) AND consumer IN (?2,?5) AND affinity=?3 AND rowid<>?7 AND ended_at_ms IS NULL", params![decision.principal, decision.consumer, affinity, alternate(&decision.principal).as_ref(), alternate(&decision.consumer).as_ref(), decision.created_at_ms, rowid])?;
-                        tx.execute("UPDATE routing_v1_affinity SET decision_id=?2, updated_at_ms=?3, ended_at_ms=NULL WHERE rowid=?1", params![rowid, decision.decision_id, decision.created_at_ms])?;
-                        return Ok(());
-                    }
                     tx.execute(
                         "INSERT INTO routing_v1_affinity
                            (principal, consumer, affinity, decision_id, updated_at_ms, ended_at_ms)

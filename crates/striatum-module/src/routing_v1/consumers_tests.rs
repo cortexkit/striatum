@@ -14,7 +14,7 @@ fn harness() -> Arc<Harness> {
     let harness = Harness::new("consumer-admission");
     harness.edit_config(|config| {
         config["consumers"] = json!({
-            "codemode": { "owner": "prefrontal-core", "pay_per_token": true },
+            "codemode": { "owner": "prefrontal", "pay_per_token": true },
             "magic-context.dream.curate": { "owner": "magic-context" }
         });
     });
@@ -31,58 +31,6 @@ fn entry(module: &str, verified: bool, names: &[&str]) -> Value {
 
 fn select(consumer: &str) -> Value {
     json!({"consumer": consumer, "requirements": {"iq": 30}})
-}
-
-#[tokio::test]
-async fn prefrontal_rename_declared_root_and_operator_owner_are_one_claim() {
-    let h = harness();
-    h.edit_config(|config| {
-        config["consumers"]["prefrontal-core.mason"] = json!({"owner":"prefrontal-core","iq":20})
-    });
-    consumers::replace_catalog(&json!([entry("prefrontal", true, &["prefrontal.mason"])]));
-    let route = h.bind(reserved("prefrontal"), None).await;
-    let reply = route
-        .call("route.select", &select("prefrontal.mason"))
-        .await;
-    assert_eq!(reply.0, FrameType::Response, "{reply:?}");
-    assert_eq!(selected_input(&h, &reply)["iq"].as_f64(), Some(20.0));
-    let old_name = route
-        .call("route.select", &select("prefrontal-core.mason"))
-        .await;
-    assert_eq!(old_name.0, FrameType::Response, "{old_name:?}");
-    let denied = h
-        .bind(reserved("unrelated"), None)
-        .await
-        .call("route.select", &select("prefrontal.mason"))
-        .await;
-    assert_eq!(denied.1["code"], "consumer_not_owned");
-}
-
-#[tokio::test]
-async fn prefrontal_rename_declared_old_module_honors_new_root() {
-    let h = harness();
-    consumers::replace_catalog(&json!([entry(
-        "prefrontal-core",
-        true,
-        &["prefrontal.sidekick"]
-    )]));
-    let route = h.bind(reserved("prefrontal"), None).await;
-    let reply = route
-        .call("route.select", &select("prefrontal.sidekick.explore"))
-        .await;
-    assert_eq!(reply.0, FrameType::Response, "{reply:?}");
-}
-
-#[tokio::test]
-async fn prefrontal_rename_selector_accepts_the_new_attested_module() {
-    let h = harness();
-    consumers::replace_catalog(&json!([{
-        "module_id":"other", "nonce_verified":true,
-        "role_declarations":{"routing/v1":{"consumers":[{"name":"other.task","iq":30,"selectors":["prefrontal-core"]}]}}
-    }]));
-    let route = h.bind(reserved("prefrontal"), None).await;
-    let reply = route.call("route.select", &select("other.task")).await;
-    assert_eq!(reply.0, FrameType::Response, "{reply:?}");
 }
 
 fn selected_input(h: &Harness, reply: &(FrameType, Value)) -> Value {
@@ -1923,7 +1871,7 @@ async fn dotted_not_for_excludes_gather_but_keeps_plain_athena_and_records_the_f
         config["consumers"]["athena.gather.regather"] = json!({});
         config["models"]["example-provider/model-a"]["not_for"] = json!(["athena.gather"]);
     });
-    let caller = harness.bind(reserved("prefrontal-core"), None).await;
+    let caller = harness.bind(reserved("prefrontal"), None).await;
     for consumer in ["athena", "athena.gather", "athena.gather.regather"] {
         let reply = caller
             .call(
@@ -1976,7 +1924,7 @@ async fn dotted_only_for_admits_gather_and_refuses_plain_athena() {
         config["consumers"]["athena.gather"] = json!({});
         config["models"]["example-provider/model-a"]["only_for"] = json!(["athena.gather"]);
     });
-    let caller = harness.bind(reserved("prefrontal-core"), None).await;
+    let caller = harness.bind(reserved("prefrontal"), None).await;
     for consumer in ["athena", "athena.gather"] {
         let reply = caller
             .call(
@@ -2014,7 +1962,7 @@ async fn dotted_unknown_root_keeps_unknown_consumer_selection_behavior() {
         config["consumers"]["nosuch.gather"] = json!({});
         config["models"]["example-provider/model-a"]["not_for"] = json!(["athena"]);
     });
-    let caller = harness.bind(reserved("prefrontal-core"), None).await;
+    let caller = harness.bind(reserved("prefrontal"), None).await;
     for consumer in ["nosuch", "nosuch.gather"] {
         let reply = caller
             .call(
@@ -2115,7 +2063,7 @@ async fn consumer_models_preserves_frozen_fractional_scores_exclusions_and_subsc
         config["models"]["p/excluded"] = json!({"pin_only":true});
         config["models"]["p/unscored"] = json!({"subscription":true});
     });
-    let route = h.bind(reserved("prefrontal-core"), None).await;
+    let route = h.bind(reserved("prefrontal"), None).await;
     let reply = route
         .call("route.consumer_models", &json!({"consumer":"codemode"}))
         .await;
@@ -2350,9 +2298,9 @@ async fn configured_owners_join_the_declaration_lock_without_overriding_it() {
 async fn delegated_select_requires_current_owner_authorized_scope_not_project_equality() {
     let harness = harness();
     let channel = harness.reserve_channel();
-    let route = scoped(&harness, "prefrontal-core", true, channel, 1).await;
+    let route = scoped(&harness, "prefrontal", true, channel, 1).await;
     let authority = Caller::for_route(channel, 1).scope_authority.unwrap();
-    assert_eq!(authority.owner, "reserved:prefrontal-core");
+    assert_eq!(authority.owner, "reserved:prefrontal");
     assert_eq!(authority.reference, "codemode-run");
     assert_eq!(serde_json::to_value(authority.kind).unwrap(), "ephemeral");
     assert_eq!(authority.scope_epoch, 7);
@@ -2362,7 +2310,7 @@ async fn delegated_select_requires_current_owner_authorized_scope_not_project_eq
         route.call("route.select", &select("codemode")).await.0,
         FrameType::Response
     );
-    for (owner, authorized, epoch) in [("prefrontal-core", false, 2), ("other-module", true, 3)] {
+    for (owner, authorized, epoch) in [("prefrontal", false, 2), ("other-module", true, 3)] {
         let route = scoped(&harness, owner, authorized, channel, epoch).await;
         refused(
             route.call("route.select", &select("codemode")).await,
@@ -2400,7 +2348,7 @@ async fn delegated_select_requires_current_owner_authorized_scope_not_project_eq
 async fn a_report_cannot_reuse_a_delegates_decision_without_owner_authorization() {
     let harness = harness();
     let channel = harness.reserve_channel();
-    let route = scoped(&harness, "prefrontal-core", true, channel, 1).await;
+    let route = scoped(&harness, "prefrontal", true, channel, 1).await;
     let selected = route.call("route.select", &select("codemode")).await;
     assert_eq!(selected.0, FrameType::Response, "{}", selected.1);
     let report =
@@ -2419,10 +2367,10 @@ async fn a_report_cannot_reuse_a_delegates_decision_without_owner_authorization(
 async fn a_dispatched_select_loses_authority_when_the_route_rebinds_before_admission() {
     let harness = harness();
     let channel = harness.reserve_channel();
-    let old_route = scoped(&harness, "prefrontal-core", true, channel, 1).await;
+    let old_route = scoped(&harness, "prefrontal", true, channel, 1).await;
     let captured_caller = Caller::for_route(channel, 1);
     let dispatched = old_route.request_frame("route.select", &select("codemode"));
-    let current_route = scoped(&harness, "prefrontal-core", true, channel, 2).await;
+    let current_route = scoped(&harness, "prefrontal", true, channel, 2).await;
     assert_eq!(
         consumers::effective(&harness.operator_config())
             .admit("codemode", &captured_caller)
@@ -2481,7 +2429,7 @@ async fn fractional_operator_score_targets_do_not_cross_the_integer_wire_validat
         config["consumers"]["codemode"]["iq"] = json!(30.5);
         config["consumers"]["codemode"]["eq"] = json!(20.5);
     });
-    let route = harness.bind(reserved("prefrontal-core"), None).await;
+    let route = harness.bind(reserved("prefrontal"), None).await;
     let reply = route.call("route.select", &select("codemode")).await;
     assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
 }
@@ -2643,21 +2591,17 @@ async fn consumer_priority_inherits_single_owner_and_operator_overrides_by_segme
 async fn consumer_cut_old_name_in_a_fresh_select_is_unknown() {
     let harness = harness();
     harness.edit_config(|config| {
-        config["consumers"] = json!({"prefrontal-core.mason":{"owner":"prefrontal-core"}});
+        config["consumers"] = json!({"prefrontal.mason":{"owner":"prefrontal"}});
     });
-    consumers::replace_catalog(&json!([entry(
-        "prefrontal-core",
-        true,
-        &["prefrontal-core.mason"]
-    )]));
-    let caller = harness.bind(reserved("prefrontal-core"), None).await;
+    consumers::replace_catalog(&json!([entry("prefrontal", true, &["prefrontal.mason"])]));
+    let caller = harness.bind(reserved("prefrontal"), None).await;
     admission_refused(
         caller.call("route.select", &select("mason")).await,
         "unknown_consumer",
         "mason",
     );
     let canonical = caller
-        .call("route.select", &select("prefrontal-core.mason"))
+        .call("route.select", &select("prefrontal.mason"))
         .await;
     assert_eq!(canonical.0, FrameType::Response, "{}", canonical.1);
 }

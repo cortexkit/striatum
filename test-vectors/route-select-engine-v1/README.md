@@ -8,8 +8,8 @@ only, not transport frames, route bindings, or module-address envelopes.
 
 ## Caller and fixture
 
-The iPhone calls through Callosum using consumer `phone.media`. The fixture
-declares that consumer in Callosum's nonce-verified `routing/v1` slot, so it is
+The iPhone calls through the phone operator using consumer `phone.media`. The fixture
+declares that consumer in the phone operator's nonce-verified `routing/v1` slot, so it is
 admitted only from `reserved:callosum` on a current route binding. The principal
 is transport-attested, not a request member. Successful samples use an unscoped
 route; the foreign and direct caller samples intentionally fail ownership.
@@ -74,7 +74,7 @@ filter that emptied the candidates, in order: `kind`, `requirements`, `privacy`,
   `consumer_not_owned`.
 - `caller-direct.json`: a direct caller has no declaring module ownership;
   `consumer_not_owned`.
-- `flow-scope-not-supported.json`: even a Callosum principal cannot select an
+- `flow-scope-not-supported.json`: even a phone-operator principal cannot select an
   engine through a flow-scoped route; the dispatcher returns
   `flow_scope_not_supported` before consumer admission.
 - `route-cooldown.json`: the model route has a future cooldown.
@@ -115,8 +115,8 @@ From the worktree root:
 UPDATE_ROUTE_SELECT_ENGINE_VECTORS=1 cargo nextest run --locked -p striatum-module --bin ck-striatum -E 'test(=routing_v1::select_engine_vectors_tests::serving_bytes_match_tagged_vectors)'
 ```
 
-For a remote CortexKit build, include every JSON file in this directory and
-`SHA256SUMS` in `return_paths` to copy the generated files back to the worktree.
+For a remote build with read-only synced sources, regenerate in a writable
+checkout and copy every JSON file and `SHA256SUMS` back into this directory.
 Without the update variable, the same test regenerates the samples in memory
 and fails if any committed sample byte or checksum differs. It also rejects
 extra JSON files not covered by the generator. Independently check the manifest:

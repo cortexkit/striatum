@@ -155,20 +155,20 @@ refusal_case!(
 refusal_case!(
     synthesizer_pin_refused_by_model_not_for,
     r#"{"consumers":{"synthesizer":{"pin":{"model":"anthropic/claude-opus-5-5","variant":"medium"}}},
-        "models":{"anthropic/claude-opus-5-5":{"not_for":["prefrontal-core.athena","prefrontal-core.lab"]}}}"#,
-    r#"consumers.synthesizer.pin pins anthropic/claude-opus-5-5 but this config refuses route anthropic/claude-opus-5-5 for consumer "prefrontal-core.athena": models["anthropic/claude-opus-5-5"].not_for lists "prefrontal-core.athena""#
+        "models":{"anthropic/claude-opus-5-5":{"not_for":["prefrontal.athena","prefrontal.lab"]}}}"#,
+    r#"consumers.synthesizer.pin pins anthropic/claude-opus-5-5 but this config refuses route anthropic/claude-opus-5-5 for consumer "prefrontal.athena": models["anthropic/claude-opus-5-5"].not_for lists "prefrontal.athena""#
 );
 refusal_case!(
     lab_planner_pin_refused_by_provider_not_for,
     r#"{"consumers":{"lab_planner":{"pin":{"model":"anthropic/claude-opus-5-5"}}},
-        "providers":{"anthropic":{"not_for":["prefrontal-core.lab"]}}}"#,
-    r#"consumers.lab_planner.pin pins anthropic/claude-opus-5-5 but this config refuses route anthropic/claude-opus-5-5 for consumer "prefrontal-core.lab": providers.anthropic.not_for lists "prefrontal-core.lab""#
+        "providers":{"anthropic":{"not_for":["prefrontal.lab"]}}}"#,
+    r#"consumers.lab_planner.pin pins anthropic/claude-opus-5-5 but this config refuses route anthropic/claude-opus-5-5 for consumer "prefrontal.lab": providers.anthropic.not_for lists "prefrontal.lab""#
 );
 refusal_case!(
     spec_designer_pin_refused_by_provider_models_list,
     r#"{"consumers":{"spec_designer":{"pin":{"model":"anthropic/claude-opus-5-5"}}},
         "providers":{"anthropic":{"models":["claude-sonnet-5"]}}}"#,
-    r#"consumers.spec_designer.pin pins anthropic/claude-opus-5-5 but this config refuses route anthropic/claude-opus-5-5 for consumer "prefrontal-core.athena": providers.anthropic.models ["claude-sonnet-5"] does not list the model"#
+    r#"consumers.spec_designer.pin pins anthropic/claude-opus-5-5 but this config refuses route anthropic/claude-opus-5-5 for consumer "prefrontal.athena": providers.anthropic.models ["claude-sonnet-5"] does not list the model"#
 );
 refusal_case!(
     project_pin_refused_by_model_only_for,
@@ -176,12 +176,6 @@ refusal_case!(
         "models":{"p/m":{"only_for":["sidekick"]}}}"#,
     r#"consumers.mason.projects.proj.pin pins p/m but this config refuses route p/m for consumer "mason": models["p/m"].only_for ["sidekick"] does not name "mason""#
 );
-refusal_case!(
-    removed_aa,
-    r#"{"aa":{"api_key":"never-read"},"unknown":true}"#,
-    "config_key_removed: aa"
-);
-refusal_case!(removed_aa_null, r#"{"aa":null}"#, "config_key_removed: aa");
 refusal_case!(
     removed_explicit_only_providers,
     r#"{"model_routing":{"explicit_only_providers":["anthropic-platform"],"exclude":{"all":["xai"]}}}"#,
@@ -487,8 +481,8 @@ fn retired_variant_keys_are_refused_at_startup_and_reload_with_exact_paths() {
             "model_routing.variants",
         ),
         (
-            r#"{"consumers":{"prefrontal-core.athena":{"variants":{}}}}"#,
-            r#"consumers."prefrontal-core.athena".variants"#,
+            r#"{"consumers":{"prefrontal.athena":{"variants":{}}}}"#,
+            r#"consumers."prefrontal.athena".variants"#,
         ),
     ];
     for (document, path) in cases {
@@ -502,7 +496,7 @@ fn retired_variant_keys_are_refused_at_startup_and_reload_with_exact_paths() {
         assert!(error.contains(&expected), "{error}");
 
         let mut rig = Rig::new();
-        rig.write(r#"{"consumers":{"prefrontal-core.athena":{"workload":"reason"}}}"#);
+        rig.write(r#"{"consumers":{"prefrontal.athena":{"workload":"reason"}}}"#);
         initialize_config(&rig.path).unwrap();
         let held = live_config(&rig.path);
         rig.write(document);
@@ -620,7 +614,7 @@ fn converted_keys_load_and_camel_case_spellings_are_refused() {
             ["anthropic", "-anthropic/claude-5", "openai/gpt-6/high"]
         );
         // The explicit converter keeps old consumer keys literally: a rule
-        // for mason does not become a rule for prefrontal-core.mason.
+        // for mason does not become a rule for prefrontal.mason.
         for (consumer, route) in [
             ("mason", "kimi-code-plan-global/k3"),
             ("mason", "openai/gpt-6-astra"),
@@ -696,7 +690,7 @@ fn absent_file_and_missing_groups_are_empty() {
         live_config(&rig.path).exclude_groups(),
         &ExcludeGroups::default()
     );
-    rig.write(r#"{"providers":{"anthropic":{"not_for":["prefrontal-core.mason"]}}}"#);
+    rig.write(r#"{"providers":{"anthropic":{"not_for":["prefrontal.mason"]}}}"#);
     let next = settle_live_config(&rig.path);
     assert_eq!(
         next.exclude_groups(),
@@ -813,18 +807,19 @@ fn retired_account_model_families_load_with_named_warnings() {
 #[test]
 fn pin_origin_enrollment_defaults_to_the_full_core_principal() {
     let defaults = LiveConfig::default();
-    assert!(defaults.honours_pin_origin("reserved:prefrontal-core"));
+    assert!(defaults.honours_pin_origin("reserved:prefrontal"));
     for principal in [
-        "prefrontal-core",
-        "reserved:prefrontal-core-other",
-        "reserved:prefrontal-core.child",
+        "prefrontal",
+        "reserved:prefrontal-core",
+        "reserved:prefrontal-other",
+        "reserved:prefrontal.child",
     ] {
         assert!(!defaults.honours_pin_origin(principal));
     }
     let parsed = LiveConfig::new(parse_config("{}").unwrap(), None);
-    assert!(parsed.honours_pin_origin("reserved:prefrontal-core"));
+    assert!(parsed.honours_pin_origin("reserved:prefrontal"));
     let disabled = LiveConfig::new(parse_config(r#"{"pin_origin_callers":[]}"#).unwrap(), None);
-    assert!(!disabled.honours_pin_origin("reserved:prefrontal-core"));
+    assert!(!disabled.honours_pin_origin("reserved:prefrontal"));
 }
 
 #[test]
@@ -866,7 +861,7 @@ fn generated_schema_is_current_and_closed() {
     assert_eq!(properties["pin_origin_callers"]["items"]["type"], "string");
     assert_eq!(
         properties["pin_origin_callers"]["default"],
-        serde_json::json!(["reserved:prefrontal-core", "reserved:prefrontal"])
+        serde_json::json!(["reserved:prefrontal"])
     );
     assert!(schema["$defs"].get("AccountSelectionFlags").is_none());
     assert!(schema["$defs"].get("AccountModelFamily").is_none());

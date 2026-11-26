@@ -16,7 +16,7 @@ three JSON files in filename order; the test also checks exact directory members
 All three requests derive from `voice-message-caller-local-en.json` in
 `test-vectors/route-select-media-v1/`, byte-identical to the version at the
 `route-select-media-v1.2` tag (commit `393e629b1b3b36f17ea5316e6bee8fc535b2e741`).
-Callosum selects for `colliculus.voice_message`, kind `transcribe`, with a 30-second
+The phone operator selects for `colliculus.voice_message`, kind `transcribe`, with a 30-second
 English (`en-US`) WAV message and `remote_allowed` privacy. Its caller-local
 `apple/phone-transcriber` advertises English, WAV, realtime latency, and a
 600000-ms duration limit.
@@ -37,8 +37,8 @@ have distinct deterministic decision IDs because the three requests run in order
 
 ## Declaration and ranking fixture
 
-The test uses the unchanged real Colliculus declarations already loaded by the
-media tests from `crates/striatum-module/fixtures/colliculus-5b/` (Colliculus commit
+The test uses the unchanged real voice-module declarations already loaded by the
+media tests from `crates/striatum-module/fixtures/colliculus-5b/` (voice-module repository commit
 `5ccd00f69eb93d7515b4e3b45938ca751bf00098`). All ten engines and six consumers
 are retained. Its transcription declarations are `openai/gpt-transcribe`
 (`bias_limit` phrase/50) and `google/gemini-3.8-flash` (phrase/100). The latter is
@@ -58,8 +58,7 @@ a phone failing demand or another requirement does not win just by being free.
 
 ## Regeneration and verification
 
-Run from the repository root on the Linux build server with four vCPUs (tool
-setting `runon: "linux,4c"`):
+Run from the repository root with the repository's Rust toolchain and nextest:
 
 ```sh
 UPDATE_TRANSCRIPTION_BIAS_VECTORS=1 cargo nextest run --locked -p striatum-module --bin ck-striatum -E 'test(=routing_v1::engines_tests::media::samples::serving_bytes_match_transcription_bias_vectors)'

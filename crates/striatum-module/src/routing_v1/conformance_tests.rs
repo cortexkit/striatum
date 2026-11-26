@@ -314,16 +314,6 @@ impl Harness {
         }
     }
 
-    pub(super) fn observe_runner_describe(&self, module: &str, describe: &Value) {
-        let credentials = self.broca_credentials.lock().unwrap();
-        super::runners::DescribeCache::default().reply(
-            module,
-            Some(describe),
-            &mut credentials.lock().unwrap(),
-            crate::now_ms() as i64,
-        );
-    }
-
     pub(super) fn publish_runner_serves(&self, module: &str, list: &Value) {
         let shared = self.credentials();
         publish_runner_serves(&mut shared.lock().unwrap(), module, list);
@@ -695,8 +685,6 @@ pub(super) fn catalog_fact(
         speed_multiplier: None,
         subscription_multiplier: None,
         score_provenance: ScoreProvenance::Override,
-        aa_index: None,
-        review_by_ms: None,
         eq_source: None,
         class_vector: None,
         class_vector_is_overlay: false,

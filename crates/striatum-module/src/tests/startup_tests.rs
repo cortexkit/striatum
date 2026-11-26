@@ -387,29 +387,11 @@ fn handles_covers_every_manifest_operation() {
             operation.name
         );
     }
-    assert!(handles(ROUTE_LIST_INFERRED_OP));
+    assert!(!handles("route.list_inferred"));
+    assert!(operations
+        .iter()
+        .all(|operation| operation.name != "route.list_inferred"));
     assert!(handles(ROUTE_LIST_UNSCORED_OP));
     assert!(handles(ROUTE_CATALOG_TARGETS_OP));
     assert!(!handles("route.unknown"));
-}
-
-#[tokio::test]
-async fn removed_aa_seed_operation_is_not_served() {
-    let rig = Rig::new("removed-aa-seed");
-    let store = Arc::new(rig.open_store());
-    assert!(!handles("route.model_seed_aa"));
-    assert!(served_operations()
-        .iter()
-        .all(|operation| operation.name != "route.model_seed_aa"));
-    let response = run_route_wire_request(
-        &store,
-        json!({
-            "method": "route.model_seed_aa",
-            "params": { "providerID": "custom", "modelID": "aa-live" }
-        }),
-    )
-    .await;
-    assert_eq!(response.header.ty, FrameType::Error);
-    let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
-    assert_eq!(body["code"], "unknown_method");
 }

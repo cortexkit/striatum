@@ -109,7 +109,7 @@ fn harness(specs: &[(&str, bool, bool, u64)]) -> Arc<Harness> {
     publish_order_runners(&mut credentials, &facts);
     harness.set_credentials(credentials);
     harness.edit_config(|config| {
-        config["consumers"]["prefrontal-core.mason"] = json!({"owner":"example-consumer"});
+        config["consumers"]["prefrontal.mason"] = json!({"owner":"example-consumer"});
         config["runners"] = json!([
             { "module": "zeta-runner" },
             { "module": "alpha-runner" }
@@ -181,7 +181,7 @@ async fn check_chat_classification(classification: Value, reason: &str) {
     harness.credentials().lock().unwrap().catalog_snapshot = Some(catalog);
     let route = harness.bind(reserved("example-consumer"), None).await;
     let automatic = route
-        .call("route.select", &select("prefrontal-core.mason"))
+        .call("route.select", &select("prefrontal.mason"))
         .await;
     let excluded = !reason.is_empty();
     assert_eq!(
@@ -195,7 +195,7 @@ async fn check_chat_classification(classification: Value, reason: &str) {
         let pinned = route
             .call(
                 "route.select",
-                &json!({"consumer": "prefrontal-core.mason", "requirements": {"iq": 30}, "pin": pin}),
+                &json!({"consumer": "prefrontal.mason", "requirements": {"iq": 30}, "pin": pin}),
             )
             .await;
         for reply in [pinned] {
@@ -234,7 +234,7 @@ async fn check_chat_classification(classification: Value, reason: &str) {
         let panel = route
             .call(
                 "route.select_panel",
-                &json!({"consumer": "prefrontal-core.mason", "class": "audit", "available_routes": [CHEAP, DEAR]}),
+                &json!({"consumer": "prefrontal.mason", "class": "audit", "available_routes": [CHEAP, DEAR]}),
             )
             .await;
         assert_eq!(panel.0, FrameType::Response, "{}", panel.1);
@@ -249,7 +249,7 @@ async fn check_chat_classification(classification: Value, reason: &str) {
         let sweep = operator
             .call(
                 "route.what_if",
-                &json!({"consumer": "prefrontal-core.mason", "iqs": [30]}),
+                &json!({"consumer": "prefrontal.mason", "iqs": [30]}),
             )
             .await;
         assert_eq!(sweep.0, FrameType::Response, "{}", sweep.1);
@@ -279,12 +279,12 @@ async fn check_chat_classification(classification: Value, reason: &str) {
 async fn task_profiles_use_the_recorded_workload_and_effective_iq_without_store_reads() {
     let harness = harness(&[(CHEAP, true, true, 200_000), (DEAR, true, true, 200_000)]);
     harness.edit_config(|config| {
-        config["consumers"]["prefrontal-core.mason"]["iq"] = json!(75);
+        config["consumers"]["prefrontal.mason"]["iq"] = json!(75);
         config["models"][CHEAP] = json!({"subscription_multiplier": 10_000.0});
     });
     let route = harness.bind(reserved("example-consumer"), None).await;
     let cold = route
-        .call("route.select", &select("prefrontal-core.mason"))
+        .call("route.select", &select("prefrontal.mason"))
         .await;
     assert_eq!(route_of(&cold), CHEAP);
 
@@ -297,12 +297,12 @@ async fn task_profiles_use_the_recorded_workload_and_effective_iq_without_store_
         .closed_task_usage(super::now_ms() as i64)
         .is_err());
     let profiles = super::profile_tests::lookup(
-        "prefrontal-core.mason",
+        "prefrontal.mason",
         75.0,
         &[(CHEAP, 10_000_000.0), (DEAR, 100_000.0)],
     );
     let answer = route
-        .select_with_profiles(&select("prefrontal-core.mason"), &profiles)
+        .select_with_profiles(&select("prefrontal.mason"), &profiles)
         .await
         .unwrap();
     assert_eq!(
@@ -319,7 +319,7 @@ async fn task_profiles_use_the_recorded_workload_and_effective_iq_without_store_
     assert_eq!(pricing["profile"]["taskCount"], 20);
     assert_eq!(pricing["valueMultiplier"], 1.0);
 
-    let mut pinned = select("prefrontal-core.mason");
+    let mut pinned = select("prefrontal.mason");
     pinned["pin"] = json!(CHEAP);
     let answer = route
         .select_with_profiles(&pinned, &profiles)
@@ -342,11 +342,11 @@ async fn task_profiles_use_the_recorded_workload_and_effective_iq_without_store_
 async fn a_compacted_selection_keeps_the_fields_core_reads() {
     let harness = harness(&[(CHEAP, true, true, 200_000), (DEAR, true, true, 200_000)]);
     harness.edit_config(|config| {
-        config["consumers"]["prefrontal-core.mason"]["iq"] = json!(75);
+        config["consumers"]["prefrontal.mason"]["iq"] = json!(75);
     });
     let route = harness.bind(reserved("example-consumer"), None).await;
     let reply = route
-        .call("route.select", &select("prefrontal-core.mason"))
+        .call("route.select", &select("prefrontal.mason"))
         .await;
     assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
     let decision = reply.1["result"]["decision_id"]
@@ -448,7 +448,7 @@ fn below_bar_harness() -> Arc<Harness> {
 async fn below_bar_policy_is_shared_by_select_and_what_if_and_bypassed_by_pins() {
     let harness = below_bar_harness();
     let route = harness.bind(reserved("example-consumer"), None).await;
-    let v1 = json!({"consumer": "prefrontal-core.mason", "requirements": {"iq": 80},
+    let v1 = json!({"consumer": "prefrontal.mason", "requirements": {"iq": 80},
         "exclude": ["strong-provider/top"], "detail": true});
 
     let refused = route.call("route.select", &v1).await;
@@ -456,7 +456,7 @@ async fn below_bar_policy_is_shared_by_select_and_what_if_and_bypassed_by_pins()
     assert_eq!(refused.1["detail"]["reason"], "all_inadequate");
 
     harness.edit_config(|config| {
-        config["consumers"]["prefrontal-core.mason"]["below_bar"] = json!("best_effort")
+        config["consumers"]["prefrontal.mason"]["below_bar"] = json!("best_effort")
     });
     let selected = route.call("route.select", &v1).await;
     assert_eq!(route_of(&selected), CHEAP);
@@ -470,10 +470,10 @@ async fn below_bar_policy_is_shared_by_select_and_what_if_and_bypassed_by_pins()
     );
 
     harness.edit_config(|config| {
-        config["consumers"]["prefrontal-core.mason"]["below_bar"] = json!("refuse");
-        config["consumers"]["prefrontal-core.mason.review"] = json!({});
+        config["consumers"]["prefrontal.mason"]["below_bar"] = json!("refuse");
+        config["consumers"]["prefrontal.mason.review"] = json!({});
     });
-    for consumer in ["prefrontal-core.mason", "prefrontal-core.mason.review"] {
+    for consumer in ["prefrontal.mason", "prefrontal.mason.review"] {
         let mut request = v1.clone();
         request["consumer"] = json!(consumer);
         let refused = route.call("route.select", &request).await;
@@ -505,8 +505,8 @@ async fn below_bar_policy_is_shared_by_select_and_what_if_and_bypassed_by_pins()
     }
 
     let operator = harness.bind(json!({"kind": "direct"}), None).await;
-    let sweep = json!({"consumer": "prefrontal-core.mason.review", "iqs": [80], "eq": 0,
-        "policy_patch": {"models": {"strong-provider/top": {"not_for": ["prefrontal-core.mason"]}}}});
+    let sweep = json!({"consumer": "prefrontal.mason.review", "iqs": [80], "eq": 0,
+        "policy_patch": {"models": {"strong-provider/top": {"not_for": ["prefrontal.mason"]}}}});
     let evaluation = operator.call("route.what_if", &sweep).await;
     assert_eq!(evaluation.0, FrameType::Response, "{}", evaluation.1);
     let row = &evaluation.1["result"]["results"][0];
@@ -532,13 +532,13 @@ async fn below_bar_policy_is_shared_by_select_and_what_if_and_bypassed_by_pins()
 async fn a_fresh_ladder_takes_the_first_allowed_entry_and_demand_takes_the_cheapest() {
     let harness = harness(&[(CHEAP, true, true, 200_000), (DEAR, true, true, 200_000)]);
     harness.edit_config(|config| {
-        config["consumers"]["prefrontal-core.mason"]["mode"] = json!("ladder");
-        config["consumers"]["prefrontal-core.mason"]["ladder"] = json!([DEAR, CHEAP]);
+        config["consumers"]["prefrontal.mason"]["mode"] = json!("ladder");
+        config["consumers"]["prefrontal.mason"]["ladder"] = json!([DEAR, CHEAP]);
         config["consumers"]["sidekick"]["mode"] = json!("demand");
     });
     let route = harness.bind(reserved("example-consumer"), None).await;
     let ladder = route
-        .call("route.select", &select("prefrontal-core.mason"))
+        .call("route.select", &select("prefrontal.mason"))
         .await;
     assert_eq!(route_of(&ladder), DEAR);
     let demand = route.call("route.select", &select("sidekick")).await;
@@ -552,12 +552,12 @@ async fn a_fresh_ladder_takes_the_first_allowed_entry_and_demand_takes_the_cheap
 async fn a_continuing_conversation_keeps_its_model_until_failure_or_exclusion() {
     let harness = harness(&[(CHEAP, true, true, 200_000), (DEAR, true, true, 200_000)]);
     harness.edit_config(|config| {
-        config["consumers"]["prefrontal-core.mason"]["mode"] = json!("ladder");
-        config["consumers"]["prefrontal-core.mason"]["ladder"] = json!([DEAR]);
-        config["models"][CHEAP]["not_for"] = json!(["prefrontal-core.mason"]);
+        config["consumers"]["prefrontal.mason"]["mode"] = json!("ladder");
+        config["consumers"]["prefrontal.mason"]["ladder"] = json!([DEAR]);
+        config["models"][CHEAP]["not_for"] = json!(["prefrontal.mason"]);
     });
     let route = harness.bind(reserved("example-consumer"), None).await;
-    let mut first = select("prefrontal-core.mason");
+    let mut first = select("prefrontal.mason");
     first["affinity"] = json!("conversation-1");
     let first = route.call("route.select", &first).await;
     assert_eq!(route_of(&first), DEAR);
@@ -565,9 +565,9 @@ async fn a_continuing_conversation_keeps_its_model_until_failure_or_exclusion() 
     // The earlier entry recovers, and a cheaper model is adequate. Affinity holds.
     harness.edit_config(|config| {
         config["models"][CHEAP]["not_for"] = json!([]);
-        config["consumers"]["prefrontal-core.mason"]["ladder"] = json!([CHEAP, DEAR]);
+        config["consumers"]["prefrontal.mason"]["ladder"] = json!([CHEAP, DEAR]);
     });
-    let mut sticky = select("prefrontal-core.mason");
+    let mut sticky = select("prefrontal.mason");
     sticky["affinity"] = json!("conversation-1");
     let again = route.call("route.select", &sticky).await;
     assert_eq!(route_of(&again), DEAR, "{}", again.1);
@@ -587,7 +587,7 @@ async fn a_continuing_conversation_keeps_its_model_until_failure_or_exclusion() 
     assert_eq!(route_of(&after_failure), CHEAP, "{}", after_failure.1);
 
     harness.edit_config(|config| {
-        config["models"][CHEAP]["not_for"] = json!(["prefrontal-core.mason"]);
+        config["models"][CHEAP]["not_for"] = json!(["prefrontal.mason"]);
     });
     let left = route.call("route.select", &sticky).await;
     assert_eq!(route_of(&left), DEAR, "{}", left.1);
@@ -607,14 +607,13 @@ async fn request_and_project_pins_beat_a_continuing_conversation_on_the_live_han
     let route = harness
         .bind(reserved("example-consumer"), Some("order-project"))
         .await;
-    let mut request = select("prefrontal-core.mason");
+    let mut request = select("prefrontal.mason");
     request["affinity"] = json!("pin-precedence");
     request["pin"] = json!(DEAR);
     assert_eq!(route_of(&route.call("route.select", &request).await), DEAR);
 
     harness.edit_config(|config| {
-        config["consumers"]["prefrontal-core.mason"]["projects"]["order-project"] =
-            json!({"pin": PIN});
+        config["consumers"]["prefrontal.mason"]["projects"]["order-project"] = json!({"pin": PIN});
     });
     request.as_object_mut().unwrap().remove("pin");
     assert_eq!(route_of(&route.call("route.select", &request).await), PIN);
@@ -636,19 +635,19 @@ async fn requirements_follow_tools_context_modality_and_the_pay_per_token_flag()
     let harness = harness(&[(CHEAP, false, false, 8_000), (DEAR, true, true, 200_000)]);
     let route = harness.bind(reserved("example-consumer"), None).await;
     let plain = route
-        .call("route.select", &select("prefrontal-core.mason"))
+        .call("route.select", &select("prefrontal.mason"))
         .await;
     assert_eq!(route_of(&plain), CHEAP);
 
-    let mut tools = select("prefrontal-core.mason");
+    let mut tools = select("prefrontal.mason");
     tools["requirements"]["tools"] = json!("required");
     assert_eq!(route_of(&route.call("route.select", &tools).await), DEAR);
 
-    let mut context = select("prefrontal-core.mason");
+    let mut context = select("prefrontal.mason");
     context["requirements"]["context_window"] = json!(100_000);
     assert_eq!(route_of(&route.call("route.select", &context).await), DEAR);
 
-    let mut image = select("prefrontal-core.mason");
+    let mut image = select("prefrontal.mason");
     image["requirements"]["modalities"] = json!(["image"]);
     let image = route.call("route.select", &image).await;
     assert_eq!(route_of(&image), DEAR);
@@ -667,16 +666,16 @@ async fn pay_per_token_follows_the_consumer_flag_not_the_name() {
     let route = harness.bind(reserved("example-consumer"), None).await;
 
     let open = route
-        .call("route.select", &select("prefrontal-core.mason"))
+        .call("route.select", &select("prefrontal.mason"))
         .await;
     assert_eq!(route_of(&open), CHEAP, "{}", open.1);
 
     harness.edit_config(|config| {
-        config["consumers"]["prefrontal-core.mason"]["pay_per_token"] = json!(true);
+        config["consumers"]["prefrontal.mason"]["pay_per_token"] = json!(true);
         config["providers"]["cheap-provider"]["subscription"] = json!(true);
     });
     let priced = route
-        .call("route.select", &select("prefrontal-core.mason"))
+        .call("route.select", &select("prefrontal.mason"))
         .await;
     assert_eq!(route_of(&priced), DEAR, "{}", priced.1);
 
@@ -727,15 +726,15 @@ async fn runner_choice_is_the_consumer_or_the_first_array_entry() {
         .bind(reserved("example-consumer"), Some("project-1"))
         .await;
     let reply = route
-        .call("route.select", &select("prefrontal-core.mason"))
+        .call("route.select", &select("prefrontal.mason"))
         .await;
     assert_eq!(reply.1["result"]["runner"]["module"], "zeta-runner");
 
     harness.edit_config(|config| {
-        config["consumers"]["prefrontal-core.mason"]["runner"] = json!("alpha-runner");
+        config["consumers"]["prefrontal.mason"]["runner"] = json!("alpha-runner");
     });
     let named = route
-        .call("route.select", &select("prefrontal-core.mason"))
+        .call("route.select", &select("prefrontal.mason"))
         .await;
     assert_eq!(named.1["result"]["runner"]["module"], "alpha-runner");
 }
@@ -748,11 +747,11 @@ async fn the_consumer_runner_must_reach_the_chosen_route() {
             {"module": "zeta-runner", "routes": [CHEAP]},
             {"module": "alpha-runner", "routes": [DEAR]}
         ]);
-        config["consumers"]["prefrontal-core.mason"]["runner"] = json!("alpha-runner");
+        config["consumers"]["prefrontal.mason"]["runner"] = json!("alpha-runner");
     });
     let route = harness.bind(reserved("example-consumer"), None).await;
     let answer = route
-        .call("route.select", &select("prefrontal-core.mason"))
+        .call("route.select", &select("prefrontal.mason"))
         .await;
     assert_eq!(route_of(&answer), DEAR);
     assert_eq!(answer.1["result"]["runner"]["module"], "alpha-runner");
@@ -766,7 +765,7 @@ async fn the_answer_carries_route_runner_variant_limits_decision_and_expiry() {
     let harness = harness(&[(CHEAP, true, true, 200_000)]);
     let route = harness.bind(reserved("example-consumer"), None).await;
     let reply = route
-        .call("route.select", &select("prefrontal-core.mason"))
+        .call("route.select", &select("prefrontal.mason"))
         .await;
     assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
     let result = &reply.1["result"];
@@ -841,11 +840,11 @@ async fn a_mason_runs_the_catalog_code_effort() {
     let harness = harness(&[(CHEAP, true, true, 200_000)]);
     seed_code_effort(&harness);
     harness.edit_config(|config| {
-        config["consumers"]["prefrontal-core.mason"]["workload"] = json!("code");
+        config["consumers"]["prefrontal.mason"]["workload"] = json!("code");
     });
     let route = harness.bind(reserved("example-consumer"), None).await;
     let v1 = route
-        .call("route.select", &select("prefrontal-core.mason"))
+        .call("route.select", &select("prefrontal.mason"))
         .await;
     assert_eq!(route_of(&v1), CHEAP);
     let result = &v1.1["result"];
@@ -864,12 +863,12 @@ async fn a_mason_runs_the_catalog_code_effort() {
     );
 
     let profiles = super::profile_tests::lookup(
-        "prefrontal-core.mason",
+        "prefrontal.mason",
         30.0,
         &[(CHEAP, 1_000.0), ("cheap-provider/model-a/xhigh", 2_000.0)],
     );
     let profiled = route
-        .select_with_profiles(&select("prefrontal-core.mason"), &profiles)
+        .select_with_profiles(&select("prefrontal.mason"), &profiles)
         .await
         .unwrap();
     assert_eq!(profiled["route"]["variant"], "xhigh");
@@ -943,7 +942,7 @@ async fn legacy_provider_reset_evidence_schedules_checks_on_select() {
             publish_order_runners(&mut credentials, &harness.store().get_facts().unwrap());
             harness.set_credentials(credentials);
             let route = harness.bind(reserved("example-consumer"), None).await;
-            let v1_select = select("prefrontal-core.mason");
+            let v1_select = select("prefrontal.mason");
             let first = route.call("route.select", &v1_select).await;
             assert_eq!(route_of(&first), CHEAP);
             let decision = &first.1["result"]["decision_id"];
@@ -990,17 +989,17 @@ async fn legacy_provider_reset_evidence_schedules_checks_on_select() {
             assert_eq!(
                 route_of(
                     &route
-                        .call("route.select", &select("prefrontal-core.mason"))
+                        .call("route.select", &select("prefrontal.mason"))
                         .await
                 ),
                 expected
             );
-            let mut pinned = select("prefrontal-core.mason");
+            let mut pinned = select("prefrontal.mason");
             pinned["pin"] = json!(CHEAP);
             let pinned = route.call("route.select", &pinned).await;
             if blocked {
                 assert_eq!(pinned.0, FrameType::Error, "{}", pinned.1);
-                let mut only_blocked = select("prefrontal-core.mason");
+                let mut only_blocked = select("prefrontal.mason");
                 only_blocked["exclude"] = json!([DEAR]);
                 let no_alternative = route.call("route.select", &only_blocked).await;
                 assert_eq!(no_alternative.0, FrameType::Error, "{}", no_alternative.1);
@@ -1024,7 +1023,7 @@ async fn legacy_provider_reset_evidence_schedules_checks_on_select() {
                 assert_eq!(
                     route_of(
                         &route
-                            .call("route.select", &select("prefrontal-core.mason"))
+                            .call("route.select", &select("prefrontal.mason"))
                             .await
                     ),
                     expected,
@@ -1051,7 +1050,7 @@ async fn decisions_freeze_the_selected_account_class() {
     let mut ids = Vec::new();
     for pay_per_token in [false, true] {
         harness.edit_config(|config| {
-            config["consumers"]["prefrontal-core.mason"]["pay_per_token"] = json!(pay_per_token)
+            config["consumers"]["prefrontal.mason"]["pay_per_token"] = json!(pay_per_token)
         });
         let expected = if pay_per_token {
             AllowedAccountClass::PricedPerTokenOnly
@@ -1059,7 +1058,7 @@ async fn decisions_freeze_the_selected_account_class() {
             AllowedAccountClass::NotPayPerToken
         };
         let v1 = route
-            .call("route.select", &select("prefrontal-core.mason"))
+            .call("route.select", &select("prefrontal.mason"))
             .await;
         assert_eq!(route_of(&v1), CHEAP);
         let id = v1.1["result"]["decision_id"].as_str().unwrap().to_owned();
@@ -1075,7 +1074,7 @@ async fn decisions_freeze_the_selected_account_class() {
         ids.push((id, expected));
     }
     harness.edit_config(|config| {
-        config["consumers"]["prefrontal-core.mason"]["pay_per_token"] = json!(false)
+        config["consumers"]["prefrontal.mason"]["pay_per_token"] = json!(false)
     });
     for (id, expected) in ids {
         assert_eq!(
@@ -1107,12 +1106,12 @@ async fn decision_stores_adequate_alternatives_in_rank_order_without_winner() {
     publish_order_runners(&mut credentials, &ranked);
     harness.set_credentials(credentials);
     harness.edit_config(|config| {
-        config["consumers"] = json!({"prefrontal-core.mason":{"owner":"example-consumer"}});
+        config["consumers"] = json!({"prefrontal.mason":{"owner":"example-consumer"}});
         config["runners"] = json!([{"module":"zeta-runner"}]);
     });
     let caller = harness.bind(reserved("example-consumer"), None).await;
     let reply = caller
-        .call("route.select", &select("prefrontal-core.mason"))
+        .call("route.select", &select("prefrontal.mason"))
         .await;
     assert_eq!(route_of(&reply), "rank/a", "{reply:?}");
     let decision = harness
@@ -1142,7 +1141,7 @@ async fn decision_rows_record_quota_signal_state_and_policy_revision() {
         harness.set_quota_cache_for_test(cache);
         let caller = harness.bind(reserved("example-consumer"), None).await;
         let reply = caller
-            .call("route.select", &select("prefrontal-core.mason"))
+            .call("route.select", &select("prefrontal.mason"))
             .await;
         assert_eq!(reply.0, FrameType::Response, "{reply:?}");
         let row = harness
@@ -1182,7 +1181,7 @@ async fn refusal_decision_row_carries_per_candidate_rejections() {
     let reply = caller
         .call(
             "route.select",
-            &json!({"consumer":"prefrontal-core.mason",
+            &json!({"consumer":"prefrontal.mason",
         "requirements":{"iq":30,"modalities":["image"]}}),
         )
         .await;
@@ -1222,7 +1221,7 @@ async fn third_session_error_writes_backoff_active_into_refusal_decision_ledger(
             .store()
             .record_decision(&striatum_core::DecisionInput {
                 decision_id: Some(format!("session-error-{failure}")),
-                target_agent: "prefrontal-core.mason".into(),
+                target_agent: "prefrontal.mason".into(),
                 requirements_json: "{\"iq\":30,\"eq\":0}".into(),
                 selected_route_key: Some(CHEAP.into()),
                 selected_provider_id: Some("cheap-provider".into()),
@@ -1249,7 +1248,7 @@ async fn third_session_error_writes_backoff_active_into_refusal_decision_ledger(
     }
     let caller = harness.bind(reserved("example-consumer"), None).await;
     let reply = caller
-        .call("route.select", &select("prefrontal-core.mason"))
+        .call("route.select", &select("prefrontal.mason"))
         .await;
     assert_eq!(reply.0, FrameType::Error, "{reply:?}");
     let summaries = harness
@@ -1294,7 +1293,7 @@ async fn third_session_error_writes_backoff_active_into_refusal_decision_ledger(
     assert_eq!(
         route_of(
             &caller
-                .call("route.select", &select("prefrontal-core.mason"))
+                .call("route.select", &select("prefrontal.mason"))
                 .await
         ),
         CHEAP
@@ -1321,7 +1320,7 @@ async fn third_session_error_writes_backoff_active_into_refusal_decision_ledger(
         .by_route[CHEAP]
         .clone();
     let blocked = caller
-        .call("route.select", &select("prefrontal-core.mason"))
+        .call("route.select", &select("prefrontal.mason"))
         .await;
     assert_eq!(blocked.0, FrameType::Error, "{blocked:?}");
     let cleared = caller
@@ -1349,7 +1348,7 @@ async fn third_session_error_writes_backoff_active_into_refusal_decision_ledger(
     assert_eq!(after.failure_backoff_until, before.failure_backoff_until);
     assert_eq!(after.failure_backoff_reason, before.failure_backoff_reason);
     let selected = caller
-        .call("route.select", &select("prefrontal-core.mason"))
+        .call("route.select", &select("prefrontal.mason"))
         .await;
     assert_eq!(route_of(&selected), CHEAP);
     assert!(!selected.1["result"]["explanation"]

@@ -64,8 +64,8 @@ fn one_account() -> Arc<Harness> {
     harness.edit_config(|config| {
         config["runners"] = json!([{"module":"broca", "via_vault":true}]);
         config["consumers"] = json!({
-            "prefrontal-core.mason":{"owner":"prefrontal-core", "mode":"demand"},
-            "prefrontal-core.sidekick.map":{"owner":"prefrontal-core", "mode":"demand"}
+            "prefrontal.mason":{"owner":"prefrontal", "mode":"demand"},
+            "prefrontal.sidekick.map":{"owner":"prefrontal", "mode":"demand"}
         });
     });
     harness
@@ -89,9 +89,9 @@ async fn expired_transient_backoff_with_inflight_probe_refuses_fresh_sidekick_se
     let harness = one_account();
     let runner = harness.bind(reserved("broca"), None).await;
     let owner = harness
-        .bind(reserved("prefrontal-core"), Some("pj-backoff-reproduction"))
+        .bind(reserved("prefrontal"), Some("pj-backoff-reproduction"))
         .await;
-    let select = json!({"consumer":"prefrontal-core.sidekick.map",
+    let select = json!({"consumer":"prefrontal.sidekick.map",
         "requirements":{"iq":45,"eq":0}});
     let before = owner.call("route.select", &select).await;
     assert_eq!(before.0, FrameType::Response, "{}", before.1);
@@ -117,7 +117,7 @@ async fn expired_transient_backoff_with_inflight_probe_refuses_fresh_sidekick_se
     let probe_at = backoff_at + 51_650;
     let _probe = crate::InjectedClock::set(probe_at);
     let mut mason_select = select.clone();
-    mason_select["consumer"] = json!("prefrontal-core.mason");
+    mason_select["consumer"] = json!("prefrontal.mason");
     let selected = owner.call("route.select", &mason_select).await;
     assert_eq!(selected.0, FrameType::Response, "{}", selected.1);
     let mut probe = admission("probe-run");
@@ -210,8 +210,9 @@ async fn expired_transient_backoff_with_inflight_probe_refuses_fresh_sidekick_se
         account_wait.1
     );
     assert_eq!(
-        account_wait.1["detail"]["reset_at_ms"], origin.next_recheck_at,
-        "account_for retains its separate admission hint in this slice: {}",
+        account_wait.1["detail"]["reset_at_ms"],
+        select_at + 30_000,
+        "account_for gives the same check-again hint: {}",
         account_wait.1
     );
     let conn = rusqlite::Connection::open(harness.store_path()).unwrap();

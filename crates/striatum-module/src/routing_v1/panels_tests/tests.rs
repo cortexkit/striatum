@@ -105,7 +105,7 @@ async fn panel_shortfall_detail_retains_package_exclusion_and_availability_evide
         .any(|c| c["model"] == routes[2] && c["reason"] == "unavailable"));
     let stored: Value = serde_json::from_str(
         &h.store()
-            .v1_panel(&answer.panel_id, "reserved:prefrontal-core")
+            .v1_panel(&answer.panel_id, "reserved:prefrontal")
             .unwrap()
             .unwrap(),
     )

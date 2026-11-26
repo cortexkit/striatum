@@ -5,22 +5,22 @@ handler. The catalog, credentials, clock and decision IDs are deterministic
 test fixtures; the replies are not normalized or rewritten after capture.
 
 The fixture has Opus 5.5 and Fable 5.2 on an eligible runner, with equal
-capability and quality. Opus is `pin_only_for: ["prefrontal-core.athena"]`. The operator sets
-`consumers["prefrontal-core.athena.synthesizer"].pin` to
+capability and quality. Opus is `pin_only_for: ["prefrontal.athena"]`. The operator sets
+`consumers["prefrontal.athena.synthesizer"].pin` to
 `{model: "anthropic/claude-opus-5-5", variant: "medium"}`. No request carries
 a pin.
 
-| Pair | What core can rely on |
+| Pair | What the caller can rely on |
 | --- | --- |
 | `pinned-chair` | The chair consumer selects exactly Opus 5.5 medium through explicit pin admission. |
-| `unpinned` | The Athena consumer has no settings pin and selects Fable automatically; Opus remains pin-only. |
+| `unpinned` | The panel consumer has no settings pin and selects Fable automatically; Opus remains pin-only. |
 | `pin-unavailable` | Changing the settings pin to the absent `anthropic/missing` model refuses with `pin_unavailable`, reason `unknown_model`; Fable is not substituted. |
 
 The answer explanation identifies the consumer's operator pin. Per
 `cortexkit-role-routing` 0.7.23 CONTRACT §5.2, `pin_outcome` is present exactly
 when the **request** pinned, so it is absent from these settings-only answers.
 The successful samples pass that crate's `check_answer_serving` against the
-original, unpinned requests. Core should use the returned route and runner
+original, unpinned requests. The caller should use the returned route and runner
 as-is instead of selecting a different route for the chair.
 
 Regenerate intentionally from the repository root:

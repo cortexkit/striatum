@@ -490,11 +490,11 @@ impl Consumer {
 
     pub(crate) const fn id(self) -> &'static str {
         match self {
-            Consumer::Mason => "prefrontal-core.mason",
-            Consumer::Sidekick => "prefrontal-core.sidekick",
-            Consumer::Athena => "prefrontal-core.athena",
-            Consumer::Lab => "prefrontal-core.lab",
-            Consumer::Core => "prefrontal-core.wake",
+            Consumer::Mason => "prefrontal.mason",
+            Consumer::Sidekick => "prefrontal.sidekick",
+            Consumer::Athena => "prefrontal.athena",
+            Consumer::Lab => "prefrontal.lab",
+            Consumer::Core => "prefrontal.wake",
             Consumer::Codemode => "basal.codemode",
             Consumer::Flow => "basal.flow",
         }

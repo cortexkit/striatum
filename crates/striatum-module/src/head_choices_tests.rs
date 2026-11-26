@@ -1012,7 +1012,7 @@ async fn bind_operator(
         "principal":principal,
     });
     if scoped {
-        bind["scope"] = json!({"owner":reserved("prefrontal-core"),"ref":"head-scope", "scope_epoch":1,"kind":"head","owner_authorized":true});
+        bind["scope"] = json!({"owner":reserved("prefrontal"),"ref":"head-scope", "scope_epoch":1,"kind":"head","owner_authorized":true});
     }
     harness.bind_frame(bind, channel, 1).await
 }
@@ -1380,8 +1380,8 @@ async fn golden_login_policy_narrows_picks_panels_picker_and_account_admission()
     harness.install_facts(&facts);
     harness.edit_config(|config| {
         config["runners"] = json!([{"module":"broca","via_vault":true}]);
-        config["consumers"]["athena"] = json!({"owner":"prefrontal-core"});
-        config["consumers"]["head"] = json!({"owner":"prefrontal-core"});
+        config["consumers"]["athena"] = json!({"owner":"prefrontal"});
+        config["consumers"]["head"] = json!({"owner":"prefrontal"});
         config["panels"]["audit"] = json!({"top_k":3,"by":"iq","extra":0,"floor":0});
     });
     let now = crate::now_ms();
@@ -1413,7 +1413,7 @@ async fn golden_login_policy_narrows_picks_panels_picker_and_account_admission()
         now,
     );
     let operator = harness.bind(json!({"kind":"direct"}), None).await;
-    let owner = harness.bind(reserved("prefrontal-core"), None).await;
+    let owner = harness.bind(reserved("prefrontal"), None).await;
     declare_picker_runner(
         &mut credentials,
         "broca",

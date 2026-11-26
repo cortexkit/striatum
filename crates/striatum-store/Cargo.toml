@@ -2,6 +2,8 @@
 name = "striatum-store"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
+repository = "https://github.com/cortexkit/striatum"
 publish = false
 description = "SQLite backend for the route-state store: implements striatum-core's RouteStateStore domain trait over the shared cortexkit-store lib (single-writer lease + namespace-keyed migrations). The pure -core crate stays rusqlite-free; this is where the backend lives. A postgres sibling is a clean drop-in later."
 

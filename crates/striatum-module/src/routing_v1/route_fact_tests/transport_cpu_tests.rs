@@ -5,8 +5,8 @@ use super::*;
 #[ignore = "one-minute seam idle and 160 observations/minute CPU measurement"]
 async fn fact_transport_cpu_at_live_rate() {
     let (harness, _runner, _) = fixture().await;
-    harness.edit_config(|config| config["consumers"]["mason"]["owner"] = json!("prefrontal-core"));
-    let owner = harness.bind(reserved("prefrontal-core"), None).await;
+    harness.edit_config(|config| config["consumers"]["mason"]["owner"] = json!("prefrontal"));
+    let owner = harness.bind(reserved("prefrontal"), None).await;
     let selected = result(
         owner
             .call(
@@ -76,13 +76,7 @@ async fn fact_transport_cpu_at_live_rate() {
         worst_ms = worst_ms.max(start.elapsed().as_secs_f64() * 1000.);
         if number % 8 == 0 {
             let report = json!({"op":"route.report", "params":{"decision_id":selected["decision_id"], "outcome":"completed", "usage":{"run_id":format!("report-{number}"), "output_tokens":20}}});
-            let bytes = publish(
-                &bus,
-                "prefrontal-core",
-                &format!("report-{number}"),
-                &report,
-            )
-            .await;
+            let bytes = publish(&bus, "prefrontal", &format!("report-{number}"), &report).await;
             let start = std::time::Instant::now();
             consume(&handler, &mut cursor, &bytes).await;
             crate::quota_events::observe_binding(

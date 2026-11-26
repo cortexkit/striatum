@@ -327,7 +327,7 @@ async fn routing_consumer_legacy_calls_and_mixed_shapes_are_counted_by_principal
             &json!({"targetAgent":"mason","settings":{}}),
         )
         .await;
-    let other = harness.bind(reserved("prefrontal-core"), None).await;
+    let other = harness.bind(reserved("prefrontal"), None).await;
     other
         .call(
             "route.model_fact",
@@ -345,6 +345,6 @@ async fn routing_consumer_legacy_calls_and_mixed_shapes_are_counted_by_principal
         .any(|c| c.method == "route.select" && c.shape == "mixed" && c.calls == 1));
     assert!(counts.counts.iter().any(|c| c.method == "route.model_fact"
         && c.shape == "legacy"
-        && c.principal == "reserved:prefrontal-core"
+        && c.principal == "reserved:prefrontal"
         && c.calls == 1));
 }

@@ -1,6 +1,6 @@
 # `route.select` search v1 wire pairs
 
-These synthetic Plexus fixtures are captured from striatum's real frame handler,
+These synthetic search-module fixtures are captured from striatum's real frame handler,
 using `cortexkit-role-routing` 0.7.32 and `cortexkit-role-routing-conformance`
 0.10.36. Final verification uses conformance 0.10.37. Its `placement_consumer_declarations`
 case declares a search route through the `search-provider/v1` slot, sends a

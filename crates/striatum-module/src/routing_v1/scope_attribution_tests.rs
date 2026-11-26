@@ -63,7 +63,7 @@ async fn scoped(
     });
     if project.is_some() || workdir.is_some() {
         let mut stamp = json!({
-            "owner": { "kind": "reserved", "module_id": "prefrontal-core" },
+            "owner": { "kind": "reserved", "module_id": "prefrontal" },
             "ref": format!("scope-{channel}"),
             "scope_epoch": 1,
             "kind": "ephemeral",

@@ -1,6 +1,7 @@
 # Local RoutingConsumer test bodies
 
-Source revision: `428d689f6330b53ae2e23bfb39f68d179db4782b` in this worktree.
+Source: the agent runtime's repository at commit
+`428d689f6330b53ae2e23bfb39f68d179db4782b`.
 These JSON params are transcribed from checked-in tests, not captured traffic.
 Undefined JavaScript members are omitted as they are by `JSON.stringify`.
 
@@ -18,11 +19,11 @@ Undefined JavaScript members are omitted as they are by `JSON.stringify`.
 The test imports the re-export in `packages/opencode/.../routing-consumer.ts`,
 which points to `packages/core/src/features/model-routing/routing-consumer.ts`.
 The latter's methods construct these routing requests at lines 189–439. It
-contains no `route.explain` call. `manager.concurrency_slots` belongs to core,
+contains no `route.explain` call. `manager.concurrency_slots` belongs to the agent runtime,
 not routing, so it is not a routing corpus operation.
 
 The implementation also exposes `route.clear_failure_backoff`. The plugin's test suite
 has no test that asserts or captures a request body for that method. It remains an
 explicit blocked method rather than an invented example. The fixture uses a
-synthetic core-owned route; it does not document which principal the live plugin
+synthetic runtime-owned route; it does not document which principal the live plugin
 used or which session and project identity fields it sent.

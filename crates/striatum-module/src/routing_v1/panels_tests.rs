@@ -40,9 +40,9 @@ async fn configured() -> (Arc<Harness>, Route, Value) {
     install_panel_families(&h, &catalog);
     h.edit_config(|c| {
         c["panels"]["audit"] = json!({"top_k":2,"by":"iq","extra":0,"floor":0});
-        c["consumers"][fixture::SUMMARY] = json!({"owner":"prefrontal-core"});
+        c["consumers"][fixture::SUMMARY] = json!({"owner":"prefrontal"});
     });
-    let route = h.bind(reserved("prefrontal-core"), None).await;
+    let route = h.bind(reserved("prefrontal"), None).await;
     let request = json!({"class":"audit","consumer":fixture::SUMMARY,"available_routes":routes,"temperatures":[0.2,0.9],"seed":"fixed"});
     (h, route, request)
 }
@@ -80,9 +80,9 @@ async fn panel_ranks_only_models_reached_by_the_consumer_runners() {
     h.edit_config(|c| {
         c["panels"]["audit"] = json!({"top_k":1,"by":"iq","extra":0,"floor":100});
         c["consumers"][fixture::SUMMARY] =
-            json!({"owner":"prefrontal-core","runners":[{"module":runner,"routes":[allowed]}]});
+            json!({"owner":"prefrontal","runners":[{"module":runner,"routes":[allowed]}]});
     });
-    let route = h.bind(reserved("prefrontal-core"), None).await;
+    let route = h.bind(reserved("prefrontal"), None).await;
     let answer = panel(
         &route,
         &json!({"class":"audit","consumer":fixture::SUMMARY,
@@ -148,7 +148,7 @@ async fn new_panel_inserts_final_state_without_update() {
     assert_eq!(writes, ["insert"]);
     let retained: Value = serde_json::from_str(
         &h.store()
-            .v1_panel(&answer.panel_id, "reserved:prefrontal-core")
+            .v1_panel(&answer.panel_id, "reserved:prefrontal")
             .unwrap()
             .unwrap(),
     )
@@ -203,7 +203,7 @@ async fn same_panel_replacements_serialize_and_consume_each_others_history() {
     );
     let retained: Value = serde_json::from_str(
         &h.store()
-            .v1_panel(&answer.panel_id, "reserved:prefrontal-core")
+            .v1_panel(&answer.panel_id, "reserved:prefrontal")
             .unwrap()
             .unwrap(),
     )
@@ -321,7 +321,7 @@ async fn panel_seats_are_independent_retained_decisions_and_replace_without_cycl
     drop(foreign);
     drop(route);
     let h = upgrade_harness(h);
-    let route = h.bind(reserved("prefrontal-core"), None).await;
+    let route = h.bind(reserved("prefrontal"), None).await;
     let parsed =
         parse_select_panel_request_serving(&request, super::describe::CAPABILITIES).unwrap();
     let mut state = PanelState::new(parsed, answer.clone());
@@ -417,7 +417,7 @@ async fn panel_replacement_package_cause_preserves_the_standing_seat() {
     let request = PanelReplacementRequest::new(&answer.panel_id, previous.slot);
     let standing = h
         .store()
-        .v1_panel(&answer.panel_id, "reserved:prefrontal-core")
+        .v1_panel(&answer.panel_id, "reserved:prefrontal")
         .unwrap();
     let reply = route
         .call(
@@ -442,7 +442,7 @@ async fn panel_replacement_package_cause_preserves_the_standing_seat() {
     );
     assert_eq!(
         h.store()
-            .v1_panel(&answer.panel_id, "reserved:prefrontal-core")
+            .v1_panel(&answer.panel_id, "reserved:prefrontal")
             .unwrap(),
         standing
     );
@@ -629,9 +629,9 @@ async fn panel_athena_and_spec_match_frozen_seats_variants_and_budgets() {
     }
     h.edit_config(|c| {
         c["demand_exponent"] = json!(1.0);
-        c["consumers"]["athena"] = json!({"owner":"prefrontal-core"});
+        c["consumers"]["athena"] = json!({"owner":"prefrontal"});
     });
-    let route = h.bind(reserved("prefrontal-core"), None).await;
+    let route = h.bind(reserved("prefrontal"), None).await;
     for case in frozen["panels"].as_array().unwrap() {
         let old = &case["request"];
         let request = json!({"class":old["panelSpec"]["class"].as_str().unwrap().to_ascii_lowercase(),"consumer":"athena","available_routes":old["availableModels"],"seed":old["seed"],"task_ref":old["taskId"],"runners":["broca"]});

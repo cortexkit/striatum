@@ -681,8 +681,8 @@ async fn account_service_tier_legacy_standard_decision_without_v1_row_admits() {
         .seed_preupgrade_decision_for_test(
             &striatum_store::V1Decision {
                 decision_id: decision_id.into(),
-                principal: "reserved:prefrontal-core".into(),
-                consumer: "prefrontal-core.mason".into(),
+                principal: "reserved:prefrontal".into(),
+                consumer: "prefrontal.mason".into(),
                 allowed_account_class: Default::default(),
                 project_id: None,
                 provider: request["provider"].as_str().unwrap().into(),
@@ -1440,7 +1440,7 @@ async fn stamped_legacy_panel_inherits_daemon_project_tier() {
     let daemon = harness.project_daemon().await;
     daemon.set(
         ID,
-        json!({"consumers":{"prefrontal-core.athena":{"service_tier":"fast"}}}),
+        json!({"consumers":{"prefrontal.athena":{"service_tier":"fast"}}}),
     );
     let excluded: Vec<_> = harness
         .store()
@@ -1464,7 +1464,7 @@ async fn service_tier_user_settings_reach_legacy_panel_members() {
     let (harness, _) = setup(&["pro_500"], true, true);
     harness.edit_config(|config| {
         config["panels"]["audit"] = json!({"top_k":1,"by":"iq"});
-        config["consumers"]["prefrontal-core.athena"]["service_tier"] = json!("fast");
+        config["consumers"]["prefrontal.athena"]["service_tier"] = json!("fast");
     });
     let excluded: Vec<_> = harness
         .store()

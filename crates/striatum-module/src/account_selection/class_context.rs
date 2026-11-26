@@ -2748,9 +2748,36 @@ impl ClassContext {
         hold_ok: bool,
         wait: Option<u64>,
         conversation: &str,
-        mut policy: AllocatorPolicy,
+        policy: AllocatorPolicy,
     ) -> Decision {
-        let mut request = synthetic_request(provider, model, conversation.into());
+        self.probe_with_policy_for(
+            provider,
+            model,
+            priced,
+            hold_ok,
+            wait,
+            conversation,
+            policy,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn probe_with_policy_for(
+        &self,
+        provider: &str,
+        model: &str,
+        priced: bool,
+        hold_ok: bool,
+        wait: Option<u64>,
+        conversation: &str,
+        mut policy: AllocatorPolicy,
+        admission: Option<(&AccountForParams, &str)>,
+    ) -> Decision {
+        let mut request = admission.map_or_else(
+            || synthetic_request(provider, model, conversation.into()),
+            |(params, _)| params.request(conversation, false),
+        );
         if let Some(wait) = wait {
             request.hold_wait_max_s = wait;
         }
@@ -2776,10 +2803,31 @@ impl ClassContext {
                 lease_active: true,
             })
         });
+        let mut roster = self.roster_for(provider, model, priced);
+        if let Some((params, credential)) = admission {
+            self.restrict_size(
+                &mut roster,
+                provider,
+                model,
+                params
+                    .request_input_tokens
+                    .unwrap_or_else(|| params.initial_input_bytes.div_ceil(4)),
+            );
+            if let Some(roster) = &mut roster.roster {
+                for account in &mut roster.accounts {
+                    account
+                        .credentials
+                        .retain(|row| row.credential_id == credential);
+                }
+                roster
+                    .accounts
+                    .retain(|account| !account.credentials.is_empty());
+            }
+        }
         striatum_core::accounts::decide_with_context(
             &request,
             &AllocatorState {
-                roster: self.roster_for(provider, model, priced).roster,
+                roster: roster.roster,
                 affinity,
                 fences: self.probe_fences(
                     provider,

@@ -327,7 +327,7 @@ fn admit_params(admission_id: &str, key: &str, runner: &str) -> Value {
         "model": "claude-opus-5-5",
         "affinity_model": "claude-opus-5-5",
         "conversation_key": key,
-        "caller": { "runner": runner, "harness": "prefrontal-core" },
+        "caller": { "runner": runner, "harness": "prefrontal" },
         "admission_id": admission_id,
         "mode": "admit",
         "expected_pin": null,

@@ -169,8 +169,8 @@ async fn capture_panel(all_full: bool, replacement: bool) -> Sample {
     install_panel_families(&harness, &catalog);
     assert_eq!(harness.store().get_facts().unwrap().len(), 3);
     harness.edit_config(|config| {
-        config["consumers"] = json!({"prefrontal-core.athena":{
-            "owner":"prefrontal-core","pay_per_token":true}});
+        config["consumers"] = json!({"prefrontal.athena":{
+            "owner":"prefrontal","pay_per_token":true}});
         config["panels"]["audit"] =
             json!({"top_k":if replacement { 2 } else { 3 },"by":"iq","extra":0,"floor":0});
         config["runners"] = json!([{"module":"broca","via_vault":true}]);
@@ -179,8 +179,8 @@ async fn capture_panel(all_full: bool, replacement: bool) -> Sample {
             "synthetic-2":{"limit":1}}});
     });
     let runner = harness.bind(reserved("broca"), None).await;
-    let consumer = harness.bind(reserved("prefrontal-core"), None).await;
-    let select_params = json!({"class":"audit","consumer":"prefrontal-core.athena",
+    let consumer = harness.bind(reserved("prefrontal"), None).await;
+    let select_params = json!({"class":"audit","consumer":"prefrontal.athena",
         "available_routes":routes,"runners":["broca"],"seed":"fixed"});
     let replacement_params = if replacement {
         let selected = consumer.call("route.select_panel", &select_params).await;

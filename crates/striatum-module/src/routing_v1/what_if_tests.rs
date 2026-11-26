@@ -777,9 +777,9 @@ async fn panel_harness() -> (std::sync::Arc<Harness>, Route, Vec<String>) {
     super::conformance_tests::install_panel_families(&harness, &catalog);
     harness.edit_config(|c| {
         c["panels"]["audit"] = json!({"top_k":2,"by":"iq","extra":1,"extra_by":"random","floor":0});
-        c["consumers"][fixture::SUMMARY] = json!({"owner":"prefrontal-core"});
+        c["consumers"][fixture::SUMMARY] = json!({"owner":"prefrontal"});
     });
-    let owner = harness.bind(reserved("prefrontal-core"), None).await;
+    let owner = harness.bind(reserved("prefrontal"), None).await;
     (harness, owner, routes)
 }
 
@@ -983,7 +983,7 @@ async fn what_if_all_panel_classes_keep_the_floor_when_strong_families_are_walle
         .map(|index| {
             (
                 format!("cpu-provider-0/model-{index}"),
-                json!({"not_for":["prefrontal-core.athena","prefrontal-core.lab"]}),
+                json!({"not_for":["prefrontal.athena","prefrontal.lab"]}),
             )
         })
         .collect();

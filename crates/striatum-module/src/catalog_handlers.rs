@@ -140,8 +140,6 @@ pub(super) fn merge_model_upsert(
                 speed_multiplier: None,
                 subscription_multiplier: None,
                 score_provenance: ScoreProvenance::Curated,
-                aa_index: None,
-                review_by_ms: None,
                 eq_source: None,
                 class_vector: None,
                 class_vector_is_overlay: false,
@@ -624,68 +622,6 @@ pub(super) fn panel_canonical_ids(
                 .map(|canonical_id| (route_key, canonical_id.clone()))
         })
         .collect())
-}
-
-fn list_inferred_json(
-    store: &SqliteRouteStateStore,
-    now_ms: i64,
-) -> Result<serde_json::Value, String> {
-    let inferred = store
-        .list_inferred_rows(now_ms)
-        .map_err(|error| error.to_string())?;
-    let unscored = store
-        .list_unscored_rows()
-        .map_err(|error| error.to_string())?;
-    Ok(json!({
-        "inferred": inferred,
-        "unscored": unscored,
-    }))
-}
-
-pub(super) async fn handle_list_inferred(
-    frame: Frame,
-    writer: &mpsc::Sender<Frame>,
-    store: &SharedStore,
-) -> Result<(), ModuleError> {
-    let (ver, channel, epoch, corr) = (
-        frame.header.ver,
-        frame.header.channel,
-        frame.header.epoch,
-        frame.header.corr,
-    );
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
-    match list_inferred_json(store, now) {
-        Ok(result) => {
-            let body =
-                serde_json::to_vec(&json!({ "result": result })).map_err(ModuleError::Json)?;
-            let response = Frame::build_with_version(
-                ver,
-                FrameType::Response,
-                Flags::new(false, Priority::Interactive, false),
-                channel,
-                epoch,
-                corr,
-                body,
-            )
-            .map_err(|error| ModuleError::Message(error.to_string()))?;
-            send(writer, response).await
-        }
-        Err(error) => {
-            send_route_error(
-                writer,
-                ver,
-                channel,
-                epoch,
-                corr,
-                "store_error",
-                &format!("list_inferred: {error}"),
-            )
-            .await
-        }
-    }
 }
 
 pub(super) async fn handle_list_unscored(

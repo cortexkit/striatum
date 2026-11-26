@@ -4319,9 +4319,9 @@ mod tests {
         install_panel_families(&harness, &catalog);
         harness.edit_config(|config| {
             config["panels"]["audit"] = json!({"top_k":2,"by":"iq","extra":0,"floor":0});
-            config["consumers"][fixture::SUMMARY] = json!({"owner":"prefrontal-core"});
+            config["consumers"][fixture::SUMMARY] = json!({"owner":"prefrontal"});
         });
-        let route = harness.bind(reserved("prefrontal-core"), None).await;
+        let route = harness.bind(reserved("prefrontal"), None).await;
         let routes: Vec<_> = catalog
             .models
             .iter()
@@ -4475,7 +4475,7 @@ mod tests {
         install_panel_families(&harness, &catalog);
         harness.edit_config(|config| {
             config["panels"]["audit"] = json!({"top_k":2,"by":"iq","extra":0,"floor":0});
-            config["consumers"][fixture::SUMMARY] = json!({"owner":"prefrontal-core"});
+            config["consumers"][fixture::SUMMARY] = json!({"owner":"prefrontal"});
         });
         *crate::ACCOUNT_QUOTA.get().unwrap().lock().unwrap() = Default::default();
         let fenced = &catalog.models[0];
@@ -4491,7 +4491,7 @@ mod tests {
                 recorded_at: reported,
             })
             .unwrap();
-        let route = harness.bind(reserved("prefrontal-core"), None).await;
+        let route = harness.bind(reserved("prefrontal"), None).await;
         let routes: Vec<_> = catalog
             .models
             .iter()

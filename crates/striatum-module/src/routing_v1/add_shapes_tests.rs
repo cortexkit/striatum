@@ -25,7 +25,7 @@ async fn explain_every_legacy_spelling_and_contract_marker_dispatch() {
             &striatum_store::V1Decision {
                 decision_id: "historical-shapes".into(),
                 principal: "reserved:example-consumer".into(),
-                consumer: "prefrontal-core.mason".into(),
+                consumer: "prefrontal.mason".into(),
                 allowed_account_class: Default::default(),
                 project_id: None,
                 provider: "example-provider".into(),

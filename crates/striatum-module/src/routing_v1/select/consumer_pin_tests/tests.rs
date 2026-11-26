@@ -14,7 +14,7 @@ async fn capture(stem: &str) -> [(String, Vec<u8>); 2] {
     let _ids = striatum_store::replay::Inputs::new(NOW as i64).install();
     let (harness, route) = configured(CHAIR).await;
     let consumer = if stem == "unpinned" {
-        "prefrontal-core.athena"
+        "prefrontal.athena"
     } else {
         CHAIR
     };

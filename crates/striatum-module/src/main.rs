@@ -225,9 +225,7 @@ const QUOTA_STATUS_OP: &str = "route.quota_status";
 /// band, its vault join and why its reading can or cannot be used for cold work,
 /// plus roster gaps. Read-only; nothing selects an account from it yet.
 const ROUTE_ACCOUNT_QUOTA_STATUS_OP: &str = "route.account_quota_status";
-/// Operator worklist: every `aa_inferred` row plus unscored catalog rows.
-const ROUTE_LIST_INFERRED_OP: &str = "route.list_inferred";
-/// Focused alias for operators that only need never-scored Fusiform discoveries.
+/// Operator worklist for served catalog rows still awaiting a score.
 const ROUTE_LIST_UNSCORED_OP: &str = "route.list_unscored";
 /// Operator worklist for Fusiform: scored routes whose catalog row states no
 /// canonical model id, so their score is not shared across the model's routes.
@@ -665,7 +663,6 @@ pub(crate) fn handles(method: &str) -> bool {
             | ROUTE_CATALOG_TARGETS_OP
             | ROUTE_HEAD_CHOICES_OP
             | ROUTE_MODEL_UPSERT_OP
-            | ROUTE_LIST_INFERRED_OP
             | ROUTE_LIST_UNSCORED_OP
             | ROUTE_LIST_CANONICAL_GAPS_OP
             | ROUTE_SELECT_PANEL_OP
@@ -758,13 +755,6 @@ pub(crate) fn served_operations() -> Vec<ManagementOperation> {
             name: ROUTE_MODEL_UPSERT_OP.to_string(),
             kind: ManagementOperationKind::Mutate,
             description: None,
-        },
-        ManagementOperation {
-            name: ROUTE_LIST_INFERRED_OP.to_string(),
-            kind: ManagementOperationKind::Query,
-            description: Some(
-                "List aa_inferred scores and unscored catalog rows for hand review".to_string(),
-            ),
         },
         ManagementOperation {
             name: ROUTE_LIST_UNSCORED_OP.to_string(),

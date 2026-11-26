@@ -1,6 +1,6 @@
 # route.account_status v1
 
-Producer: **routing** (`striatum`). Consumer: **Broca**, through the
+Producer: **routing** (`striatum`). Consumer: **the worker runner**, through the
 same runner management route used for `route.account_for`.
 
 Each JSON file contains a wire request and reply. The examples use routing's
@@ -15,7 +15,7 @@ The request takes the producer's `apiProvider` (routing's vendor id) and the
 vault account id, not the feed's producer name (for example `openai`, not
 `codex`). The query
 reads only routing's in-memory quota snapshot: it does not poll, refresh,
-reserve quota, write shadow decisions, or touch the store. Broca must stop
+reserve quota, write shadow decisions, or touch the store. The worker runner must stop
 warming whenever `warm_ok` is false; it must not replicate reserve thresholds.
 
 `reason` is a tagged object with a closed `code` vocabulary:

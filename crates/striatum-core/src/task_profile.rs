@@ -203,12 +203,12 @@ fn summarize_rated(mut tasks: Vec<&RatedTask<'_>>) -> Option<ProfileStats> {
 
 #[derive(Hash, PartialEq, Eq)]
 enum Population<'a> {
-    Own(std::borrow::Cow<'a, str>, &'a str, Option<&'a str>, u8),
-    FamilyTier(std::borrow::Cow<'a, str>, Option<&'a str>, &'static str, u8),
-    FamilyBucket(std::borrow::Cow<'a, str>, Option<&'a str>, u8),
-    Family(std::borrow::Cow<'a, str>, Option<&'a str>),
-    FleetBucket(std::borrow::Cow<'a, str>, u8),
-    Fleet(std::borrow::Cow<'a, str>),
+    Own(&'a str, &'a str, Option<&'a str>, u8),
+    FamilyTier(&'a str, Option<&'a str>, &'static str, u8),
+    FamilyBucket(&'a str, Option<&'a str>, u8),
+    Family(&'a str, Option<&'a str>),
+    FleetBucket(&'a str, u8),
+    Fleet(&'a str),
 }
 
 /// Summarize each shared population once, rather than rating and sorting the
@@ -223,28 +223,23 @@ impl<'a> TaskProfileIndex<'a> {
         let mut populations: HashMap<Population<'a>, Vec<&RatedTask<'_>>> = HashMap::new();
         for rated in &rated {
             let task = rated.task;
-            let workload = crate::module_identity::canonical(task.workload);
+            let workload = task.workload;
             let bucket = task.iq_bucket;
             let mut add = |key| populations.entry(key).or_default().push(rated);
             add(Population::Own(
-                workload.clone(),
+                workload,
                 &task.model.model_id,
                 task.model.variant.as_deref(),
                 bucket,
             ));
-            add(Population::FleetBucket(workload.clone(), bucket));
-            add(Population::Fleet(workload.clone()));
+            add(Population::FleetBucket(workload, bucket));
+            add(Population::Fleet(workload));
             {
                 let family = task.model.grand_family_id();
-                add(Population::FamilyBucket(workload.clone(), family, bucket));
-                add(Population::Family(workload.clone(), family));
+                add(Population::FamilyBucket(workload, family, bucket));
+                add(Population::Family(workload, family));
                 if let Some(tier) = model_tier(&task.model.model_id) {
-                    add(Population::FamilyTier(
-                        workload.clone(),
-                        family,
-                        tier,
-                        bucket,
-                    ));
+                    add(Population::FamilyTier(workload, family, tier, bucket));
                 }
             }
         }
@@ -264,12 +259,11 @@ impl<'a> TaskProfileIndex<'a> {
         workload: &str,
         bucket: u8,
     ) -> Option<TaskProfile> {
-        let workload = crate::module_identity::canonical(workload);
         let get = |key| self.stats.get(&key).copied();
         let supported =
             |stats: Option<ProfileStats>| stats.filter(|stats| stats.task_count >= MIN_TASKS);
         let own = get(Population::Own(
-            workload.clone(),
+            workload,
             &candidate.model_id,
             candidate.variant.as_deref(),
             bucket,
@@ -280,26 +274,20 @@ impl<'a> TaskProfileIndex<'a> {
         {
             let family = candidate.grand_family_id();
             if let Some(tier) = model_tier(&candidate.model_id) {
-                if let Some(stats) = supported(get(Population::FamilyTier(
-                    workload.clone(),
-                    family,
-                    tier,
-                    bucket,
-                ))) {
+                if let Some(stats) =
+                    supported(get(Population::FamilyTier(workload, family, tier, bucket)))
+                {
                     return Some(served(stats, ProfileLevel::SameFamilyTier, own));
                 }
             }
-            if let Some(stats) = supported(get(Population::FamilyBucket(
-                workload.clone(),
-                family,
-                bucket,
-            ))) {
+            if let Some(stats) = supported(get(Population::FamilyBucket(workload, family, bucket)))
+            {
                 return Some(served(stats, ProfileLevel::SameFamily, own));
             }
             if let (Some(family), Some(bucket), Some(all)) = (
-                supported(get(Population::Family(workload.clone(), family))),
-                supported(get(Population::FleetBucket(workload.clone(), bucket))),
-                supported(get(Population::Fleet(workload.clone()))),
+                supported(get(Population::Family(workload, family))),
+                supported(get(Population::FleetBucket(workload, bucket))),
+                supported(get(Population::Fleet(workload))),
             ) {
                 let ratio =
                     bucket.tokens.zip(
@@ -322,7 +310,7 @@ impl<'a> TaskProfileIndex<'a> {
                 }
             }
         }
-        if let Some(stats) = supported(get(Population::FleetBucket(workload.clone(), bucket))) {
+        if let Some(stats) = supported(get(Population::FleetBucket(workload, bucket))) {
             return Some(served(stats, ProfileLevel::FleetBucket, own));
         }
         supported(get(Population::Fleet(workload)))
@@ -380,10 +368,7 @@ pub fn compute_profile(
         summarize_rated(
             tasks
                 .iter()
-                .filter(|task| {
-                    crate::module_identity::equal(task.task.workload, workload)
-                        && predicate(task.task)
-                })
+                .filter(|task| task.task.workload == workload && predicate(task.task))
                 .collect(),
         )
     };
@@ -439,41 +424,6 @@ pub fn compute_profile(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn prefrontal_rename_split_history_has_the_all_old_profile() {
-        let fact = model("sol", Some("gpt"), 2.0);
-        let tasks: Vec<_> = (0..40)
-            .map(|i| ClosedTask {
-                model: &fact,
-                workload: if i < 20 {
-                    "prefrontal-core.mason"
-                } else {
-                    "prefrontal.mason"
-                },
-                iq_bucket: 7,
-                tokens: tokens((i + 1) as f64),
-            })
-            .collect();
-        let all_old: Vec<_> = tasks
-            .iter()
-            .map(|task| ClosedTask {
-                workload: "prefrontal-core.mason",
-                ..*task
-            })
-            .collect();
-        let expected = compute_profile(&all_old, &fact, "prefrontal-core.mason", 7).unwrap();
-        for name in ["prefrontal-core.mason", "prefrontal.mason"] {
-            assert_eq!(
-                compute_profile(&tasks, &fact, name, 7),
-                Some(expected.clone())
-            );
-            assert_eq!(
-                TaskProfileIndex::new(&tasks).compute_profile(&fact, name, 7),
-                Some(expected.clone())
-            );
-        }
-    }
 
     #[test]
     fn batched_refresh_matches_full_recompute_over_randomized_history_edits() {

@@ -29,20 +29,20 @@ neither of the two accounts is blocked.
   `cortexkit-role-routing` contract derives wait classification from the
   `concurrency_full` reason.
 * `basal-flow-select.request.json` / `basal-flow-select.reply.json`: attested
-  `reserved:basal` selects its declared consumer `basal.flow`, with Broca as
-  its placement and without a request `detail` member. The request uses Basal's
+  `reserved:basal` selects its declared consumer `basal.flow`, with the worker runner as
+  its placement and without a request `detail` member. The request uses the flow consumer's
   `requirements.iq`, `requirements.tools` and `eligible_routes` fields, with the
   single synthetic route substituted.
   The fixture removes all seeded model facts except `synthetic/model`; its two
   synthetic accounts are filled via the same real admissions as above. This keeps
   the public sample free of real catalog routes, including in refusal diagnostics.
 * `panel-all-full.request.json` / `panel-all-full.reply.json`: attested
-  `reserved:prefrontal-core` asks for an `audit` panel for consumer
-  `prefrontal-core.athena`, matching the Athena caller and class in panel tests.
+  `reserved:prefrontal` asks for an `audit` panel for consumer
+  `prefrontal.athena`, matching the panel caller and class in panel tests.
   The synthetic policy requests three seats, without extras. All three candidate
   accounts are full. Routing returns an answer with zero seats and a
   `size_reduced` shortfall, not a refusal.
-* `panel-partial.request.json` / `panel-partial.reply.json`: the same Athena caller,
+* `panel-partial.request.json` / `panel-partial.reply.json`: the same panel caller,
   consumer and class request three seats, with only two accounts filled. One seat
   stands and two candidates are rejected on concurrency, giving a `size_reduced`
   shortfall. Each cause has `reason: "no_route"`, a cause-level `reset_at_ms`, and
@@ -51,12 +51,12 @@ neither of the two accounts is blocked.
 Both panel fixtures remove the seeded catalog entirely and install only
 `synthetic-0/panel-model`, `synthetic-1/panel-model` and `synthetic-2/panel-model`,
 with distinct `claude`, `gpt` and `gemini` families so diversity is satisfiable.
-Broca serves one API-key account per synthetic provider. The accounts are filled
+The worker runner serves one API-key account per synthetic provider. The accounts are filled
 by real `route.account_for` admissions, not injected reservation rows; enforcement
 is enabled only in the fixture. No real catalog routes appear in either panel
 pair, including nested diagnostics.
 
-Core reads the panel result's `shortfall.detail.causes[i].reset_at_ms` and
+The agent runtime reads the panel result's `shortfall.detail.causes[i].reset_at_ms` and
 `shortfall.detail.causes[i].detail.detail.reason` (the latter is
 `causes[i].detail.detail.reason` relative to `shortfall.detail`). The reset belongs
 to each cause, not directly to the shortfall. Both panel replies preserve
@@ -83,8 +83,8 @@ From the worktree root, with writable sources:
 UPDATE_CONCURRENCY_FULL_SAMPLES=1 cargo nextest run --locked -p striatum-module --bin ck-striatum -E 'test(=routing_v1::concurrency_samples_tests::handler_samples_regenerate_byte_for_byte)'
 ```
 
-For remote builds with read-only synced sources, regenerate in a writable scratch
-copy and return the twelve JSON files and `SHA256SUMS`, then install them locally.
+For remote builds with read-only synced sources, regenerate in a writable
+checkout and copy the twelve JSON files and `SHA256SUMS` into this directory.
 The environment variable enables writes only for generated files, not this README.
 Without it, regeneration happens in memory and any byte difference, missing file,
 unexpected file or manifest drift fails the test. The additional handler tests

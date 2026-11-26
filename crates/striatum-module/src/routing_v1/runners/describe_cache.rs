@@ -522,12 +522,7 @@ mod tests {
         let (mut cache, mut credentials, _, _) = setup();
         crate::take_operator_warnings();
         cache.reply("runner-a", None, &mut credentials, 1);
-        cache.reply(
-            "runner-a",
-            Some(&json!({"code":"unavailable"})),
-            &mut credentials,
-            2,
-        );
+        cache.reply("runner-a", None, &mut credentials, 2);
         assert!(credentials.runner_service_tiers.contains_key("runner-a"));
         cache.reply(
             "runner-a",

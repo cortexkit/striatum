@@ -1902,7 +1902,6 @@
     },
     "pin_origin_callers": {
       "default": [
-        "reserved:prefrontal-core",
         "reserved:prefrontal"
       ],
       "description": "Full caller identities allowed to mark a model choice as made by the user. An empty list allows nobody.",

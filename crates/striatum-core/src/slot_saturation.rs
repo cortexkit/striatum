@@ -1,6 +1,6 @@
 //! Caller concurrency slots as a per-decision admission input.
 //!
-//! The caller that launches the selected model (prefrontal-core's task manager)
+//! The caller that launches the selected model (prefrontal's task manager)
 //! admits a launch only while the model's slot count is below its configured
 //! limit; a launch at the limit waits in a queue until a running task finishes.
 //! Routing never saw those counts, so it kept choosing a model whose slots were

@@ -30,7 +30,7 @@ impl ClassContext {
                         striatum_core::blocks::LifetimeClass::NonQuota,
                     );
                     block.test_check_at_ms =
-                        self.in_flight_test_check_at(provider, model, priced, policy);
+                        self.in_flight_test_check_at(provider, model, priced, policy, None);
                     return Some(block);
                 }
             }
@@ -71,8 +71,47 @@ impl ClassContext {
             reset,
             striatum_core::blocks::LifetimeClass::Quota,
         );
-        block.test_check_at_ms = self.in_flight_test_check_at(provider, model, priced, policy);
+        block.test_check_at_ms =
+            self.in_flight_test_check_at(provider, model, priced, policy, None);
         Some(block)
+    }
+
+    pub(super) fn account_test_check_refusal(
+        &self,
+        params: &AccountForParams,
+        provider: &str,
+        priced: bool,
+        policy: &AllocatorPolicy,
+        mut reply: OpReply,
+    ) -> OpReply {
+        let OpReply::Error {
+            code,
+            message,
+            detail: Some(detail),
+        } = &mut reply
+        else {
+            return reply;
+        };
+        if code != "account_pool_exhausted" {
+            return reply;
+        }
+        let Some(until) = detail["reset_at_ms"].as_i64() else {
+            return reply;
+        };
+        let model = normalize(&params.model);
+        let Some(check_at) = self
+            .in_flight_test_check_at(provider, &model, priced, policy, Some(params))
+            .filter(|check| *check <= until)
+        else {
+            return reply;
+        };
+        // The check is a caller hint, not a change to the probe's recheck clock.
+        detail["reset_at_ms"] = json!(check_at);
+        let wait_ms = check_at.saturating_sub(self.now_ms).max(0) as u64;
+        detail["retry_after_s"] = json!(wait_ms.div_ceil(1_000));
+        *message =
+            format!("A recovery test is in progress for {provider}/{model}. Check again shortly.");
+        because("recovery_test_in_progress", reply)
     }
 
     fn in_flight_test_check_at(
@@ -81,6 +120,7 @@ impl ClassContext {
         model: &str,
         priced: bool,
         policy: &AllocatorPolicy,
+        admission: Option<&AccountForParams>,
     ) -> Option<i64> {
         let fact = self.fact_for(provider, model)?;
         self.class(fact, priced)
@@ -88,6 +128,15 @@ impl ClassContext {
             .into_iter()
             .filter_map(|row| {
                 let account = self.account_id(row);
+                if admission.is_some_and(|params| {
+                    !params.offers_pair(account, &row.id)
+                        || params
+                            .bound_tier
+                            .as_ref()
+                            .is_some_and(|tier| !tier.supports(&row.id))
+                }) {
+                    return None;
+                }
                 let blocked: Vec<_> = self
                     .indexed_origins(provider, account, &row.id, model)
                     .filter(|origin| {
@@ -108,6 +157,11 @@ impl ClassContext {
                             })
                             .collect();
                         !origin.quota
+                            && (admission.is_none()
+                                || matches!(
+                                    origin.kind.as_str(),
+                                    "route" | "transient_route" | "observation" | "pool_rate"
+                                ))
                             && origin.due_at() > self.now_ms
                             && !(self.probe_owner.is_some()
                                 && (origin.claim_owner == self.probe_owner
@@ -141,14 +195,15 @@ impl ClassContext {
                 );
                 if !matches!(
                     recovered
-                        .probe_with_policy(
+                        .probe_with_policy_for(
                             provider,
                             model,
                             priced,
                             false,
                             None,
                             "in-flight-test-recovery",
-                            policy.clone()
+                            policy.clone(),
+                            admission.map(|params| (params, row.id.as_str())),
                         )
                         .outcome,
                     Outcome::Admit(_)

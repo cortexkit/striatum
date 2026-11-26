@@ -322,17 +322,6 @@ fn read_catalog_fingerprint_key(
     })
 }
 
-/// One `aa_inferred` catalog row for the operator's hand-placement worklist.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct InferredScoreRow {
-    pub route_key: String,
-    pub aa_index: Option<f64>,
-    pub elo: f64,
-    pub review_by_ms: Option<i64>,
-    pub review_by_passed: bool,
-}
-
 /// A catalog row with no score, waiting for Fusiform or a hand placement.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -416,9 +405,7 @@ pub(super) fn row_to_fact(row: &Row<'_>) -> rusqlite::Result<ModelFact> {
         speed_multiplier: row.get::<_, Option<f64>>("speed_multiplier")?,
         subscription_multiplier: None,
         score_provenance: source.provenance(),
-        aa_index: row.get::<_, Option<f64>>("aa_index")?,
-        review_by_ms: row.get::<_, Option<i64>>("review_by_ms")?,
-        eq_source: row.get::<_, Option<String>>("eq_source")?,
+        eq_source: None,
         class_vector: None,
         class_vector_is_overlay: false,
         upstream_status: row.get::<_, Option<String>>("upstream_status")?,
@@ -1122,31 +1109,6 @@ impl SqliteRouteStateStore {
         })
     }
 
-    /// Every `aa_inferred` row with review-by status relative to `now_ms`.
-    pub fn list_inferred_rows(&self, now_ms: i64) -> RouteStateResult<Vec<InferredScoreRow>> {
-        self.store
-            .with_conn(|c: &Connection| {
-                let mut stmt = c.prepare(
-                    "SELECT route_key, aa_index, scores_json, review_by_ms
-                     FROM model_facts
-                     WHERE source = 'aa_inferred'
-                     ORDER BY route_key",
-                )?;
-                let rows = stmt.query_map([], |row| {
-                    let review_by_ms: Option<i64> = row.get(3)?;
-                    Ok(InferredScoreRow {
-                        route_key: row.get(0)?,
-                        aa_index: row.get(1)?,
-                        elo: stored_scores(&row.get::<_, String>(2)?).elo,
-                        review_by_ms,
-                        review_by_passed: review_by_ms.is_some_and(|deadline| deadline <= now_ms),
-                    })
-                })?;
-                rows.collect::<rusqlite::Result<Vec<_>>>()
-            })
-            .map_err(err)
-    }
-
     /// Routable catalog rows that still have no score after same-model sharing:
     /// a route that borrows its model's placement is not awaiting one, and a
     /// route the upstream marks deprecated will never be offered.
@@ -1323,8 +1285,8 @@ impl crate::AccountTx<'_> {
                                cost_per_mtok_out, input_rate, cache_read_rate,
                                cache_write_rate, reasoning_rate, supports_vision,
                                supports_tool_use, prompt_defaults_json, confidence, notes,
-                               speed_multiplier, excluded, source, updated_at, aa_index,
-                               review_by_ms, eq_source, facts_source, fusiform_version,
+                                speed_multiplier, excluded, source, updated_at,
+                                facts_source, fusiform_version,
                                fusiform_present, context_window_source,
                                max_output_tokens_source, cost_tier_source,
                                cost_per_mtok_out_source, supports_vision_source,
@@ -1335,7 +1297,7 @@ impl crate::AccountTx<'_> {
                                ?1, ?1, ?2, ?3, NULL, NULL, ?4, ?5, ?6, ?7,
                                ?8, ?9, ?10, ?11, ?12, ?13, ?14, NULL, 'unknown',
                                'discovered by Fusiform; awaiting operator score placement',
-                               NULL, 0, 'unscored', ?15, NULL, NULL, NULL,
+                                NULL, 0, 'unscored', ?15,
                                'fusiform', ?16, ?17,
                                'fusiform', 'fusiform', 'fusiform', 'fusiform',
                                 'fusiform', 'fusiform', ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26
@@ -1496,34 +1458,11 @@ impl crate::AccountTx<'_> {
             })
             .transpose()
             .map_err(err)?;
-        let (aa_index, review_by_ms, eq_source) = if source == FactSource::AaInferred {
-            (fact.aa_index, fact.review_by_ms, fact.eq_source.clone())
-        } else {
-            (None, None, None)
-        };
         self.command_sql(|c: &Connection| {
                 // Fact replacement and route-state insertion share one transaction.
                 // The store connection mutex serializes this with provider fanout,
                 // so a new route resolves either before fanout or after inheritance.
                 let tx = c;
-                if source == FactSource::AaInferred {
-                    let existing: Option<String> = tx
-                        .query_row(
-                            "SELECT source FROM model_facts WHERE route_key = ?1",
-                            [&route.route_key],
-                            |row| row.get(0),
-                        )
-                        .optional()?;
-                    if let Some(existing) = existing {
-                        if FactSource::parse(&existing).blocks_aa_inferred() {
-                            return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
-                                std::io::Error::other(
-                                    "aa_inferred does not overwrite curated or override rows",
-                                ),
-                            )));
-                        }
-                    }
-                }
                  // Score placement and new variants cannot replace catalog lineage,
                  // including an explicitly absent lineage.
                  let lineage: Option<Option<String>> = tx.query_row(
@@ -1552,9 +1491,9 @@ impl crate::AccountTx<'_> {
                        scores_json, context_window, max_output_tokens, cost_tier, cost_per_mtok_out,
                          input_rate, cache_read_rate, cache_write_rate, reasoning_rate,
                          supports_vision, supports_tool_use, prompt_defaults_json, confidence, notes, speed_multiplier,
-                          source, updated_at, aa_index, review_by_ms, eq_source, auth_methods_json, login_methods_documented,
+                           source, updated_at, auth_methods_json, login_methods_documented,
                           canonical_id, upstream_status, model_type, model_kind, mode_of_mode, mode_of_model_id
-                         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,
+                          ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,
                            (SELECT auth_methods_json FROM model_facts
                             WHERE provider_id = ?3 AND model_id = ?4 ORDER BY route_key LIMIT 1),
                            COALESCE((SELECT login_methods_documented FROM model_facts
@@ -1563,7 +1502,7 @@ impl crate::AccountTx<'_> {
                             WHERE provider_id = ?3 AND model_id = ?4 ORDER BY route_key LIMIT 1),
                             (SELECT upstream_status FROM model_facts
                              WHERE provider_id = ?3 AND model_id = ?4 ORDER BY route_key LIMIT 1),
-                            ?28, ?29, ?30, ?31)
+                             ?25, ?26, ?27, ?28)
                       ON CONFLICT(route_key) DO UPDATE SET
                        capacity_key=excluded.capacity_key, provider_id=excluded.provider_id,
                        model_id=excluded.model_id, variant=excluded.variant, family=excluded.family,
@@ -1577,9 +1516,7 @@ impl crate::AccountTx<'_> {
                        supports_vision=excluded.supports_vision, supports_tool_use=excluded.supports_tool_use,
                        prompt_defaults_json=excluded.prompt_defaults_json, confidence=excluded.confidence,
                         notes=excluded.notes, speed_multiplier=excluded.speed_multiplier,
-                        source=excluded.source, updated_at=excluded.updated_at,
-                        aa_index=excluded.aa_index, review_by_ms=excluded.review_by_ms,
-                        eq_source=excluded.eq_source",
+                         source=excluded.source, updated_at=excluded.updated_at",
                     params![
                         route.route_key,
                         route.capacity_key,
@@ -1609,9 +1546,6 @@ impl crate::AccountTx<'_> {
                         fact.speed_multiplier,
                         source.as_str(),
                         now_ms(),
-                        aa_index,
-                        review_by_ms,
-                        eq_source,
                         model_type,
                         model_kind,
                         mode_of_mode,

@@ -938,6 +938,16 @@ pub(super) fn prepare_and_admit(
             Ok(prepared) => prepared,
             Err(reply) => return Err(reply),
         };
+    let check_held_test = |params: &AccountForParams, reply| match &ctx.classes {
+        Some(classes) => classes.account_test_check_refusal(
+            params,
+            &provider,
+            class == striatum_core::accounts::AllowedAccountClass::PricedPerTokenOnly,
+            ctx.policy,
+            reply,
+        ),
+        None => reply,
+    };
     checking("service_tier");
     parsed.bound_tier = bound_tier
         .filter(|bound| !bound.tier.is_standard())
@@ -956,9 +966,9 @@ pub(super) fn prepare_and_admit(
                 })
             })
         {
-            return Err(bound_tier_empty_refusal(
-                &parsed, ctx, principal, &provider, class, &roster,
-            ));
+            let refusal =
+                bound_tier_empty_refusal(&parsed, ctx, principal, &provider, class, &roster);
+            return Err(check_held_test(&parsed, refusal));
         }
         Some(bound.tier)
     } else {
@@ -975,7 +985,7 @@ pub(super) fn prepare_and_admit(
         selection.as_ref(),
     ));
     if let Some(reply) = route_fence_refusal(&roster, &route_fenced, &parsed, ctx.now_ms) {
-        return Err(because("route_fence", reply));
+        return Err(check_held_test(&parsed, because("route_fence", reply)));
     }
     #[cfg(test)]
     run_after_roster_hook(&parsed.admission_id);
@@ -1002,7 +1012,7 @@ pub(super) fn prepare_and_admit(
                 ctx.now_ms,
                 Some(&parsed),
             ) {
-                return Err(reply);
+                return Err(check_held_test(&parsed, reply));
             }
             if let Some(reply) = disjoint_candidates_refusal(&parsed, ctx, &roster, class) {
                 return Err(reply);
@@ -1054,6 +1064,9 @@ pub(super) fn prepare_and_admit(
     let principal = principal.to_owned();
     let finish = finish.take();
     let admission_id = parsed.admission_id.clone();
+    let parsed = std::sync::Arc::new(parsed);
+    let writer_params = parsed.clone();
+    let writer_provider = provider.clone();
     let reply = crate::account_writer::execute_with_error(
         ctx.store,
         striatum_store::AccountCommandKind::Admit,
@@ -1067,8 +1080,8 @@ pub(super) fn prepare_and_admit(
                 tx,
                 &command_ctx,
                 &principal,
-                &parsed,
-                &provider,
+                &writer_params,
+                &writer_provider,
                 &roster,
                 &request_fingerprint,
                 &mut pin_diagnostic,
@@ -1079,7 +1092,7 @@ pub(super) fn prepare_and_admit(
             ))
         },
     );
-    Ok(match reply {
+    let reply = match reply {
         Ok((reply, Some(mut diagnostic))) => {
             match &reply {
                 OpReply::Result(result) => {
@@ -1095,7 +1108,10 @@ pub(super) fn prepare_and_admit(
         }
         Ok((reply, None)) => reply,
         Err(error) => admission_error(error),
-    })
+    };
+    // The account handler reads the log reason from its own thread-local
+    // trace, so record the wait here after the writer returns.
+    Ok(check_held_test(&parsed, reply))
 }
 
 pub(super) fn finish_reply(

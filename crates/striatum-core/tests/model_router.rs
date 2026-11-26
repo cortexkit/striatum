@@ -95,8 +95,6 @@ fn fact(b: FactBuilder) -> ModelFact {
         speed_multiplier: None,
         subscription_multiplier: None,
         score_provenance: ScoreProvenance::Curated,
-        aa_index: None,
-        review_by_ms: None,
         eq_source: None,
         class_vector: b.class_vector,
         class_vector_is_overlay: has_vector,
@@ -2418,15 +2416,13 @@ fn iq_endpoints_admit_all_at_zero_and_clear_only_the_top_at_100() {
 }
 
 #[test]
-fn unscored_rows_are_rejected_while_aa_inferred_rows_are_admitted() {
-    let mut inferred = fact(FactBuilder {
+fn unscored_rows_are_rejected_while_scored_rows_are_admitted() {
+    let scored = fact(FactBuilder {
         provider_id: "p".into(),
-        model_id: "inferred".into(),
+        model_id: "scored".into(),
         scores: scores(60.0, 1700.0, 100.0),
         ..Default::default()
     });
-    inferred.score_provenance = ScoreProvenance::AaInferred;
-    inferred.aa_index = Some(40.0);
 
     let mut unscored = fact(FactBuilder {
         provider_id: "p".into(),
@@ -2437,20 +2433,12 @@ fn unscored_rows_are_rejected_while_aa_inferred_rows_are_admitted() {
     unscored.score_provenance = ScoreProvenance::Unscored;
 
     let selected = select_model_route(input(
-        vec![inferred.clone(), unscored.clone()],
+        vec![scored, unscored],
         req(20.0, 0.0),
         Extra::default(),
     ))
-    .expect("aa_inferred is routable");
-    assert_eq!(selected.model.model_id, "inferred");
-    assert!(
-        selected
-            .explanation
-            .iter()
-            .any(|line| line == "provenance=aa_inferred"),
-        "live pick must be attributable: {:?}",
-        selected.explanation
-    );
+    .expect("scored candidate is routable");
+    assert_eq!(selected.model.model_id, "scored");
     assert!(selected
         .rejected
         .iter()

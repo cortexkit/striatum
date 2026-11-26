@@ -154,7 +154,7 @@ mod usage_measurements;
 use catalog::CachedCatalogFingerprint;
 pub use catalog::{
     CanonicalGapRow, CatalogFact, CatalogFactsSnapshot, CatalogFingerprintKey,
-    FusiformCatalogCursor, InferredScoreRow, UnscoredRow,
+    FusiformCatalogCursor, UnscoredRow,
 };
 pub use connection_store::store_now_ms;
 use connection_store::{err, now_ms};
@@ -328,7 +328,7 @@ const MIGRATION_068: &str = include_str!("../migrations/068_account_demand_by_ac
 const MIGRATION_069: &str = include_str!("../migrations/069_task_workload.sql");
 const MIGRATION_071: &str = include_str!("../migrations/071_service_tiers.sql");
 
-fn route_state_migrations() -> [Migration; 102] {
+fn route_state_migrations() -> [Migration; 103] {
     [
         Migration {
             version: 1,
@@ -734,6 +734,10 @@ fn route_state_migrations() -> [Migration; 102] {
         Migration {
             version: 103,
             statements: include_str!("../migrations/103_retention_lookups.sql"),
+        },
+        Migration {
+            version: 104,
+            statements: include_str!("../migrations/104_remove_aa_inferred_provenance.sql"),
         },
     ]
 }
