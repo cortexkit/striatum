@@ -519,6 +519,68 @@ async fn route_fence_is_exhausted_with_its_reset_on_both_entrypoints() {
 }
 
 #[tokio::test]
+async fn account_for_logs_when_the_only_offered_login_has_hit_its_weekly_limit() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, _) = setup("anthropic", false);
+    let runner = harness.bind(reserved(RUNNER), None).await;
+    let mut request = v1_request("anthropic", "weekly-limit-origin");
+    request["mode"] = json!("admit");
+    request["candidates"] = json!({"view_digest":"weekly-limit-login", "accounts":[
+        {"account_id":"oauth-account", "credential_id":"oauth:test"}
+    ]});
+    let admitted = runner.call("route.account_for", &request).await;
+    assert_eq!(admitted.0, FrameType::Response, "{}", admitted.1);
+    let observed = runner
+        .call(
+            "route.account_observe",
+            &json!({"event_id":"weekly-limit-observation", "kind":"account_limit_exhausted",
+                "admission_id":"weekly-limit-origin", "served_account_id":"oauth-account",
+                "limit_window":"seven_day", "resets_at_ms":NOW + 86_400_000}),
+        )
+        .await;
+    assert_eq!(observed.0, FrameType::Response, "{}", observed.1);
+
+    request["admission_id"] = json!("weekly-limit-refusal");
+    request["conversation_key"] = json!("new-weekly-limit-conversation");
+    crate::take_operator_warnings();
+    let refused = runner.call("route.account_for", &request).await;
+    assert_eq!(refused.0, FrameType::Error, "{}", refused.1);
+    assert_eq!(refused.1["code"], "account_pool_exhausted", "{}", refused.1);
+    assert_eq!(
+        refused.1["detail"]["reset_at_ms"],
+        Value::Null,
+        "{}",
+        refused.1
+    );
+    assert_eq!(refused.1["detail"]["retry_after_s"], 300, "{}", refused.1);
+    assert!(
+        refused.1["detail"]["exclusions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| {
+                row["account_id"] == "oauth-account"
+                    && row["reason"] == "confirmed_fence"
+                    && row["pool"]["window_minutes"] == 10_080
+            }),
+        "{}",
+        refused.1
+    );
+    let fields = crate::take_operator_warnings()
+        .iter()
+        .filter_map(|line| line.strip_prefix("routing refused an account call: "))
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|fields| fields["admission_id"] == "weekly-limit-refusal")
+        .expect("weekly-limit refusal log");
+    assert_eq!(
+        fields["offered_candidate_credential_ids"],
+        json!(["oauth:test"])
+    );
+    assert_eq!(fields["requested_account_present"], false);
+    assert_eq!(fields["reason"], "offered_accounts_at_limit", "{fields}");
+}
+
+#[tokio::test]
 async fn route_fence_names_eligible_accounts_outside_the_offered_set() {
     let _clock = crate::InjectedClock::set(NOW);
     let (harness, mut credentials) = setup("synthetic", false);
