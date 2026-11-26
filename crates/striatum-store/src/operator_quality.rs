@@ -2,7 +2,9 @@ use std::collections::BTreeMap;
 
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use striatum_core::{Confidence, ModelFact, ScoreProvenance};
+use striatum_core::{
+    model_facts::CLASSIFIER_SERVING_KINDS, Confidence, ModelFact, ScoreProvenance,
+};
 
 use super::{err, RouteStateResult, SqliteRouteStateStore};
 
@@ -163,14 +165,28 @@ impl SqliteRouteStateStore {
     ) -> RouteStateResult<Vec<UnscoredAdmissibleModel>> {
         self.store
             .with_conn(|c: &Connection| {
-                let mut stmt = c.prepare(
-                "SELECT model, first_seen_ms, last_seen_ms FROM routing_unscored_admissible_models
-                 WHERE last_seen_ms BETWEEN ?1 AND ?2
-                   AND (SELECT active FROM routing_operator_quality_state) = 1
-                   AND EXISTS (SELECT 1 FROM routing_operator_quality)
-                 ORDER BY model",
-            )?;
-                let rows = stmt.query_map(params![since_ms, now_ms], |row| {
+                let kind_params = (0..CLASSIFIER_SERVING_KINDS.len())
+                    .map(|i| format!("?{}", i + 3))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let sql = format!(
+                    "SELECT model, first_seen_ms, last_seen_ms FROM routing_unscored_admissible_models AS sightings
+                     WHERE last_seen_ms BETWEEN ?1 AND ?2
+                       AND (SELECT active FROM routing_operator_quality_state) = 1
+                       AND EXISTS (SELECT 1 FROM routing_operator_quality)
+                       AND NOT EXISTS (
+                           SELECT 1 FROM model_facts AS facts
+                           WHERE (sightings.model = facts.canonical_id
+                                  OR sightings.model = facts.provider_id || '/' || facts.model_id)
+                             AND (facts.model_type IN ({kind_params}) OR facts.model_kind IN ({kind_params}))
+                       )
+                     ORDER BY model"
+                );
+                let mut stmt = c.prepare(&sql)?;
+                let values = [rusqlite::types::Value::Integer(since_ms), rusqlite::types::Value::Integer(now_ms)]
+                    .into_iter()
+                    .chain(CLASSIFIER_SERVING_KINDS.iter().map(|kind| rusqlite::types::Value::Text((*kind).to_owned())));
+                let rows = stmt.query_map(rusqlite::params_from_iter(values), |row| {
                     Ok(UnscoredAdmissibleModel {
                         model: row.get(0)?,
                         first_seen_ms: row.get(1)?,
@@ -194,20 +210,27 @@ pub(super) fn observe_decision(c: &Connection, score: &str, now_ms: i64) -> rusq
         let Some(route) = candidate["routeKey"].as_str() else {
             continue;
         };
-        let identity: Option<(String, String, Option<String>)> = c
+        let identity: Option<(String, String, Option<String>, Option<String>, Option<String>)> = c
             .query_row(
-                "SELECT provider_id, model_id, canonical_id FROM model_facts WHERE route_key = ?1",
+                "SELECT provider_id, model_id, canonical_id, model_type, model_kind FROM model_facts WHERE route_key = ?1",
                 [route],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
             .optional()?;
         let identity = identity.or_else(|| {
             let (provider, model) = candidate["model"].as_str()?.split_once('/')?;
-            Some((provider.to_owned(), model.to_owned(), None))
+            Some((provider.to_owned(), model.to_owned(), None, None, None))
         });
-        let Some((provider, model, canonical)) = identity else {
+        let Some((provider, model, canonical, model_type, model_kind)) = identity else {
             continue;
         };
+        if [model_type.as_deref(), model_kind.as_deref()]
+            .into_iter()
+            .flatten()
+            .any(|kind| CLASSIFIER_SERVING_KINDS.contains(&kind))
+        {
+            continue;
+        }
         let route = format!("{provider}/{model}");
         let model = canonical
             .filter(|id| !id.trim().is_empty())
@@ -301,6 +324,122 @@ mod tests {
         assert_eq!(store.catalog_fingerprint().unwrap(), before);
     }
     use serde_json::json;
+
+    fn classification_test_store(name: &str) -> SqliteRouteStateStore {
+        let dir =
+            cortexkit_test_support::scratch_root().join(format!("{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let descriptor =
+            crate::dev_descriptor(name, dir.join("route.db").to_string_lossy().into_owned());
+        let store = SqliteRouteStateStore::open(&descriptor).unwrap();
+        for model in [
+            "kind-decision",
+            "kind-classifier",
+            "type-decision",
+            "type-classifier",
+            "chat",
+        ] {
+            let fact: ModelFact = serde_json::from_value(json!({
+                "providerID": "synthetic", "modelID": model, "confidence": "curated",
+                "scores": {"elo": 1000, "eq": 1100, "speed": 0}
+            }))
+            .unwrap();
+            store.upsert_fact(&fact, FactSource::Override).unwrap();
+        }
+        store.store.with_conn(|c| c.execute_batch("\
+            UPDATE model_facts SET model_kind = 'decision', canonical_id = 'canonical/kind-decision' WHERE model_id = 'kind-decision';\
+            UPDATE model_facts SET model_kind = 'classifier' WHERE model_id = 'kind-classifier';\
+            UPDATE model_facts SET model_type = 'decision' WHERE model_id = 'type-decision';\
+            UPDATE model_facts SET model_type = 'classifier' WHERE model_id = 'type-classifier';\
+            UPDATE model_facts SET model_type = 'chat' WHERE model_id = 'chat';\
+        ")).unwrap();
+        store
+            .replace_operator_quality(
+                true,
+                &BTreeMap::from([(
+                    "synthetic/graded".into(),
+                    OperatorQuality {
+                        model: "synthetic/graded".into(),
+                        elo: 1000.0,
+                        eq: 1100.0,
+                    },
+                )]),
+            )
+            .unwrap();
+        store
+    }
+
+    #[test]
+    fn unscored_admissible_observation_excludes_classifier_serving_kinds() {
+        let store = classification_test_store("unscored-observation-classification");
+        let score = json!({"candidates": [
+            {"routeKey": "synthetic/kind-decision", "eligible": true},
+            {"routeKey": "synthetic/kind-classifier", "eligible": true},
+            {"routeKey": "synthetic/type-decision", "eligible": true},
+            {"routeKey": "synthetic/type-classifier", "eligible": true},
+            {"routeKey": "synthetic/chat", "eligible": true}
+        ]})
+        .to_string();
+        store
+            .store
+            .with_conn(|c| observe_decision(c, &score, 100))
+            .unwrap();
+        let rows: Vec<String> = store
+            .store
+            .with_conn(|c| {
+                let mut stmt = c.prepare(
+                    "SELECT model FROM routing_unscored_admissible_models ORDER BY model",
+                )?;
+                let rows = stmt.query_map([], |row| row.get(0))?;
+                rows.collect()
+            })
+            .unwrap();
+        assert_eq!(rows, ["synthetic/chat"]);
+    }
+
+    #[test]
+    fn unscored_admissible_read_hides_old_classifier_sightings_until_retyped() {
+        let store = classification_test_store("unscored-read-classification");
+        store.store.with_conn(|c| c.execute_batch("\
+            INSERT INTO routing_unscored_admissible_models VALUES ('canonical/kind-decision', 10, 100);\
+            INSERT INTO routing_unscored_admissible_models VALUES ('synthetic/kind-decision', 10, 100);\
+            INSERT INTO routing_unscored_admissible_models VALUES ('synthetic/kind-classifier', 10, 100);\
+            INSERT INTO routing_unscored_admissible_models VALUES ('synthetic/type-decision', 10, 100);\
+            INSERT INTO routing_unscored_admissible_models VALUES ('synthetic/type-classifier', 10, 100);\
+            INSERT INTO routing_unscored_admissible_models VALUES ('synthetic/chat', 10, 100);\
+        ")).unwrap();
+        let rows = store.unscored_admissible_models(0, 200).unwrap();
+        assert_eq!(
+            rows,
+            [UnscoredAdmissibleModel {
+                model: "synthetic/chat".into(),
+                first_seen_ms: 10,
+                last_seen_ms: 100
+            }]
+        );
+        store.store.with_conn(|c| c.execute_batch("UPDATE model_facts SET model_kind = NULL, model_type = 'chat' WHERE model_id = 'kind-decision'")).unwrap();
+        let rows = store.unscored_admissible_models(0, 200).unwrap();
+        assert_eq!(
+            rows,
+            [
+                UnscoredAdmissibleModel {
+                    model: "canonical/kind-decision".into(),
+                    first_seen_ms: 10,
+                    last_seen_ms: 100
+                },
+                UnscoredAdmissibleModel {
+                    model: "synthetic/chat".into(),
+                    first_seen_ms: 10,
+                    last_seen_ms: 100
+                },
+                UnscoredAdmissibleModel {
+                    model: "synthetic/kind-decision".into(),
+                    first_seen_ms: 10,
+                    last_seen_ms: 100
+                },
+            ]
+        );
+    }
 
     #[test]
     fn unscored_admissible_first_seen_survives_passes_and_restarts_after_grading() {
