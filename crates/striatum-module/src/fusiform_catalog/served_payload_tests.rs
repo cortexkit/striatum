@@ -7,6 +7,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
 const GOLDEN: &[u8] = include_bytes!("../../fixtures/served-payloads-710f929f.json");
+const ANTIGRAVITY_GOLDEN: &[u8] = include_bytes!("../../fixtures/served-payloads-dd928ca5.json");
 
 #[derive(Deserialize)]
 struct Case<'a> {
@@ -91,13 +92,8 @@ fn check(request: &Value, response: &[u8], error: bool) -> Result<(), String> {
     Ok(())
 }
 
-#[test]
-fn producer_served_payloads_reader_matrix() {
-    assert_eq!(
-        format!("{:x}", Sha256::digest(GOLDEN)),
-        "cdb5589a6d054ff5a0e1887dcaa7f78025f0b96ab0903f7eb0a74d6404eb2ce9"
-    );
-    let cases: BTreeMap<String, Case<'_>> = serde_json::from_slice(GOLDEN).unwrap();
+fn check_golden(golden: &[u8], methods: &[&str]) -> BTreeMap<String, usize> {
+    let cases: BTreeMap<String, Case<'_>> = serde_json::from_slice(golden).unwrap();
     let mut failures = Vec::new();
     let mut checked = BTreeMap::new();
     for (name, case) in cases {
@@ -118,7 +114,7 @@ fn producer_served_payloads_reader_matrix() {
         };
         for (index, (request, reply)) in requests.iter().zip(replies).enumerate() {
             let method = request["name"].as_str().unwrap();
-            if !matches!(method, "catalog.get" | "catalog.status" | "quality.grades") {
+            if !methods.contains(&method) {
                 continue;
             }
             *checked.entry(method.to_owned()).or_insert(0) += 1;
@@ -128,13 +124,34 @@ fn producer_served_payloads_reader_matrix() {
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+    checked
+}
+
+#[test]
+fn producer_served_payloads_reader_matrix() {
     assert_eq!(
-        checked,
+        format!("{:x}", Sha256::digest(GOLDEN)),
+        "cdb5589a6d054ff5a0e1887dcaa7f78025f0b96ab0903f7eb0a74d6404eb2ce9"
+    );
+    assert_eq!(
+        check_golden(GOLDEN, &["catalog.get", "catalog.status", "quality.grades"]),
         [
             ("catalog.get".to_owned(), 121),
             ("catalog.status".to_owned(), 3),
             ("quality.grades".to_owned(), 2)
         ]
         .into()
+    );
+}
+
+#[test]
+fn antigravity_golden_catalog_get_reader_matrix() {
+    assert_eq!(
+        format!("{:x}", Sha256::digest(ANTIGRAVITY_GOLDEN)),
+        "e1d000b295b29ed53db4effb134586d0391624eba9ee39891378e0fc316a1ac6"
+    );
+    assert_eq!(
+        check_golden(ANTIGRAVITY_GOLDEN, &["catalog.get"]),
+        [("catalog.get".to_owned(), 126)].into()
     );
 }

@@ -224,6 +224,12 @@ also exercises a copy of the exhaustion body without the two reset members.
 | --- | --- | --- |
 | `served-payloads-710f929f.json` | Fusiform `710f929f`, `crates/fusiform-module/fixtures/served-payloads.json` | `cdb5589a6d054ff5a0e1887dcaa7f78025f0b96ab0903f7eb0a74d6404eb2ce9` |
 
+## Fusiform Antigravity alias login methods
+
+| Imported path | Source | SHA-256 |
+| --- | --- | --- |
+| `served-payloads-dd928ca5.json` | Fusiform (FUSI) commit `dd928ca5`, supplied served-payload golden | `e1d000b295b29ed53db4effb134586d0391624eba9ee39891378e0fc316a1ac6` |
+
 ## Broca unpinned llm_classify routing request
 
 The select envelope was copied byte for byte from BROCA's capture and verified

@@ -2,6 +2,7 @@ mod login_methods_tests {
     use super::*;
     use crate::broca_credentials::BrocaCredentials;
     use cortexkit_claustrum_client::{ListedCredential, ScopedCredentialListing};
+    use std::collections::HashSet;
 
     pub(crate) fn golden_reply() -> Value {
         let golden = fixture();
@@ -211,6 +212,86 @@ mod login_methods_tests {
             snapshot.model("openai/gpt-6.1-sol").unwrap().auth_methods,
             Some(vec!["apikey".into(), "chatgpt".into()])
         );
+    }
+
+    #[test]
+    fn antigravity_golden_login_policy_reaches_alias_routes_only() {
+        const ALIASES: [&str; 7] = [
+            "google/antigravity-claude-opus-5-5",
+            "google/antigravity-claude-sonnet-5-5",
+            "google/antigravity-gemini-3.8-flash",
+            "google/antigravity-gemini-4-argon",
+            "google/antigravity-gemini-4-carbon",
+            "google/antigravity-gemini-4-hydrogen",
+            "google/antigravity-gemini-4-neon",
+        ];
+        const PLAIN: &str = "google/gemini-4-hydrogen";
+        let golden: BTreeMap<String, Value> = serde_json::from_str(include_str!(
+            "../fixtures/served-payloads-dd928ca5.json"
+        ))
+        .unwrap();
+        let mut aliases = BTreeMap::new();
+        let mut checked = 0;
+        for (name, case) in &golden {
+            let arguments = &case["request"]["arguments"];
+            let Some(id) = arguments["model_id"].as_str() else {
+                continue;
+            };
+            let route = format!("google/{id}");
+            if case["request"]["name"] != "catalog.get"
+                || arguments["provider_id"] != "google"
+                || !ALIASES.contains(&route.as_str())
+            {
+                continue;
+            }
+            let mut reply = case["response"].clone();
+            let model = reply["models"][&route]
+                .as_object_mut()
+                .unwrap_or_else(|| panic!("{name}: missing {route}"));
+            // Reads limited to selected facts can omit existence. Add it here
+            // to check the login policy on a usable row; the reader matrix
+            // checks the unchanged replies.
+            model.entry("existence").or_insert(json!("present"));
+            let snapshot = decode_catalog_get(serde_json::to_vec(&reply).unwrap()).unwrap();
+            let fact = snapshot
+                .model(&route)
+                .unwrap_or_else(|| panic!("{name}: no decoded fact for {route}"));
+            assert!(fact.login_methods_documented, "{name}: {route}");
+            assert_eq!(fact.auth_methods, Some(vec!["antigravity".into()]), "{name}");
+            aliases.insert(route, fact.clone());
+            checked += 1;
+        }
+        assert_eq!(checked, 11);
+        assert_eq!(aliases.keys().map(String::as_str).collect::<Vec<_>>(), ALIASES);
+
+        let plain_reply = &golden["catalog.get — Gemini 4 Hydrogen full row"]["response"];
+        let snapshot = decode_catalog_get(serde_json::to_vec(plain_reply).unwrap()).unwrap();
+        let plain = snapshot.model(PLAIN).unwrap();
+        assert!(!plain.login_methods_documented);
+        assert_eq!(plain.auth_methods, None);
+
+        let rig = Rig::new("antigravity-golden");
+        let store = rig.store();
+        let updates: Vec<_> = aliases.into_values().chain([plain.clone()]).collect();
+        store.apply_fusiform_catalog(&updates, snapshot.cursor).unwrap();
+        // The store opens with seeded facts. Test only the captured models.
+        let facts: Vec<_> = store
+            .get_facts()
+            .unwrap()
+            .into_iter()
+            .filter(|fact| {
+                updates.iter().any(|update| {
+                    fact.provider_id == update.provider_id && fact.model_id == update.model_id
+                })
+            })
+            .collect();
+
+        // Do not add runner protocol restrictions: these assertions should
+        // depend only on the login methods in the catalog.
+        let signin = cache("antigravity").statically_served_routes(&facts);
+        assert_eq!(signin, HashSet::from(ALIASES.map(str::to_owned)));
+        let apikey = cache("apikey").statically_served_routes(&facts);
+        assert_eq!(apikey, HashSet::from([PLAIN.to_owned()]));
     }
 
     #[test]
