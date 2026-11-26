@@ -655,7 +655,13 @@ mod wall_generation_tests {
                 .pool_wall("p", "key", kind, 1100, "first refusal", 100)
                 .unwrap();
         }
-        let clocks = store.fence_rechecks().unwrap();
+        let clocks: Vec<_> = store
+            .load_blocks(100)
+            .unwrap()
+            .blocks
+            .iter()
+            .map(crate::FenceRecheck::from)
+            .collect();
         assert_eq!(
             clocks.len(),
             2,
@@ -680,6 +686,13 @@ mod wall_generation_tests {
         let store = SqliteRouteStateStore::open(&descriptor).unwrap();
         let origins = store.fence_rechecks().unwrap();
         let probe_at = origins.iter().map(|origin| origin.due_at()).max().unwrap();
+        let origins: Vec<_> = store
+            .load_blocks(probe_at)
+            .unwrap()
+            .blocks
+            .iter()
+            .map(crate::FenceRecheck::from)
+            .collect();
         assert!(store
             .account_transaction(|tx| tx.grant_fence_rechecks(&origins, probe_at, Some("probe")))
             .unwrap());
