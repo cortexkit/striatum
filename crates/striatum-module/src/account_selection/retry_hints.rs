@@ -157,11 +157,7 @@ impl ClassContext {
                             })
                             .collect();
                         !origin.quota
-                            && (admission.is_none()
-                                || matches!(
-                                    origin.kind.as_str(),
-                                    "route" | "transient_route" | "observation" | "pool_rate"
-                                ))
+                            && (admission.is_none() || matches!(origin.kind.as_str(), "route"))
                             && origin.due_at() > self.now_ms
                             && !(self.probe_owner.is_some()
                                 && (origin.claim_owner == self.probe_owner

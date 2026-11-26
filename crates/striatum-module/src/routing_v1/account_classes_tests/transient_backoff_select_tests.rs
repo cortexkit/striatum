@@ -83,7 +83,7 @@ fn served(id: &str, event: &str) -> Value {
 }
 
 #[tokio::test]
-async fn expired_transient_backoff_with_inflight_probe_refuses_fresh_sidekick_select() {
+async fn expired_transient_backoff_reopens_fresh_sidekick_select_without_sql_reads() {
     let _clock = crate::InjectedClock::set(NOW);
     let harness = one_account();
     let runner = harness.bind(reserved("broca"), None).await;
@@ -113,44 +113,25 @@ async fn expired_transient_backoff_with_inflight_probe_refuses_fresh_sidekick_se
         .await;
     assert_eq!(observed.0, FrameType::Response, "{}", observed.1);
 
-    let probe_at = backoff_at + 51_650;
-    let _probe = crate::InjectedClock::set(probe_at);
-    let mut mason_select = select.clone();
-    mason_select["consumer"] = json!("prefrontal.mason");
-    let selected = owner.call("route.select", &mason_select).await;
-    assert_eq!(selected.0, FrameType::Response, "{}", selected.1);
-    let mut probe = admission("probe-run");
-    probe["model"] = selected.1["result"]["route"]["model"].clone();
-    probe["decision_id"] = selected.1["result"]["decision_id"].clone();
-    assert_credential(&runner.call("route.account_for", &probe).await, CREDENTIAL);
-    let started = runner
-        .call(
-            "route.account_observe",
-            &json!({"event_id":"probe-started",
-        "kind":"admission_started", "admission_id":"probe-run", "run_id":"streaming-run"}),
-        )
-        .await;
-    assert_eq!(started.0, FrameType::Response, "{}", started.1);
-    let origin = harness
-        .store()
-        .fence_rechecks()
-        .unwrap()
-        .into_iter()
-        .find(|origin| origin.kind == "observation")
-        .unwrap();
-    assert_eq!(
-        origin.claim_owner, None,
-        "admission consumes the decision's reservation"
+    let reopened_at = retry_at + 1;
+    let _reopened = crate::InjectedClock::set(reopened_at);
+    let first_request = select.clone();
+    let second_request = select.clone();
+    let (first, second) = tokio::join!(
+        owner.call("route.select", &first_request),
+        owner.call("route.select", &second_request)
     );
-    assert_eq!(origin.last_claimed_at, Some(probe_at as i64));
-    assert_eq!(
-        origin.next_recheck_at,
-        probe_at as i64 + striatum_core::fence_lifetimes::NON_QUOTA_FENCE_MAX_MS
+    assert_eq!(first.0, FrameType::Response, "{}", first.1);
+    assert_eq!(second.0, FrameType::Response, "{}", second.1);
+    assert!(
+        crate::account_state::published(harness.store(), reopened_at as i64)
+            .unwrap()
+            .fence_rechecks()
+            .unwrap()
+            .iter()
+            .all(|origin| origin.kind != "observation")
     );
 
-    let select_at = backoff_at + 58_128;
-    let _during = crate::InjectedClock::set(select_at);
-    assert!(select_at > retry_at);
     let ignored = runner
         .call(
             "route.account_observe",
@@ -164,11 +145,12 @@ async fn expired_transient_backoff_with_inflight_probe_refuses_fresh_sidekick_se
         ignored.1
     );
     let trace = harness.store().trace_block_reads_for_test().unwrap();
+    trace.take();
     let owners = harness
         .store()
         .account_read(|tx| tx.probe_authorization_owners())
         .unwrap();
-    assert!(!owners.is_empty());
+    assert!(owners.is_empty(), "expiry creates no recovery-test claim");
     let oracle_reads = trace.take();
     assert!(
         oracle_reads
@@ -183,91 +165,10 @@ async fn expired_transient_backoff_with_inflight_probe_refuses_fresh_sidekick_se
         reads.reader.is_empty() && reads.writer.is_empty(),
         "live select must not read probe authorizations from SQL: {reads:?}"
     );
-    println!("HELD_PROBE_REFUSAL={}", String::from_utf8_lossy(&bytes));
-    assert_eq!(frame, FrameType::Error);
-    let refusal: Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(refusal["code"], "no_route", "{refusal}");
-    assert_eq!(bytes, br#"{"code":"no_route","message":"An account that can serve this request is being tested. Check again shortly.","detail":{"reason":"accounts_blocked","reset_at_ms":1800000089128}}"#);
-    let during = harness
-        .store()
-        .fence_rechecks()
-        .unwrap()
-        .into_iter()
-        .find(|origin| origin.kind == "observation")
-        .unwrap();
     assert_eq!(
-        during, origin,
-        "a check-again hint must not move the test clock"
-    );
-    let account_wait = runner
-        .call("route.account_for", &admission("another-run"))
-        .await;
-    assert_eq!(account_wait.0, FrameType::Error, "{}", account_wait.1);
-    assert_eq!(
-        account_wait.1["code"], "account_pool_exhausted",
+        frame,
+        FrameType::Response,
         "{}",
-        account_wait.1
+        String::from_utf8_lossy(&bytes)
     );
-    assert_eq!(
-        account_wait.1["detail"]["reset_at_ms"],
-        select_at + 30_000,
-        "account_for gives the same check-again hint: {}",
-        account_wait.1
-    );
-    let conn = rusqlite::Connection::open(harness.store_path()).unwrap();
-    let rejected: String = conn
-        .query_row(
-            "SELECT rejected_json FROM model_route_decisions ORDER BY rowid DESC LIMIT 1",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    let rejected: Vec<Value> = serde_json::from_str(&rejected).unwrap();
-    assert_eq!(rejected.len(), 3, "{rejected:?}");
-    for model in MODELS {
-        assert!(
-            rejected
-                .iter()
-                .any(|route| route["routeKey"] == format!("openai/{model}")
-                    && route["reason"] == "backoff_active"),
-            "{rejected:?}"
-        );
-    }
-
-    let _served = crate::InjectedClock::set(backoff_at + 80_434);
-    let success = runner
-        .call(
-            "route.account_observe",
-            &served("probe-run", "probe-first-step-served"),
-        )
-        .await;
-    assert_eq!(success.0, FrameType::Response, "{}", success.1);
-    assert!(
-        success.1.to_string().contains("block_cleared"),
-        "{}",
-        success.1
-    );
-    assert!(harness
-        .store()
-        .fence_rechecks()
-        .unwrap()
-        .iter()
-        .all(|origin| origin.kind != "observation"));
-    let active: i64 = conn
-        .query_row(
-            "SELECT count(*) FROM block WHERE kind='observation' AND source_present=1",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    let retired: i64 = conn
-        .query_row(
-            "SELECT count(*) FROM retirement_tombstone WHERE kind='observation'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!((active, retired), (0, 1));
-    let after = owner.call("route.select", &select).await;
-    assert_eq!(after.0, FrameType::Response, "{}", after.1);
 }

@@ -567,6 +567,7 @@ impl crate::AccountTx<'_> {
                     quota: Some(false),
                     deadline: Some(until_ms as f64),
                     reset_at: None,
+                    rate_limit_retry: false,
                 })
                 .map_err(err)?;
             row.deadline = Some(crate::block_storage::Deadline::Integer(until_ms));

@@ -418,6 +418,8 @@ impl StoredBlock {
         self.is_origin
     }
     pub(crate) fn from_origin(origin: crate::fence_rechecks::ViewOrigin) -> rusqlite::Result<Self> {
+        let rate_limit_retry = origin.rate_limit_retry;
+        let rate_limit_cooldown = origin.rate_limit_retry.then_some(origin.deadline).flatten();
         let reset_at = origin.reset_at.map(SqlReal::from);
         let deadline = origin.deadline.map(|value| Deadline::Real(value.into()));
         let block =
@@ -445,11 +447,11 @@ impl StoredBlock {
             created_at: None,
             recorded_at: None,
             last_reported_at: None,
-            cooldown_until: None,
+            cooldown_until: rate_limit_cooldown.map(SqlReal::from),
             quota_exhausted_until: None,
             reason: None,
             code: None,
-            wall_class: None,
+            wall_class: rate_limit_retry.then(|| "transient".into()),
             is_origin: true,
             wall_unscoped: false,
             scope_error: None,
@@ -492,6 +494,9 @@ impl StoredBlock {
             quota: Some(self.block.lifetime == striatum_core::blocks::LifetimeClass::Quota),
             deadline: self.deadline.map(Deadline::as_f64),
             reset_at: self.reset_at.map(SqlReal::as_f64),
+            rate_limit_retry: matches!(self.block.kind.as_str(), "route" | "provider")
+                && self.wall_class.as_deref() == Some("transient")
+                && self.cooldown_until.is_some(),
         }
     }
 }

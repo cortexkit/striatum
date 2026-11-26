@@ -303,13 +303,16 @@ impl AccountCommand<'_> {
 /// published state, shared with every other reader, or SQL where there is no
 /// state.
 pub(crate) enum Published<'s> {
-    State(Arc<AccountState>),
+    State {
+        state: Arc<AccountState>,
+        now_ms: i64,
+    },
     Sql(&'s SqliteRouteStateStore),
 }
 
-/// The published block tables of `store`.
-/// `now_ms` is the request's own time, the one its command uses, so the
-/// expiry releases the view applies are the ones the command makes.
+/// The published block tables of `store`. `now_ms` is the request's own time,
+/// so its expired rate-limit pauses disappear before selection reserves a
+/// probe; the writer command retires those same generations at that time.
 pub(crate) fn published(
     store: &SqliteRouteStateStore,
     now_ms: i64,
@@ -321,7 +324,7 @@ pub(crate) fn published(
     // releases them before it decides (`AccountCommand::release_expired`).
     let state = super::published_at(store, now_ms)?;
     Ok(if state.blocks.enabled() {
-        Published::State(state)
+        Published::State { state, now_ms }
     } else {
         Published::Sql(store)
     })
@@ -335,7 +338,7 @@ impl Published<'_> {
 
     fn blocks(&self) -> Option<&BlockState> {
         match self {
-            Self::State(state) => Some(&state.blocks),
+            Self::State { state, .. } => Some(&state.blocks),
             Self::Sql(_) => None,
         }
     }
@@ -346,20 +349,23 @@ impl Published<'_> {
     ) -> RouteStateResult<T> {
         match self {
             Self::Sql(store) => store.account_read(read),
-            Self::State(_) => unreachable!("the state answers"),
+            Self::State { .. } => unreachable!("the state answers"),
         }
     }
 
     fn store(&self) -> &SqliteRouteStateStore {
         match self {
             Self::Sql(store) => store,
-            Self::State(_) => unreachable!("the state answers"),
+            Self::State { .. } => unreachable!("the state answers"),
         }
     }
 
     pub(crate) fn fence_rechecks(&self) -> RouteStateResult<Vec<FenceRecheck>> {
         match self.blocks() {
-            Some(blocks) => blocks.fence_rechecks(wall_now()),
+            Some(blocks) => match self {
+                Self::State { now_ms, .. } => blocks.fence_rechecks(*now_ms),
+                Self::Sql(_) => unreachable!("SQL has no in-memory blocks"),
+            },
             None => self.store().fence_rechecks(),
         }
     }

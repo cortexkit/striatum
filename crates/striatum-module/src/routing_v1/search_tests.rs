@@ -325,6 +325,7 @@ async fn search_declarations_are_atomic_verified_and_join_only_catalog_search_ro
 #[tokio::test]
 async fn search_report_outcomes_are_route_scoped_bounded_and_idempotent() {
     let _clock = crate::InjectedClock::set(NOW);
+    let _replay = striatum_store::replay::Inputs::new(NOW as i64).install();
     for (status, legacy, wait, cooldown, success) in [
         ("served", "completed", None, None, true),
         ("served_empty", "completed", None, None, true),
@@ -385,10 +386,7 @@ async fn search_report_outcomes_are_route_scoped_bounded_and_idempotent() {
                 "paid",
                 "{status}"
             );
-            h.credentials()
-                .lock()
-                .unwrap()
-                .engine_clock_offset_ms = cooldown_wait + 1;
+            h.credentials().lock().unwrap().engine_clock_offset_ms = cooldown_wait + 1;
             assert_eq!(
                 selected(&route, &request()).await["engine"]["model"],
                 "allowance",
@@ -405,7 +403,7 @@ async fn search_report_outcomes_are_route_scoped_bounded_and_idempotent() {
             let wall_class: Option<String> = rusqlite::Connection::open(h.store_path())
                 .unwrap()
                 .query_row(
-                    "SELECT wall_class FROM model_route_state WHERE route_key=?1",
+                    "SELECT wall_class FROM block WHERE kind='route' AND origin_key=json_array(?1)",
                     [key],
                     |row| row.get(0),
                 )
@@ -416,6 +414,48 @@ async fn search_report_outcomes_are_route_scoped_bounded_and_idempotent() {
                 "an explicit provider retry must be distinguishable from a guessed or outage cooldown"
             );
         }
+    }
+}
+
+#[tokio::test]
+async fn unmarked_attempt_cooldowns_do_not_inherit_an_explicit_rate_limit_marker() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let _replay = striatum_store::replay::Inputs::new(NOW as i64).install();
+    let h = setup(400);
+    let route = h.bind(reserved("plexus"), None).await;
+    let mut decisions = Vec::new();
+    for _ in 0..3 {
+        let answer = selected(&route, &request()).await;
+        decisions.push(answer["decision_id"].as_str().unwrap().to_owned());
+    }
+    for ((index, status, retry), decision_id) in [
+        ("explicit", "throttled", Some(5_000)),
+        ("default", "throttled", None),
+        ("outage", "unavailable", None),
+    ]
+    .into_iter()
+    .zip(decisions)
+    {
+        let mut report = json!({"decision_id":decision_id,"outcome":"failed",
+            "attempt_outcome":{"status":status}});
+        if let Some(retry) = retry {
+            report["attempt_outcome"]["retry_after_ms"] = json!(retry);
+        }
+        let (ty, reply) = route.call("route.report", &report).await;
+        assert_eq!(ty, FrameType::Response, "{index}: {reply}");
+        let wall_class: Option<String> = rusqlite::Connection::open(h.store_path())
+            .unwrap()
+            .query_row(
+                "SELECT wall_class FROM block WHERE kind='route' AND origin_key=json_array('search-fixture/allowance')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            wall_class.as_deref(),
+            (index == "explicit").then_some("transient"),
+            "{index}: each new pause must carry its own evidence class"
+        );
     }
 }
 

@@ -621,6 +621,16 @@ fn decode(table: usize, r: &Row<'_>) -> rusqlite::Result<(i64, String, Option<He
             class.as_deref(),
         ))
     };
+    let mark_rate_limit =
+        |origin: &mut ViewOrigin, class_at: usize, cooldown_at: usize| -> rusqlite::Result<()> {
+            if matches!(origin.kind.as_str(), "route" | "provider") {
+                let class: Option<String> = r.get(class_at)?;
+                let cooldown: Option<f64> = r.get(cooldown_at)?;
+                origin.rate_limit_retry =
+                    class.as_deref() == Some("transient") && cooldown.is_some();
+            }
+            Ok(())
+        };
     let source = |origins: Vec<Option<ViewOrigin>>, link: Link, raw: Raw, always: bool| {
         let origins: Vec<ViewOrigin> = origins.into_iter().flatten().collect();
         (always || !origins.is_empty()).then_some(Held::Source { origins, link, raw })
@@ -691,27 +701,39 @@ fn decode(table: usize, r: &Row<'_>) -> rusqlite::Result<(i64, String, Option<He
             },
             true,
         ),
-        PROVIDER_TABLE => source(
-            vec![slot(2)?],
-            Link::Provider {
-                key: r.get(17)?,
-                quarantined: quarantined(18)?,
-                wall: wall(18)?,
-            },
-            Raw::Provider(crate::route_snapshot::provider_row_at(r, 24)?),
-            true,
-        ),
-        ROUTE_TABLE => source(
-            vec![slot(2)?, slot(17)?],
-            Link::Route {
-                key: r.get(39)?,
-                provider: r.get(32)?,
-                quarantined: quarantined(33)?,
-                wall: wall(33)?,
-            },
-            Raw::Route(crate::route_snapshot::route_row_at(r, 40)?),
-            true,
-        ),
+        PROVIDER_TABLE => {
+            let mut origins = vec![slot(2)?];
+            for origin in origins.iter_mut().flatten() {
+                mark_rate_limit(origin, 22, 20)?;
+            }
+            source(
+                origins,
+                Link::Provider {
+                    key: r.get(17)?,
+                    quarantined: quarantined(18)?,
+                    wall: wall(18)?,
+                },
+                Raw::Provider(crate::route_snapshot::provider_row_at(r, 24)?),
+                true,
+            )
+        }
+        ROUTE_TABLE => {
+            let mut origins = vec![slot(2)?, slot(17)?];
+            for origin in origins.iter_mut().flatten() {
+                mark_rate_limit(origin, 37, 35)?;
+            }
+            source(
+                origins,
+                Link::Route {
+                    key: r.get(39)?,
+                    provider: r.get(32)?,
+                    quarantined: quarantined(33)?,
+                    wall: wall(33)?,
+                },
+                Raw::Route(crate::route_snapshot::route_row_at(r, 40)?),
+                true,
+            )
+        }
         CLOCK_TABLE => {
             let (block, cleared) = fence_rechecks::clock_row(r, 2)?;
             Some(Held::Clock(block, cleared))

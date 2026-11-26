@@ -132,6 +132,7 @@ impl BlockState {
                     reset_at: json
                         .pointer("/reset/at_ms")
                         .and_then(|value| value.as_f64()),
+                    rate_limit_retry: false,
                 })
                 .map_err(crate::err)?;
                 row.observation_id = evidence.observation_id.clone();

@@ -1042,7 +1042,11 @@ impl crate::AccountTx<'_> {
                 let cooldown_until = if new_wall {update.cooldown_until} else {existing.cooldown_until};
                 let quota_exhausted_until = if new_wall {update.quota_exhausted_until} else {existing.quota_exhausted_until};
                 let quota_pressure = update.quota_pressure.or(existing.quota_pressure);
-                let wall_class = update.wall_class.or(existing.wall_class);
+                let wall_class = if new_wall && update.overwrite_wall_class {
+                    update.wall_class
+                } else {
+                    update.wall_class.or(existing.wall_class)
+                };
                 let (last_error, last_error_at) = match &update.last_error {
                     Some(error) => (Some(error.clone()), Some(observed_at)),
                     None if (update.cooldown_until.is_some()
@@ -1239,10 +1243,14 @@ impl crate::AccountTx<'_> {
                     .quota_pressure
                     .or(ex.quota_pressure)
                     .or(provider.quota_pressure);
-                let wall_class = update
-                    .wall_class
-                    .or(ex.wall_class)
-                    .or(provider.wall_class);
+                let wall_class = if new_wall && update.overwrite_wall_class {
+                    update.wall_class
+                } else {
+                    update
+                        .wall_class
+                        .or(ex.wall_class)
+                        .or(provider.wall_class)
+                };
                 let latency_ema_ms = update.latency_ema_ms.or(ex.latency_ema_ms);
                 let success_ema = update.success_ema.or(ex.success_ema);
                 let failure_count = ex.failure_count + if update.increment_failure { 1 } else { 0 };

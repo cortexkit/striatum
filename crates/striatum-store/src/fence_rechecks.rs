@@ -186,19 +186,39 @@ pub(crate) fn sync_on(tx: &crate::AccountTx<'_>, now: i64) -> rusqlite::Result<(
         Some(state) => state.into_owned(),
         None => crate::BlockState::read(tx.conn)?,
     };
-    let retiring: Vec<_> = state
+    let mut retiring: Vec<_> = state
         .view_origins_in_scan_order()
         .into_iter()
         .filter(|origin| {
+            let reopens = reopens_at_deadline(origin);
             origin.quota == Some(false)
-                && origin
-                    .deadline
-                    .is_some_and(|deadline| deadline < now as f64)
-                && state
-                    .clock(&origin.kind, &origin.origin_key)
-                    .is_none_or(|(clock, _)| clock.evidence != origin.evidence)
+                && origin.deadline.is_some_and(|deadline| {
+                    if reopens {
+                        deadline <= now as f64
+                    } else {
+                        deadline < now as f64
+                    }
+                })
+                && (reopens
+                    || state
+                        .clock(&origin.kind, &origin.origin_key)
+                        .is_none_or(|(clock, _)| clock.evidence != origin.evidence))
         })
         .collect();
+    let mut planned: std::collections::HashSet<_> = retiring
+        .iter()
+        .map(|origin| (origin.kind.clone(), origin.origin_key.clone()))
+        .collect();
+    for origin in state.source_origins().into_iter().filter(|origin| {
+        reopens_at_deadline(origin)
+            && origin
+                .deadline
+                .is_some_and(|deadline| deadline <= now as f64)
+    }) {
+        if planned.insert((origin.kind.clone(), origin.origin_key.clone())) {
+            retiring.push(origin);
+        }
+    }
     for origin in &retiring {
         state.check_source(tx.conn, &origin.kind, &origin.origin_key, &origin.provider)?;
         state.check_clock(tx.conn, &origin.kind, &origin.origin_key)?;
@@ -593,6 +613,8 @@ pub struct ViewOrigin {
     pub quota: Option<bool>,
     pub deadline: Option<f64>,
     pub reset_at: Option<f64>,
+    /// A route cooldown backed by an explicit provider rate-limit retry.
+    pub rate_limit_retry: bool,
 }
 
 /// Decode the view's 14 columns starting at `at`, in the view's order.
@@ -613,7 +635,19 @@ pub(crate) fn view_origin(r: &rusqlite::Row<'_>, at: usize) -> rusqlite::Result<
         quota: r.get(at + 11)?,
         deadline: r.get(at + 12)?,
         reset_at: r.get(at + 13)?,
+        rate_limit_retry: false,
     })
+}
+
+/// Whether this block's provider-supplied short pause ends in open admission
+/// rather than one request claiming a recovery test. Other transient-looking
+/// walls, including guessed and outage cooldowns, keep the recovery test.
+fn reopens_at_deadline(origin: &ViewOrigin) -> bool {
+    origin.quota == Some(false)
+        && (matches!(
+            origin.kind.as_str(),
+            "observation" | "transient_route" | "pool_rate"
+        ) || (matches!(origin.kind.as_str(), "route" | "provider") && origin.rate_limit_retry))
 }
 
 /// Merge source evidence with the stored clocks. The SQL adapter and the
@@ -661,6 +695,10 @@ pub(crate) fn derive_block(
     prior: Option<(&Block, Option<i64>)>,
     now: i64,
 ) -> rusqlite::Result<Option<Block>> {
+    let deadline = origin.deadline.map(|at| at as i64);
+    if reopens_at_deadline(&origin) && deadline.is_some_and(|at| at <= now) {
+        return Ok(None);
+    }
     if let Some((block, cleared)) = prior {
         if block.evidence == origin.evidence {
             return Ok(cleared.is_none().then(|| block.clone()));
@@ -668,7 +706,6 @@ pub(crate) fn derive_block(
     }
     let evidence_at = origin.evidence_at;
     let quota = origin.quota.unwrap_or(false);
-    let deadline = origin.deadline.map(|at| at as i64);
     if !quota && deadline.is_some_and(|at| at < now) {
         return Ok(None);
     }
@@ -1351,7 +1388,7 @@ impl AccountTx<'_> {
         grant_owner: Option<&str>,
         authorization: Option<&str>,
     ) -> RouteStateResult<bool> {
-        sync_on(self, crate::now_ms()).map_err(err)?;
+        sync_on(self, now).map_err(err)?;
         let blocks = self.working_blocks()?;
         claim_decided(
             self.conn,
@@ -2156,12 +2193,17 @@ impl AccountTx<'_> {
     /// reads them: from the command's working state when it has one, which
     /// evaluates expiry at the same wall clock, else from SQL.
     pub fn fence_rechecks(&self) -> RouteStateResult<Vec<FenceRecheck>> {
+        self.fence_rechecks_at(crate::now_ms())
+    }
+
+    /// Effective rechecks at the command's own evidence clock.
+    pub fn fence_rechecks_at(&self, now: i64) -> RouteStateResult<Vec<FenceRecheck>> {
         #[cfg(any(test, feature = "test-support"))]
         let _writer_entry =
             crate::writer_entry_trace::enter("account_tx::fence_rechecks::fence_rechecks");
         match self.working_blocks()? {
-            Some(blocks) => blocks.fence_rechecks(crate::now_ms()),
-            None => read_effective(self.conn).map_err(err),
+            Some(blocks) => blocks.fence_rechecks(now),
+            None => read_effective_at(self.conn, now).map_err(err),
         }
     }
 
@@ -2792,7 +2834,7 @@ mod tests {
     }
 
     #[test]
-    fn a_repeat_transient_observation_replaces_the_claimed_origins_short_retry() {
+    fn a_newer_transient_observation_reopens_after_each_expiry() {
         let scratch = cortexkit_test_support::ScratchDir::new("transient-retry");
         let store = SqliteRouteStateStore::open(&crate::dev_descriptor(
             "transient-retry",
@@ -2805,21 +2847,21 @@ mod tests {
             observation_json:"{}".into(),effects_json:serde_json::json!([{"effect":"transient_backoff","provider":"p","account_id":"a","retry_at_ms":until}]).to_string(),received_at:at,
         })).unwrap()
         };
-        observe("first", 0, 10_000);
+        let at = crate::now_ms();
+        observe("first", at, at + 10_000);
         let origins = store.fence_rechecks().unwrap();
-        assert!(store
-            .account_transaction(|tx| tx.claim_fence_rechecks(&origins, 10_000))
+        assert!(!store
+            .account_transaction(|tx| tx.claim_fence_rechecks(&origins, at + 10_000))
             .unwrap());
-        observe("repeat", 10_001, 20_000);
+        assert!(store.fence_rechecks().unwrap().is_empty());
+        observe("repeat", at + 10_001, at + 20_000);
         let origins = store.fence_rechecks().unwrap();
         assert_eq!(origins.len(), 1);
-        assert_eq!(origins[0].due_at(), 20_000);
-        assert!(store
-            .account_transaction(|tx| tx.claim_fence_rechecks(&origins, 20_000))
-            .unwrap());
+        assert_eq!(origins[0].due_at(), at + 20_000);
         assert!(!store
-            .account_transaction(|tx| tx.claim_fence_rechecks(&origins, 20_000))
+            .account_transaction(|tx| tx.claim_fence_rechecks(&origins, at + 20_000))
             .unwrap());
+        assert!(store.fence_rechecks().unwrap().is_empty());
     }
 
     #[test]
@@ -2946,7 +2988,7 @@ mod tests {
     }
 
     #[test]
-    fn every_non_quota_origin_caps_at_one_hour_preserves_shorter_retry_and_claims_once() {
+    fn every_non_quota_origin_caps_at_one_hour_and_only_probe_gated_origins_claim_once() {
         for duration in [10_000, 86_400_000] {
             let scratch = cortexkit_test_support::ScratchDir::new("all-fence-caps");
             let store = SqliteRouteStateStore::open(&crate::dev_descriptor(
@@ -3063,22 +3105,32 @@ mod tests {
                 if duration == 10_000 && clock.kind != "credential" {
                     assert_eq!(clock.next_recheck_at, until, "{}", clock.kind);
                 }
-                assert!(
-                    store
-                        .account_transaction(|tx| tx
-                            .claim_fence_rechecks(std::slice::from_ref(clock), clock.due_at()))
-                        .unwrap(),
-                    "{}",
-                    clock.kind
-                );
-                assert!(
-                    !store
-                        .account_transaction(|tx| tx
-                            .claim_fence_rechecks(std::slice::from_ref(clock), clock.due_at()))
-                        .unwrap(),
-                    "{}",
-                    clock.kind
-                );
+                let claimed = store
+                    .account_transaction(|tx| {
+                        tx.claim_fence_rechecks(std::slice::from_ref(clock), clock.due_at())
+                    })
+                    .unwrap();
+                if matches!(
+                    clock.kind.as_str(),
+                    "observation" | "transient_route" | "pool_rate"
+                ) {
+                    assert!(!claimed, "{} must reopen without a claim", clock.kind);
+                    assert!(store
+                        .fence_rechecks()
+                        .unwrap()
+                        .iter()
+                        .all(|origin| origin.kind != clock.kind));
+                } else {
+                    assert!(claimed, "{}", clock.kind);
+                    assert!(
+                        !store
+                            .account_transaction(|tx| tx
+                                .claim_fence_rechecks(std::slice::from_ref(clock), clock.due_at()))
+                            .unwrap(),
+                        "{}",
+                        clock.kind
+                    );
+                }
             }
         }
     }
@@ -3298,7 +3350,7 @@ mod tests {
             .pool_wall(
                 "p",
                 "managed",
-                crate::PoolWallKind::RateLimited,
+                crate::PoolWallKind::Billing,
                 now - 1,
                 "new refusal, immediate retry",
                 now - 100,

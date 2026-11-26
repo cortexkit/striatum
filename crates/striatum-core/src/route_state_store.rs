@@ -121,6 +121,9 @@ pub struct RouteStateUpdate {
     pub cooldown_until: Option<f64>,
     pub quota_exhausted_until: Option<f64>,
     pub wall_class: Option<RouteWallClass>,
+    /// Replace the previous wall class with `wall_class` when this update
+    /// carries new wall evidence, rather than inheriting a missing class.
+    pub overwrite_wall_class: bool,
     pub quota_pressure: Option<f64>,
     pub latency_ema_ms: Option<f64>,
     pub success_ema: Option<f64>,

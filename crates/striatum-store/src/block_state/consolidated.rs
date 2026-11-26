@@ -482,6 +482,15 @@ impl BlockState {
         self.scan_order(self.block_rows())
     }
 
+    /// Every current source, including a route hidden by its provider's
+    /// covering wall. Expiry retires both generations together so the covered
+    /// route cannot reappear after its provider is retired.
+    pub(crate) fn source_origins(&self) -> Vec<ViewOrigin> {
+        self.block_rows()
+            .filter_map(|row| self.view_origin(row))
+            .collect()
+    }
+
     fn scan_order<'a>(&'a self, rows: impl Iterator<Item = &'a StoredBlock>) -> Vec<ViewOrigin> {
         let mut rows = self.view_rows(rows);
         rows.sort_by_key(|(position, _)| *position);

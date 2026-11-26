@@ -460,7 +460,7 @@ async fn quota_wall_still_allows_only_one_recovery_request() {
 }
 
 #[tokio::test]
-async fn in_flight_test_with_less_than_thirty_seconds_remaining_uses_its_clock() {
+async fn expired_backoff_reopens_select_after_the_old_test_window() {
     let _clock = crate::InjectedClock::set(NOW);
     let (harness, owner, runner) = blocked(NOW + 5_000).await;
     let claimed_at = NOW + 5_001;
@@ -481,16 +481,19 @@ async fn in_flight_test_with_less_than_thirty_seconds_remaining_uses_its_clock()
     );
     drop(credentials);
     let reply = owner.call("route.select", &select()).await;
-    assert_eq!(reply.0, FrameType::Error, "{}", reply.1);
-    assert_eq!(reply.1["detail"]["reset_at_ms"], clock, "{}", reply.1);
-    assert!(reply.1["message"]
-        .as_str()
-        .unwrap()
-        .contains("being tested"));
+    assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
+    assert!(
+        crate::account_state::published(harness.store(), (clock - 10_000) as i64)
+            .unwrap()
+            .fence_rechecks()
+            .unwrap()
+            .iter()
+            .all(|origin| origin.kind != "observation")
+    );
 }
 
 #[tokio::test]
-async fn claimed_non_quota_test_gives_panel_seats_a_short_check_time() {
+async fn expired_backoff_reopens_pinned_and_panel_selection() {
     let _clock = crate::InjectedClock::set(NOW);
     let (harness, owner, runner) = blocked(NOW + 5_000).await;
     let _due = crate::InjectedClock::set(NOW + 5_001);
@@ -507,18 +510,7 @@ async fn claimed_non_quota_test_gives_panel_seats_a_short_check_time() {
             }),
         )
         .await;
-    assert_eq!(pinned.1["code"], "pin_unavailable", "{}", pinned.1);
-    assert_eq!(pinned.1["detail"]["reason"], "backoff", "{}", pinned.1);
-    assert_eq!(
-        pinned.1["detail"]["reset_at_ms"],
-        NOW + 35_001,
-        "{}",
-        pinned.1
-    );
-    assert!(pinned.1["message"]
-        .as_str()
-        .unwrap()
-        .contains("being tested"));
+    assert_eq!(pinned.0, FrameType::Response, "{}", pinned.1);
     let reply = owner
         .call(
             "route.select_panel",
@@ -531,19 +523,8 @@ async fn claimed_non_quota_test_gives_panel_seats_a_short_check_time() {
     assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
     let panel: cortexkit_role_routing::panel::SelectPanelAnswer =
         serde_json::from_value(reply.1["result"].clone()).unwrap();
-    assert!(panel.seats.is_empty());
-    let detail = panel.shortfall.unwrap().typed_detail().unwrap().unwrap();
-    assert!(!detail.causes.is_empty());
-    for cause in detail.causes {
-        assert_eq!(cause.reset_at_ms, Some(NOW + 35_001), "{cause:?}");
-        assert_eq!(cause.reason, "quota_exhausted");
-        assert!(cause
-            .detail
-            .unwrap()
-            .as_str()
-            .unwrap()
-            .contains("being tested"));
-    }
+    assert_eq!(panel.seats.len(), 1);
+    assert!(panel.shortfall.is_none());
 }
 
 fn quota_route(harness: &Harness) {
@@ -603,7 +584,7 @@ fn quota_route(harness: &Harness) {
 }
 
 #[tokio::test]
-async fn in_flight_test_shortens_mixed_quota_retry_only_on_a_usable_route() {
+async fn reopened_backoff_leaves_quota_only_retry_unchanged() {
     let _clock = crate::InjectedClock::set(NOW);
     let (harness, owner, runner) = blocked(NOW + 5_000).await;
     let _due = crate::InjectedClock::set(NOW + 5_001);
@@ -611,17 +592,7 @@ async fn in_flight_test_shortens_mixed_quota_retry_only_on_a_usable_route() {
     quota_route(&harness);
     let _later = crate::InjectedClock::set(NOW + 6_000);
     let allowed = owner.call("route.select", &select()).await;
-    assert_eq!(allowed.0, FrameType::Error, "{}", allowed.1);
-    assert_eq!(
-        allowed.1["detail"]["reset_at_ms"],
-        NOW + 36_000,
-        "{}",
-        allowed.1
-    );
-    assert!(allowed.1["message"]
-        .as_str()
-        .unwrap()
-        .contains("being tested"));
+    assert_eq!(allowed.0, FrameType::Response, "{}", allowed.1);
     let mut excluded = select();
     excluded["exclude"] = json!(MODELS.map(|model| format!("openai/{model}")));
     let reply = owner.call("route.select", &excluded).await;
@@ -639,7 +610,7 @@ async fn in_flight_test_shortens_mixed_quota_retry_only_on_a_usable_route() {
 }
 
 #[tokio::test]
-async fn same_route_quota_alternative_does_not_hide_held_test_hint() {
+async fn reopened_backoff_is_not_hidden_by_a_quota_alternative() {
     let _clock = crate::InjectedClock::set(NOW);
     let (harness, owner, runner) = blocked(NOW + 5_000).await;
     let _due = crate::InjectedClock::set(NOW + 5_001);
@@ -704,30 +675,10 @@ async fn same_route_quota_alternative_does_not_hide_held_test_hint() {
         .unwrap();
     let _later = crate::InjectedClock::set(NOW + 6_000);
     let automatic = owner.call("route.select", &select()).await;
-    assert_eq!(
-        automatic.1["detail"]["reset_at_ms"],
-        NOW + 36_000,
-        "{}",
-        automatic.1
-    );
+    assert_eq!(automatic.0, FrameType::Response, "{}", automatic.1);
     let mut request = select();
     request["pin"] = json!(format!("openai/{}", MODELS[0]));
     request["hold_wait_max_s"] = json!(0);
     let pinned = owner.call("route.select", &request).await;
-    assert_eq!(pinned.1["code"], "pin_unavailable", "{}", pinned.1);
-    assert_eq!(
-        pinned.1["detail"]["reason"], "quota_exhausted",
-        "{}",
-        pinned.1
-    );
-    assert_eq!(
-        pinned.1["detail"]["reset_at_ms"],
-        NOW + 36_000,
-        "{}",
-        pinned.1
-    );
-    assert!(pinned.1["message"]
-        .as_str()
-        .unwrap()
-        .contains("being tested"));
+    assert_eq!(pinned.0, FrameType::Response, "{}", pinned.1);
 }

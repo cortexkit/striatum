@@ -28,7 +28,9 @@ pub(super) fn origins(conn: &Connection) -> rusqlite::Result<Vec<ViewOrigin>> {
                      length('credential-quota:'||src.origin_key||':'))
                      = 'credential-quota:'||src.origin_key||':'
                ) ELSE src.quota END,
-               src.deadline,src.reset_at
+               src.deadline,src.reset_at,
+               CASE WHEN src.kind IN ('route','provider') AND src.wall_class='transient'
+                 AND src.cooldown_until IS NOT NULL THEN 1 ELSE 0 END
              FROM block src
              WHERE src.source_present=1 AND src.is_origin=1
                AND (src.cleared_by IS NULL OR src.cleared_by='kept')
@@ -59,6 +61,7 @@ pub(super) fn origins(conn: &Connection) -> rusqlite::Result<Vec<ViewOrigin>> {
                 quota: row.get(11)?,
                 deadline: row.get(12)?,
                 reset_at: row.get(13)?,
+                rate_limit_retry: row.get(14)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
