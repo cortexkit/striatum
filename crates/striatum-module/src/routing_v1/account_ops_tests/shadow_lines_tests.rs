@@ -45,7 +45,7 @@ async fn account_shadow_marks_scope_independently_of_authorization_and_logs_refu
     assert_eq!(calls.len(), 4);
     for (call, head_call, owner) in [
         (&calls[0], false, Value::Null),
-        (&calls[1], true, json!("reserved:prefrontal")),
+        (&calls[1], true, json!("reserved:prefrontal-core")),
         (&calls[2], true, json!("reserved:replaceable-host")),
         (&calls[3], false, Value::Null),
     ] {
