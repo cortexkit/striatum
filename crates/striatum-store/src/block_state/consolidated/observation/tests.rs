@@ -1,5 +1,5 @@
 #[test]
-fn bound_observation_replay_keeps_its_last_effect_and_healed_clock() {
+fn bound_observation_replay_keeps_its_last_effect_and_retired_clock() {
     let rig = super::credential::native_rig("native-observation-replay");
     let now = crate::now_ms();
     let effects=serde_json::json!([
@@ -61,8 +61,8 @@ fn bound_observation_replay_keeps_its_last_effect_and_healed_clock() {
                     [&key],
                     |row| Ok((row.get::<_,String>(0)?,row.get::<_,i64>(1)?,row.get::<_,i64>(2)?)),
                 )?,
-                (evidence.clone(),now-10,probe+2),
-                "authorized success must retire the exact bound-observation evidence"
+                (evidence.clone(),now-10,probe),
+                "expiry must retire the exact bound-observation evidence"
             );
             assert_eq!(conn.query_row(
                 "SELECT count(*) FROM probe_authorization WHERE kind='observation' AND origin_key=?1",
