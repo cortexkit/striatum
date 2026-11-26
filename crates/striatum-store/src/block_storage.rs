@@ -281,8 +281,7 @@ fn source_insert_sql(kind: &str) -> String {
         deadline=excluded.deadline,reset_at=excluded.reset_at,observed_at=excluded.observed_at,created_at=excluded.created_at,
         recorded_at=excluded.recorded_at,last_reported_at=excluded.last_reported_at,cooldown_until=excluded.cooldown_until,
         quota_exhausted_until=excluded.quota_exhausted_until,
-        reason=CASE WHEN excluded.kind IN ('route','provider') THEN COALESCE(excluded.reason,block.reason) ELSE excluded.reason END,
-        code=excluded.code,
+        reason=excluded.reason,code=excluded.code,
         wall_class=excluded.wall_class,wall_unscoped=excluded.wall_unscoped,scope_error=excluded.scope_error,
         listing_fingerprint=excluded.listing_fingerprint,recovery_set_json=excluded.recovery_set_json,
         source_metadata_json=excluded.source_metadata_json,cleared_reason=excluded.cleared_reason,
@@ -721,10 +720,6 @@ pub(crate) fn account_route_source(
     row.recorded_at = Some(fence.recorded_at);
     row.last_reported_at = reported;
     row.wall_class = Some(class.into());
-    if kind == "transient_route" {
-        // No current producer of this kind carries a provider retry time.
-        row.reason = Some(String::new());
-    }
     row.meta = Meta::Route(RouteMeta {
         decision_id: fence.decision_id.clone(),
     });
@@ -793,11 +788,9 @@ pub(crate) fn wall_source_with_retry(
     row.wall_class = wall.class.map(str::to_owned);
     row.wall_unscoped = wall.unscoped;
     if new_wall {
-        row.reason = Some(if provider_retry {
-            PROVIDER_RETRY_REASON.into()
-        } else {
-            String::new()
-        });
+        // Null is the ordinary public reason. A new unmarked wall must also
+        // clear an older provider-retry marker on the same origin.
+        row.reason = provider_retry.then(|| PROVIDER_RETRY_REASON.into());
     }
     Ok(Some(row))
 }
