@@ -9,7 +9,9 @@
 //! Provenance (all real sources, no fabrication):
 //!   - `elo`  : operator-resolved open capability Elo placement.
 //!   - `eq`   : EQ-Bench 3 elo_norm (absolute) + curated values on the same scale.
-//!   - `speed`: historical benchmark median output tokens/sec (max-effort variant).
+//!   - `speed`: output tokens per second from a public benchmark median, taken
+//!     when the seed was written and measured at each model's highest reasoning
+//!     effort. Live routing prefers speeds measured from recent usage.
 //!   - context/cost/vision: models.dev catalog.
 
 use std::sync::OnceLock;
