@@ -223,3 +223,14 @@ also exercises a copy of the exhaustion body without the two reset members.
 | Imported path | Source | SHA-256 |
 | --- | --- | --- |
 | `served-payloads-710f929f.json` | Fusiform `710f929f`, `crates/fusiform-module/fixtures/served-payloads.json` | `cdb5589a6d054ff5a0e1887dcaa7f78025f0b96ab0903f7eb0a74d6404eb2ce9` |
+
+## Broca unpinned llm_classify routing request
+
+The select envelope was copied byte for byte from BROCA's capture and verified
+against its supplied SHA256SUMS. It has no explicit model pin, leaving routing
+to choose a model. The other captures are caller-facing results, not routing
+inputs.
+
+| Imported path | Source | SHA-256 |
+| --- | --- | --- |
+| `broca-llm-classify-unpinned-1126/routing-select.json` | BROCA `.cortexkit/internal-docs/samples/broca-llm-classify-unpinned-1126/routing-select.json` | `7c4ed39b6f639758aa040c53d6148154b57318f8e63fd3ee399e761715468978` |

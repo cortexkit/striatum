@@ -351,6 +351,116 @@ async fn broca_classifier_routed_select_body() {
 }
 
 #[tokio::test]
+async fn broca_unpinned_llm_classify_select_sample() {
+    const SAMPLE: &str =
+        include_str!("../../fixtures/broca-llm-classify-unpinned-1126/routing-select.json");
+    const SLOT: &[u8] = include_bytes!(
+        "../../fixtures/broca-output-cap-harness-1124/current-live-routing-slot.json"
+    );
+    const JEV_114: &str = "typesafe/jev-1.14.0";
+    const LUNA: &str = "openai/gpt-6-luna-decisions";
+    let harness = rig(
+        |catalog| {
+            catalog["quality_scores"] = json!({"graded_by":"operator", "graded_at_ms":1});
+            catalog["models"][CLEF]["quality.grade.decision"] = json!(60);
+            for (model, rate, grade) in [(JEV_114, 0.042, 66), (LUNA, 0.1, 60)] {
+                let mut row = catalog["models"][JEV].clone();
+                row["rate.input"]["units"] = json!((rate * 1e9_f64) as i64);
+                if model == LUNA {
+                    row["rate.cache_read"] = json!({"state":"priced", "currency":"USD", "units":10_000_000, "exponent":9});
+                }
+                row["quality.grade.decision"] = json!(grade);
+                catalog["models"][model] = row;
+            }
+        },
+        |description| {
+            let models = description["result"]["models"].as_array_mut().unwrap();
+            let base = models[0].clone();
+            for (model, rate) in [(JEV_114, 0.042), (LUNA, 0.1)] {
+                let mut entry = base.clone();
+                entry["model"] = json!(model);
+                entry["price"]["input_per_mtok_usd"] = json!(rate);
+                models.push(entry);
+            }
+        },
+    );
+    harness.edit_config(|config| {
+        for provider in ["cloudflare-workers-ai", "typesafe"] {
+            config["providers"][provider]["pin_only"] = json!(true);
+        }
+        for model in [CLEF, FLASH, LUNA, JEV, JEV_114] {
+            config["models"][model] = json!({"only_for":[CONSUMER], "pin_only":false});
+        }
+    });
+    let slot: Value = serde_json::from_slice(SLOT).unwrap();
+    let declarations = super::runners::declarations_from_catalog(&json!([{
+        "module_id":"broca", "nonce_verified":true, "role_declarations":{"routing/v1":slot}
+    }]));
+    assert!(declarations.contains_key("broca"));
+    harness.credentials().lock().unwrap().runner_declarations = declarations;
+    let registry = super::consumers::effective(&harness.operator_config());
+    let matching_names: Vec<_> = registry
+        .names()
+        .into_iter()
+        .filter(|name| crate::config_policy::consumer_matches(name, "broca.classifier.basal.flow"))
+        .collect();
+    assert_eq!(matching_names, vec![CONSUMER]);
+    let route = harness.bind(reserved("broca"), None).await;
+    let body = SAMPLE
+        .trim_end()
+        .strip_prefix("{\"method\":\"route.select\",\"params\":")
+        .unwrap()
+        .strip_suffix('}')
+        .unwrap();
+    let (frame, bytes) = route.call_raw_params("route.select", body.as_bytes()).await;
+    let reply: Value = serde_json::from_slice(&bytes).unwrap();
+    println!("Broca unpinned select: {reply}");
+    let answer = result((frame, reply));
+    assert_eq!(route_key(&answer), JEV_114);
+    assert_eq!(answer["runner"]["module"], "broca");
+    assert_eq!(answer["price"]["basis"], "metered");
+    assert_eq!(answer["price"]["rates_per_mtok"]["input"], 0.042);
+    let input_rate = answer["price"]["rates_per_mtok"]["input"].as_f64().unwrap();
+    assert!(input_rate * 564.0 / 1_000_000.0 < 1.0);
+    let mut params: Value = serde_json::from_str(body).unwrap();
+    let outsider = harness.bind(reserved("other"), None).await;
+    let (frame, reply) = outsider.call("route.select", &params).await;
+    assert_eq!(frame, FrameType::Error, "{reply}");
+    assert_eq!(reply["code"], "consumer_not_owned", "{reply}");
+    params["requirements"]["max_cost_usd"] = json!(0.000000000001);
+    let (frame, reply) = route.call("route.select", &params).await;
+    println!("Broca unpinned cost control: {reply}");
+    assert_eq!(frame, FrameType::Error, "{reply}");
+    assert_eq!(reply["code"], "no_route", "{reply}");
+    assert_eq!(reply["detail"]["reason"], "missing_capability", "{reply}");
+    assert_eq!(
+        reply["message"],
+        "no route meets the request: missing_capability"
+    );
+
+    harness.edit_config(|config| {
+        config["consumers"]["broca.classifierish"] = json!({"owner":"broca"})
+    });
+    for (consumer, excluded) in [
+        ("broca.classifier.basal.flow", false),
+        ("broca.classifierish", true),
+    ] {
+        let inventory = result(
+            route
+                .call("route.consumer_models", &json!({"consumer":consumer}))
+                .await,
+        );
+        let jev = inventory["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["provider"] == "typesafe" && entry["model"] == "jev-1.14.0")
+            .unwrap();
+        assert_eq!(jev["excluded"], excluded, "{consumer}: {jev}");
+    }
+}
+
+#[tokio::test]
 async fn decision_grades_filter_automatic_picks_but_not_pins_or_the_settings_ladder() {
     let harness = rig(decision_grades, |_| {});
     let route = harness.bind(reserved("broca"), None).await;
