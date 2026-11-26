@@ -465,7 +465,7 @@ impl SqliteRouteStateStore {
             // or claimed a newer refusal since the read.
             let changed = crate::fence_rechecks::needs_sync(conn).map_err(err)?;
             if changed {
-                crate::fence_rechecks::sync_on(&crate::AccountTx::sql(conn), crate::now_ms())
+                crate::fence_rechecks::sync_on(&crate::AccountTx::sql(conn), now_ms)
                     .map_err(err)?;
             }
             let states = read_key_states(conn, &provider, now_ms, None).map_err(err)?;
@@ -484,7 +484,7 @@ impl crate::AccountTx<'_> {
         now_ms: i64,
         excluded_lease: Option<&str>,
     ) -> rusqlite::Result<BTreeMap<String, PoolKeyState>> {
-        crate::fence_rechecks::sync_on(self, crate::now_ms())?;
+        crate::fence_rechecks::sync_on(self, now_ms)?;
         let state = self
             .working_blocks()
             .map_err(|error| rusqlite::Error::ToSqlConversionFailure(error.0.into()))?;
@@ -909,7 +909,7 @@ impl crate::AccountTx<'_> {
                     let Some(credential_id) = credential_id else {
                         return Ok(None);
                     };
-                    crate::fence_rechecks::sync_on(self, crate::now_ms())?;
+                    crate::fence_rechecks::sync_on(self, now_ms)?;
                     // The refusal below and the grant both rest on the
                     // provider's rows as the state shows them.
                     self.check_lease_inputs(&[provider])?;
