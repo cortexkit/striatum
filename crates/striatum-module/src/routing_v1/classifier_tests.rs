@@ -71,11 +71,9 @@ pub(super) fn rig(
         .collect();
     assert_eq!(facts.len(), rows.len());
     for fact in &facts {
-        assert_eq!(
-            fact.model_kind.as_deref(),
-            catalog["models"][format!("{}/{}", fact.provider_id, fact.model_id)]["model.kind"]
-                .as_str(),
-        );
+        let row = &catalog["models"][format!("{}/{}", fact.provider_id, fact.model_id)];
+        assert_eq!(fact.model_kind.as_deref(), row["model.kind"].as_str());
+        assert_eq!(fact.model_type.as_deref(), row["model.type"].as_str());
         assert_eq!(fact.score_provenance, ScoreProvenance::Unscored);
         assert_eq!(fact.scores.elo, 0.0);
         assert_eq!(fact.scores.eq, 0.0);
@@ -352,6 +350,15 @@ async fn broca_classifier_routed_select_body() {
 
 #[tokio::test]
 async fn broca_unpinned_llm_classify_select_sample() {
+    check_broca_unpinned_llm_classify_select_sample(None).await;
+}
+
+#[tokio::test]
+async fn broca_unpinned_llm_classify_select_sample_with_v2_decision_type() {
+    check_broca_unpinned_llm_classify_select_sample(Some("decision")).await;
+}
+
+async fn check_broca_unpinned_llm_classify_select_sample(model_type: Option<&str>) {
     const SAMPLE: &str =
         include_str!("../../fixtures/broca-llm-classify-unpinned-1126/routing-select.json");
     const SLOT: &[u8] = include_bytes!(
@@ -371,6 +378,11 @@ async fn broca_unpinned_llm_classify_select_sample() {
                 }
                 row["quality.grade.decision"] = json!(grade);
                 catalog["models"][model] = row;
+            }
+            if let Some(model_type) = model_type {
+                for row in catalog["models"].as_object_mut().unwrap().values_mut() {
+                    row["model.type"] = json!(model_type);
+                }
             }
         },
         |description| {
@@ -752,6 +764,50 @@ async fn missing_question_limit_fails_closed_and_another_modules_listing_is_igno
         reply.1.to_string().contains("not_chat_kind:decision"),
         "{}",
         reply.1
+    );
+}
+
+#[tokio::test]
+async fn classifier_request_and_settings_pins_admit_v2_decision_type() {
+    let harness = rig(
+        |catalog| catalog["models"][JEV]["model.type"] = json!("decision"),
+        |_| {},
+    );
+    let route = harness.bind(reserved("broca"), None).await;
+    assert_eq!(route_key(&selected(&route, json!({"iq":100})).await), FLASH);
+    let mut pinned = request(json!({"iq":100}));
+    pinned["pin"] = json!(JEV);
+    assert_eq!(
+        route_key(&result(route.call("route.select", &pinned).await)),
+        JEV
+    );
+
+    harness.edit_config(|config| config["consumers"][CONSUMER]["pin"] = json!({"model":JEV}));
+    assert_eq!(route_key(&selected(&route, json!({"iq":100})).await), JEV);
+}
+
+#[tokio::test]
+async fn mason_select_rejects_v2_decision_type() {
+    let harness = rig(
+        |catalog| {
+            for row in catalog["models"].as_object_mut().unwrap().values_mut() {
+                row["model.type"] = json!("decision");
+            }
+        },
+        |_| {},
+    );
+    let route = harness.bind(reserved("example-consumer"), None).await;
+    let (frame, reply) = route
+        .call(
+            "route.select",
+            &json!({"consumer":"mason","requirements":{"iq":50}}),
+        )
+        .await;
+    assert_eq!(frame, FrameType::Error, "{reply}");
+    assert_eq!(reply["code"], "no_route", "{reply}");
+    assert!(
+        reply.to_string().contains("not_chat_model:decision"),
+        "{reply}"
     );
 }
 

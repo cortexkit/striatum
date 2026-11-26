@@ -452,10 +452,16 @@ pub struct ModelFact {
     pub mode_of: Option<SpeedTwin>,
 }
 
-/// A declared non-chat engine cannot serve LLM work, even if it has chat wire
-/// metadata and grades. Specialist kinds are reserved for the classifier path.
+/// Catalog kinds served by the `classifier/v1` role.
+pub const CLASSIFIER_SERVING_KINDS: &[&str] = &["decision", "classifier"];
+
+/// Reject non-chat engines even when they have chat wire metadata.
+/// A classifier can also use its serving kinds when the catalog declares them
+/// as `model.type`; specialist `model.kind` rows remain unavailable to chat.
 pub fn llm_classification_rejection(fact: &ModelFact, classifier: bool) -> Option<String> {
-    if let Some(model_type) = fact.model_type.as_deref().filter(|value| *value != "chat") {
+    if let Some(model_type) = fact.model_type.as_deref().filter(|value| {
+        *value != "chat" && !(classifier && CLASSIFIER_SERVING_KINDS.contains(value))
+    }) {
         return Some(format!("not_chat_model:{model_type}"));
     }
     if !classifier {

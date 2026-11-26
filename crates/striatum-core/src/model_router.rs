@@ -21,7 +21,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::model_facts::{
     fact_to_route, BasketDimension, BasketPrice, ClassVector, ModelFact, ModelMetric,
-    ModelRequirements, ModelRoute, ScoreProvenance, CLASS_VECTOR_SAMPLE_FLOOR,
+    ModelRequirements, ModelRoute, ScoreProvenance, CLASSIFIER_SERVING_KINDS,
+    CLASS_VECTOR_SAMPLE_FLOOR,
 };
 use crate::provider_model_spec::{ExclusionPolicy, ExclusionSource, ExclusionSpecs};
 use crate::route_scoring::{score_adequacy, AdequacyScore, MetricFit};
@@ -943,7 +944,10 @@ fn unscored_requires_placement(fact: &ModelFact, allow_unscored_decisions: bool)
     // need not have chat Elo, and their chat score provenance stays unscored.
     fact.score_provenance == ScoreProvenance::Unscored
         && !(allow_unscored_decisions
-            && matches!(fact.model_kind.as_deref(), Some("decision" | "classifier")))
+            && fact
+                .model_kind
+                .as_deref()
+                .is_some_and(|kind| CLASSIFIER_SERVING_KINDS.contains(&kind)))
 }
 
 /// Apply the usual admission checks with an explicit opt-in for decision rows.
@@ -998,16 +1002,17 @@ pub fn admit_routes_with_score_policy(
         // Catalog-role refusals are structural, not account availability. Keep
         // their reason even for an ungraded model or a route with no account.
         if let Some(reason) =
-            crate::model_facts::llm_classification_rejection(fact, true).or_else(|| {
-                availability_rejections
-                    .get(&route.route_key)
-                    .or_else(|| availability_rejections.get(&route.capacity_key))
-                    .filter(|reason| {
-                        reason.starts_with("not_chat_model:")
-                            || reason.starts_with("not_chat_kind:")
-                    })
-                    .cloned()
-            })
+            crate::model_facts::llm_classification_rejection(fact, allow_unscored_decisions)
+                .or_else(|| {
+                    availability_rejections
+                        .get(&route.route_key)
+                        .or_else(|| availability_rejections.get(&route.capacity_key))
+                        .filter(|reason| {
+                            reason.starts_with("not_chat_model:")
+                                || reason.starts_with("not_chat_kind:")
+                        })
+                        .cloned()
+                })
         {
             rejected.push(RejectedRoute {
                 route_key: route.route_key,

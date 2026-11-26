@@ -15,10 +15,10 @@ use striatum_core::model_facts::{
 };
 use striatum_core::model_facts_seed::model_facts_seed;
 use striatum_core::model_router::{
-    admit_routes, evaluate_model_route_with_concurrency, price_selection_shortlist,
-    select_model_route, select_model_route_with_config, BasketVectorSource,
-    ModelRouteStateSnapshot, PricingMode, RequiredCapabilities, RouteFailureReason,
-    RouteRuntimeState, SelectModelRouteInput,
+    admit_routes, admit_routes_with_score_policy, evaluate_model_route_with_concurrency,
+    price_selection_shortlist, select_model_route, select_model_route_with_config,
+    BasketVectorSource, ModelRouteStateSnapshot, PricingMode, RequiredCapabilities,
+    RouteFailureReason, RouteRuntimeState, SelectModelRouteInput,
 };
 use striatum_core::{
     select_panel, AvailabilitySubstrate, ExclusionPolicy, ModelMetric, OverqualificationConfig,
@@ -229,7 +229,52 @@ fn only_classifier_decision_admission_can_use_unscored_rows_and_report_their_coo
                 assert_eq!(refusal.earliest_reset, Some(20.0));
             } else {
                 let refusal = route(allow, None).unwrap_err();
-                assert_eq!(refusal.rejected[0].reason, "unscored_awaiting_placement");
+                let expected = kind.map_or_else(
+                    || "unscored_awaiting_placement".to_string(),
+                    |kind| format!("not_chat_kind:{kind}"),
+                );
+                assert_eq!(refusal.rejected[0].reason, expected);
+            }
+        }
+    }
+}
+
+#[test]
+fn specialist_catalog_types_only_bypass_chat_admission_for_classifiers() {
+    for (model_type, serves_classifier) in [
+        ("decision", true),
+        ("classifier", true),
+        ("extraction", false),
+    ] {
+        let mut model = fact(FactBuilder {
+            provider_id: "fixture".into(),
+            model_id: "specialist".into(),
+            ..Default::default()
+        });
+        model.model_type = Some(model_type.into());
+        model.model_kind = Some("decision".into());
+        let facts = [model];
+        for classifier in [false, true] {
+            let result = admit_routes_with_score_policy(
+                &facts,
+                None,
+                ExclusionPolicy::caller_only(&[]),
+                &[],
+                None,
+                &availability_of(&facts),
+                &req(0.0, 0.0),
+                &DEFAULT_ROUTING_CONFIG,
+                &HashMap::new(),
+                classifier,
+            );
+            if classifier && serves_classifier {
+                assert_eq!(result.admitted.len(), 1, "{model_type}");
+            } else {
+                assert!(result.admitted.is_empty(), "{model_type}");
+                assert_eq!(
+                    result.rejected[0].reason,
+                    format!("not_chat_model:{model_type}")
+                );
             }
         }
     }

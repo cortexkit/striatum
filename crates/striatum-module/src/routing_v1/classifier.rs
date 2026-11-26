@@ -6,13 +6,12 @@ use std::collections::{BTreeMap, BTreeSet};
 pub(crate) use cortexkit_role_classifier::describe::ModelEntry as ServedModel;
 use cortexkit_role_routing::select::{Modality, Requirements};
 use serde_json::Value;
+use striatum_core::model_facts::CLASSIFIER_SERVING_KINDS;
 use striatum_core::{fact_to_route, ModelFact};
 
 use crate::account_refusal_log::LogLimiter;
 use crate::broca_credentials::BrocaCredentials;
 
-// Mirrors classifier 0.6.1's SERVING_KINDS until routing pins that release.
-const SERVING_KINDS: &[&str] = &["decision", "classifier"];
 const LAST_GOOD_MS: i64 = 5 * 60_000;
 pub(crate) const DESCRIBE_REQUEST: &[u8] = br#"{"method":"role.describe","params":{}}"#;
 
@@ -243,7 +242,7 @@ pub(crate) fn meets_capabilities(
         dropped(module, &key, "missing_catalog_row", now);
         return false;
     };
-    if !SERVING_KINDS.contains(&kind.as_str()) {
+    if !CLASSIFIER_SERVING_KINDS.contains(&kind.as_str()) {
         return false;
     }
     let Some(catalog_model) = catalog.model(&key) else {
