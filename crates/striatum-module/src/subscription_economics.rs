@@ -21,6 +21,7 @@ use striatum_core::{
     model_facts::{make_capacity_key, RoutePricing},
     model_router::ModelRouteStateSnapshot,
     subscription::{
+        free_before_reset::{AccountWindows, PreviewPool},
         MeasuredValue, PlanMeasurements, QuotaAccount, QuotaConstraint, SubscriptionPlan,
         SubscriptionPool, DEFAULT_PLAN_FEE_USD,
     },
@@ -30,6 +31,7 @@ use striatum_core::{
 #[derive(Clone, Default)]
 struct EconomicsCache {
     pools: HashMap<String, SubscriptionPool>,
+    recent_pace: HashMap<String, Arc<Vec<Vec<AccountWindows>>>>,
     unpriced_tiers: BTreeSet<String>,
     refreshed_at_ms: i64,
 }
@@ -341,11 +343,16 @@ fn carries_prepaid_credits(reading: &Value) -> bool {
     })
 }
 
-fn account(reading: &Value, now: i64, account_id: &str) -> Option<QuotaAccount> {
+fn account(
+    reading: &Value,
+    now: i64,
+    account_id: &str,
+    mut observe: impl FnMut(&str, &Value, Option<&'static str>, bool),
+) -> Option<QuotaAccount> {
     let usage = reading.get("usage")?;
-    let windows: Vec<&Value> = ["primary", "secondary", "tertiary"]
+    let windows: Vec<_> = ["primary", "secondary", "tertiary"]
         .iter()
-        .filter_map(|k| usage.get(*k).filter(|w| w.is_object()))
+        .filter_map(|&k| usage.get(k).filter(|w| w.is_object()).map(|w| (k, w)))
         .collect();
     // A past reset does not make last-good free. Even a short window with expired
     // usage makes a stale account unknown until a new observation arrives.
@@ -356,10 +363,10 @@ fn account(reading: &Value, now: i64, account_id: &str) -> Option<QuotaAccount> 
             .and_then(parse_rfc3339_ms)
             .is_some_and(|reset| reset <= now)
     };
-    if stale && windows.iter().any(|window| expired(window)) {
+    if stale && windows.iter().any(|(_, window)| expired(window)) {
         return None;
     }
-    let weekly = windows.iter().find(|w| {
+    let &(weekly_name, weekly) = windows.iter().find(|(_, w)| {
         w["windowKind"] == "weekly"
             || w["windowMinutes"]
                 .as_i64()
@@ -387,6 +394,7 @@ fn account(reading: &Value, now: i64, account_id: &str) -> Option<QuotaAccount> 
         ))
     };
     let (time, hours) = remaining(weekly)?;
+    observe(weekly_name, weekly, None, true);
     let constraint = |window: &Value| {
         let window_minutes = window["windowMinutes"].as_i64()?;
         let (_, hours_to_reset) = remaining(window)?;
@@ -400,8 +408,12 @@ fn account(reading: &Value, now: i64, account_id: &str) -> Option<QuotaAccount> 
     };
     let short_windows: Vec<_> = windows
         .iter()
-        .filter(|w| !std::ptr::eq(**w, *weekly))
-        .filter_map(|window| constraint(window))
+        .filter(|(name, _)| *name != weekly_name)
+        .filter_map(|(name, window)| {
+            let bound = constraint(window)?;
+            observe(name, window, None, false);
+            Some(bound)
+        })
         .collect();
     let short_walled = short_windows
         .iter()
@@ -413,16 +425,22 @@ fn account(reading: &Value, now: i64, account_id: &str) -> Option<QuotaAccount> 
         .filter_map(|extra| {
             let window = extra.get("window")?;
             let minutes = window["windowMinutes"].as_i64()?;
-            let scope = map_scoped_window(
-                reading["provider"].as_str()?,
-                extra["id"].as_str(),
-                Some(minutes),
-            )?;
+            let id = extra["id"].as_str();
+            let scope = map_scoped_window(reading["provider"].as_str()?, id, Some(minutes))?;
             if stale && expired(window) {
                 // A stale reset is not fresh headroom, but only this model scope loses it.
                 return Some((scope.family, None));
             }
-            Some((scope.family, Some(constraint(window)?)))
+            let bound = constraint(window)?;
+            if let Some(id) = id {
+                observe(
+                    &crate::account_quota::recent_pace::scoped_key(id),
+                    window,
+                    Some(scope.family),
+                    false,
+                );
+            }
+            Some((scope.family, Some(bound)))
         })
         .collect();
     let saved = saved_resets::decode(&reading["savedResets"], account_id);
@@ -446,7 +464,8 @@ fn build(state: &AccountQuotaState, report: &Value, prices: &Value, now: i64) ->
         refreshed_at_ms: now,
         ..Default::default()
     };
-    let mut plans: BTreeMap<(String, PlanGroup), SubscriptionPlan> = BTreeMap::new();
+    let mut plans: BTreeMap<(String, PlanGroup), (SubscriptionPlan, Vec<AccountWindows>)> =
+        BTreeMap::new();
     for reading in state.readings.readings.values() {
         if reading.tombstoned_at_ms.is_some() {
             continue;
@@ -527,22 +546,41 @@ fn build(state: &AccountQuotaState, report: &Value, prices: &Value, now: i64) ->
                 now_ms: now,
                 ..Default::default()
             });
-        let Some(account) = account(&reading.entry, now, &reading.account_id) else {
+        let mut windows = AccountWindows::default();
+        let Some(account) = account(
+            &reading.entry,
+            now,
+            &reading.account_id,
+            |name, raw, scope, weekly| {
+                if let Some(sample) = state.recent_pace.reading(reading, name, raw) {
+                    if weekly {
+                        windows.weekly = Some(sample);
+                    } else if let Some(scope) = scope {
+                        windows.scoped.push((scope, sample));
+                    } else {
+                        windows.short.push(sample);
+                    }
+                }
+            },
+        ) else {
             continue;
         };
         let group = astro_plan.as_ref().map_or_else(
             || PlanGroup::Unjoined(tier.clone(), fee.to_bits()),
             |plan| PlanGroup::Joined(plan.clone()),
         );
-        let plan = plans
-            .entry((provider.into(), group))
-            .or_insert_with(|| SubscriptionPlan {
-                tier: tier.clone(),
-                plan: astro_plan,
-                measured: joined.and_then(measured),
-                fee_usd: fee,
-                accounts: Vec::new(),
-            });
+        let (plan, pace) = plans.entry((provider.into(), group)).or_insert_with(|| {
+            (
+                SubscriptionPlan {
+                    tier: tier.clone(),
+                    plan: astro_plan,
+                    measured: joined.and_then(measured),
+                    fee_usd: fee,
+                    accounts: Vec::new(),
+                },
+                Vec::new(),
+            )
+        });
         // For report-joined accounts, fees are metadata rather than a grouping
         // key: capacity and value are pooled by report plan. Unjoined accounts
         // remain grouped by roster tier and fee.
@@ -551,9 +589,11 @@ fn build(state: &AccountQuotaState, report: &Value, prices: &Value, now: i64) ->
             plan.tier = None;
         }
         plan.accounts.push(account);
+        pace.push(windows);
     }
-    for ((provider, _), plan) in plans {
+    for ((provider, _), (plan, pace)) in plans {
         out.pools.get_mut(&provider).unwrap().plans.push(plan);
+        Arc::make_mut(out.recent_pace.entry(provider).or_default()).push(pace);
     }
     out
 }
@@ -783,6 +823,38 @@ pub(crate) fn overlay(
     overlay_pools(pools, snapshot, facts, now, pricing);
 }
 
+pub(crate) fn overlay_free_before_reset(
+    snapshot: &mut ModelRouteStateSnapshot,
+    facts: &[ModelFact],
+    now: i64,
+    pricing: &RoutePricing,
+) {
+    let economics = cache()
+        .lock()
+        .map(|c| Arc::clone(&c.economics))
+        .unwrap_or_default();
+    let mut pools = economics.pools.clone();
+    for fact in facts {
+        let pool = pools
+            .entry(fact.provider_id.clone())
+            .or_insert_with(|| SubscriptionPool {
+                provider: fact.provider_id.clone(),
+                ..Default::default()
+            });
+        if pool.free_before_reset.is_none() {
+            pool.free_before_reset = Some(PreviewPool {
+                plans: economics
+                    .recent_pace
+                    .get(&fact.provider_id)
+                    .cloned()
+                    .unwrap_or_default(),
+                scope: None,
+            });
+        }
+    }
+    overlay_pools(pools, snapshot, facts, now, pricing);
+}
+
 #[cfg(test)]
 pub(crate) fn test_account_pools(
     state: &AccountQuotaState,
@@ -814,6 +886,27 @@ pub(crate) fn test_pools(pools: HashMap<String, SubscriptionPool>) -> impl Drop 
     Restore(std::mem::replace(
         &mut Arc::make_mut(&mut cache().lock().unwrap().economics).pools,
         pools,
+    ))
+}
+
+#[cfg(test)]
+pub(crate) fn test_pools_with_recent_pace(
+    state: &AccountQuotaState,
+    mut others: HashMap<String, SubscriptionPool>,
+    now: i64,
+) -> impl Drop {
+    struct Restore(Arc<EconomicsCache>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            cache().lock().unwrap().economics = self.0.clone();
+        }
+    }
+    let mut economics = build(state, &Value::Null, &Value::Null, now);
+    others.extend(economics.pools);
+    economics.pools = others;
+    Restore(std::mem::replace(
+        &mut cache().lock().unwrap().economics,
+        Arc::new(economics),
     ))
 }
 
@@ -901,7 +994,7 @@ fn overlay_pools(
     }
 }
 
-fn pool_for_scope(pool: &Arc<SubscriptionPool>, family: &str) -> Arc<SubscriptionPool> {
+fn pool_for_scope(pool: &Arc<SubscriptionPool>, family: &'static str) -> Arc<SubscriptionPool> {
     if !pool
         .plans
         .iter()
@@ -918,6 +1011,10 @@ fn pool_for_scope(pool: &Arc<SubscriptionPool>, family: &str) -> Arc<Subscriptio
     // Keep the provider budget shared. Only models that use the same scope
     // share this narrower projection of its accounts and window pressure.
     let mut scoped = (**pool).clone();
+    if let Some(preview) = &mut scoped.free_before_reset {
+        // The same catalog scope decides which of the sidecar's windows bind.
+        preview.scope = Some(family);
+    }
     for account in scoped.plans.iter_mut().flat_map(|plan| &mut plan.accounts) {
         for (scope, window) in std::mem::take(&mut account.scoped_windows) {
             if scope != family {
@@ -938,7 +1035,12 @@ fn pool_for_scope(pool: &Arc<SubscriptionPool>, family: &str) -> Arc<Subscriptio
 #[cfg(test)]
 mod tests {
     fn account(reading: &Value, now: i64) -> Option<QuotaAccount> {
-        super::account(reading, now, reading["account"].as_str().unwrap_or("test"))
+        super::account(
+            reading,
+            now,
+            reading["account"].as_str().unwrap_or("test"),
+            |_, _, _, _| {},
+        )
     }
     #[cfg(feature = "heap-measure")]
     #[test]

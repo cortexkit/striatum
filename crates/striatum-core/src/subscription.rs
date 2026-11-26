@@ -46,7 +46,10 @@ pub struct SubscriptionPool {
     /// Count saved windows in pricing only; account admission still uses live quota.
     pub banked_as_capacity: bool,
     pub now_ms: i64,
+    pub free_before_reset: Option<free_before_reset::PreviewPool>,
 }
+
+pub mod free_before_reset;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SubscriptionPlan {
@@ -105,6 +108,8 @@ pub struct SubscriptionPricing {
     pub available_points: Option<f64>,
     pub banked_resets_applied: u64,
     pub plan_tier: Option<String>,
+    #[serde(skip)]
+    pub free_before_reset: Option<Box<free_before_reset::PricePreview>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -284,7 +289,7 @@ impl SubscriptionPlan {
         (Some(points), pressure, banked_applied)
     }
 
-    fn short_pressure(&self) -> Option<f64> {
+    fn short_pools(&self) -> std::collections::BTreeMap<i64, (f64, f64, usize)> {
         let mut short_pools = std::collections::BTreeMap::<i64, (f64, f64, usize)>::new();
         for account in self
             .accounts
@@ -299,6 +304,10 @@ impl SubscriptionPlan {
             }
         }
         short_pools
+    }
+
+    fn short_pressure(&self) -> Option<f64> {
+        self.short_pools()
             .values()
             .filter_map(|(points, time, count)| {
                 let remaining_share = points / (*count as f64 * 100.0);
@@ -490,7 +499,7 @@ impl SubscriptionPool {
         } else {
             resolve_value(operator, None, self.now_ms)
         };
-        let pricing = |points, pressure: PlanPressure, banked, tier| SubscriptionPricing {
+        let pricing = |points, pressure: PlanPressure, banked, tier, preview| SubscriptionPricing {
             value_multiplier: value,
             value_source: source.clone(),
             plan_values: plan_values.clone(),
@@ -503,26 +512,59 @@ impl SubscriptionPool {
             available_points: points,
             banked_resets_applied: banked,
             plan_tier: tier,
+            free_before_reset: preview,
         };
         if self.plans.is_empty() {
             return (head || keep_free == 0.0)
-                .then(|| pricing(None, PlanPressure::neutral(), 0, None));
+                .then(|| pricing(None, PlanPressure::neutral(), 0, None, None));
         }
         self.plans
             .iter()
             .zip(budgets)
-            .filter_map(|(plan, (points, pressure, banked))| {
+            .enumerate()
+            .filter_map(|(index, (plan, (points, mut pressure, banked)))| {
                 if points.is_some_and(|p| p <= 0.0) || points.is_none() && !head && keep_free > 0.0
                 {
                     return None;
                 }
-                Some(pricing(points, pressure, banked, plan.tier.clone()))
+                let preview = self.free_before_reset.as_ref().map(|pool| {
+                    let (projected, mut preview) = pool.project(
+                        index,
+                        plan,
+                        pressure,
+                        if head { 0.0 } else { keep_free },
+                        self.now_ms,
+                    );
+                    pressure = projected;
+                    preview.final_cost_usd = Some(list_usd / value * pressure.plan);
+                    preview.pressure = Some(pressure.plan);
+                    preview.weekly_pressure = Some(pressure.weekly);
+                    preview.short_window_pressure = pressure.short_window;
+                    Box::new(preview)
+                });
+                Some(pricing(
+                    points,
+                    pressure,
+                    banked,
+                    plan.tier.clone(),
+                    preview,
+                ))
             })
-            .min_by(|a, b| a.dollars().total_cmp(&b.dollars()))
+            .min_by(|a, b| {
+                a.dollars().total_cmp(&b.dollars()).then_with(|| {
+                    a.free_reset_ms()
+                        .unwrap_or(i64::MAX)
+                        .cmp(&b.free_reset_ms().unwrap_or(i64::MAX))
+                })
+            })
     }
 }
 
 impl SubscriptionPricing {
+    pub(crate) fn free_reset_ms(&self) -> Option<i64> {
+        self.free_before_reset.as_ref()?.free_reset_ms
+    }
+
     pub fn dollars(&self) -> f64 {
         self.list_cost_usd / self.value_multiplier * self.plan_pressure
     }
@@ -830,8 +872,8 @@ mod tests {
                 p
             }],
             allow_banked: true,
-            banked_as_capacity: false,
             now_ms: 1,
+            ..Default::default()
         };
         assert!(!pool(false).available(5.0, false));
         assert!(pool(true).available(5.0, false));

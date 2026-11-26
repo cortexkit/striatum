@@ -127,6 +127,9 @@ only narrow the runner's admitted pairs.
   the fixed core curve even if live additive settings have custom tuning;
   it does not reinterpret those tuning values. Persistent settings combining
   `cost_scaled` with tuning members are refused instead.
+* `free_before_reset_preview`: optional boolean, default `false`. Add a
+  comparison price and pick to the IQ sweep under the expiring-quota rule
+  below. This does not change the ordinary pick or the panel dry run.
 * `panel`: optional object `{class, package_tokens?, runners?, seed?}` that
   dry-runs `route.select_panel` for `consumer` (see [Panel dry run](#panel-dry-run)).
   `class` is one class name or a list of 1–16 names; each is seated separately.
@@ -136,7 +139,7 @@ only narrow the runner's admitted pairs.
   the top-level `runner` is given. Unknown members are rejected.
 
 Consumer policy, global exclusions, configured service tiers, grades, pricing
-(except the explicit request-local `pricing_patch` and `pacing`),
+(except the explicit request-local `pricing_patch` and comparison preview),
 runner availability and account eligibility all remain in force. As with
 `route.select`, an operator-configured consumer IQ/EQ overrides request demand;
 the returned `bar` is the effective demand bar, not an independently calculated
@@ -201,6 +204,26 @@ A refused row has `pick: null` and `refusal: {code, detail}`; the other fields
 remain present. If selection stops before model admission (for example no
 runner is available), bar/frontier objects and candidate arrays can be empty.
 Malformed requests and unauthorized callers are top-level errors, not rows.
+
+### Quota free before reset
+
+With `free_before_reset_preview: true`, each IQ row also carries
+`free_before_reset_pick`. Each adequate subscription candidate adds a
+`free_before_reset_preview` object; its ordinary `task_pricing` is unchanged.
+
+The object reports `window` (the producer's slot or named scope),
+`window_minutes`, `resets_at_ms`, `pace_points_per_hour`, `hours_to_reset`,
+`projected_leftover_points`, and `free_before_reset`. A window is free only
+within 24 hours of its reset, with more than five percentage points projected
+to expire and at least one hour of observations from the last six hours.
+Unavailable observations appear as `null`. A pool is free only if every
+spendable member qualifies. The preview breaks zero-cost ties by earliest
+qualifying reset, then list price.
+
+`binding_short_windows` explains the short-window pools under 25% remaining.
+They can keep the plan's `pressure` positive even when `weekly_pressure` is
+zero; `short_window_pressure` shows their contribution. `final_cost_usd` uses
+the same pricing unit as the candidate's ordinary `task_pricing`.
 
 ### Account concurrency snapshot
 

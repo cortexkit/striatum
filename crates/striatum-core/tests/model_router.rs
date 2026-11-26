@@ -4600,9 +4600,8 @@ fn subscription_scenario(
                     provider: f.provider_id.clone(),
                     keep_free_percent: if claude { margin } else { 0.0 },
                     plans,
-                    allow_banked: false,
-                    banked_as_capacity: false,
                     now_ms: 1_000_000,
+                    ..Default::default()
                 })),
                 ..Default::default()
             },
