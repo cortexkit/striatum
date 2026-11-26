@@ -112,7 +112,7 @@ fn route_state_oracle() -> BTreeSet<String> {
     let store = harness.store();
     let trace = store.trace_block_reads_for_test().unwrap();
     store
-        .account_transaction(|tx| tx.sync_fence_rechecks())
+        .account_transaction(|tx| tx.sync_fence_rechecks(crate::account_selection::now_ms()))
         .unwrap();
     let shared: BTreeSet<String> = trace.take().writer.into_iter().collect();
     store.build_snapshot(1_000.0).unwrap();
@@ -160,7 +160,7 @@ fn decision_oracle(now: i64) -> Vec<(&'static str, BTreeSet<String>)> {
     .unwrap();
     let trace = store.trace_block_reads_for_test().unwrap();
     store
-        .account_transaction(|tx| tx.sync_fence_rechecks())
+        .account_transaction(|tx| tx.sync_fence_rechecks(crate::account_selection::now_ms()))
         .unwrap();
     let mut sync: BTreeSet<String> = trace.take().writer.into_iter().collect();
     // The `tx.fence_rechecks()` read is left out too, for the same reason:
@@ -650,7 +650,7 @@ async fn an_admission_on_a_state_holding_a_dropped_route_clear_runs_again_and_wa
     )
     .unwrap();
     store
-        .account_transaction(|tx| tx.sync_fence_rechecks())
+        .account_transaction(|tx| tx.sync_fence_rechecks(crate::account_selection::now_ms()))
         .unwrap();
     store
         .with_writer_for_test(|conn| {

@@ -43,19 +43,15 @@ impl World {
         let PoolAcquireOutcome::Leased(lease) = outcome else {
             panic!("due pool probe did not get a lease: {outcome:?}");
         };
-        self.command("pool/claimed clock is durable", move |tx| {
+        self.command("pool/expired rate limit has no probe clock", move |tx| {
             let clocks = tx.working_blocks()?.unwrap().blocks(now).unwrap().blocks;
             assert!(
-                clocks
-                    .iter()
-                    .any(|clock| clock.scope.provider == POOL_PROVIDER
-                        && clock.last_claimed_at == Some(now)
-                        && clock.claim_generation > 0),
-                "the granted pool lease holds no probe generation: {clocks:?}"
+                clocks.iter().all(|clock| clock.kind != "pool_rate"),
+                "the expired pool rate limit still holds a probe clock: {clocks:?}"
             );
             Ok(())
         });
-        self.witness("probe_claim");
+        self.witness("pool_rate_reopen");
         self.witness("pool_lease_claim");
         self.ok(Caller::Operator,"route.pool_renew",json!({"provider":POOL_PROVIDER,"session":session,"leaseId":lease.lease_id,"credentialId":lease.credential_id})).await;
         let serving_credential = lease.credential_id.clone();

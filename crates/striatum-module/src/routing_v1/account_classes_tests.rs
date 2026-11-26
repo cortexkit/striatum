@@ -6175,7 +6175,7 @@ fn bind_and_launch_claims_check_the_rows_that_chose_their_clocks() {
         .unwrap();
         harness
             .store()
-            .account_transaction(|tx| tx.sync_fence_rechecks())
+            .account_transaction(|tx| tx.sync_fence_rechecks(crate::account_selection::now_ms()))
             .unwrap();
         let mut context = s4b_load(&harness, NOW as i64);
         context
@@ -6257,7 +6257,7 @@ fn due_provider_block(harness: &Harness) {
     .unwrap();
     harness
         .store()
-        .account_transaction(|tx| tx.sync_fence_rechecks())
+        .account_transaction(|tx| tx.sync_fence_rechecks(crate::account_selection::now_ms()))
         .unwrap();
 }
 

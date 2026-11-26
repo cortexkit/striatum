@@ -2197,7 +2197,7 @@ impl AccountTx<'_> {
     }
 
     /// Effective rechecks at the command's own evidence clock.
-    pub fn fence_rechecks_at(&self, now: i64) -> RouteStateResult<Vec<FenceRecheck>> {
+    fn fence_rechecks_at(&self, now: i64) -> RouteStateResult<Vec<FenceRecheck>> {
         #[cfg(any(test, feature = "test-support"))]
         let _writer_entry =
             crate::writer_entry_trace::enter("account_tx::fence_rechecks::fence_rechecks");

@@ -60,18 +60,12 @@ impl AccountTx<'_> {
         })?;
         self.release_expired_admission_probes(now_ms)?;
         self.release_expired_continuations(now_ms)?;
-        self.sync_fence_rechecks()
+        self.sync_fence_rechecks(now_ms)
     }
 
     /// The part of a Tick that synchronizes fence rechecks, for a caller that
     /// applies the admission and continuation expiries itself.
-    pub fn sync_fence_rechecks(&self) -> RouteStateResult<()> {
-        self.sync_fence_rechecks_at(crate::now_ms())
-    }
-
-    /// Synchronize block transitions at the command's own clock. Admission and
-    /// replayed requests use their captured time rather than a later wall tick.
-    pub fn sync_fence_rechecks_at(&self, now_ms: i64) -> RouteStateResult<()> {
+    pub fn sync_fence_rechecks(&self, now_ms: i64) -> RouteStateResult<()> {
         #[cfg(any(test, feature = "test-support"))]
         let _writer_entry =
             crate::writer_entry_trace::enter("account_tx::account_writer::sync_fence_rechecks");

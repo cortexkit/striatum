@@ -585,7 +585,7 @@ async fn what_if_cleared_account_source_drops_its_clock_like_sql_without_live_wr
     let (harness, operator) = fixture_with_repairs().await;
     harness
         .store()
-        .account_transaction(|tx| tx.sync_fence_rechecks())
+        .account_transaction(|tx| tx.sync_fence_rechecks(crate::account_selection::now_ms()))
         .unwrap();
     let initial = crate::account_state::snapshot(harness.store()).unwrap();
     let key = serde_json::json!(["fresh-headroom-fixture"]).to_string();

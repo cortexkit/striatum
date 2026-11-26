@@ -421,7 +421,7 @@ fn prune_ends_route_and_failure_sources_atomically_like_the_old_schema() {
         })
         .unwrap();
     native
-        .account_transaction(|tx| tx.sync_fence_rechecks())
+        .account_transaction(|tx| tx.sync_fence_rechecks(crate::now_ms()))
         .unwrap();
     assert_eq!(
         native

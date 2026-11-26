@@ -1479,7 +1479,7 @@ impl AccountCommand<'_> {
         if offers {
             self.release_expired_continuations(now)?;
         }
-        self.sql.sync_fence_rechecks_at(now)?;
+        self.sql.sync_fence_rechecks(now)?;
         Ok(())
     }
 
@@ -1494,7 +1494,7 @@ impl AccountCommand<'_> {
         if let Some(state) = self.state.as_deref_mut() {
             state.inflight.expire_lapsed(now_ms);
         }
-        self.sql.sync_fence_rechecks_at(now_ms)
+        self.sql.sync_fence_rechecks(now_ms)
     }
     #[cfg(test)]
     pub(crate) fn prune_account_admissions(
