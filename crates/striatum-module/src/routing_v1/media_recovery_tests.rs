@@ -58,9 +58,9 @@ async fn observe(route: &Route, id: &str, kind: &str, at: u64, extra: Value) -> 
     reply.clone()
 }
 
-fn origin(harness: &Harness) -> striatum_store::FenceRecheck {
-    harness
-        .store()
+fn origin(harness: &Harness, at: u64) -> striatum_store::FenceRecheck {
+    crate::account_state::published(harness.store(), at as i64)
+        .unwrap()
         .fence_rechecks()
         .unwrap()
         .into_iter()
@@ -91,25 +91,14 @@ async fn backoff(route: &Route, id: &str, at: u64, retry_at: u64) {
     );
 }
 
-async fn claim(route: &Route, harness: &Harness) -> striatum_store::FenceRecheck {
+async fn reopen(route: &Route, harness: &Harness) {
     let first = admit(route, FIRST, None).await;
     assert_eq!(first.0, FrameType::Response, "{}", first.1);
     assert_eq!(first.1["result"]["account"]["credential_id"], KEY);
     backoff(route, FIRST, BACKOFF_AT, RETRY_AT).await;
     let _clock = crate::InjectedClock::set(PROBE_AT);
-    assert_probe(admit(route, PROBE, None).await);
-    let block = origin(harness);
-    assert_eq!(block.last_claimed_at, Some(PROBE_AT as i64));
-    assert_eq!(block.next_recheck_at, (PROBE_AT + HOUR) as i64);
-    block
-}
-
-fn assert_probe((frame, reply): (FrameType, Value)) {
-    assert_eq!(frame, FrameType::Response, "{reply}");
-    assert_eq!(
-        reply["result"]["reason"]["code"], "credential_fence_probe",
-        "{reply}"
-    );
+    assert_ordinary(admit(route, PROBE, None).await);
+    assert_no_backoff(harness);
 }
 
 async fn finish(route: &Route, at: u64) -> Value {
@@ -117,11 +106,11 @@ async fn finish(route: &Route, at: u64) -> Value {
 }
 
 #[tokio::test]
-async fn colliculus_bare_finish_hands_back_one_recovery_slot() {
+async fn colliculus_bare_finish_after_reopened_backoff_admits_all() {
     let _clock = crate::InjectedClock::set(BACKOFF_AT);
     let harness = google();
     let route = harness.bind(reserved("colliculus"), None).await;
-    let original = claim(&route, &harness).await;
+    reopen(&route, &harness).await;
     {
         let _clock = crate::InjectedClock::set(START_AT);
         observe(&route, PROBE, "admission_started", START_AT, json!({})).await;
@@ -134,20 +123,12 @@ async fn colliculus_bare_finish_hands_back_one_recovery_slot() {
     assert_eq!(row.state, "finished");
     assert_eq!(row.run_id, None);
     assert_eq!(row.finished_at, Some(FINISH_AT as i64));
-    assert_probe(admit(&route, "next-test", None).await);
-    let next = origin(&harness);
-    assert_eq!(next.evidence, original.evidence);
-    assert_eq!(next.last_claimed_at, Some(FINISH_AT as i64));
-    assert_eq!(next.next_recheck_at, (FINISH_AT + HOUR) as i64);
+    assert_ordinary(admit(&route, "next-test", None).await);
 
     let duplicate = finish(&route, FINISH_AT).await;
     assert_eq!(duplicate["duplicate"], true);
     assert_eq!(duplicate["id"], answer["id"]);
-    assert_refused(admit(&route, "second-next-test", None).await);
-    let after_replay = origin(&harness);
-    assert_eq!(after_replay.evidence, next.evidence);
-    assert_eq!(after_replay.last_claimed_at, next.last_claimed_at);
-    assert_eq!(after_replay.next_recheck_at, next.next_recheck_at);
+    assert_ordinary(admit(&route, "second-next-test", None).await);
 }
 
 fn assert_refused((frame, reply): (FrameType, Value)) {
@@ -156,11 +137,11 @@ fn assert_refused((frame, reply): (FrameType, Value)) {
 }
 
 #[tokio::test]
-async fn colliculus_old_finish_leaves_newer_claim_held() {
+async fn colliculus_old_finish_does_not_restore_expired_backoff() {
     let _clock = crate::InjectedClock::set(BACKOFF_AT);
     let harness = google();
     let route = harness.bind(reserved("colliculus"), None).await;
-    let original = claim(&route, &harness).await;
+    reopen(&route, &harness).await;
     {
         let _clock = crate::InjectedClock::set(START_AT);
         observe(
@@ -174,16 +155,12 @@ async fn colliculus_old_finish_leaves_newer_claim_held() {
     }
     let at = PROBE_AT + HOUR;
     let _clock = crate::InjectedClock::set(at);
-    assert_probe(admit(&route, "newer-test", None).await);
-    let held = origin(&harness);
-    assert_eq!(held.last_claimed_at, Some(at as i64));
-    assert_eq!(held.evidence, original.evidence);
+    assert_ordinary(admit(&route, "newer-test", None).await);
     finish(&route, at).await;
-    assert_refused(admit(&route, "third-test", None).await);
-    assert_eq!(origin(&harness).next_recheck_at, held.next_recheck_at);
+    assert_ordinary(admit(&route, "third-test", None).await);
 
     observe(&route, "newer-test", "run_finished", at, json!({})).await;
-    assert_probe(admit(&route, "after-newer-finish", None).await);
+    assert_ordinary(admit(&route, "after-newer-finish", None).await);
 }
 
 #[tokio::test]
@@ -191,7 +168,7 @@ async fn colliculus_finish_does_not_release_newer_backoff() {
     let _clock = crate::InjectedClock::set(BACKOFF_AT);
     let harness = google();
     let route = harness.bind(reserved("colliculus"), None).await;
-    let original = claim(&route, &harness).await;
+    reopen(&route, &harness).await;
     let newer_at = START_AT + 500;
     let retry_at = FINISH_AT + 20_000;
     {
@@ -201,13 +178,12 @@ async fn colliculus_finish_does_not_release_newer_backoff() {
     let _clock = crate::InjectedClock::set(FINISH_AT);
     finish(&route, FINISH_AT).await;
     assert_refused(admit(&route, "too-early", None).await);
-    let block = origin(&harness);
-    assert_ne!(block.evidence, original.evidence);
+    let block = origin(&harness, FINISH_AT);
     assert_eq!(block.evidence_at, newer_at as i64);
     assert_eq!(block.next_recheck_at, retry_at as i64);
 
     let _clock = crate::InjectedClock::set(retry_at);
-    assert_probe(admit(&route, "new-evidence-test", None).await);
+    assert_ordinary(admit(&route, "new-evidence-test", None).await);
     observe(
         &route,
         "new-evidence-test",
@@ -216,12 +192,12 @@ async fn colliculus_finish_does_not_release_newer_backoff() {
         json!({}),
     )
     .await;
-    assert_probe(admit(&route, "after-new-evidence-finish", None).await);
-    assert_eq!(origin(&harness).evidence, block.evidence);
+    assert_ordinary(admit(&route, "after-new-evidence-finish", None).await);
+    assert_no_backoff(&harness);
 }
 
 #[tokio::test]
-async fn colliculus_decision_probe_heals_on_success_report_after_finish() {
+async fn colliculus_success_report_after_reopened_backoff_keeps_requests_open() {
     let _clock = crate::InjectedClock::set(BACKOFF_AT);
     let harness = google();
     let route = harness.bind(reserved("colliculus"), None).await;
@@ -231,7 +207,7 @@ async fn colliculus_decision_probe_heals_on_success_report_after_finish() {
     let decision = {
         let _clock = crate::InjectedClock::set(PROBE_AT);
         let decision = selected(&route, &request()).await["decision_id"].clone();
-        assert_probe(admit(&route, PROBE, Some(&decision)).await);
+        assert_ordinary(admit(&route, PROBE, Some(&decision)).await);
         let scope = harness
             .store()
             .account_read(|tx| {
@@ -249,7 +225,6 @@ async fn colliculus_decision_probe_heals_on_success_report_after_finish() {
         );
         decision
     };
-    let held = origin(&harness);
     {
         let _clock = crate::InjectedClock::set(START_AT);
         observe(
@@ -264,8 +239,7 @@ async fn colliculus_decision_probe_heals_on_success_report_after_finish() {
     let _clock = crate::InjectedClock::set(FINISH_AT);
     finish(&route, FINISH_AT).await;
     assert_eq!(admission_row(&harness, PROBE).state, "finished");
-    assert_refused(admit(&route, "while-waiting-for-report", None).await);
-    assert_eq!(origin(&harness).next_recheck_at, held.next_recheck_at);
+    assert_ordinary(admit(&route, "while-waiting-for-report", None).await);
 
     let (frame, reply) = route
         .call(
@@ -301,11 +275,11 @@ fn assert_ordinary((frame, reply): (FrameType, Value)) {
 }
 
 #[tokio::test]
-async fn colliculus_typed_served_attempt_heals_before_finish() {
+async fn colliculus_typed_served_attempt_after_reopened_backoff() {
     let _clock = crate::InjectedClock::set(BACKOFF_AT);
     let harness = google();
     let route = harness.bind(reserved("colliculus"), None).await;
-    claim(&route, &harness).await;
+    reopen(&route, &harness).await;
     let _clock = crate::InjectedClock::set(FINISH_AT);
     let (frame, reply) = route
         .call(
@@ -318,9 +292,13 @@ async fn colliculus_typed_served_attempt_heals_before_finish() {
         )
         .await;
     assert_eq!(frame, FrameType::Response, "{reply}");
-    assert_eq!(
-        reply["result"]["observation"]["effects"][0]["effect"], "block_cleared",
-        "{reply}"
+    assert!(
+        reply["result"]["observation"]["effects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|effect| effect["effect"] != "block_cleared"),
+        "{reply}: expiry already retired the backoff"
     );
     finish(&route, FINISH_AT).await;
     assert_no_backoff(&harness);
@@ -332,7 +310,7 @@ async fn colliculus_started_without_run_id_is_not_an_expired_reservation() {
     let _clock = crate::InjectedClock::set(BACKOFF_AT);
     let harness = google();
     let route = harness.bind(reserved("colliculus"), None).await;
-    let held = claim(&route, &harness).await;
+    reopen(&route, &harness).await;
     {
         let _clock = crate::InjectedClock::set(START_AT);
         let started = observe(&route, PROBE, "admission_started", START_AT, json!({})).await;
@@ -364,9 +342,8 @@ async fn colliculus_started_without_run_id_is_not_an_expired_reservation() {
     assert_eq!(count(row.admission_valid_until), 1);
     assert_eq!(count(started_deadline - 1), 1);
     assert_eq!(count(started_deadline), 0);
-    assert_refused(admit(&route, "after-reservation-deadline", None).await);
+    assert_ordinary(admit(&route, "after-reservation-deadline", None).await);
     assert_eq!(admission_row(&harness, PROBE).state, "started");
-    assert_eq!(origin(&harness).next_recheck_at, held.next_recheck_at);
 }
 
 #[tokio::test]
@@ -375,7 +352,7 @@ async fn colliculus_later_start_does_not_name_an_anonymously_started_run() {
         let _clock = crate::InjectedClock::set(BACKOFF_AT);
         let harness = google();
         let route = harness.bind(reserved("colliculus"), None).await;
-        claim(&route, &harness).await;
+        reopen(&route, &harness).await;
         let first_start = if finish_first {
             let _clock = crate::InjectedClock::set(FINISH_AT);
             finish(&route, FINISH_AT).await;
