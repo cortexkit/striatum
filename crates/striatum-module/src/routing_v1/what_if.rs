@@ -31,6 +31,8 @@ struct Params {
     head_choices: Option<Value>,
     panel: Option<PanelParams>,
     workloads: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    free_before_reset_preview: bool,
 }
 
 /// A dry-run panel. Member values are passed to `route.select_panel`'s own
@@ -195,6 +197,17 @@ pub(super) async fn what_if_with_profile_lookup(
     let mut inputs =
         select::RequestInputs::read_with_config(&deps, live.clone(), operator.clone())?;
     inputs.efforts.workloads = params.workloads.unwrap_or_default();
+    let free_before_reset = params
+        .free_before_reset_preview
+        .then(|| {
+            let mut inputs = inputs.clone();
+            inputs.free_before_reset_preview = true;
+            accounts
+                .fork_from_initial(deps.store)
+                .map(|accounts| (inputs, accounts))
+        })
+        .transpose()
+        .map_err(store_refusal)?;
     let concurrency = concurrency::Snapshot::from_snapshot(
         &deps,
         &live,
@@ -263,6 +276,56 @@ pub(super) async fn what_if_with_profile_lookup(
             Err(refusal) => {
                 row["refusal"] = json!({"code": refusal.code, "detail": refusal.detail})
             }
+        }
+        if free_before_reset.is_some() {
+            row["free_before_reset_pick"] = row["pick"].clone();
+        }
+        // A zero price must not affect a best-effort pick below the bar.
+        if let Some((inputs, accounts)) = free_before_reset.as_ref().filter(|_| {
+            row["adequate"]
+                .as_array()
+                .is_some_and(|rows| !rows.is_empty())
+        }) {
+            let preview = select::Evaluation {
+                inputs,
+                accounts,
+                evidence: Mutex::new(Default::default()),
+                effort_diagnostics: Mutex::new(Default::default()),
+                ..view
+            };
+            let pick = Box::pin(select::evaluate(
+                &request,
+                caller,
+                &deps,
+                &preview,
+                profile_lookup,
+            ))
+            .await;
+            row["free_before_reset_pick"] = pick.unwrap_or(Value::Null);
+            let previews: BTreeMap<_, _> = preview
+                .evidence
+                .into_inner()
+                .unwrap()
+                .adequate
+                .into_iter()
+                .filter_map(|candidate| {
+                    candidate
+                        .free_before_reset_preview
+                        .map(|price| (candidate.route, price))
+                })
+                .collect();
+            if let Some(candidates) = row["adequate"].as_array_mut() {
+                for candidate in candidates {
+                    let Some(price) = candidate["route"]
+                        .as_str()
+                        .and_then(|route| previews.get(route))
+                    else {
+                        continue;
+                    };
+                    candidate["free_before_reset_preview"] = json!(price);
+                }
+            }
+            accounts.after_evaluation(deps.routing_config_path, false, results.len() + 1);
         }
         results.push(row);
         accounts.after_evaluation(deps.routing_config_path, false, results.len());
