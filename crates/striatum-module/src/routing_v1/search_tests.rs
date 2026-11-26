@@ -379,13 +379,16 @@ async fn search_report_outcomes_are_route_scoped_bounded_and_idempotent() {
                 .and_then(|state| state.cooldown_until),
             state.and_then(|state| state.cooldown_until)
         );
-        if let Some(wait) = cooldown {
+        if let Some(cooldown_wait) = cooldown {
             assert_eq!(
                 selected(&route, &request()).await["engine"]["model"],
                 "paid",
                 "{status}"
             );
-            h.credentials().lock().unwrap().engine_clock_offset_ms = wait + 1;
+            h.credentials()
+                .lock()
+                .unwrap()
+                .engine_clock_offset_ms = cooldown_wait + 1;
             assert_eq!(
                 selected(&route, &request()).await["engine"]["model"],
                 "allowance",
@@ -396,6 +399,21 @@ async fn search_report_outcomes_are_route_scoped_bounded_and_idempotent() {
                 selected(&route, &request()).await["engine"]["model"],
                 "allowance",
                 "{status}"
+            );
+        }
+        if status == "throttled" && wait.is_some() {
+            let wall_class: Option<String> = rusqlite::Connection::open(h.store_path())
+                .unwrap()
+                .query_row(
+                    "SELECT wall_class FROM model_route_state WHERE route_key=?1",
+                    [key],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                wall_class.as_deref(),
+                Some("transient"),
+                "an explicit provider retry must be distinguishable from a guessed or outage cooldown"
             );
         }
     }
