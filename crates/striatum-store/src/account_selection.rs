@@ -2968,10 +2968,23 @@ mod transient_fence_tests {
             14_000
         );
         assert_eq!(store.account_route_fences(14_000).unwrap().len(), 1);
-        let clocks = store.fence_rechecks().unwrap();
+        let clocks: Vec<_> = store
+            .load_blocks(14_000)
+            .unwrap()
+            .blocks
+            .iter()
+            .map(crate::FenceRecheck::from)
+            .collect();
         assert!(!store
             .account_transaction(|tx| tx.claim_fence_rechecks(&clocks, 14_000))
             .unwrap());
+        let clocks: Vec<_> = store
+            .load_blocks(16_000)
+            .unwrap()
+            .blocks
+            .iter()
+            .map(crate::FenceRecheck::from)
+            .collect();
         assert!(store
             .account_transaction(|tx| tx.claim_fence_rechecks(&clocks, 16_000))
             .unwrap());
