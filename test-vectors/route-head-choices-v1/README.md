@@ -30,7 +30,7 @@ that replay uses a different catalog and model set.
 - `harness-narrowed.json`: `harness-runner` hosts `opencode2` and `claude-code`, defaults to `opencode2`, and reaches both OpenAI and Anthropic at runner level. The request selects `claude-code`, whose `harness_limits` allow only the `anthropic.messages`/`oauth` pair and explicit provider `anthropic`, so only `anthropic/claude` is listed.
 - `harness-runner-wide.json`: the same runner with `harness: "opencode2"`. It has no harness-specific limits, so both Anthropic and OpenAI models are listed.
 - `harness-unavailable.json`: the same runner with `harness: "pi"`, which it does not host. The refusal pair captures `no_route` with `detail.reason: "harness_unavailable"`.
-- `broca-live-catalog.json`: a phone picker sample with 25 models, generated from a frozen snapshot of 14 Nov 2026, Broca's real runner declaration and tier capabilities, and a redacted credential roster. It includes subscription and per-token entries, pin-only models, and fast tiers.
+- `broca-live-catalog.json`: a phone picker sample with 25 models, generated from a frozen snapshot of 14 Nov 2026, the worker runner's real runner declaration and tier capabilities, and a redacted credential roster. It includes subscription and per-token entries, pin-only models, and fast tiers.
 - `SHA256SUMS`: SHA-256 hashes of the eleven captured pairs (ten replies and one refusal).
 
 The independent frozen inputs are in `crates/striatum-module/fixtures/head-choices-broca-live-inputs-20261114.json`.

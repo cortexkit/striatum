@@ -2,6 +2,8 @@
 name = "striatum-core"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
+repository = "https://github.com/cortexkit/striatum"
 publish = false
 description = "Pure model-routing core for Alfonso: the saturating-adequacy quality gate + cost-primary objective scorer, the model-facts and route-state types, quota, account and failure-backoff policy, and the RouteStateStore trait that striatum-store implements over SQLite. Wire-agnostic and rusqlite-free: knows nothing about subc."
 

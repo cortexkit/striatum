@@ -8,19 +8,19 @@ has no trailing newline. They are bodies, not transport frames or route bindings
 ## Caller and fixture
 
 The phone selects through the transport-attested `reserved:callosum` principal
-on a current, unscoped route binding. The nonce-verified Colliculus catalog entry
+on a current, unscoped route binding. The nonce-verified voice-module catalog entry
 declares its `routing/v1` consumer exactly as follows:
 
 ```json
 {"name":"colliculus.voice_message","kind":"transcribe","selectors":["callosum"]}
 ```
 
-There is no `iq` member. Colliculus owns the consumer; Callosum is admitted as a
-listed selector, not as its owner. Callosum does not declare `phone.media` in this
+There is no `iq` member. The voice module owns the consumer; the phone operator is admitted as a
+listed selector, not as its owner. The phone operator does not declare `phone.media` in this
 fixture. Caller identity is transport metadata, not a request member. The foreign,
 direct, and flow-scoped samples intentionally use different route bindings.
 
-Colliculus also declares fixture provider engines in its `media-provider/v1`
+The voice module also declares fixture provider engines in its `media-provider/v1`
 slot. These synthetic engines use provider `media-vendor` and models named
 `fixture-<kind>`. An active vault key `opaque-media-key` in category
 `media-provider`, plus a category `list` grant, supplies media account readiness.
@@ -33,7 +33,7 @@ No sample identifies routing's module address. The `engine.module` in a remote
 pick identifies the executor (`colliculus`), not routing. Module addressing and
 transport failures are outside these request/reply bodies.
 
-## Phone and Colliculus picks
+## Phone and voice-module picks
 
 - `accepted-transcribe.json`: the provider transcription engine wins, with
   `caller_local: false`, `local: false`, and `module: "colliculus"`.
@@ -48,7 +48,7 @@ transport failures are outside these request/reply bodies.
 
 ## Expired decision use
 
-The pinned [`cortexkit-role-routing` 0.7.22 contract](https://github.com/cortexkit/commons/blob/cortexkit-role-routing-v0.7.22/crates/cortexkit-role-routing/CONTRACT.md),
+The pinned `cortexkit-role-routing` 0.7.22 contract (tag `cortexkit-role-routing-v0.7.22`),
 §13 (`route.select_engine`), specifies that a remote engine's executor redeems
 its decision through `route.account_for`. After slot authorization, a **new**
 admission at or after `expires_at_ms` receives `unknown_decision`. A replay of an
@@ -83,11 +83,11 @@ order: `kind`, `requirements`, `privacy`, `reachability`.
 - `invalid-request.json`: unsupported `effect_id`; `invalid_request`.
 - `invalid-requirements.json`: negative duration; `invalid_requirements`.
 - `unknown-consumer.json`: absent registry entry; `unknown_consumer`.
-- `caller-not-owner.json`: attested `reserved:stranger` is neither Colliculus
-  nor its listed selector Callosum; `consumer_not_owned`.
+- `caller-not-owner.json`: attested `reserved:stranger` is neither the voice module
+  nor its listed phone selector; `consumer_not_owned`.
 - `caller-direct.json`: a direct caller is neither owner nor listed selector;
   `consumer_not_owned`.
-- `flow-scope-not-supported.json`: even Callosum cannot select through a
+- `flow-scope-not-supported.json`: even the phone operator cannot select through a
   flow-scoped route; the dispatcher refuses with `flow_scope_not_supported`
   before consumer admission.
 - `route-cooldown.json`: a future route cooldown.
@@ -148,9 +148,9 @@ From the worktree root:
 UPDATE_ROUTE_SELECT_ENGINE_V2_VECTORS=1 cargo nextest run --locked -p striatum-module --bin ck-striatum -E 'test(=routing_v1::select_engine_vectors_tests::serving_bytes_match_v2_vectors)'
 ```
 
-When recording with CortexKit's `bash` tool on a remote build server, list every
-generated JSON path and `SHA256SUMS` in the tool call's `return_paths` argument;
-otherwise remote file changes are not copied back to the local worktree.
+When recording on a remote build server with read-only synced sources, use a
+writable checkout and copy every generated JSON path and `SHA256SUMS` back into
+this directory.
 The v2 update variable does not update v1.
 Without it, the same test regenerates replies in memory and compares every byte
 and the exact checksum manifest. It rejects extra or missing directory entries,

@@ -14,12 +14,12 @@ unverified clients and other reserved modules, receive `not_permitted`. A JSON
 parameter cannot grant operator authority.
 
 Send the following management request to module `striatum` on an
-operator route. For example, the head session can use its `AlfonsoCoreClient`
-configured with `moduleId: "striatum"` to call `route.what_if` with
-these params. A plain client script that the daemon labels `unverified` cannot
-make this call; it needs a daemon-attested `direct` route instead.
+operator route. An operator client configured with `moduleId: "striatum"` can
+call `route.what_if` with these params. A plain client script that the daemon
+labels `unverified` cannot make this call; it needs a daemon-attested `direct`
+route instead.
 
-Today's policy:
+Example policy preview:
 
 ```json
 {
@@ -32,7 +32,7 @@ Today's policy:
 }
 ```
 
-As if Opus were not pin-only for masons:
+As if Opus were not pin-only for the `mason` consumer:
 
 ```json
 {
@@ -53,8 +53,8 @@ As if Opus were not pin-only for masons:
 The empty array replaces that model's `pin_only_for` array for this call. It does
 not clear a separate `pin_only: true`, `not_for`, provider exclusion or account-level quota, cooldown or credential restriction. If the live model uses `pin_only: true`, also patch `"pin_only": false`.
 
-As if Broca published a proposed `routing/v1` runner slot, including the head
-picker under that declaration:
+As if the worker runner published a proposed `routing/v1` runner slot, including
+the head picker under that declaration:
 
 ```json
 {
@@ -285,7 +285,7 @@ including an omitted or lower floor.
 With `panel`, the what-if runs that same code path for each listed class,
 under the call's `policy_patch` and `runner_declarations`, against the same
 account snapshot as the IQ sweep. For example, as if two routes were not for
-Athena:
+the `athena` consumer:
 
 ```json
 {

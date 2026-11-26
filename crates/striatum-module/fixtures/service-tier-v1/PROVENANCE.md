@@ -1,8 +1,7 @@
 # Service tier fixtures
 
-`cases.json`, `SHA256SUMS` and `README.md` are byte-for-byte copies of
-the CortexKit commons repository (<https://github.com/cortexkit/commons>),
-`test-vectors/service-tier-v1` at
+`cases.json`, `SHA256SUMS` and `README.md` are byte-for-byte copies from
+the shared contract test-vector repository, `test-vectors/service-tier-v1` at
 `1af6bfb593f979b4e9b500aa1ab82dec7b01aaf1`.
 `route-select-baseline.json` is that revision's existing
 `crates/cortexkit-role-routing/test-vectors/routing-v1/route-select.json`;

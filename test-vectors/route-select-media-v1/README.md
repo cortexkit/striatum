@@ -14,12 +14,12 @@ These are synthetic fixtures, not captures of private user requests or live keys
 
 ## Realtime token pairs
 
-The dictation pairs come from a Callosum-attested caller through the real `route.select`
+The dictation pairs come from a caller attested as the phone operator through the real `route.select`
 handler. Their identical request is
 `{"consumer":"colliculus.dictation_token","kind":"realtime","requirements":{},"privacy":"remote_allowed"}`.
 
-The isolated fixture loads Colliculus's real declaration bytes from
-`crates/striatum-module/fixtures/colliculus-5b/`, generated at Colliculus commit
+The isolated fixture loads the voice module's real declaration bytes from
+`crates/striatum-module/fixtures/colliculus-5b/`, generated in the voice module's repository at commit
 `5ccd00f69eb93d7515b4e3b45938ca751bf00098` by
 `service::sets::tests::write_declaration_goldens`. The committed inputs retain all
 ten engines and six consumers, including the `callosum` selector and distinct
@@ -34,7 +34,7 @@ do not override the declared selection mode or ladder.
 | --- | --- |
 | `dictation-token-realtime.json` | The unmodified declarations select `colliculus/openai/gpt-live-transcribe` with kind `realtime`. |
 | `dictation-token-no-engine.json` | Both `realtime` engines are removed in this isolated fixture; the `stream_transcribe` declaration for the dictation model remains. With the request unchanged, the handler refuses with `no_route`, message `no route meets the request: no_available_model`, and exact detail `{"reason":"no_available_model"}`. |
-| `voice-front-token-realtime.json` | Callosum selects `colliculus.voice_front_token` with kind `realtime`, empty requirements and `remote_allowed` privacy. Both realtime engines are declared, keyed and priced; the declared ladder selects `colliculus/openai/gpt-realtime-2.1`, never the dictation engine. |
+| `voice-front-token-realtime.json` | The phone operator selects `colliculus.voice_front_token` with kind `realtime`, empty requirements and `remote_allowed` privacy. Both realtime engines are declared, keyed and priced; the declared ladder selects `colliculus/openai/gpt-realtime-2.1`, never the dictation engine. |
 
 The same test module checks the declarations parse without warnings and preserves
 the other four consumers. Separate real-handler regressions give the opposite
@@ -46,10 +46,10 @@ the build server makes every corresponding never-substitute regression fail.
 
 ## Fixture and cases
 
-Colliculus declares `colliculus.voice_message` as `transcribe`, with Callosum
+The voice module declares `colliculus.voice_message` as `transcribe`, with the phone operator
 authorized to select for it, and `colliculus.speech` as `synthesize`. Both use
 demand mode at level 40 initially. A synthetic, active media credential reaches
-the remote engines, all declared by Colliculus under provider `media-vendor`.
+the remote engines, all declared by the voice module under provider `media-vendor`.
 
 The transcription and speech rate rows are copied from the checked-in pinned
 Fusiform fixture (`openai/gpt-transcribe` and
@@ -61,12 +61,12 @@ inherits that catalog grade and has known-zero ranking cost, with no price.
 
 | File | Selection context and expected reply |
 | --- | --- |
-| `voice-message-transcribe.json` | Callosum selects a 30-second voice message in demand mode: the priced, adequate grade-80 engine precedes the unpriced grade-100 engine. The reply quotes its per-second rate. |
-| `speech.json` | Colliculus selects speech for 24 ASCII characters / 24 UTF-8 bytes. The reply quotes the per-character rate, using the current contract's explicit `input_characters` member. |
+| `voice-message-transcribe.json` | The phone operator selects a 30-second voice message in demand mode: the priced, adequate grade-80 engine precedes the unpriced grade-100 engine. The reply quotes its per-second rate. |
+| `speech.json` | The voice module selects speech for 24 ASCII characters / 24 UTF-8 bytes. The reply quotes the per-character rate, using the current contract's explicit `input_characters` member. |
 | `pinned.json` | The request pins the unpriced grade-100 engine after its model policy becomes `pin_only`. It is admitted without substitution or a `price`. |
 | `ladder.json` | Settings switch voice messages to ladder mode: a missing entry and the pin-only model are skipped, then the priced engine wins. |
 | `no-route.json` | The same ladder with `privacy: "local_only"` cannot use any engine. The reply is `no_route` with only the contract's reason in its detail. |
-| `voice-message-caller-local.json` | Back in demand mode, Callosum offers its phone engine for the same 30-second voice message. Its catalog grade equals the remote engine's; known-zero cost wins, and the reply has `caller_local: true`, `index: 0`, and no module or price. |
+| `voice-message-caller-local.json` | Back in demand mode, the phone operator offers its phone engine for the same 30-second voice message. Its catalog grade equals the remote engine's; known-zero cost wins, and the reply has `caller_local: true`, `index: 0`, and no module or price. |
 | `voice-message-caller-local-en.json` | The phone's `apple/phone-transcriber` offers English (`en-US`), WAV, realtime transcription with a 600000-ms duration limit. With a 30-second English request, its grade 80 and known-zero cost win; the reply has `caller_local: true`, `index: 0`, and no price. |
 | `voice-message-caller-local-fr.json` | The same phone offer cannot meet the request's `fr-FR` language. In this pair's isolated fixture, the priced `media-vendor/fixture-transcribe` module engine declares `fr` and wins instead. |
 
@@ -78,21 +78,21 @@ bound route; they are not extra request members.
 
 | File | Cause and expected reply |
 | --- | --- |
-| `unknown-consumer.json` | Callosum names an undeclared consumer: `unknown_consumer`. |
+| `unknown-consumer.json` | The phone operator names an undeclared consumer: `unknown_consumer`. |
 | `caller-not-owner.json` | `reserved:stranger` is neither the owner nor an authorized selector: `consumer_not_owned`. |
 | `caller-direct.json` | A direct caller is neither the owner nor an authorized selector: `consumer_not_owned`. |
 | `invalid-request.json` | An unsupported top-level `effect_id`: `invalid_request`, naming that field. |
 | `kind-mismatch.json` | `synthesize` conflicts with the voice consumer's declared `transcribe` kind: `invalid_request`, naming `kind`. |
 | `invalid-requirements.json` | Negative `duration_ms`: `invalid_requirements`, naming that field. |
-| `flow-scope-not-supported.json` | Even the authorized selector Callosum cannot select on a flow-stamped route: `flow_scope_not_supported`. |
+| `flow-scope-not-supported.json` | Even the authorized phone operator cannot select on a flow-stamped route: `flow_scope_not_supported`. |
 | `store-error.json` | Removing the actual `routing_engine_eval` table induces `store_error` through the real selection handler. |
 | `reachability-unavailable.json` | All otherwise suitable remote routes are unavailable: `no_route`, with only `reason: no_available_model` in `detail`. The grouped causes below produce identical complete pairs. |
 | `requirements-unmet.json` | No declared engine advertises the requested French language (`fr`): `no_route` / `no_available_model`. |
 | `no-engines.json` | The consumer remains declared but no module engines are declared: `no_route` / `no_available_model`. |
 | `missing-capability.json` | A video request requires a 1000-ms output duration, but the catalog has no `limit.output_duration_ms` fact: `no_route` / `missing_capability`, with the failed fact named in the message. |
-| `decision-admitted.json` | Colliculus, the selected provider executor, redeems the decision from `voice-message-transcribe.json` before expiry. Admission is `reserved` and keeps the same `media-vendor` / `fixture-transcribe` binding. |
+| `decision-admitted.json` | The voice module, as the selected provider executor, redeems the decision from `voice-message-transcribe.json` before expiry. Admission is `reserved` and keeps the same `media-vendor` / `fixture-transcribe` binding. |
 | `decision-caller-mismatch.json` | A new admission of that same decision from `reserved:stranger` fails the account caller check: `account_not_authorized`. The stranger has no runner declaration or authorized session scope; this is distinct from an authorized executor naming an unknown decision. |
-| `decision-expired.json` | Colliculus requests a new admission 600001 ms after selection, past the ten-minute decision life: `unknown_decision`. It is an account redemption refusal, not a select-time expiry code. |
+| `decision-expired.json` | The voice module requests a new admission 600001 ms after selection, past the ten-minute decision life: `unknown_decision`. It is an account redemption refusal, not a select-time expiry code. |
 
 ### Shared reachability shape
 
