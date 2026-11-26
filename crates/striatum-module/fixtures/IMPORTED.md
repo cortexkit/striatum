@@ -259,3 +259,14 @@ JSON samples were verified against the supplied manifest before import.
 | `broca-runner-serves-1126/role-describe-default-after.json` | `39fbc7fe630d8c3e5d5aed7e477ce1d1f6361d4329077f9a8ae75dc3b705e4e4` |
 | `broca-runner-serves-1126/role-describe-serves.json` | `ee737df8a5b7dac07983e1d10433cc62412a4469b5bfe896f64223d5a261bf31` |
 | `broca-runner-serves-1126/SHA256SUMS` | `086a261ba4217d9015b2d904d3ac0c892d4f8aa22898440149b9a8e171babb0d` |
+
+## Astrocyte per-pool plan values
+
+`astrocyte-spend-multiplier-report-v2/` copies Astrocyte's
+`crates/astrocyte-module/test-vectors/spend-multiplier-report-v2/` byte for
+byte, from its `quota-pools` campaign commit `c64dfc41` (tag
+`spend-multiplier-report-v2` when that campaign lands). Its README describes the
+cases; the pool ids and plans are synthetic. The files were checked against the
+supplied manifest before import; the manifest itself has SHA-256
+`d7c7cba095cfe8da67352de2e9c8cad60383542f6888faf7039e32386373114c`, and each file's
+own SHA-256 is listed in `astrocyte-spend-multiplier-report-v2/SHA256SUMS`.
