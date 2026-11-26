@@ -135,6 +135,7 @@ pub(crate) enum CandidateSource<'a> {
         /// Legacy pool pins report per-key lease failures through the pool's
         /// existing refusal adapter. Automatic and v1 selection reject here.
         defer_pool_pin: bool,
+        keyless_routes: Option<&'a std::collections::HashSet<String>>,
     },
 }
 
@@ -295,6 +296,7 @@ pub(crate) fn prepare_candidates(
             fences,
             stale,
             defer_pool_pin,
+            keyless_routes,
         } => {
             let full: Vec<striatum_core::route_state_store::CredentialEntitlementFence> =
                 fences.iter().chain(stale.iter()).cloned().collect();
@@ -312,6 +314,9 @@ pub(crate) fn prepare_candidates(
             let mut metered_accounts = std::collections::HashSet::new();
             for fact in facts {
                 let route = fact_to_route(fact);
+                if keyless_routes.is_some_and(|routes| routes.contains(&route.route_key)) {
+                    continue;
+                }
                 let provider_rows: Vec<_> = rows
                     .iter()
                     .filter(|row| {
@@ -415,7 +420,7 @@ pub(crate) fn prepare_candidates(
             if priced_per_token {
                 admission_facts = with_vault_methods(&admission_facts, rows);
             }
-            filters = candidate_rejections_priced(
+            let mut policy_rejections = candidate_rejections_priced(
                 &admission_facts,
                 consumer,
                 priced_per_token,
@@ -423,6 +428,10 @@ pub(crate) fn prepare_candidates(
                 subscription_plan_providers,
                 Some(&metered_accounts),
             );
+            if let Some(keyless) = keyless_routes {
+                policy_rejections.retain(|route, _| !keyless.contains(route));
+            }
+            filters = policy_rejections;
         }
     }
     rejected.extend(filters.clone());
@@ -840,6 +849,7 @@ mod candidate_tests {
                 fences,
                 stale: &[],
                 defer_pool_pin: false,
+                keyless_routes: None,
             },
             false,
             Some(Consumer::Mason),

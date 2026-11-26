@@ -17,10 +17,7 @@ async fn head_turn_auto_enrolled_first_party_runner_is_trusted_on_both_surfaces(
             crate::routing_v1::runners::DescribeCache::default().catalog(
                 &json!([{"module_id":"class-runner","first_party":true,
                 "incarnation":"daemon-a","spawn":7,
-                "role_declarations":{"routing/v1":{"runner":{
-                    "pairs":[{"wire_api":"anthropic.messages","auth_method":"oauth"},
-                        {"wire_api":"anthropic.messages","auth_method":"apikey"}]
-                }}}}]),
+                "role_declarations":{"routing/v1":{"runner":{}}}}]),
                 &[],
                 &mut credentials,
                 NOW as i64,

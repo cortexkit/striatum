@@ -5,6 +5,9 @@ use striatum_core::{
     task_profile::{ProfileLevel, TaskProfile, TokenVector},
 };
 
+#[path = "what_if_free_before_reset_tests.rs"]
+mod free_before_reset;
+
 const SCENARIO: &str =
     include_str!("../../../striatum-core/tests/fixtures/overqualification-cost-replay.json");
 
@@ -213,6 +216,7 @@ fn install_key_only_kimi(
         ..Default::default()
     };
     credentials.apply_listing(&listing, KIMI_NOW as u64);
+    credentials.set_watch_confirmed(Some(&listing.view));
     credentials.refresh_serving_methods(&Default::default(), &facts, KIMI_NOW, &[]);
     drop(shared);
     harness.set_credentials(credentials);
@@ -457,6 +461,80 @@ fn kimi_join_ignores_another_credential() {
         kimi_join_pool(&state, &report).plans[0].plan.as_deref(),
         Some(KIMI_PLAN)
     );
+}
+
+#[tokio::test]
+async fn free_before_reset_preview_prices_kimis_expiring_week_at_zero() {
+    let _clock = crate::InjectedClock::set(KIMI_NOW as u64);
+    let (harness, scenario, fixture) = setup(false);
+    let listing = install_key_only_kimi(&harness);
+    let mut state = kimi_state(&listing, false);
+    for (at, used) in [(KIMI_NOW - 3_600_000, 5.21), (KIMI_NOW, 6.21)] {
+        let mut reading = kimi_reading();
+        reading["fetchedAt"] = json!(crate::account_selection::rfc3339(at));
+        reading["usage"]["primary"]["usedPercent"] = json!(used);
+        crate::account_quota::apply_usage_reply(
+            &mut state,
+            &serde_json::to_vec(&json!({"result":[reading]})).unwrap(),
+            at,
+        )
+        .unwrap();
+    }
+    drop(scenario);
+    let _pools = crate::subscription_economics::test_pools_with_recent_pace(
+        &state,
+        scenario_pools(&fixture, false),
+        KIMI_NOW,
+    );
+    publish_kimi_state(state);
+    let consumer = harness.bind(reserved(fixture::CONSUMER), None).await;
+    let live_score = async || {
+        let (frame, reply) = consumer
+            .call(
+                "route.select",
+                &json!({
+                    "consumer":"prefrontal.mason","requirements":{"iq":50},"pin":KIMI_ROUTE
+                }),
+            )
+            .await;
+        assert_eq!(frame, FrameType::Response, "{reply}");
+        let id = reply["result"]["decision_id"].as_str().unwrap();
+        rusqlite::Connection::open(harness.store_path())
+            .unwrap()
+            .query_row(
+                "SELECT score_json FROM model_route_decisions WHERE id = ?1",
+                [id],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap()
+    };
+    let before_preview = live_score().await;
+    let operator = operator(&harness).await;
+    let answer = operator
+        .what_if_with_profiles(
+            &json!({"consumer":"prefrontal.mason","iqs":[50],"free_before_reset_preview":true}),
+            &kimi_lookup("prefrontal.mason", &fixture),
+        )
+        .await
+        .expect("opt-in free-before-reset comparison");
+    let kimi = answer["results"][0]["adequate"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["route"] == KIMI_ROUTE)
+        .unwrap();
+    assert!(kimi["task_pricing"]["finalCostUsd"].as_f64().unwrap() > 0.0);
+    assert_eq!(kimi["free_before_reset_preview"]["free_before_reset"], true);
+    assert_eq!(kimi["free_before_reset_preview"]["final_cost_usd"], 0.0);
+    assert_eq!(
+        kimi["free_before_reset_preview"]["pace_points_per_hour"],
+        1.0
+    );
+    assert_eq!(
+        answer["results"][0]["free_before_reset_pick"]["route"],
+        KIMI_ROUTE
+    );
+    assert_eq!(live_score().await.as_bytes(), before_preview.as_bytes());
 }
 
 #[tokio::test]

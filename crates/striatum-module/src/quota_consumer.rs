@@ -302,8 +302,14 @@ impl QuotaConsumer {
         body: serde_json::Value,
     ) -> Result<serde_json::Value, QuotaConsumerError> {
         let bytes = self.operation_body(body).await?;
+        Self::decode_query_reply(&bytes)
+    }
+
+    pub(crate) fn decode_query_reply(
+        bytes: &[u8],
+    ) -> Result<serde_json::Value, QuotaConsumerError> {
         let value: serde_json::Value =
-            serde_json::from_slice(&bytes).map_err(QuotaConsumerError::Json)?;
+            serde_json::from_slice(bytes).map_err(QuotaConsumerError::Json)?;
         Ok(value.get("result").cloned().unwrap_or(value))
     }
 

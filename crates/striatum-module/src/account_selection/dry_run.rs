@@ -18,12 +18,26 @@ pub(crate) struct Sweep {
 impl Sweep {
     pub(crate) fn capture(store: &SqliteRouteStateStore) -> RouteStateResult<Self> {
         let initial = crate::account_state::snapshot(store)?;
+        Self::from_initial(store, initial)
+    }
+
+    pub(crate) fn fork_from_initial(
+        &self,
+        store: &SqliteRouteStateStore,
+    ) -> RouteStateResult<Self> {
+        Self::from_initial(store, self.initial.clone())
+    }
+
+    fn from_initial(
+        _store: &SqliteRouteStateStore,
+        initial: Arc<AccountState>,
+    ) -> RouteStateResult<Self> {
         Ok(Self {
             state: Mutex::new((*initial).clone()),
             initial,
             #[cfg(test)]
             oracle: if std::env::var_os("STRIATUM_SWEEP_SQL_ORACLE").is_some() {
-                Some(Arc::new(store.private_account_copy_for_test(
+                Some(Arc::new(_store.private_account_copy_for_test(
                     crate::account_selection::now_ms(),
                 )?))
             } else {

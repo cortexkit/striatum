@@ -107,14 +107,19 @@ pub(super) fn setup_for_method(
     );
     credentials.wire_apis = wires;
     credentials.publish_plan_prices(&served()["plan.prices — every curated row"]["response"]);
-    credentials.runner_declarations.insert(
-        RUNNER.into(),
-        runners::parse_declaration(&json!({"runner":{
-            "pairs":[{"wire_api":wire,"auth_method":method}],
-            "follows_account_choice":true
-        }}))
-        .unwrap()
-        .unwrap(),
+    let declaration =
+        runners::parse_declaration(&json!({"runner":{"follows_account_choice":true}}))
+            .unwrap()
+            .unwrap();
+    credentials
+        .runner_declarations
+        .insert(RUNNER.into(), declaration);
+    super::conformance_tests::publish_runner_serves(
+        &mut credentials,
+        RUNNER,
+        &json!({
+            "generation":"service-tier-fixture", "entries":[{"provider":"openai", "models":[MODEL]}]
+        }),
     );
     let levels = if runner_ultrafast {
         json!(["fast", "ultrafast"])
@@ -310,6 +315,12 @@ fn legacy_broca_setup() -> (Arc<Harness>, BrocaCredentials) {
         "openai.chatgpt_responses",
     );
     live_broca_credentials(&mut credentials);
+    let declaration = credentials.runner_declarations.remove(RUNNER).unwrap();
+    credentials
+        .runner_declarations
+        .insert("broca".into(), declaration);
+    credentials.runner_serves.remove(RUNNER);
+    super::conformance_tests::publish_runner_serves(&mut credentials, "broca", &broca_serves());
     let tiers = credentials.runner_service_tiers.remove(RUNNER).unwrap();
     credentials
         .runner_service_tiers
@@ -319,6 +330,29 @@ fn legacy_broca_setup() -> (Arc<Harness>, BrocaCredentials) {
         config["runners"] = json!([{"module":"broca","via_vault":true}]);
     });
     (harness, credentials)
+}
+
+fn broca_serves() -> Value {
+    json!({"generation":"legacy-broca-fixture", "entries":[{"provider":"openai","models":[MODEL]}]})
+}
+
+fn broca_modules() -> Value {
+    json!([{"module_id":"broca", "nonce_verified":true,
+        "role_declarations":{"routing/v1":{"runner":{"follows_account_choice":true}}}}])
+}
+
+fn with_broca_serves(mut describe: Value) -> Value {
+    let result = if describe.get("result").is_some() {
+        &mut describe["result"]
+    } else {
+        &mut describe
+    };
+    result["capabilities"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!("serves"));
+    result["serves"] = broca_serves();
+    describe
 }
 
 fn legacy_broca_request(id: &str) -> Value {
@@ -394,7 +428,7 @@ async fn account_service_tier_ultrafast_steps_down_to_fast_then_standard() {
 async fn bound_fast_resume_is_admitted_after_a_missed_describe_poll() {
     let _clock = crate::InjectedClock::set(NOW);
     let (harness, mut credentials) = legacy_broca_setup();
-    let modules = json!([{"module_id":"broca","nonce_verified":true}]);
+    let modules = broca_modules();
     let policies = serde_json::from_value::<Vec<crate::config_policy::RunnerPolicy>>(
         json!([{"module":"broca","via_vault":true}]),
     )
@@ -405,7 +439,12 @@ async fn bound_fast_resume_is_admitted_after_a_missed_describe_poll() {
     .unwrap();
     let mut cache = runners::DescribeCache::default();
     cache.catalog(&modules, &policies, &mut credentials, NOW as i64);
-    cache.reply("broca", Some(&describe), &mut credentials, NOW as i64);
+    cache.reply(
+        "broca",
+        Some(&with_broca_serves(describe)),
+        &mut credentials,
+        NOW as i64,
+    );
     harness.set_credentials(credentials.clone());
     let owner = harness.bind(reserved("tier-owner"), None).await;
     let selected = owner.call("route.select", &select_sol("fast")).await;
@@ -454,7 +493,7 @@ async fn bound_fast_resume_is_admitted_after_a_missed_describe_poll() {
 async fn bound_fast_resume_survives_a_restart_catalog_gap_until_describe_expires() {
     let _clock = crate::InjectedClock::set(NOW);
     let (harness, mut credentials) = legacy_broca_setup();
-    let modules = json!([{"module_id":"broca","nonce_verified":true}]);
+    let modules = broca_modules();
     let policies = serde_json::from_value::<Vec<crate::config_policy::RunnerPolicy>>(
         json!([{"module":"broca","via_vault":true}]),
     )
@@ -465,7 +504,12 @@ async fn bound_fast_resume_survives_a_restart_catalog_gap_until_describe_expires
     .unwrap();
     let mut cache = runners::DescribeCache::default();
     cache.catalog(&modules, &policies, &mut credentials, NOW as i64);
-    cache.reply("broca", Some(&describe), &mut credentials, NOW as i64);
+    cache.reply(
+        "broca",
+        Some(&with_broca_serves(describe)),
+        &mut credentials,
+        NOW as i64,
+    );
     harness.set_credentials(credentials.clone());
     let owner = harness.bind(reserved("tier-owner"), None).await;
     let selected = owner.call("route.select", &select_sol("fast")).await;
@@ -976,13 +1020,10 @@ fn live_broca_credentials(credentials: &mut BrocaCredentials) {
         "dd0ef1d533f267ea3422e508c7e16f7ece51239fcc93580924572c610bf8e581"
     );
     let reply: Value = serde_json::from_slice(bytes).unwrap();
-    credentials.runner_declarations.clear();
     credentials.runner_service_tiers.clear();
     let modules = json!([{"module_id":RUNNER,"nonce_verified":true,"role_declarations":null}]);
     let policies = vec![serde_json::from_value(json!({"module":RUNNER,"via_vault":true})).unwrap()];
-    for module in
-        runners::tier_discovery_modules(&modules, &credentials.runner_declarations, &policies)
-    {
+    for module in runners::tier_discovery_modules(&modules, &Default::default(), &policies) {
         if let Some(tiers) = runners::service_tiers_from_describe(&reply) {
             credentials.runner_service_tiers.insert(module, tiers);
         }
@@ -996,7 +1037,7 @@ fn service_tier_discovery_polls_only_verified_declared_or_vault_runners() {
         {"module_id":"unverified","nonce_verified":false,"role_declarations":null},
         {"module_id":"not-vault","nonce_verified":true,"role_declarations":null},
         {"module_id":"declared","nonce_verified":true,"role_declarations":{"routing/v1":{
-            "runner":{"pairs":[{"wire_api":"anthropic.messages","auth_method":"oauth"}],"follows_account_choice":true}
+            "runner":{"follows_account_choice":true}
         }}}
     ]);
     let policies: Vec<crate::config_policy::RunnerPolicy> = serde_json::from_value(json!([
@@ -1463,7 +1504,12 @@ async fn service_tier_sol_pro_500_selects_ultrafast_and_admits_only_eligible_acc
     let route = harness.bind(reserved("tier-owner"), None).await;
     let reply = route.call("route.select", &select("ultrafast")).await;
     assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
-    assert_eq!(reply.1["result"]["service_tier_chosen"], "ultrafast");
+    assert_eq!(
+        reply.1["result"]["service_tier_chosen"],
+        "ultrafast",
+        "{}",
+        stored_tier_fallback(&harness, &reply.1)
+    );
     let runner = harness.bind(reserved(RUNNER), None).await;
     let admitted = runner.call("route.account_for", &json!({
         "provider":"openai", "model":MODEL, "conversation_key":"session", "admission_id":"one",

@@ -165,15 +165,15 @@ async fn capture(stem: &str) -> [(String, Vec<u8>); 2] {
     facts.multipliers.insert(SUBSCRIPTION.into(), 22.into());
     selection_facts(&harness, &facts);
 
-    let slot: Value =
-        serde_json::from_str(include_str!("../runners/broca-runner-slot.after.json")).unwrap();
+    let slot = json!({"runner":{"follows_account_choice":true,"harnesses":["broca"],
+        "harness_limits":{"broca":{"capabilities":["one_off","fork_answer"]}}}});
     {
         let shared = harness.credentials();
         let mut credentials = shared.lock().unwrap();
         let mut broca = slot.clone();
         if stem != "broca-harness" {
-            // Today's Broca has no harness facts. Keep that wire shape alongside
-            // the unchanged real declaration that Broca will publish next.
+            // Most examples use a runner with no named harness to keep the
+            // original response shape.
             broca["runner"].as_object_mut().unwrap().remove("harnesses");
             broca["runner"]
                 .as_object_mut()
@@ -187,14 +187,28 @@ async fn capture(stem: &str) -> [(String, Vec<u8>); 2] {
         credentials.runner_declarations.insert(
             "sample-harness-runner".into(),
             runners::parse_declaration(&json!({"runner":{
-                "pairs":[{"wire_api":"anthropic.messages","auth_method":"apikey"}],
                 "harnesses":["sample-harness"],"default_harness":"sample-harness"
             }}))
             .unwrap()
             .unwrap(),
         );
-        // Broca's real slot requires a curated wire endpoint for API-key routes.
-        // Supply that catalog fact without weakening the runner declaration.
+        let broca_harnesses = credentials.runner_declarations["broca"].harnesses.clone();
+        super::super::conformance_tests::publish_runner_serves(
+            &mut credentials,
+            "broca",
+            &super::super::conformance_tests::test_serves(
+                &[METERED.into(), SUBSCRIPTION.into()],
+                broca_harnesses.as_deref(),
+                "select-vectors",
+            ),
+        );
+        super::super::conformance_tests::publish_runner_serves(
+            &mut credentials,
+            "sample-harness-runner",
+            &json!({
+                "generation":"select-vectors", "harnesses":{"sample-harness":[{"provider":"example-provider","models":[METERED.split_once('/').unwrap().1]}]}
+            }),
+        );
         let rate = |units| json!({"state":"priced","currency":"USD","units":units,"exponent":0});
         let catalog = credentials.billing_catalog.clone().with_test_plane(
             &serde_json::to_vec(&json!({

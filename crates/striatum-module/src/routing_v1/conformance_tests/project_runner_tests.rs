@@ -171,12 +171,10 @@ async fn project_runner_refusal_names_claude_code_when_no_sidekick_model_runs_on
     )
     .unwrap();
     let declaration = super::super::runners::parse_declaration(&json!({"runner":{
-        "pairs":[{"wire_api":"anthropic.messages", "auth_method":"apikey"}],
         "harnesses":["opencode2", "claude-code"], "starts_sessions":true,
         "harness_limits":{
             "opencode2":{},
-            "claude-code":{"explicit_providers":["anthropic"],
-                "capabilities":["plans","fork_answer","submit_tool","final_text","output_cap","one_off"]}
+            "claude-code":{"capabilities":["plans","fork_answer","submit_tool","final_text","output_cap","one_off"]}
         }
     }})).unwrap().unwrap();
     harness
@@ -185,6 +183,10 @@ async fn project_runner_refusal_names_claude_code_when_no_sidekick_model_runs_on
         .unwrap()
         .runner_declarations
         .insert(AGENT.into(), declaration);
+    harness.publish_runner_serves(AGENT, &json!({"generation":"sidekick-project-fixture", "harnesses":{
+        "opencode2":[{"provider":"anthropic","models":["model-a","model-b"]},{"provider":"example-provider","models":["model-c","model-d"]}],
+        "claude-code":[{"provider":"anthropic","models":["model-a","model-b"]}]
+    }}));
     harness.edit_config(|config| {
         config["consumers"][consumer] = json!({
             "owner":fixture::CONSUMER.trim_start_matches("reserved:"), "workload":"lookup"
@@ -205,7 +207,9 @@ async fn project_runner_refusal_names_claude_code_when_no_sidekick_model_runs_on
     assert_eq!(
         reply["detail"],
         json!({"reason":"harness_unavailable", "runners":[{
-            "module":AGENT, "harness":"claude-code", "reason":"excluded_by_policy", "filter":"harness_routes"
+            "module":AGENT, "harness":"claude-code", "reason":"excluded_by_policy", "filter":"harness_routes",
+            "unavailable_harnesses":[{"harness":"claude-code", "reason":"model_not_served",
+                "message":"The model isn't in this harness's serves list."}]
         }]})
     );
     assert_eq!(
@@ -253,7 +257,6 @@ fn mason_declared_on_broca() -> Arc<Harness> {
         "one_off",
     ];
     let declaration = super::super::runners::parse_declaration(&json!({"runner":{
-        "pairs":[{"wire_api":"anthropic.messages", "auth_method":"apikey"}],
         "harnesses":["opencode2", "pi", "claude-code"],
         "default_harness":"opencode2", "starts_sessions":true,
         "harness_limits":{
@@ -269,6 +272,14 @@ fn mason_declared_on_broca() -> Arc<Harness> {
         .unwrap()
         .runner_declarations
         .insert(AGENT.into(), declaration);
+    let models =
+        json!([{"provider":"anthropic","models":["model-a","model-b","model-c","model-d"]}]);
+    harness.publish_runner_serves(
+        AGENT,
+        &json!({"generation":"mason-project-fixture", "harnesses":{
+            "opencode2":models,"pi":models,"claude-code":models
+        }}),
+    );
     harness.edit_config(|config| {
         config["runners"] = json!([
             {"module":"broca","via_vault":true}, {"module":AGENT,"via_vault":true}
@@ -573,7 +584,6 @@ async fn project_may_choose_an_auto_enrolled_first_party_runner() {
     super::super::runners::DescribeCache::default().catalog(
         &json!([{"module_id":AGENT,"first_party":true,"incarnation":"daemon-a","spawn":7,
         "role_declarations":{"routing/v1":{"runner":{
-            "pairs":[{"wire_api":"anthropic.messages","auth_method":"apikey"}],
             "harnesses":HARNESSES
         }}}}]),
         &config.v1_runners(),

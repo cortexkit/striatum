@@ -1372,10 +1372,20 @@ impl ClassContext {
         store: &SqliteRouteStateStore,
         credentials: &crate::broca_credentials::SharedBrocaCredentials,
     ) -> Result<(), String> {
+        self.reserve_selection_probes_where(store, credentials, |_| true)
+    }
+
+    pub(crate) fn reserve_selection_probes_where(
+        &mut self,
+        store: &SqliteRouteStateStore,
+        credentials: &crate::broca_credentials::SharedBrocaCredentials,
+        consider: impl Fn(&striatum_core::ModelFact) -> bool,
+    ) -> Result<(), String> {
         let mut probes = Vec::new();
         for row in self.credentials.listed_credentials() {
             for fact in &self.facts {
-                if self.probe_eligible(&fact.provider_id, &fact.model_id, &row.id) {
+                if consider(fact) && self.probe_eligible(&fact.provider_id, &fact.model_id, &row.id)
+                {
                     probes.push((fact.provider_id.clone(), row.id.clone()));
                 }
             }
@@ -2877,10 +2887,10 @@ impl ClassContext {
         })
     }
 
-    pub(crate) fn apply_eligibility(
+    pub(crate) fn apply_eligibility<'a>(
         &self,
         snapshot: &mut striatum_core::ModelRouteStateSnapshot,
-        facts: &[striatum_core::ModelFact],
+        facts: impl IntoIterator<Item = &'a striatum_core::ModelFact>,
         priced: bool,
         defer_pool_pin: bool,
     ) {
@@ -2905,10 +2915,10 @@ impl ClassContext {
     /// allocator preflight. V1 must keep these walls at account preflight: a
     /// capacity wall would hide an adequate route and lose `accounts_blocked`
     /// and the reset that lets the caller wait.
-    pub(crate) fn apply_legacy_route_fences(
+    pub(crate) fn apply_legacy_route_fences<'a>(
         &self,
         snapshot: &mut striatum_core::ModelRouteStateSnapshot,
-        facts: &[striatum_core::ModelFact],
+        facts: impl IntoIterator<Item = &'a striatum_core::ModelFact>,
         priced: bool,
         defer_pool_pin: bool,
     ) {

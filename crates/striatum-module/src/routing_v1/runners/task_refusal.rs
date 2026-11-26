@@ -6,6 +6,153 @@ use serde_json::{json, Value};
 use super::{explicit_needs, task_needs, EffectiveRunner, Refusal, Registry, SelectRequest};
 use crate::config_policy::{ConsumerPolicy, RunnerPolicy};
 
+// A connected runner normally answers quickly, but a harness may still be
+// loading its catalog. Don't make callers poll it every second while it starts.
+const RUNNER_READY_RETRY_MS: u64 = 10_000;
+
+pub(crate) fn empty_reachable(
+    request: &SelectRequest,
+    pin: Option<&str>,
+    registry: &Registry,
+    policies: &[RunnerPolicy],
+    facts: &[&striatum_core::ModelFact],
+    credentials: &crate::broca_credentials::BrocaCredentials,
+    now: u64,
+) -> Refusal {
+    use super::super::ListStatus;
+    use cortexkit_role_routing::errors::{NoRouteReason, PinUnavailableReason};
+    use cortexkit_role_routing::select::PinFallback;
+
+    let pin = pin.filter(|_| request.pin_fallback != Some(PinFallback::Route));
+    let parsed_pin = pin.and_then(cortexkit_role_routing::select::RouteRef::parse_pin);
+    let relevant: Vec<_> = facts
+        .iter()
+        .filter(|fact| {
+            striatum_core::model_facts::llm_classification_rejection(fact, false).is_none()
+                && parsed_pin.as_ref().is_none_or(|pin| {
+                    pin.provider == fact.provider_id
+                        && pin.model == fact.model_id
+                        && pin.variant.as_ref().is_none_or(|variant| {
+                            fact.variant
+                                .as_ref()
+                                .is_none_or(|fact_variant| variant == fact_variant)
+                        })
+                })
+        })
+        .map(|fact| (fact, striatum_core::fact_to_route(fact)))
+        .collect();
+
+    let mut rows = Vec::new();
+    let mut any_served = false;
+    let mut all_pending = true;
+    for policy in policies {
+        let Some(runner) = registry
+            .get(policy)
+            .filter(|runner| runner.wire_declaration().is_some())
+        else {
+            all_pending = false;
+            continue;
+        };
+        let requested = request.harness.as_deref().or(policy.harness.as_deref());
+        let selected = runner.selection_harness(requested);
+        let harnesses = if let Some(choices) = &runner.harness_choices {
+            choices
+                .iter()
+                .map(|candidate| Some(candidate.harness.as_str()))
+                .collect()
+        } else if let Some(harness) = selected.as_deref() {
+            vec![Some(harness)]
+        } else if runner.harnesses.is_empty() {
+            vec![None]
+        } else {
+            runner
+                .harnesses
+                .iter()
+                .map(|name| Some(name.as_str()))
+                .collect()
+        };
+        let lists = credentials.runner_serves.get(&policy.module);
+        let mut unavailable = Vec::new();
+        for harness in harnesses {
+            if runner.wire_declaration().is_some_and(|declaration| {
+                declaration
+                    .limits_for_harness(harness)
+                    .is_ok_and(|limits| limits.starts_sessions == Some(false))
+            }) {
+                continue;
+            }
+            let mut allowed = relevant
+                .iter()
+                .filter(|(_, route)| {
+                    runner
+                        .route_policy
+                        .as_ref()
+                        .is_none_or(|specs| specs.resolve(&route.route_key, false))
+                })
+                .peekable();
+            if allowed.peek().is_none() {
+                continue;
+            }
+            let status = lists.map_or(ListStatus::Missing, |lists| {
+                lists.status(harness, now as i64)
+            });
+            if matches!(status, ListStatus::Ready)
+                && allowed.any(|(fact, _)| {
+                    lists.is_some_and(|lists| {
+                        lists.includes(harness, &fact.provider_id, &fact.model_id, now as i64)
+                    })
+                })
+            {
+                any_served = true;
+                all_pending = false;
+                continue;
+            }
+            all_pending &= matches!(status, ListStatus::Missing)
+                && credentials
+                    .runner_describe_connected
+                    .contains(&policy.module);
+            unavailable.push(harness_list_row(harness, status));
+        }
+        if !unavailable.is_empty() {
+            let mut row = json!({"module":policy.module, "reason":"excluded_by_policy", "filter":"harness_routes", "unavailable_harnesses":unavailable});
+            if let Some(harness) = requested {
+                row["harness"] = json!(harness);
+            }
+            rows.push(row);
+        }
+    }
+
+    let reset =
+        (all_pending && !rows.is_empty()).then(|| now.saturating_add(RUNNER_READY_RETRY_MS));
+    // The routing kit also treats two settled account states as unservable
+    // pins: runner_serves_login_none before the list waives login on an empty
+    // vault, and runner_gateway_credential when its vault alias has no unique
+    // target. A still-loading or stale vault is not either case.
+    let confirmed_no_login = any_served && credentials.listed_credentials().is_empty();
+    let unresolved_gateway = parsed_pin.as_ref().is_some_and(|pin| {
+        relevant.is_empty()
+            && credentials.listed_credentials().iter().any(|row| {
+                row.state == "active"
+                    && row.auth_method.as_deref() == Some("gateway")
+                    && row.provider_ids.contains(&pin.provider)
+                    && row.serves.len() != 1
+            })
+    });
+    let account_cannot_serve =
+        credentials.listing_is_fresh(now) && (confirmed_no_login || unresolved_gateway);
+    let mut refusal = if let Some(pin) = pin.filter(|_| {
+        parsed_pin.is_some() && ((!any_served && !rows.is_empty()) || account_cannot_serve)
+    }) {
+        Refusal::pin_unavailable(pin, PinUnavailableReason::NotAvailable, reset)
+    } else {
+        Refusal::no_route(NoRouteReason::MissingCapability, reset)
+    };
+    if !rows.is_empty() {
+        refusal.detail.insert("runners".into(), json!(rows));
+    }
+    refusal
+}
+
 struct Candidate {
     policy: RunnerPolicy,
     excluded_by: Option<&'static str>,
@@ -310,9 +457,61 @@ fn describe_harnesses(
         json!({"reason":"harness_stopped"})
     } else if !blocked.is_empty() && blocked.len() == running {
         json!({"reason":"capabilities_missing", "missing":blocked})
+    } else if remaining_filter == "harness_routes" {
+        let declarations = if harnesses.is_empty() {
+            vec![None]
+        } else {
+            harnesses.iter().copied().map(Some).collect()
+        };
+        let unavailable: Vec<_> = declarations
+            .into_iter()
+            .filter(|harness| {
+                harness.is_none_or(|name| {
+                    !blocked.contains_key(&format!("{}/{name}", runner.policy.module))
+                        && runner.wire_declaration().is_none_or(|d| {
+                            d.limits_for_harness(Some(name))
+                                .is_ok_and(|limits| limits.starts_sessions == Some(true))
+                        })
+                })
+            })
+            .map(|harness| {
+                harness_list_row(
+                    harness,
+                    runner
+                        .serves_status
+                        .get(&harness.map(str::to_owned))
+                        .copied()
+                        .unwrap_or(super::super::ListStatus::Missing),
+                )
+            })
+            .collect();
+        json!({"reason":"excluded_by_policy", "filter":remaining_filter, "unavailable_harnesses":unavailable})
     } else {
         json!({"reason":"excluded_by_policy", "filter":remaining_filter})
     }
+}
+
+fn harness_list_row(harness: Option<&str>, status: super::super::ListStatus) -> Value {
+    use super::super::ListStatus;
+    let (reason, message) = match status {
+        ListStatus::Ready => (
+            "model_not_served",
+            "The model isn't in this harness's serves list.",
+        ),
+        ListStatus::Expired => (
+            "serves_list_expired",
+            "This harness's last serves list is over five minutes old.",
+        ),
+        ListStatus::Missing => (
+            "serves_list_missing",
+            "The runner hasn't sent a serves list for this harness yet.",
+        ),
+    };
+    let mut row = json!({"reason":reason, "message":message});
+    if let Some(harness) = harness {
+        row["harness"] = json!(harness);
+    }
+    row
 }
 
 fn warn_once(

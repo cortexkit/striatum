@@ -106,12 +106,17 @@ fn paid_anthropic_harness_with_catalog(
     credentials.runner_declarations.insert(
         "broca".into(),
         super::super::runners::parse_declaration(&json!({"runner": {
-            "pairs":[{"wire_api":"anthropic.messages", "auth_method":"apikey"},
-                {"wire_api":"anthropic.messages", "auth_method":"oauth"}],
             "follows_account_choice":true
         }}))
         .unwrap()
         .unwrap(),
+    );
+    super::super::conformance_tests::publish_runner_serves(
+        &mut credentials,
+        "broca",
+        &json!({
+            "generation":"paid-anthropic-fixture", "entries":[{"provider":"anthropic","models":[MODEL]},{"provider":POOL,"models":[MODEL]}]
+        }),
     );
     credentials
         .runner_routed_accounts

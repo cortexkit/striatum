@@ -106,6 +106,7 @@ fn harness(specs: &[(&str, bool, bool, u64)]) -> Arc<Harness> {
         .unwrap();
     let mut credentials = BrocaCredentials::api_test_credentials(&facts);
     credentials.publish_plan_prices(&json!({ "prices": [] }));
+    publish_order_runners(&mut credentials, &facts);
     harness.set_credentials(credentials);
     harness.edit_config(|config| {
         config["consumers"]["prefrontal.mason"] = json!({"owner":"example-consumer"});
@@ -115,6 +116,12 @@ fn harness(specs: &[(&str, bool, bool, u64)]) -> Arc<Harness> {
         ]);
     });
     harness
+}
+
+fn publish_order_runners(credentials: &mut BrocaCredentials, facts: &[ModelFact]) {
+    for module in ["zeta-runner", "alpha-runner"] {
+        super::conformance_tests::publish_fixture_models(credentials, module, facts, false);
+    }
 }
 
 fn select(consumer: &str) -> Value {
@@ -654,6 +661,7 @@ async fn pay_per_token_follows_the_consumer_flag_not_the_name() {
     let harness = harness(&specs);
     let mut credentials = BrocaCredentials::api_test_credentials(&facts(&specs));
     credentials.publish_plan_prices(&json!({"prices": [{"provider_id": "cheap-provider"}]}));
+    publish_order_runners(&mut credentials, &facts(&specs));
     harness.set_credentials(credentials);
     let route = harness.bind(reserved("example-consumer"), None).await;
 
@@ -931,6 +939,7 @@ async fn legacy_provider_reset_evidence_schedules_checks_on_select() {
                 },
                 now as u64,
             );
+            publish_order_runners(&mut credentials, &harness.store().get_facts().unwrap());
             harness.set_credentials(credentials);
             let route = harness.bind(reserved("example-consumer"), None).await;
             let v1_select = select("prefrontal.mason");
@@ -1093,7 +1102,9 @@ async fn decision_stores_adequate_alternatives_in_rank_order_without_winner() {
         ranked.push(fact);
     }
     harness.install_facts(&ranked);
-    harness.set_credentials(BrocaCredentials::api_test_credentials(&ranked));
+    let mut credentials = BrocaCredentials::api_test_credentials(&ranked);
+    publish_order_runners(&mut credentials, &ranked);
+    harness.set_credentials(credentials);
     harness.edit_config(|config| {
         config["consumers"] = json!({"prefrontal.mason":{"owner":"example-consumer"}});
         config["runners"] = json!([{"module":"zeta-runner"}]);

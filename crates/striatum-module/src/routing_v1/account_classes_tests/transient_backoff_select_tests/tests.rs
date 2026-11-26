@@ -479,6 +479,7 @@ async fn expired_backoff_reopens_select_after_the_old_test_window() {
         },
         clock - 10_000,
     );
+    publish_fixture_providers(&mut credentials, "broca", &["openai"], true);
     drop(credentials);
     let reply = owner.call("route.select", &select()).await;
     assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
@@ -566,6 +567,12 @@ fn quota_route(harness: &Harness) {
     credentials.refresh_serving_methods(&Default::default(), &facts, NOW as i64 + 5_001, &[]);
     credentials.publish_billing_catalog(
         crate::fusiform_catalog::PlaneCatalog::ordinary_test_catalog(&facts),
+    );
+    publish_fixture_providers(
+        &mut credentials,
+        "broca",
+        &["openai", "quota-provider"],
+        true,
     );
     harness.set_credentials(credentials);
     harness

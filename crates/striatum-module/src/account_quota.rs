@@ -1482,6 +1482,7 @@ pub fn build_report(
 /// Fallback listing poll and independent account-view maintenance cadence.
 pub const ACCOUNT_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
+pub(crate) mod recent_pace;
 mod watch;
 
 /// Everything the account views are built from, shared between the refresh
@@ -1490,6 +1491,7 @@ mod watch;
 #[derive(Debug, Clone)]
 pub struct AccountQuotaState {
     pub readings: AccountReadings,
+    pub(crate) recent_pace: recent_pace::RecentPace,
     pub roster: Option<VaultRoster>,
     /// Resolved identities for every listed credential, including API keys
     /// which have no vault account id.
@@ -1508,6 +1510,7 @@ impl Default for AccountQuotaState {
     fn default() -> Self {
         Self {
             readings: AccountReadings::default(),
+            recent_pace: Default::default(),
             roster: None,
             credential_identities: BTreeMap::new(),
             credential_orgs: BTreeMap::new(),
@@ -1793,6 +1796,9 @@ pub fn apply_provider_reply(
         );
     }
     let outcome = merge_provider_poll(&mut state.readings, provider, &envelope, received_at_ms);
+    state
+        .recent_pace
+        .update(&state.readings, &outcome, received_at_ms);
     for note in &outcome.duplicate_lanes {
         tracing::info!(note = %note, "account quota: duplicate Insula lanes");
     }
@@ -1844,6 +1850,9 @@ pub(super) fn apply_decoded_usage_reply(
     for provider in providers {
         let outcome =
             merge_provider_poll(&mut state.readings, &provider, &envelope, received_at_ms);
+        state
+            .recent_pace
+            .update(&state.readings, &outcome, received_at_ms);
         for note in &outcome.duplicate_lanes {
             tracing::info!(note = %note, "account quota: duplicate Insula lanes");
         }

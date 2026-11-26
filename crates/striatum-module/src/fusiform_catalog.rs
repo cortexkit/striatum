@@ -893,6 +893,7 @@ impl PlaneCatalog {
     }
 
     /// A served plane's endpoint facts override the ordinary catalog, even when absent.
+    #[cfg(test)]
     pub(crate) fn row_serves_wire_api(&self, model: &str, auth_method: &str) -> Option<bool> {
         let provider = model.split_once('/')?.0;
         match self.pages.get(&(provider.into(), auth_method.into())) {
@@ -2082,7 +2083,14 @@ pub(crate) fn apply_mapped_catalog(
             .map_err(|_| error("credential cache poisoned"))?;
         credentials.wire_apis = snapshot.wire_apis.clone();
         credentials.wire_api_models = snapshot.wire_api_models.clone();
+        let changed = credentials
+            .catalog_snapshot
+            .as_ref()
+            .is_none_or(|previous| previous.cursor != snapshot.cursor);
         credentials.catalog_snapshot = Some(Arc::clone(snapshot));
+        if changed {
+            credentials.runner_catalog_wake.notify_one();
+        }
     }
     Ok(())
 }

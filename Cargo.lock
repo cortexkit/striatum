@@ -234,7 +234,7 @@ dependencies = [
  "serde",
  "serde_json",
  "subc-client-rs",
- "subc-protocol 0.37.4",
+ "subc-protocol",
  "thiserror",
  "tokio",
  "tracing",
@@ -302,7 +302,7 @@ dependencies = [
  "sha2",
  "subc-client-rs",
  "subc-os",
- "subc-protocol 0.37.4",
+ "subc-protocol",
  "subc-transport",
  "tokio",
  "zeroize",
@@ -354,9 +354,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-llm-runner"
-version = "0.8.51"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c2a3ae3cda558743c95936d7ccdde2e82589516b06beccb8fd452d38a6d8f173"
+checksum = "6ab8685a5c8b903f24e38a69dadefcddf55fbb512eadcdcd097e3dcafb61bd05"
 dependencies = [
  "cortexkit-rich-ui-syntax",
  "cortexkit-role-tool-provider",
@@ -380,9 +380,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-routing"
-version = "0.7.41"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "82b2c2bfcea5b51b6bb981eb3e56e88aa5dbe83a1a79784779b7d3e5fbf4516a"
+checksum = "5b27c135f28891a1abea982747152b69c8b28c600619e5931f4dc73d81d476e7"
 dependencies = [
  "cortexkit-role-media",
  "serde",
@@ -391,42 +391,43 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-routing-conformance"
-version = "0.10.46"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6e043bff7d5b8ff9f6a79c4c087f713063e3ebc3ff23693dbbf159bdfa69cfad"
+checksum = "d00f91d6e01ecc216ecdd63f94d458f6b9e34ed3790eb575722eed921bdfe4e5"
 dependencies = [
  "async-trait",
  "cortexkit-role-routing",
  "serde",
  "serde_json",
- "subc-protocol 0.37.4",
+ "subc-protocol",
 ]
 
 [[package]]
 name = "cortexkit-role-tool-display"
-version = "0.1.5"
+version = "0.1.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4984bdea7810ecef09c980ed4adca5eaae2cb3fe9f99b8c5d0dffdc1fb5109c2"
+checksum = "b747316be66c224ba1ff89d35edd6747de28a8d53dc56ac469e575d84d239a40"
 dependencies = [
  "serde",
  "serde_jcs",
  "serde_json",
- "subc-protocol 0.34.1",
+ "subc-protocol",
  "url",
 ]
 
 [[package]]
 name = "cortexkit-role-tool-provider"
-version = "0.15.7"
+version = "0.15.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eacc12b7cedba20bfa612db37d9673151efde7a2050c906b38eee49b684ec597"
+checksum = "cda42380d2af2fbbc2724984862b5fbd1120bbb00d874cbdc806453bbfb0686f"
 dependencies = [
+ "cortexkit-bus-naming 0.5.0",
  "cortexkit-role-tool-display",
  "serde",
  "serde_jcs",
  "serde_json",
  "sha2",
- "subc-protocol 0.34.1",
+ "subc-protocol",
 ]
 
 [[package]]
@@ -1711,7 +1712,7 @@ dependencies = [
  "subc-client-rs",
  "subc-jsonc",
  "subc-os",
- "subc-protocol 0.37.4",
+ "subc-protocol",
  "subc-transport",
  "tokio",
  "tracing",
@@ -1746,7 +1747,7 @@ dependencies = [
  "subc-config",
  "subc-control",
  "subc-os",
- "subc-protocol 0.37.4",
+ "subc-protocol",
  "subc-transport",
  "tokio",
  "tokio-util",
@@ -1775,7 +1776,7 @@ dependencies = [
  "serde",
  "serde_json",
  "subc-config",
- "subc-protocol 0.37.4",
+ "subc-protocol",
 ]
 
 [[package]]
@@ -1798,16 +1799,6 @@ dependencies = [
  "tokio",
  "windows-sys 0.61.2",
  "zeroize",
-]
-
-[[package]]
-name = "subc-protocol"
-version = "0.34.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "96eefeafa9c6e179bf1ab06027cb6dd916b2502b99fc99d4a7dbfa9db04e3e58"
-dependencies = [
- "serde",
- "serde_json",
 ]
 
 [[package]]
@@ -1835,7 +1826,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "subc-os",
- "subc-protocol 0.37.4",
+ "subc-protocol",
  "subtle",
  "tokio",
 ]

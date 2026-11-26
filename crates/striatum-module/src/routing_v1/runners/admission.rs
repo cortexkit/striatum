@@ -63,7 +63,7 @@ pub(super) async fn fetch_describe_result(
         consumer,
         module,
         subc_protocol::BindIdentity::new(crate::DEFAULT_MODULE_ID, "runner-service-tiers"),
-        br#"{"method":"role.describe","params":{}}"#.to_vec(),
+        br#"{"method":"role.describe","params":{"serves":true}}"#.to_vec(),
         CallOptions {
             timeout: Duration::from_secs(1),
             ..Default::default()

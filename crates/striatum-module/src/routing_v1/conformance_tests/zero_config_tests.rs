@@ -48,15 +48,11 @@ async fn absent_settings_keeps_runners_unenrolled_but_installs_safe_billing_and_
         {"module_id":"broca", "nonce_verified":true,
             "role_declarations":{"routing/v1":{"runner":{
                 "follows_account_choice":true,
-                "pairs":[{"wire_api":"anthropic.messages", "auth_method":"oauth"},
-                    {"wire_api":"anthropic.messages", "auth_method":"apikey"}],
                 "harnesses":["broca"]
             }}}},
         {"module_id":"thalamus", "nonce_verified":true,
             "role_declarations":{"routing/v1":{"runner":{
                 "follows_account_choice":true,
-                "pairs":[{"wire_api":"anthropic.messages", "auth_method":"oauth"},
-                    {"wire_api":"anthropic.messages", "auth_method":"apikey"}],
                 "harnesses":["opencode", "pi", "claude-code"], "default_harness":"opencode"
             }}}}
     ]);
@@ -67,6 +63,15 @@ async fn absent_settings_keeps_runners_unenrolled_but_installs_safe_billing_and_
         credentials.runner_declarations =
             crate::routing_v1::runners::declarations_from_catalog(&modules);
         assert_eq!(credentials.runner_declarations.len(), 2);
+        let keys: Vec<_> = facts
+            .iter()
+            .map(|fact| striatum_core::fact_to_route(fact).route_key)
+            .collect();
+        for module in ["broca", "thalamus"] {
+            let harnesses = credentials.runner_declarations[module].harnesses.as_deref();
+            let list = super::test_serves(&keys, harnesses, "zero-config-fixture");
+            super::publish_runner_serves(&mut credentials, module, &list);
+        }
         credentials.wire_apis = facts
             .iter()
             .map(|fact| {

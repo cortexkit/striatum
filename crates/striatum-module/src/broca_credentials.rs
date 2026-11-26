@@ -267,6 +267,8 @@ pub struct CredentialData {
     pub(crate) runner_service_tiers:
         BTreeMap<String, cortexkit_role_llm_runner::service_tier::ServiceTiers>,
     pub(crate) runner_routed_accounts: BTreeMap<String, Vec<String>>,
+    pub(crate) runner_serves: BTreeMap<String, crate::routing_v1::runners::RunnerServes>,
+    pub(crate) runner_describe_connected: BTreeSet<String>,
     /// Successful describes, including explicit withdrawals of tier support.
     /// Shared timestamps let admission-time refreshes renew the poller's view.
     pub(crate) runner_describe_observed: BTreeMap<String, i64>,
@@ -334,7 +336,7 @@ pub(crate) fn credential_serves_fact(
     row: &ListedCredential,
     fact: &ModelFact,
     catalog: &AuthCatalog,
-    credentials: &CredentialData,
+    _credentials: &CredentialData,
 ) -> bool {
     row.state == "active"
         && row
@@ -343,7 +345,6 @@ pub(crate) fn credential_serves_fact(
             .any(|category| matches!(category.as_str(), "llm-provider" | "llm-gateway"))
         && credential_providers(row, catalog).contains(&fact.provider_id)
         && catalog.allows(fact, row.auth_method.as_deref())
-        && credentials.method_serves_fact(fact, row.auth_method.as_deref())
 }
 
 fn choose_method(roster: BTreeSet<String>, listed: BTreeSet<String>) -> ServingMethod {
@@ -510,25 +511,6 @@ impl CredentialData {
             })
             .generation
     }
-    /// Known wire families require a runner's wire/auth pair. Missing wire or
-    /// declaration snapshots retain provider/allowlist reachability so discovery
-    /// gaps do not withdraw rows. Endpoint requirements remain runner-specific:
-    /// a runner's `requires_wire_api` is checked when that runner is selected.
-    fn method_serves_fact(&self, fact: &ModelFact, method: Option<&str>) -> bool {
-        if self.runner_declarations.is_empty() {
-            return true;
-        }
-        let Some(wire) = self.wire_api(fact, method.unwrap_or("")) else {
-            return true;
-        };
-        self.runner_declarations.values().any(|runner| {
-            runner
-                .pairs
-                .iter()
-                .any(|pair| pair.wire_api == wire && Some(pair.auth_method.as_str()) == method)
-        })
-    }
-
     pub(crate) fn listing_is_fresh(&self, now_ms: u64) -> bool {
         self.view.is_some()
             && (self.watch_confirmed
@@ -548,24 +530,7 @@ impl CredentialData {
             .unwrap_or_else(|| self.wire_apis.get(&model).map(String::as_str))
     }
 
-    pub(crate) fn runner_allows_provider(
-        &self,
-        fact: &ModelFact,
-        row: &ListedCredential,
-        explicit_providers: &[String],
-    ) -> bool {
-        // A gateway owns its route and account pool, but borrows catalog rows
-        // from the unique provider its vault `serves` resolves to. Runner limits
-        // constrain those rows, not the gateway's name. An unresolved gateway
-        // cannot satisfy a provider limit, even when its own id is listed.
-        let provider = if row.auth_method.as_deref() == Some("gateway") {
-            self.priced_targets.get(&fact.provider_id)
-        } else {
-            Some(&fact.provider_id)
-        };
-        provider.is_some_and(|provider| explicit_providers.contains(provider))
-    }
-
+    #[cfg(test)]
     pub(crate) fn row_serves_wire_api(&self, fact: &ModelFact, auth_method: &str) -> bool {
         let provider = self
             .priced_targets
@@ -1510,8 +1475,10 @@ mod tests {
             .insert("runner".into(), vec!["oauth".into()]));
         changes!(credentials.billing_catalog = Default::default());
         let declaration = crate::routing_v1::runners::parse_declaration(&serde_json::json!({
-            "runner": {"pairs":[{"wire_api":"messages","auth_method":"oauth"}],"follows_account_choice":true}
-        })).unwrap().unwrap();
+            "runner": {"follows_account_choice":true}
+        }))
+        .unwrap()
+        .unwrap();
         changes!(credentials
             .runner_declarations
             .insert("generation-runner".into(), declaration));
@@ -1640,9 +1607,12 @@ mod tests {
     fn serving_refresh_runner_declarations_change_rebuilds() {
         serving_refresh_case(
             |_, credentials, _| {
-                let declaration = crate::routing_v1::runners::parse_declaration(&serde_json::json!({
-                "runner":{"pairs":[{"wire_api":"messages","auth_method":"oauth"}],"follows_account_choice":true}
-            })).unwrap().unwrap();
+                let declaration =
+                    crate::routing_v1::runners::parse_declaration(&serde_json::json!({
+                        "runner":{"follows_account_choice":true}
+                    }))
+                    .unwrap()
+                    .unwrap();
                 credentials
                     .runner_declarations
                     .insert("changed-runner".into(), declaration);

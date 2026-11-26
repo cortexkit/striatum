@@ -55,8 +55,6 @@ pub const REASON_EXCLUDED: &str = "excluded";
 /// set that was is a property of the caller, so consumers that can name it
 /// attach it as the rejection's detail.
 pub const REASON_NOT_AVAILABLE: &str = "not_available";
-pub const REASON_RUNNER_WIRE_FAMILY_UNVERIFIED: &str = "runner_wire_family_unverified";
-pub const REASON_RUNNER_REQUIRES_WIRE_API: &str = "runner_requires_wire_api";
 /// A route the upstream catalog marks `deprecated` (Fusiform's `model.status`):
 /// the provider no longer serves it, so no selection, panel seat or pin may
 /// use it. Checked before every other fence, because no policy can make a
@@ -82,7 +80,7 @@ pub struct CredentialRefusalMark {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RouteRuntimeState {
     /// Request-local reachability independent of runtime availability. A known
-    /// credential/transport match still anchors quality when its accounts cannot
+    /// runner and catalog match still anchors quality when its accounts cannot
     /// send; missing credentials do not. None uses the caller's availability set/map.
     /// This affects quality normalization only, never candidate admission.
     pub statically_routable: Option<bool>,
@@ -127,6 +125,9 @@ pub struct ModelRouteStateSnapshot {
     pub by_route: HashMap<String, RouteRuntimeState>,
     /// Keyed by capacityKey for shared provider/model state.
     pub by_capacity: HashMap<String, RouteRuntimeState>,
+    /// Keyless routes sharing a capacity with a login-requiring sibling.
+    /// The shared account state remains available for those siblings only.
+    pub keyless_mixed_routes: HashSet<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -809,7 +810,22 @@ pub(crate) fn merged_runtime_state(
             merged.latency_ema_ms = route_state.latency_ema_ms;
         }
     }
+    if snapshot.is_some_and(|snapshot| snapshot.keyless_mixed_routes.contains(&route.route_key)) {
+        merged.clear_account_state();
+    }
     merged
+}
+
+impl RouteRuntimeState {
+    pub fn clear_account_state(&mut self) {
+        self.credential_refusal = None;
+        self.quota_exhausted_until = None;
+        self.quota_pressure = None;
+        self.quota_window_model = None;
+        self.quota_abundance = None;
+        self.quota_abundance_window = None;
+        self.subscription_pool = None;
+    }
 }
 
 /// When a route that admission rejects for a timed wall (`cooldown_active`,
@@ -824,6 +840,7 @@ pub fn route_wall_until(
 ) -> Option<f64> {
     let by_route = snapshot.by_route.get(route_key);
     let by_capacity = snapshot.by_capacity.get(capacity_key);
+    let keyless = snapshot.keyless_mixed_routes.contains(route_key);
     // Admission composes the hard walls of both scopes and reads the failure
     // backoff from the route when it has state (see `merged_runtime_state`).
     let backoff = match by_route {
@@ -836,7 +853,7 @@ pub fn route_wall_until(
         .flat_map(|state| {
             [
                 state.cooldown_until,
-                state.quota_exhausted_until,
+                (!keyless).then_some(state.quota_exhausted_until).flatten(),
                 state.provider_reset_until,
             ]
         })
@@ -1057,26 +1074,15 @@ pub fn admit_routes_with_score_policy(
         }
         if unavailable {
             let refusal = runtime.credential_refusal.as_ref();
-            let runner_rejection = availability_rejections
-                .get(&route.route_key)
-                .filter(|reason| {
-                    matches!(
-                        reason.as_str(),
-                        REASON_RUNNER_WIRE_FAMILY_UNVERIFIED | REASON_RUNNER_REQUIRES_WIRE_API
-                    )
-                });
             rejected.push(RejectedRoute {
-                detail: if refusal.is_some() || runner_rejection.is_some() {
+                detail: if refusal.is_some() {
                     None
                 } else {
                     availability_rejections.get(&route.route_key).cloned()
                 },
                 route_key: route.route_key,
                 reason: refusal
-                    .map_or(
-                        runner_rejection.map_or(REASON_NOT_AVAILABLE, String::as_str),
-                        |mark| mark.reason,
-                    )
+                    .map_or(REASON_NOT_AVAILABLE, |mark| mark.reason)
                     .to_string(),
                 credential_ids: refusal.map_or_else(Vec::new, |mark| mark.credential_ids.clone()),
             });
@@ -1844,6 +1850,15 @@ fn apply_overqualification(
     if term <= 0.0 {
         return;
     }
+    // An additive surcharge would make an approved zero price nonzero before
+    // the reset tie-break. Quality has already decided which routes qualify.
+    if objective
+        .subscription_pricing
+        .as_ref()
+        .is_some_and(|price| price.free_reset_ms().is_some())
+    {
+        return;
+    }
     let cost_scaled =
         config.overqualification.mode == crate::routing_config::OverqualificationMode::CostScaled;
     let surcharge = if cost_scaled {
@@ -1953,6 +1968,9 @@ pub struct RouteEvaluation {
 
 #[derive(Debug, serde::Serialize)]
 pub struct EvaluatedRoute {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub free_before_reset_preview:
+        Option<Box<crate::subscription::free_before_reset::PricePreview>>,
     pub route: String,
     pub fit: BTreeMap<ModelMetric, MetricFit>,
     pub adequacy: f64,
@@ -2316,6 +2334,29 @@ fn admit_and_price_shortlist(
             .filter_map(|s| {
                 let a = &admissible[s.idx];
                 a.adequacy.clears_adequacy_floor().then(|| EvaluatedRoute {
+                    free_before_reset_preview: s
+                        .objective
+                        .subscription_pricing
+                        .as_ref()
+                        .and_then(|p| p.free_before_reset.clone())
+                        .or_else(|| {
+                            (s.objective.subscription_covered
+                                && a.runtime
+                                    .subscription_pool
+                                    .as_ref()
+                                    .is_some_and(|pool| pool.free_before_reset.is_some()))
+                            .then(|| {
+                                let price = s.objective.task_pricing.as_ref();
+                                Box::new(crate::subscription::free_before_reset::PricePreview {
+                                    final_cost_usd: price.and_then(|p| p.final_cost_usd),
+                                    pressure: price.map(|p| p.pressure),
+                                    weekly_pressure: price.and_then(|p| p.weekly_pressure),
+                                    short_window_pressure: price
+                                        .and_then(|p| p.short_window_pressure),
+                                    ..Default::default()
+                                })
+                            })
+                        }),
                     route: a.route.route_key.clone(),
                     fit: a.adequacy.metrics.clone(),
                     adequacy: a.adequacy.adequacy,
@@ -2588,7 +2629,25 @@ pub fn evaluate_model_route_with_concurrency(
             .collect();
         let keys = route_order_keys(&facts);
         let mut positions: Vec<usize> = (0..keys.len()).collect();
-        positions.sort_by(|&a, &b| compare_route_order_keys(&keys[a], &keys[b], best_effort));
+        positions.sort_by(|&a, &b| {
+            compare_route_order_keys_with(&keys[a], &keys[b], best_effort, || {
+                if best_effort || keys[a].cost_key != 0.0 {
+                    return std::cmp::Ordering::Equal;
+                }
+                let free_key = |index: usize| {
+                    let price = scored[index].objective.subscription_pricing.as_ref()?;
+                    Some((price.free_reset_ms()?, price.list_cost_usd))
+                };
+                match (free_key(a), free_key(b)) {
+                    (Some((reset_a, list_a)), Some((reset_b, list_b))) => reset_a
+                        .cmp(&reset_b)
+                        .then_with(|| list_a.total_cmp(&list_b)),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => std::cmp::Ordering::Equal,
+                }
+            })
+        });
         positions
     };
     let mut chosen = order(true);
@@ -3090,10 +3149,20 @@ pub(crate) fn route_order_keys<'r>(routes: &[RouteOrderFacts<'r>]) -> Vec<RouteO
 }
 
 /// Lexicographic comparison of two routes' sort keys; the first sorts first.
+#[cfg(test)]
 pub(crate) fn compare_route_order_keys(
     a: &RouteOrderKey<'_>,
     b: &RouteOrderKey<'_>,
     best_effort: bool,
+) -> std::cmp::Ordering {
+    compare_route_order_keys_with(a, b, best_effort, || std::cmp::Ordering::Equal)
+}
+
+fn compare_route_order_keys_with(
+    a: &RouteOrderKey<'_>,
+    b: &RouteOrderKey<'_>,
+    best_effort: bool,
+    compare_free_reset: impl FnOnce() -> std::cmp::Ordering,
 ) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     // Adequacy and abundance only decide for bucket routes; every route
@@ -3121,6 +3190,7 @@ pub(crate) fn compare_route_order_keys(
         // 3. Lowest cost, with the free bucket and each subscription pool
         // collapsed to one cost (see `route_order_keys`).
         .then(total_f64(a.cost_key, b.cost_key))
+        .then_with(compare_free_reset)
         // At one cost above the free threshold, pool members sort before
         // routes outside any pool. Equal costs there are exact float ties,
         // rare in practice; the partition only keeps the order total.
@@ -3751,6 +3821,7 @@ mod abundance_tests {
                     now: 1_000.0,
                     by_route: HashMap::new(),
                     by_capacity,
+                    ..Default::default()
                 }),
                 exclude_route_keys: options.exclude_route_keys,
                 operator_exclude_keys: Vec::new(),
@@ -4290,6 +4361,7 @@ mod availability_credential_tests {
                         ..Default::default()
                     },
                 )]),
+                ..Default::default()
             }),
             exclude_route_keys: Vec::new(),
             operator_exclude_keys: Vec::new(),

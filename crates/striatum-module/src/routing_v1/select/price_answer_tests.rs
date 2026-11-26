@@ -41,20 +41,23 @@ fn checked(params: &Value, answer: &Value) {
 fn declare_price_harness(
     credentials: &mut crate::broca_credentials::BrocaCredentials,
     module: &str,
-    wire: &str,
-    methods: &[&str],
+    route: &str,
 ) {
-    let pairs: Vec<_> = methods
-        .iter()
-        .map(|method| json!({"wire_api":wire,"auth_method":method}))
-        .collect();
     credentials.runner_declarations.insert(
         module.into(),
         super::super::runners::parse_declaration(&json!({"runner":{
-            "pairs":pairs, "harnesses":["price-test"], "follows_account_choice":true
+            "harnesses":["price-test"], "follows_account_choice":true
         }}))
         .unwrap()
         .unwrap(),
+    );
+    let (provider, model) = route.split_once('/').unwrap();
+    super::super::conformance_tests::publish_runner_serves(
+        credentials,
+        module,
+        &json!({
+            "generation":"price-fixture", "harnesses":{"price-test":[{"provider":provider,"models":[model]}]}
+        }),
     );
 }
 
@@ -320,12 +323,7 @@ async fn mixed_credentials_quote_subscription_or_metered_and_fallback_uses_list_
         .unwrap();
     let credentials = h.credentials();
     let mut credentials = credentials.lock().unwrap();
-    declare_price_harness(
-        &mut credentials,
-        "class-runner",
-        "anthropic.messages",
-        &["apikey", "oauth"],
-    );
+    declare_price_harness(&mut credentials, "class-runner", "synthetic/model");
     credentials
         .wire_apis
         .insert("synthetic/model".into(), "anthropic.messages".into());
@@ -453,12 +451,7 @@ async fn no_price_for_unmeasured_subscription_or_unpriced_antigravity() {
     }
     let credentials = h.credentials();
     let mut credentials = credentials.lock().unwrap();
-    declare_price_harness(
-        &mut credentials,
-        "class-runner",
-        "anthropic.messages",
-        &["apikey", "oauth"],
-    );
+    declare_price_harness(&mut credentials, "class-runner", "antigravity/model");
     credentials
         .wire_apis
         .insert("antigravity/model".into(), "anthropic.messages".into());
@@ -537,7 +530,7 @@ async fn kimi_fast_price_answer_uses_plane_rates_with_existing_subscription_scal
             )
             .with_test_plane(&serde_json::to_vec(&page).unwrap());
         credentials.publish_billing_catalog(catalog.clone());
-        declare_price_harness(&mut credentials, "tier-runner", wire, &[method]);
+        declare_price_harness(&mut credentials, "tier-runner", key);
         h.set_credentials(credentials);
         h.edit_config(|config| {
             config["providers"][provider]["subscription_multiplier"] = json!(22);
@@ -597,12 +590,7 @@ async fn nonstandard_tier_uses_catalog_modes_not_quota_draw_and_omits_unknown_mo
         {
             let shared = h.credentials();
             let mut credentials = shared.lock().unwrap();
-            declare_price_harness(
-                &mut credentials,
-                "tier-runner",
-                "openai.responses",
-                &[method],
-            );
+            declare_price_harness(&mut credentials, "tier-runner", "openai/gpt-6.1-sol");
         }
         h.edit_config(|config| {
             config["providers"]["openai"]["subscription_multiplier"] = json!(22);
@@ -796,11 +784,12 @@ async fn answer_thresholds_use_request_size_before_context_and_profile() {
         .map(|(key, rate)| (key.into(), BillingRate::Priced { rate }))
         .collect(),
     });
-    let (declarations, wire_apis) = {
+    let (declarations, served, wire_apis) = {
         let shared = h.credentials();
         let credentials = shared.lock().unwrap();
         (
             credentials.runner_declarations.clone(),
+            credentials.runner_serves.clone(),
             credentials.wire_apis.clone(),
         )
     };
@@ -808,6 +797,7 @@ async fn answer_thresholds_use_request_size_before_context_and_profile() {
     let credentials = h.credentials();
     let mut credentials = credentials.lock().unwrap();
     credentials.runner_declarations = declarations;
+    credentials.runner_serves = served;
     credentials.wire_apis = wire_apis;
     let catalog = crate::fusiform_catalog::PlaneCatalog::ordinary_test_catalog(&[fact])
         .with_wire_apis(&credentials.wire_apis);
