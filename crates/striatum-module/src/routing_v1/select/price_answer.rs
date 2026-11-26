@@ -17,12 +17,45 @@ use striatum_core::price_rates::{
 use striatum_core::task_profile::TokenVector;
 use striatum_core::ModelFact;
 
-use crate::{account_selection::ClassContext, config_overrides::LiveConfig};
+use crate::{
+    account_selection::ClassContext, broca_credentials::BrocaCredentials,
+    config_overrides::LiveConfig,
+};
 
 pub(super) const UNKNOWN: &str = "price_unknown";
 
 pub(super) fn unknown_refusal() -> Refusal {
     Refusal::no_route(NoRouteReason::parse(UNKNOWN), None)
+}
+
+pub(super) fn apply_max_cost(
+    candidates: &mut Vec<&ModelFact>,
+    credentials: Option<&BrocaCredentials>,
+    cap: Option<f64>,
+    input_tokens: u64,
+    otherwise_capable: impl Fn(&ModelFact) -> bool,
+) -> Result<(), Refusal> {
+    let mut any_over_cap = false;
+    let mut all_over_cap = true;
+    candidates.retain(|fact| {
+        let fits = credentials
+            .and_then(|credentials| super::super::classifier::input_price(credentials, fact))
+            .zip(cap)
+            .map(|(price, cap)| price * input_tokens as f64 / 1_000_000.0 <= cap);
+        if otherwise_capable(fact) {
+            any_over_cap |= fits == Some(false);
+            all_over_cap &= fits == Some(false);
+        }
+        fits == Some(true)
+    });
+    // An unknown price must fail closed, but it does not prove a model costs too much.
+    if any_over_cap && all_over_cap {
+        let mut refusal = Refusal::no_route(NoRouteReason::AllInadequate, None);
+        refusal.message =
+            "no route meets the request: all eligible models exceed max_cost_usd".into();
+        return Err(refusal);
+    }
+    Ok(())
 }
 
 pub(super) fn record_rejections(rejected: &mut Vec<RejectedRoute>, unpriceable: &BTreeSet<String>) {

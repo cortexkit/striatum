@@ -303,7 +303,7 @@ impl Registry {
         let models: BTreeSet<String> = facts
             .iter()
             .filter(|fact| {
-                super::classifier::eligible(
+                super::classifier::meets_capabilities(
                     credentials,
                     module,
                     fact,

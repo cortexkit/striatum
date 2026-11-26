@@ -1511,33 +1511,21 @@ async fn select_at_tier_attempt(
         .collect();
     let requirements = &request.requirements;
     let modalities = requirements.modalities.clone().unwrap_or_default();
+    let vision = modalities.contains(&Modality::Image);
     let unconfirmable = modalities
         .iter()
         .any(|modality| matches!(modality, Modality::Pdf | Modality::Audio))
         || requirements.structured_output == Some(true);
-    let capable: Vec<&ModelFact> = reachable
+    let mut capable: Vec<&ModelFact> = reachable
         .iter()
         .copied()
         .filter(|_| !unconfirmable)
         .filter(|_| classifier || requirements.questions.is_none())
         .filter(|fact| {
-            classifier
-                || requirements.max_cost_usd.as_ref().is_none_or(|cap| {
-                    deps.broca_credentials.lock().is_ok_and(|credentials| {
-                        super::classifier::input_price(&credentials, fact)
-                            .zip(cap.as_f64())
-                            .is_some_and(|(price, cap)| {
-                                price * requirements.input_tokens.unwrap_or(0) as f64 / 1_000_000.0
-                                    <= cap
-                            })
-                    })
-                })
-        })
-        .filter(|fact| {
             !classifier
                 || deps.broca_credentials.lock().is_ok_and(|credentials| {
                     caller.attested_module().is_some_and(|module| {
-                        super::classifier::eligible(
+                        super::classifier::meets_capabilities(
                             &credentials,
                             module,
                             fact,
@@ -1557,6 +1545,31 @@ async fn select_at_tier_attempt(
                 .is_none_or(|floor| fact.max_output_tokens.is_some_and(|limit| limit >= floor))
         })
         .collect();
+    if let Some(cap) = &requirements.max_cost_usd {
+        price_answer::apply_max_cost(
+            &mut capable,
+            deps.broca_credentials.lock().ok().as_deref(),
+            cap.as_f64(),
+            requirements.input_tokens.unwrap_or(0),
+            |fact| {
+                // Chat checks vision and context in the scorer. A route that
+                // would fail those checks cannot establish a cost-only refusal.
+                if !classifier
+                    && ((vision && fact.supports_vision != Some(true))
+                        || requirements.context_window.is_some_and(|floor| {
+                            floor > 0 && fact.context_window.is_none_or(|size| size < floor as f64)
+                        }))
+                {
+                    return false;
+                }
+                let route = fact_to_route(fact);
+                striatum_core::model_facts::llm_classification_rejection(fact, classifier).is_none()
+                    && runners
+                        .iter()
+                        .any(|runner| runs(runner, &route.route_key, &route.capacity_key))
+            },
+        )?;
+    }
     if capable.is_empty() && !reachable.is_empty() {
         return Err(Refusal::no_route(NoRouteReason::MissingCapability, None));
     }
@@ -1702,7 +1715,6 @@ async fn select_at_tier_attempt(
             }),
         }
     };
-    let vision = modalities.contains(&Modality::Image);
     let required_capabilities = if classifier {
         Some(RequiredCapabilities {
             vision: None,

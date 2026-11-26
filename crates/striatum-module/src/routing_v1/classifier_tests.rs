@@ -432,10 +432,10 @@ async fn broca_unpinned_llm_classify_select_sample() {
     println!("Broca unpinned cost control: {reply}");
     assert_eq!(frame, FrameType::Error, "{reply}");
     assert_eq!(reply["code"], "no_route", "{reply}");
-    assert_eq!(reply["detail"]["reason"], "missing_capability", "{reply}");
+    assert_eq!(reply["detail"]["reason"], "all_inadequate", "{reply}");
     assert_eq!(
         reply["message"],
-        "no route meets the request: missing_capability"
+        "no route meets the request: all eligible models exceed max_cost_usd"
     );
 
     harness.edit_config(|config| {
@@ -644,6 +644,47 @@ async fn caps_use_total_input_tokens_catalog_price_and_stated_zero() {
         ),
         JEV
     );
+}
+
+#[tokio::test]
+async fn cost_and_capability_refusals_are_distinct() {
+    let harness = rig(|_| {}, |_| {});
+    let route = harness.bind(reserved("broca"), None).await;
+    let mut requirements =
+        json!({"iq":0,"context_window":30_000,"modalities":["image"],"input_tokens":1000});
+    assert_eq!(
+        route_key(&selected(&route, requirements.clone()).await),
+        CLEF
+    );
+
+    // The cheaper models cannot serve an image at this context size.
+    requirements["max_cost_usd"] = json!(0.00005);
+    let (frame, reply) = route
+        .call("route.select", &request(requirements.clone()))
+        .await;
+    assert_eq!(frame, FrameType::Error, "{reply}");
+    assert_eq!(reply["code"], "no_route", "{reply}");
+    assert_eq!(reply["detail"]["reason"], "all_inadequate", "{reply}");
+
+    requirements["questions"] = json!(65);
+    let (frame, reply) = route.call("route.select", &request(requirements)).await;
+    assert_eq!(frame, FrameType::Error, "{reply}");
+    assert_eq!(reply["code"], "no_route", "{reply}");
+    assert_eq!(reply["detail"]["reason"], "missing_capability", "{reply}");
+}
+
+#[tokio::test]
+async fn unknown_price_prevents_a_cost_only_refusal() {
+    let harness = rig(
+        |catalog| catalog["models"][FLASH]["rate.input"] = json!({"state":"unpriced"}),
+        |_| {},
+    );
+    let route = harness.bind(reserved("broca"), None).await;
+    let params = request(json!({"iq":0,"input_tokens":1000,"max_cost_usd":0.00001}));
+    let (frame, reply) = route.call("route.select", &params).await;
+    assert_eq!(frame, FrameType::Error, "{reply}");
+    assert_eq!(reply["code"], "no_route", "{reply}");
+    assert_eq!(reply["detail"]["reason"], "missing_capability", "{reply}");
 }
 
 #[tokio::test]

@@ -240,6 +240,35 @@ async fn broca_complete_child_request_reaches_selection() {
 }
 
 #[tokio::test]
+async fn broca_complete_max_cost_usd_below_every_route_names_the_cap() {
+    let (harness, _, _) = setup();
+    let route = harness.bind(reserved("broca"), None).await;
+    let mut params: Value = serde_json::from_slice(BODY).unwrap();
+    let (ty, answer) = route.call("route.select", &params).await;
+    assert_eq!(ty, FrameType::Response, "{answer}");
+
+    params["requirements"]["max_cost_usd"] = json!(0.001);
+    let (ty, reply) = route.call("route.select", &params).await;
+    assert_eq!(ty, FrameType::Error, "{reply}");
+    assert_eq!(reply["code"], "no_route", "{reply}");
+    assert_eq!(
+        reply["detail"],
+        json!({"reason":"all_inadequate"}),
+        "{reply}"
+    );
+    assert_eq!(
+        reply["message"],
+        "no route meets the request: all eligible models exceed max_cost_usd"
+    );
+
+    params["requirements"]["context_window"] = json!(300_000);
+    let (ty, reply) = route.call("route.select", &params).await;
+    assert_eq!(ty, FrameType::Error, "{reply}");
+    assert_eq!(reply["code"], "no_route", "{reply}");
+    assert_eq!(reply["detail"]["reason"], "missing_capability", "{reply}");
+}
+
+#[tokio::test]
 async fn broca_complete_capped_retries_each_unpriceable_route_once() {
     use std::time::Instant;
 

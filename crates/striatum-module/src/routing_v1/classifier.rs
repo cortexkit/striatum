@@ -220,7 +220,7 @@ pub(crate) fn report_missing_rows(credentials: &BrocaCredentials, module: &str, 
     }
 }
 
-pub(crate) fn eligible(
+pub(crate) fn meets_capabilities(
     credentials: &BrocaCredentials,
     module: &str,
     fact: &ModelFact,
@@ -276,15 +276,7 @@ pub(crate) fn eligible(
     }) {
         return false;
     }
-    requirements.max_cost_usd.as_ref().is_none_or(|cap| {
-        let cap = cap.as_f64();
-        catalog
-            .input_price(&key)
-            .zip(cap)
-            .is_some_and(|(price, cap)| {
-                price * requirements.input_tokens.unwrap_or(0) as f64 / 1_000_000.0 <= cap
-            })
-    })
+    true
 }
 
 pub(crate) fn input_price(credentials: &BrocaCredentials, fact: &ModelFact) -> Option<f64> {
