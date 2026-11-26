@@ -16,12 +16,15 @@ use striatum_core::RouteStateStore;
 use striatum_store::AccountFenceRow;
 use subc_protocol::FrameType;
 
-use super::conformance_tests::{reserved, Harness};
+use super::conformance_tests::{publish_fixture_providers, reserved, Harness};
 use crate::broca_credentials::BrocaCredentials;
 
 const NOW: u64 = 1_800_000_000_000;
 const RUNNER: &str = "class-runner";
 const OWNER: &str = "class-owner";
+
+mod fixture_tests;
+use fixture_tests::configure_harness;
 
 mod fork_class_tests;
 mod listing_repair_race_tests;
@@ -684,78 +687,6 @@ pub(super) fn setup_from_template(
     configure_harness(harness, provider, converted_live, None)
 }
 
-fn configure_harness(
-    harness: Arc<Harness>,
-    provider: &str,
-    converted_live: bool,
-    version: Option<u32>,
-) -> (Arc<Harness>, BrocaCredentials) {
-    let fact = account_fact(provider);
-    // Historical fixtures seed only decisions before upgrading. Current fact
-    // writers require the current schema, so install those facts after upgrade.
-    if version.is_none() {
-        harness.install_facts(&[fact.clone()]);
-        catalog_fact(&harness, &fact);
-    }
-    let mut subscription = fact.clone();
-    subscription.billing_plane.as_mut().unwrap().auth_method = "oauth".into();
-    subscription.billing_plane.as_mut().unwrap().kind = "subscription".into();
-    subscription
-        .billing_plane
-        .as_mut()
-        .unwrap()
-        .rates
-        .insert("rate.output".into(), BillingRate::Priced { rate: 1.0 });
-    let mut credentials = BrocaCredentials::default();
-    credentials.apply_listing(
-        &ScopedCredentialListing {
-            view: "mixed-vault".into(),
-            credentials: ["oauth", "apikey"]
-                .into_iter()
-                .map(|method| ListedCredential {
-                    id: format!("{method}:test"),
-                    account_id: Some(format!("{method}-account")),
-                    state: "active".into(),
-                    categories: vec!["llm-provider".into()],
-                    provider_ids: vec![provider.into()],
-                    serves: vec![provider.into()],
-                    credential_type: method.into(),
-                    auth_method: Some(method.into()),
-                    ..Default::default()
-                })
-                .collect(),
-            ..Default::default()
-        },
-        NOW,
-    );
-    credentials.refresh_serving_methods(&Default::default(), &[fact.clone()], NOW as i64, &[]);
-    credentials.publish_billing_catalog(
-        crate::fusiform_catalog::PlaneCatalog::ordinary_test_catalog(&[fact, subscription]),
-    );
-    credentials.publish_plan_prices(&json!({"prices":[]}));
-    super::conformance_tests::publish_fixture_providers(
-        &mut credentials,
-        RUNNER,
-        &[provider],
-        true,
-    );
-    harness.set_credentials(credentials.clone());
-    harness.edit_config(|config| {
-        if converted_live {
-            *config = crate::test_config::convert_archived(include_str!(
-                "../../fixtures/routing-config-live-2026-10-24.jsonc"
-            ));
-        }
-        config["runners"] = json!([{"module":RUNNER,"via_vault":true}]);
-        config["consumers"] = json!({
-            "mason":{"owner":OWNER,"mode":"demand"},
-            "codemode":{"owner":OWNER,"mode":"demand","pay_per_token":true},
-            "flow":{"owner":OWNER,"mode":"demand","pay_per_token":true}
-        });
-    });
-    (harness, credentials)
-}
-
 fn account_request(provider: &str, id: &str) -> Value {
     json!({"provider":provider,"model":"model","conversation_key":format!("conversation-{id}"),"admission_id":id})
 }
@@ -953,6 +884,12 @@ async fn pinned_paid_pool_decision_requires_the_selected_provider_not_the_runner
         .insert("anthropic/model".into(), "anthropic.messages".into());
     let planes = credentials.billing_catalog.clone();
     credentials.publish_billing_catalog(planes.with_wire_apis(&credentials.wire_apis));
+    publish_fixture_providers(
+        &mut credentials,
+        RUNNER,
+        &["anthropic", "anthropic-platform"],
+        true,
+    );
     harness.set_credentials(credentials);
     harness.edit_config(|config| {
         config["providers"]["anthropic-platform"] = json!({"pin_only":true, "only_for":["mason"]});
@@ -1500,6 +1437,15 @@ async fn assert_account_unavailability_keeps_frontier(block: &str) {
     );
     credentials.publish_billing_catalog(
         crate::fusiform_catalog::PlaneCatalog::ordinary_test_catalog(&[top.clone(), weak]),
+    );
+    publish_fixture_providers(&mut credentials, "direct-runner", &["fallback"], false);
+    // The fallback remains runnable even when class-runner's vault listing is stale.
+    super::conformance_tests::publish_runner_serves(
+        &mut credentials,
+        "direct-runner",
+        &json!({
+            "generation":"direct-fallback", "entries":[{"provider":"fallback","models":["model"],"login":"none"}]
+        }),
     );
     harness.set_credentials(credentials.clone());
     let caller = harness.bind(reserved(OWNER), None).await;
@@ -2304,6 +2250,12 @@ async fn select_past_held_ladder_entry() -> (u64, u64, u64, u64) {
     );
     harness.set_credentials(credentials);
     harness.edit_config(|config| config["consumers"]["mason"]=json!({"owner":OWNER,"mode":"ladder","ladder":["synthetic/model","secondary/model"]}));
+    publish_fixture_providers(
+        &mut harness.credentials().lock().unwrap(),
+        RUNNER,
+        &["synthetic", "secondary"],
+        true,
+    );
     exhaust_oauth(&harness, "synthetic");
     let caller = harness.bind(reserved(OWNER), None).await;
     let loads = CONTEXT_LOADS.with(|loads| loads.get());
@@ -2469,6 +2421,12 @@ async fn ladder_holds_a_blocked_entry_but_demand_and_no_wait_use_the_next_model(
     );
     harness.set_credentials(credentials);
     harness.edit_config(|config| config["consumers"]["mason"]=json!({"owner":OWNER,"mode":"ladder","ladder":["synthetic/model","secondary/model"]}));
+    publish_fixture_providers(
+        &mut harness.credentials().lock().unwrap(),
+        RUNNER,
+        &["synthetic", "secondary"],
+        true,
+    );
     exhaust_oauth(&harness, "synthetic");
     let caller = harness.bind(reserved(OWNER), None).await;
     let request = json!({"consumer":"mason","requirements":{"iq":30}});
@@ -4198,6 +4156,12 @@ fn codex_pool(used: [f64; 3]) -> Arc<Harness> {
         config["consumers"]["sidekick"] = json!({"owner":OWNER,"mode":"demand"});
         config["runners"] = json!([{"module":RUNNER,"via_vault":true,"routes":["openai/gpt-6-luna","fallback/adequate"]}]);
     });
+    publish_fixture_providers(
+        &mut harness.credentials().lock().unwrap(),
+        RUNNER,
+        &["openai", "fallback"],
+        true,
+    );
     let mut state = crate::account_quota::AccountQuotaState::default();
     // Codex usage here has a weekly primary window, not a five-hour
     // primary plus weekly secondary. Dates are shifted to the injected clock.
@@ -4519,6 +4483,7 @@ async fn xai_credit_window_is_a_billing_wall_until_one_probe_and_matching_succes
             },
             deadline,
         );
+        publish_fixture_providers(&mut credentials, RUNNER, &["xai"], true);
         harness.set_credentials(credentials.clone());
         let probe = owner
             .call(
@@ -4691,6 +4656,7 @@ async fn a_decision_owned_probe_answers_other_admissions_with_a_timed_wait() {
         },
         deadline,
     );
+    publish_fixture_providers(&mut credentials, RUNNER, &["xai"], true);
     harness.set_credentials(credentials.clone());
     let probe = owner.call("route.select", &select).await;
     assert_eq!(probe.0, FrameType::Response, "{}", probe.1);
@@ -4845,6 +4811,7 @@ async fn a_losing_racer_on_a_mixed_roster_gets_a_timed_wait() {
         },
         deadline,
     );
+    publish_fixture_providers(&mut credentials, RUNNER, &["xai"], true);
     harness.set_credentials(credentials.clone());
     let probe = owner.call("route.select", &select).await;
     assert_eq!(probe.0, FrameType::Response, "{}", probe.1);

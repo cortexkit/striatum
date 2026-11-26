@@ -310,6 +310,48 @@ fn describe_harnesses(
         json!({"reason":"harness_stopped"})
     } else if !blocked.is_empty() && blocked.len() == running {
         json!({"reason":"capabilities_missing", "missing":blocked})
+    } else if remaining_filter == "harness_routes" {
+        let declarations = if harnesses.is_empty() {
+            vec![None]
+        } else {
+            harnesses.iter().copied().map(Some).collect()
+        };
+        let unavailable: Vec<_> = declarations
+            .into_iter()
+            .filter(|harness| {
+                harness.is_none_or(|name| {
+                    !blocked.contains_key(&format!("{}/{name}", runner.policy.module))
+                        && runner.wire_declaration().is_none_or(|d| {
+                            d.limits_for_harness(Some(name))
+                                .is_ok_and(|limits| limits.starts_sessions == Some(true))
+                        })
+                })
+            })
+            .map(|harness| {
+                use super::super::ListStatus;
+                let (reason, message) = match runner.serves_status.get(&harness.map(str::to_owned))
+                {
+                    Some(ListStatus::Ready) => (
+                        "model_not_served",
+                        "The model isn't in this harness's serves list.",
+                    ),
+                    Some(ListStatus::Expired) => (
+                        "serves_list_expired",
+                        "This harness's last serves list is over five minutes old.",
+                    ),
+                    Some(ListStatus::Missing) | None => (
+                        "serves_list_missing",
+                        "The runner hasn't sent a serves list for this harness yet.",
+                    ),
+                };
+                let mut row = json!({"reason":reason, "message":message});
+                if let Some(harness) = harness {
+                    row["harness"] = json!(harness);
+                }
+                row
+            })
+            .collect();
+        json!({"reason":"excluded_by_policy", "filter":remaining_filter, "unavailable_harnesses":unavailable})
     } else {
         json!({"reason":"excluded_by_policy", "filter":remaining_filter})
     }

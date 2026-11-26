@@ -213,6 +213,7 @@ fn install_key_only_kimi(
         ..Default::default()
     };
     credentials.apply_listing(&listing, KIMI_NOW as u64);
+    credentials.set_watch_confirmed(Some(&listing.view));
     credentials.refresh_serving_methods(&Default::default(), &facts, KIMI_NOW, &[]);
     drop(shared);
     harness.set_credentials(credentials);

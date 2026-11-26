@@ -81,6 +81,12 @@ async fn subsets_rank_only_listed_routes_and_repetitions_add_nothing() {
 #[tokio::test]
 async fn subsets_never_widen_operator_consumer_or_request_policy() {
     let (harness, route) = configured().await;
+    super::super::conformance_tests::publish_fixture_providers(
+        &mut harness.credentials().lock().unwrap(),
+        "broca",
+        &[fixture::PRICED_PROVIDER, fixture::SUBSCRIPTION_PROVIDER],
+        true,
+    );
     for policy in ["operator", "consumer", "request"] {
         harness.edit_config(|config| {
             config["model_routing"]["exclude"] = json!({"all":[]});

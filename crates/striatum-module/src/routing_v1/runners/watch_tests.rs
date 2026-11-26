@@ -325,18 +325,18 @@ impl Rig {
             .await
     }
 
-    async fn declared(&self) {
+    async fn ready(&self) {
         until(
             || {
-                self.harness
-                    .credentials()
-                    .lock()
-                    .unwrap()
+                let shared = self.harness.credentials();
+                let credentials = shared.lock().unwrap();
+                credentials
                     .runner_declarations
                     .contains_key(fixture::RUNNER_ONE)
+                    && credentials.runner_serves.contains_key(fixture::RUNNER_ONE)
             },
             Duration::from_secs(3),
-            "watch change did not publish runner declarations",
+            "watch change did not publish the declaration and serves list",
         )
         .await;
     }
@@ -348,7 +348,7 @@ async fn catalog_watch_change_is_visible_to_route_select_without_interval() {
     assert_eq!(rig.select().await.0, FrameType::Error);
     rig.state.declared.store(true, Ordering::SeqCst);
     rig.push(vec![2]);
-    rig.declared().await;
+    rig.ready().await;
     let selected = rig.select().await;
     assert_eq!(selected.0, FrameType::Response, "{selected:?}");
     assert_eq!(
@@ -400,7 +400,7 @@ async fn catalog_watch_failure_retries_and_falls_back_to_thirty_seconds() {
         "watch failure did not restore the 30 second pass",
     )
     .await;
-    rig.declared().await;
+    rig.ready().await;
     assert_eq!(rig.select().await.0, FrameType::Response);
     assert!(rig.state.watches.load(Ordering::SeqCst) > attempts);
     assert!(
@@ -484,7 +484,7 @@ async fn catalog_watch_daemon_restart_rebuilds_consumer_and_refreshes() {
     let watches = rig.state.watches.load(Ordering::SeqCst);
     rig.state.declared.store(true, Ordering::SeqCst);
     rig.commands.send(Command::Disconnect).unwrap();
-    rig.declared().await;
+    rig.ready().await;
     assert!(rig.state.connections.load(Ordering::SeqCst) > connections);
     until(
         || rig.state.watches.load(Ordering::SeqCst) > watches,

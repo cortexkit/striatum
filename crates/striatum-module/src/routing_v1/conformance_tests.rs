@@ -265,8 +265,34 @@ impl Harness {
             }
         });
         facts.iter().for_each(persist);
-        *self.broca_credentials.lock().unwrap() =
-            Arc::new(Mutex::new(BrocaCredentials::api_test_credentials(facts)));
+        let mut credentials = BrocaCredentials::api_test_credentials(facts);
+        // This fixture owns both the catalog and the synthetic runners that
+        // consume it. A harness named only in settings still needs a real
+        // test declaration from the caller.
+        let route_keys: Vec<_> = facts
+            .iter()
+            .map(|fact| format!("{}/{}", fact.provider_id, fact.model_id))
+            .collect();
+        for policy in self
+            .operator_config()
+            .v1_runners()
+            .into_iter()
+            .filter(|policy| policy.harness.is_none())
+        {
+            let slot = json!({"runner":{
+                "follows_account_choice":policy.via_vault, "tool_capabilities":policy.tool_capabilities
+            }});
+            let declaration = super::runners::parse_declaration(&slot).unwrap().unwrap();
+            credentials
+                .runner_declarations
+                .insert(policy.module.clone(), declaration);
+            publish_runner_serves(
+                &mut credentials,
+                &policy.module,
+                &test_serves(&route_keys, None, "test-catalog"),
+            );
+        }
+        *self.broca_credentials.lock().unwrap() = Arc::new(Mutex::new(credentials));
     }
 
     /// Serve requests with `credentials` as Broca's credential and billing
@@ -301,6 +327,12 @@ impl Harness {
     pub(super) fn publish_runner_serves(&self, module: &str, list: &Value) {
         let shared = self.credentials();
         publish_runner_serves(&mut shared.lock().unwrap(), module, list);
+    }
+
+    pub(super) fn refresh_catalog_fixture_serves(&self, catalog: &Catalog) {
+        for runner in &catalog.runners {
+            self.publish_runner_serves(&runner.module, &fixture_serves(runner));
+        }
     }
 
     /// Bind a new route as `principal`, scoped to `project_id` when given,
@@ -759,9 +791,34 @@ pub(super) fn publish_runner_serves(
     module: &str,
     list: &Value,
 ) {
+    let mut answer = json!({"capabilities": ["serves"], "serves": list});
+    for (capability, payload) in [
+        (
+            "service_tier",
+            credentials
+                .runner_service_tiers
+                .get(module)
+                .map(|tiers| ("service_tiers", json!(tiers))),
+        ),
+        (
+            "routed_accounts",
+            credentials
+                .runner_routed_accounts
+                .get(module)
+                .map(|methods| ("routed_accounts", json!(methods))),
+        ),
+    ] {
+        if let Some((member, payload)) = payload {
+            answer["capabilities"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!(capability));
+            answer[member] = payload;
+        }
+    }
     assert!(super::runners::DescribeCache::default().reply(
         module,
-        Some(&json!({"capabilities": ["serves"], "serves": list})),
+        Some(&answer),
         credentials,
         crate::now_ms() as i64,
     ));
@@ -800,6 +857,32 @@ pub(super) fn publish_fixture_providers(
 
 fn fixture_serves(runner: &cortexkit_role_routing_conformance::CatalogRunner) -> Value {
     test_serves(&runner.route_keys, runner.harnesses.as_deref(), "fixture")
+}
+
+pub(super) fn publish_fixture_models(
+    credentials: &mut BrocaCredentials,
+    module: &str,
+    facts: &[ModelFact],
+    follows_account_choice: bool,
+) {
+    use sha2::{Digest, Sha256};
+    let declaration = credentials
+        .runner_declarations
+        .entry(module.to_owned())
+        .or_insert_with(|| {
+            super::runners::parse_declaration(
+                &json!({"runner":{"follows_account_choice":follows_account_choice}}),
+            )
+            .unwrap()
+            .unwrap()
+        });
+    let keys: Vec<_> = facts
+        .iter()
+        .map(|fact| format!("{}/{}", fact.provider_id, fact.model_id))
+        .collect();
+    let generation = format!("{:x}", Sha256::digest(keys.join("\n")));
+    let list = test_serves(&keys, declaration.harnesses.as_deref(), &generation);
+    publish_runner_serves(credentials, module, &list);
 }
 
 pub(super) fn test_serves(
@@ -953,6 +1036,7 @@ fn install_catalog_with(
             .collect();
         credentials.runner_declarations =
             super::runners::declarations_from_catalog(&json!(declarations));
+        credentials.runner_serves.clear();
         assert_eq!(credentials.runner_declarations.len(), catalog.runners.len());
         for runner in &catalog.runners {
             if !runner.route_keys.is_empty() {
@@ -1372,151 +1456,6 @@ impl RoutingSubject for KitSubject {
                 json!({"limit":cap});
         });
         Ok(())
-    }
-
-    async fn configure_runner_route_facts(
-        &self,
-        routes: &[cortexkit_role_routing_conformance::RunnerRouteFacts],
-    ) -> Result<bool, String> {
-        let harness = self.harness();
-        let shared = harness.broca_credentials.lock().unwrap().clone();
-        let mut credentials = shared.lock().unwrap();
-        let mut facts = harness
-            .store()
-            .get_facts()
-            .map_err(|error| error.to_string())?;
-        let catalog_targets = credentials.catalog_targets(&facts);
-        let mut serving = std::collections::BTreeSet::new();
-        for route in routes {
-            let (provider, model) = route
-                .route_key
-                .split_once('/')
-                .ok_or_else(|| format!("runner route fact {} has no provider", route.route_key))?;
-            // Gateway route keys keep the gateway's identity, while wire and
-            // billing facts belong to the provider named by its credential's `serves`.
-            let catalog_key = if route.auth_method == "gateway" {
-                catalog_targets
-                    .get(provider)
-                    .map(|target| format!("{target}/{model}"))
-                    .unwrap_or_else(|| route.route_key.clone())
-            } else {
-                route.route_key.clone()
-            };
-            let fact = facts
-                .iter_mut()
-                .find(|fact| striatum_core::fact_to_route(fact).route_key == catalog_key);
-            let Some(fact) = fact else {
-                // A gateway can declare a route with no matching catalog model
-                // under its credential's `serves`. Leave that route absent so
-                // refusal checks exercise routing.
-                if route.auth_method == "gateway"
-                    && credentials.listed_credentials().iter().any(|row| {
-                        row.provider_ids.iter().any(|id| id == provider)
-                            && row.auth_method.as_deref() == Some("gateway")
-                    })
-                {
-                    continue;
-                }
-                return Err(format!(
-                    "runner route fact {} has no catalog model",
-                    route.route_key
-                ));
-            };
-            credentials
-                .wire_apis
-                .insert(catalog_key, route.wire_api.clone());
-            serving.insert((provider.to_owned(), route.auth_method.clone()));
-            let mut plane = striatum_core::billing::BillingPlane {
-                provider_id: fact.provider_id.clone(),
-                auth_method: route.auth_method.clone(),
-                kind: "upstream".into(),
-                selection_reason: "conformance runner route facts".into(),
-                rates: Default::default(),
-            };
-            plane.rates.insert(
-                "rate.output".into(),
-                striatum_core::billing::BillingRate::Priced {
-                    rate: fact.cost_per_m_tok_out.unwrap(),
-                },
-            );
-            fact.billing_plane = Some(plane);
-        }
-        let mut rows: Vec<_> = credentials
-            .listed_credentials()
-            .iter()
-            .filter(|row| {
-                !serving
-                    .iter()
-                    .any(|(provider, _)| row.provider_ids.contains(provider))
-            })
-            .cloned()
-            .collect();
-        for (provider, method) in serving {
-            let existing: Vec<_> = credentials
-                .listed_credentials()
-                .iter()
-                .filter(|row| {
-                    row.provider_ids.contains(&provider)
-                        && row.auth_method.as_deref() == Some(method.as_str())
-                })
-                .cloned()
-                .collect();
-            if existing.is_empty() {
-                rows.push(ListedCredential {
-                    id: format!("runner-fact-{provider}-{method}"),
-                    provider_ids: vec![provider.clone()],
-                    serves: vec![provider],
-                    auth_method: Some(method.clone()),
-                    credential_type: method,
-                    categories: vec!["llm-provider".into()],
-                    state: "active".into(),
-                    ..Default::default()
-                });
-            } else {
-                // Route facts describe the existing login, not a replacement
-                // identity; account_for must admit the seeded credential.
-                rows.extend(existing);
-            }
-        }
-        credentials.apply_listing(
-            &ScopedCredentialListing {
-                view: "runner-route-facts".into(),
-                credentials: rows,
-                ..Default::default()
-            },
-            crate::now_ms(),
-        );
-        credentials.refresh_serving_methods(
-            &Default::default(),
-            &facts,
-            crate::now_ms() as i64,
-            &[],
-        );
-        let catalog = crate::fusiform_catalog::PlaneCatalog::ordinary_test_catalog(&facts)
-            .with_wire_apis(&credentials.wire_apis);
-        credentials.publish_billing_catalog(catalog);
-        Ok(true)
-    }
-
-    async fn configure_route_wire_api(
-        &self,
-        route_key: &str,
-        endpoint: Option<&str>,
-    ) -> Result<bool, String> {
-        let harness = self.harness();
-        let shared = harness.broca_credentials.lock().unwrap().clone();
-        let mut credentials = shared.lock().unwrap();
-        if endpoint.is_some() {
-            credentials.wire_api_models.insert(route_key.into());
-        } else {
-            credentials.wire_api_models.remove(route_key);
-        }
-        let catalog = credentials
-            .billing_catalog
-            .clone()
-            .with_wire_api_models(&credentials.wire_api_models);
-        credentials.publish_billing_catalog(catalog);
-        Ok(true)
     }
 
     async fn configure_continue_credentials(
@@ -2407,7 +2346,7 @@ async fn candidate_capabilities_reach_readers_without_leaking_to_production_call
     let harness = Harness::new("candidate-capabilities");
     let slot = json!({
         "consumers": [{"name":"example-consumer.task", "iq":40}],
-        "runner": {"pairs":[{"wire_api":"openai.chat", "auth_method":"apikey"}]}
+        "runner": {}
     });
     let catalog = json!([{
         "module_id":"example-consumer", "nonce_verified":true,

@@ -21,6 +21,13 @@ struct List {
     in_last_answer: bool,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(super) enum ListStatus {
+    Missing,
+    Expired,
+    Ready,
+}
+
 impl RunnerServes {
     pub(super) fn apply(
         &mut self,
@@ -57,7 +64,6 @@ impl RunnerServes {
             }
             self.last_answer = Some(Arc::new(raw.clone()));
         }
-        self.lists.retain(|_, list| fresh(list, now));
         Ok(())
     }
 
@@ -65,6 +71,18 @@ impl RunnerServes {
         self.lists.iter().filter_map(move |(harness, list)| {
             fresh(list, now).then_some((harness.as_deref(), list.entries.as_ref()))
         })
+    }
+
+    pub(super) fn status(&self, harness: Option<&str>, now: i64) -> ListStatus {
+        match self
+            .lists
+            .iter()
+            .find(|(name, _)| name.as_deref() == harness)
+        {
+            Some((_, list)) if fresh(list, now) => ListStatus::Ready,
+            Some(_) => ListStatus::Expired,
+            None => ListStatus::Missing,
+        }
     }
 }
 

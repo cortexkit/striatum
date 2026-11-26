@@ -87,6 +87,7 @@ fn setup_models(models: &[&str]) -> Arc<Harness> {
         crate::fusiform_catalog::PlaneCatalog::ordinary_test_catalog(&facts),
     );
     credentials.publish_plan_prices(&json!({"prices":[]}));
+    super::conformance_tests::publish_fixture_models(&mut credentials, RUNNER, &facts, true);
     harness.set_credentials(credentials);
     harness.edit_config(|config| {
         config["runners"] = json!([{"module":RUNNER,"via_vault":true}]);

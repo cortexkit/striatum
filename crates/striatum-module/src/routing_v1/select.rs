@@ -49,6 +49,7 @@ mod declared_samples_tests;
 mod eligible_routes;
 #[cfg(test)]
 mod eligible_routes_tests;
+mod keyless;
 mod price_answer;
 #[cfg(test)]
 mod price_answer_tests;
@@ -1208,35 +1209,10 @@ async fn prepare_selection(
         return Err(Refusal::no_route(NoRouteReason::MissingCapability, None));
     }
     if let Some(classes) = priced.classes.as_mut().filter(|_| evaluation.is_none()) {
-        let keyless = |fact: &ModelFact| {
-            let route = fact_to_route(fact);
-            let placements = runners.iter().filter_map(|policy| {
-                registry
-                    .runs(policy, &route.route_key, &route.capacity_key)
-                    .then(|| registry.get(policy))
-                    .flatten()
-            });
-            let mut found = false;
-            for runner in placements {
-                if !runner.keyless(&route.route_key, &route.capacity_key) {
-                    return false;
-                }
-                found = true;
-            }
-            found
-        };
-        let keyless_models: HashSet<_> = if registry.has_keyless_routes() {
-            facts
-                .iter()
-                .filter(|fact| keyless(fact))
-                .map(|fact| (&fact.provider_id, &fact.model_id))
-                .collect()
-        } else {
-            HashSet::new()
-        };
+        let keyless_models = keyless::models_without_logins(&facts, &registry, &runners);
         classes
             .reserve_selection_probes_where(deps.store, deps.broca_credentials, |fact| {
-                !keyless_models.contains(&(&fact.provider_id, &fact.model_id))
+                !keyless_models.contains(&(fact.provider_id.as_str(), fact.model_id.as_str()))
             })
             .map_err(store_refusal)?;
     }
@@ -1469,43 +1445,14 @@ async fn select_at_tier_attempt(
         && !facts
             .iter()
             .any(|fact| eligible_routes::includes_model(request.eligible_routes.as_deref(), fact));
-    let has_keyless_routes = registry.has_keyless_routes();
-    let keyless_routes: HashSet<_> = facts
-        .iter()
-        .filter(|_| has_keyless_routes)
-        .filter_map(|fact| {
-            let route = fact_to_route(fact);
-            select_policy::choose_runner(
-                runners,
-                consumer_policy.runner.as_deref(),
-                &route.route_key,
-                &route.capacity_key,
-                &runs,
-            )
-            .and_then(|runner| registry.get(runner))
-            .filter(|runner| runner.keyless(&route.route_key, &route.capacity_key))
-            .map(|_| route.route_key)
-        })
-        .collect();
-    for fact in &mut facts {
-        let route = fact_to_route(fact);
-        if keyless_routes.contains(&route.route_key) {
-            fact.billing_plane = None;
-            fact.subscription_multiplier = None;
-            for state in [
-                snapshot.by_route.get_mut(&route.route_key),
-                snapshot.by_capacity.get_mut(&route.capacity_key),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                state.credential_refusal = None;
-                state.quota_exhausted_until = None;
-                state.quota_pressure = None;
-                state.subscription_pool = None;
-            }
-        }
-    }
+    let keyless_routes = keyless::routes(
+        &facts,
+        registry,
+        runners,
+        consumer_policy.runner.as_deref(),
+        &runs,
+    );
+    keyless::clear_account_state(&keyless_routes, &mut facts, &mut snapshot);
     let reachable: Vec<&ModelFact> = facts
         .iter()
         .filter(|fact| eligible_routes::includes_model(request.eligible_routes.as_deref(), fact))
@@ -1604,7 +1551,13 @@ async fn select_at_tier_attempt(
         return Err(Refusal::no_route(NoRouteReason::MissingCapability, None));
     }
     if capable.is_empty() && runner_rejections.is_empty() && !eligible_catalog_empty {
-        if request.pin_fallback != Some(PinFallback::Route) {
+        if request.pin_fallback != Some(PinFallback::Route)
+            && runners.iter().any(|policy| {
+                registry
+                    .get(policy)
+                    .is_some_and(|runner| runner.wire_declaration().is_some())
+            })
+        {
             if let Some(pin) = request.pin.as_deref().or(inputs.slot_pin.as_deref()) {
                 return Err(Refusal::pin_unavailable(
                     pin,
@@ -4280,9 +4233,21 @@ mod tests {
         );
         credentials.wire_apis = wires;
         credentials.publish_plan_prices(&served["plan.prices — every curated row"]["response"]);
-        credentials.runner_declarations.insert("tier-runner".into(), super::super::runners::parse_declaration(&json!({"runner":{
-            "pairs":[{"wire_api":"openai.responses","auth_method":"oauth"}],"follows_account_choice":true
-        }})).unwrap().unwrap());
+        credentials.runner_declarations.insert(
+            "tier-runner".into(),
+            super::super::runners::parse_declaration(&json!({"runner":{
+                "follows_account_choice":true
+            }}))
+            .unwrap()
+            .unwrap(),
+        );
+        super::super::conformance_tests::publish_runner_serves(
+            &mut credentials,
+            "tier-runner",
+            &json!({
+                "generation":"tier-affinity-fixture", "entries":[{"provider":"openai","models":["gpt-6.1-sol"]}]
+            }),
+        );
         credentials.runner_service_tiers.insert("tier-runner".into(), super::super::runners::service_tiers_from_describe(&json!({
             "capabilities":["service_tier"],"service_tiers":{"openai.responses":{"levels":["fast"],"served":"reported"}}
         })).unwrap());
@@ -4460,6 +4425,7 @@ mod tests {
             "{reported:?}"
         );
         let _old_interval = crate::InjectedClock::set(RECOVERY_NOW + 900_000);
+        harness.refresh_catalog_fixture_serves(&catalog);
         let waiting = route.call("route.select_panel", &request).await;
         assert_eq!(
             waiting.1["result"]["seats"].as_array().unwrap().len(),
@@ -4479,6 +4445,7 @@ mod tests {
             RECOVERY_NOW + 1_100_000,
         );
         drop(credentials);
+        harness.refresh_catalog_fixture_serves(&catalog);
         let next = route.call("route.select_panel", &request).await;
         assert_eq!(
             next.1["result"]["seats"].as_array().unwrap().len(),

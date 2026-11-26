@@ -487,3 +487,61 @@ async fn two_configured_vault_runners_keep_consumer_order_and_account_authority(
         }
     }
 }
+
+#[tokio::test]
+async fn harness_unavailable_names_the_missing_excluded_and_expired_lists() {
+    const NOW: u64 = 1_800_000_000_000;
+    let _clock = crate::InjectedClock::set(NOW);
+    let harness = Harness::new("serve-list-diagnostics");
+    let mut catalog = fixture::catalog();
+    catalog.runners.truncate(1);
+    let runner = &mut catalog.runners[0];
+    runner.module = MODULE.into();
+    runner.harnesses = Some(vec!["alpha".into(), "beta".into()]);
+    runner.default_harness = Some("alpha".into());
+    install_catalog(&harness, &catalog);
+    harness
+        .credentials()
+        .lock()
+        .unwrap()
+        .runner_serves
+        .remove(MODULE);
+    let served = json!([{"provider":fixture::PRICED_PROVIDER, "models":[catalog.models[0].model]}]);
+    let caller = harness.bind(reserved(fixture::CONSUMER), None).await;
+    let request = json!({"consumer":"mason","requirements":{"iq":0},
+        "available_routes":[catalog.models[0].route_key()], "harness":"alpha"});
+    for (now, serves, reason) in [
+        (
+            NOW,
+            json!({"generation":"beta", "harnesses":{"beta":served}}),
+            "serves_list_missing",
+        ),
+        (
+            NOW,
+            json!({"generation":"alpha-empty", "harnesses":{"alpha":[],"beta":served}}),
+            "model_not_served",
+        ),
+        (
+            NOW + LAST_GOOD_MS as u64 + 1,
+            json!({"generation":"beta", "harnesses":{"beta":served}}),
+            "serves_list_expired",
+        ),
+    ] {
+        let _at = crate::InjectedClock::set(now);
+        harness.publish_runner_serves(MODULE, &serves);
+        let (ty, reply) = caller.call("route.select", &request).await;
+        assert_eq!(ty, FrameType::Error, "{reply}");
+        assert_eq!(reply["detail"]["reason"], "harness_unavailable", "{reply}");
+        let row = &reply["detail"]["runners"][0];
+        assert_eq!(row["module"], MODULE, "{reply}");
+        assert_eq!(
+            row["unavailable_harnesses"][0]["harness"], "alpha",
+            "{reply}"
+        );
+        assert_eq!(row["unavailable_harnesses"][0]["reason"], reason, "{reply}");
+        assert!(
+            row["unavailable_harnesses"][0]["message"].is_string(),
+            "{reply}"
+        );
+    }
+}

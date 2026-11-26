@@ -33,6 +33,7 @@ pub(crate) use admission::fetch_describe;
 pub(crate) use admission::{refresh_admission_tiers, tier_view_unknown, AdmissionDescribes};
 pub(crate) use describe_cache::DescribeCache;
 pub(crate) use harness_facts::RunnerDeclaration;
+use serves_cache::ListStatus;
 pub(crate) use serves_cache::RunnerServes;
 
 #[derive(Debug, Clone, Serialize)]
@@ -58,6 +59,8 @@ pub(crate) struct EffectiveRunner {
     statically_reachable_models: BTreeSet<String>,
     #[serde(skip)]
     keyless_models: BTreeSet<String>,
+    #[serde(skip)]
+    serves_status: BTreeMap<Option<String>, ListStatus>,
     #[serde(skip)]
     no_account_models: BTreeSet<String>,
     #[serde(skip)]
@@ -405,6 +408,7 @@ impl Registry {
                 reachable_models: reachable,
                 statically_reachable_models: models,
                 keyless_models: BTreeSet::new(),
+                serves_status: BTreeMap::new(),
                 no_account_models: BTreeSet::new(),
                 harness_choices: None,
                 placement_baseline: None,
@@ -488,6 +492,19 @@ impl Registry {
                         }
                     });
                 let listing_fresh = credentials.listing_is_fresh(now_ms);
+                let serves = credentials.runner_serves.get(&policy.module);
+                let serves_status = match declaration.and_then(|d| d.harnesses.as_ref()) {
+                    Some(harnesses) => harnesses.iter().cloned().map(Some).collect::<Vec<_>>(),
+                    None => vec![None],
+                }
+                .into_iter()
+                .map(|harness| {
+                    let status = serves.map_or(ListStatus::Missing, |serves| {
+                        serves.status(harness.as_deref(), now_ms as i64)
+                    });
+                    (harness, status)
+                })
+                .collect();
                 let entries = serving_entries(
                     credentials,
                     &policy.module,
@@ -593,6 +610,7 @@ impl Registry {
                     reachable_models,
                     statically_reachable_models,
                     keyless_models,
+                    serves_status,
                     no_account_models,
                     harness_choices: None,
                     placement_baseline: None,

@@ -310,7 +310,6 @@ mod tests {
     fn declared_modules() -> Value {
         json!([{"module_id":"runner-a","nonce_verified":true,
         "role_declarations":{"routing/v1":{"runner":{
-            "pairs":[{"wire_api":"anthropic.messages","auth_method":"apikey"}],
             "harnesses":["runner-a"],
             "harness_limits":{"runner-a":{"capabilities":["one_off"]}}
         }}}}])

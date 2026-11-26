@@ -1474,8 +1474,10 @@ mod tests {
             .insert("runner".into(), vec!["oauth".into()]));
         changes!(credentials.billing_catalog = Default::default());
         let declaration = crate::routing_v1::runners::parse_declaration(&serde_json::json!({
-            "runner": {"pairs":[{"wire_api":"messages","auth_method":"oauth"}],"follows_account_choice":true}
-        })).unwrap().unwrap();
+            "runner": {"follows_account_choice":true}
+        }))
+        .unwrap()
+        .unwrap();
         changes!(credentials
             .runner_declarations
             .insert("generation-runner".into(), declaration));
@@ -1604,9 +1606,12 @@ mod tests {
     fn serving_refresh_runner_declarations_change_rebuilds() {
         serving_refresh_case(
             |_, credentials, _| {
-                let declaration = crate::routing_v1::runners::parse_declaration(&serde_json::json!({
-                "runner":{"pairs":[{"wire_api":"messages","auth_method":"oauth"}],"follows_account_choice":true}
-            })).unwrap().unwrap();
+                let declaration =
+                    crate::routing_v1::runners::parse_declaration(&serde_json::json!({
+                        "runner":{"follows_account_choice":true}
+                    }))
+                    .unwrap()
+                    .unwrap();
                 credentials
                     .runner_declarations
                     .insert("changed-runner".into(), declaration);

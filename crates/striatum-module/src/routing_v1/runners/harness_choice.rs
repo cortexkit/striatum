@@ -229,7 +229,7 @@ impl Registry {
             *entry = parent;
         }
         for (entry, policy) in registry.entries.iter_mut().zip(&source_policies) {
-            if requested.is_some() || policy.harness.is_some() {
+            if requested.is_some() || policy.harness.is_some() || !explicit.is_empty() {
                 entry.placement_baseline = Self::build_for_harness(
                     RunnerPolicies {
                         policies: vec![policy.clone()],

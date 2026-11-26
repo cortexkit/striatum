@@ -317,6 +317,13 @@ async fn legacy_continue_keeps_frozen_priced_account_class() {
 #[tokio::test]
 async fn legacy_continue_waits_for_unobserved_frozen_service_tier() {
     let (subject, runner, _, admitted, request) = legacy(json!({}), false).await;
+    subject
+        .harness()
+        .credentials()
+        .lock()
+        .unwrap()
+        .runner_describe_observed
+        .remove(fixture::RUNNER_ONE);
     edit_snapshot(&subject, &admitted, |context| {
         context["continuation_input"]["service_tier"] = json!("fast")
     });

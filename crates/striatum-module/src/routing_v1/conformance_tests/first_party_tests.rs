@@ -6,8 +6,6 @@ fn modules(mark: Option<bool>) -> Value {
         "roles":[], "control_ops":[],
         "incarnation":"daemon-a", "spawn":7,
         "role_declarations":{"routing/v1":{"runner":{
-            "pairs":[{"wire_api":"anthropic.messages","auth_method":"apikey"},
-                {"wire_api":"anthropic.messages","auth_method":"oauth"}],
             "harnesses":["fixture"]
         }}}
     });
@@ -202,12 +200,24 @@ async fn route_open_matching_target_sends_and_settings_need_no_mark() {
 fn catalog(harness: &Harness, modules: &Value) {
     let shared = harness.credentials();
     let mut credentials = shared.lock().unwrap();
-    super::super::runners::DescribeCache::default().catalog(
+    let queried = super::super::runners::DescribeCache::default().catalog(
         modules,
         &harness.operator_config().v1_runners(),
         &mut credentials,
         crate::now_ms() as i64,
     );
+    if queried.contains(fixture::RUNNER_ONE)
+        && credentials
+            .runner_declarations
+            .contains_key(fixture::RUNNER_ONE)
+    {
+        publish_fixture_providers(
+            &mut credentials,
+            fixture::RUNNER_ONE,
+            &[fixture::PRICED_PROVIDER, fixture::SUBSCRIPTION_PROVIDER],
+            false,
+        );
+    }
 }
 
 fn setup(label: &str) -> Arc<Harness> {

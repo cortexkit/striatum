@@ -893,6 +893,7 @@ impl PlaneCatalog {
     }
 
     /// A served plane's endpoint facts override the ordinary catalog, even when absent.
+    #[cfg(test)]
     pub(crate) fn row_serves_wire_api(&self, model: &str, auth_method: &str) -> Option<bool> {
         let provider = model.split_once('/')?.0;
         match self.pages.get(&(provider.into(), auth_method.into())) {

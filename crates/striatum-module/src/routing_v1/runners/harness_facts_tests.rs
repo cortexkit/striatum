@@ -162,9 +162,9 @@ async fn refused_typed_map_is_wholly_legacy_and_warns_at_catalog_read() {
         let valid = slot(json!({"primary":{"capabilities":["one_off"]}}));
         assert!(read(&valid).declares_harness_facts());
         for invalid in [
-            json!({"exclude":["anthropic//model"]}),
+            json!({"starts_sessions":[]}),
             json!({"capabilities":["not a runner token"]}),
-            json!({"pairs":[]}),
+            json!({"capabilities":{}}),
         ] {
             let mut value = valid.clone();
             value["runner"]["harness_limits"]["secondary"] = invalid;

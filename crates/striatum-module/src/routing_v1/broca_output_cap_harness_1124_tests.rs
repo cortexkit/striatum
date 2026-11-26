@@ -25,23 +25,23 @@ const CURRENT: Slot = Slot {
     ),
     size: 1277,
     sha256: "6c54624ca04c67c6a6d295849837ccbff28ac0cc9fe840f0298cc51a46a1fa5d",
+    split: false,
 };
 const PROPOSED: Slot = Slot {
     bytes: include_bytes!("../../fixtures/broca-output-cap-harness-1124/routing-slot.json"),
     size: 2191,
     sha256: "168755640c483cbd479e915a103a8f335d39f0d4cc8ab4579da1140c6d6b9987",
+    split: true,
 };
 const QUICK: &[u8] =
-    include_bytes!("../../fixtures/broca-routing-consumer-quick-1125/routing-slot.json");
-const QUICK_WITH_EXCLUDE: &[u8] = include_bytes!(
-    "../../fixtures/broca-routing-consumer-quick-1125/routing-slot-with-exclude.json"
-);
+    include_bytes!("../../fixtures/broca-runner-serves-1126/hello-routing-slot.json");
 const BASAL: &[u8] = br#"{"consumer":"broca.complete.basal.run","requirements":{"iq":30,"max_output_tokens":16,"input_tokens":200,"max_cost_usd":0.01},"runners":["broca"]}"#;
 
 struct Slot {
     bytes: &'static [u8],
     size: usize,
     sha256: &'static str,
+    split: bool,
 }
 
 fn install_slot(
@@ -50,16 +50,47 @@ fn install_slot(
         bytes,
         size,
         sha256,
+        split,
     }: Slot,
 ) {
     assert_eq!(bytes.len(), size);
     assert_eq!(format!("{:x}", Sha256::digest(bytes)), sha256);
-    let slot: Value = serde_json::from_slice(bytes).unwrap();
+    let slot: Value = if split {
+        serde_json::from_slice(QUICK).unwrap()
+    } else {
+        json!({"runner":{"harnesses":["broca"],"follows_account_choice":true,
+            "harness_limits":{"broca":{"capabilities":["one_off","fork_answer","submit_tool","final_text","plans"]}}}})
+    };
     let declarations = declarations_from_catalog(&json!([{
         "module_id":"broca", "nonce_verified":true, "role_declarations":{"routing/v1":slot}
     }]));
     assert!(declarations.contains_key("broca"));
     harness.credentials().lock().unwrap().runner_declarations = declarations;
+    publish_fixture_serves(harness, split, true);
+}
+
+fn publish_fixture_serves(harness: &Harness, split: bool, allow_opencode: bool) {
+    let mut capped = Vec::new();
+    let mut uncapped = Vec::new();
+    for fact in harness.store().get_facts().unwrap() {
+        if !allow_opencode && matches!(fact.provider_id.as_str(), "opencode" | "opencode-go") {
+            continue;
+        }
+        let key = format!("{}/{}", fact.provider_id, fact.model_id);
+        if split && fact.provider_id == "openai" {
+            uncapped.push(key);
+        } else {
+            capped.push(key);
+        }
+    }
+    let entries =
+        |keys| super::conformance_tests::test_serves(keys, None, "unused")["entries"].clone();
+    let mut lists = json!({"broca":entries(&capped)});
+    if split {
+        lists["broca-uncapped"] = entries(&uncapped);
+    }
+    let generation = format!("{:x}", Sha256::digest(lists.to_string()));
+    harness.publish_runner_serves("broca", &json!({"generation":generation,"harnesses":lists}));
 }
 
 fn model(provider: &str, model: &str, method: &str, kind: &str) -> ModelFact {
@@ -212,7 +243,7 @@ fn selected(label: &str, (ty, reply): (FrameType, Value), harness: &str) -> Valu
 }
 
 #[tokio::test]
-async fn basal_gets_a_metered_route_only_when_the_split_has_a_capped_pair() {
+async fn basal_gets_a_metered_route_only_when_the_split_has_a_capped_route() {
     let _clock = crate::InjectedClock::set(NOW);
     let harness = setup(true);
     let route = harness.bind(reserved("broca"), None).await;
@@ -316,8 +347,8 @@ async fn split_names_the_uncapped_harness_without_changing_sidekick_or_mason_rou
     }
 }
 
-fn publish_broca_catalog_slot(harness: &Harness, bytes: &[u8]) {
-    let slot: Value = serde_json::from_slice(bytes).unwrap();
+fn publish_broca_catalog_slot(harness: &Harness, allow_opencode: bool) {
+    let slot: Value = serde_json::from_slice(QUICK).unwrap();
     // Decode the daemon's module entry before handing it to both catalog readers.
     let catalog: subc_client_rs::CatalogList = serde_json::from_value(json!({
         "op":"catalog.list", "generation":1, "subc_ops":[], "modules":[{
@@ -339,6 +370,7 @@ fn publish_broca_catalog_slot(harness: &Harness, bytes: &[u8]) {
     assert_eq!(health["issues"], json!([]), "{health}");
     let warnings = crate::take_operator_warnings();
     assert!(warnings.is_empty(), "{warnings:?}");
+    publish_fixture_serves(harness, true, allow_opencode);
 }
 
 #[tokio::test]
@@ -365,7 +397,7 @@ async fn broca_completion_slot_declares_quick_for_both_basal_children() {
         "{description}"
     );
 
-    publish_broca_catalog_slot(&harness, QUICK);
+    publish_broca_catalog_slot(&harness, false);
     let registry = consumers::effective(&harness.operator_config());
     let mut request: Value = serde_json::from_slice(BASAL).unwrap();
     request["detail"] = json!(true);
@@ -395,7 +427,7 @@ async fn broca_completion_slot_declares_quick_for_both_basal_children() {
 }
 
 #[tokio::test]
-async fn broca_completion_slot_excludes_pinned_opencode_routes() {
+async fn broca_completion_cannot_pin_an_unlisted_opencode_route() {
     let _clock = crate::InjectedClock::set(NOW);
     const PROVIDERS: [&str; 2] = ["opencode-go", "opencode"];
     const MODEL: &str = "deepseek-v4-flash";
@@ -406,8 +438,8 @@ async fn broca_completion_slot_excludes_pinned_opencode_routes() {
     });
     let route = harness.bind(reserved("broca"), None).await;
 
-    for (slot, excludes_opencode) in [(QUICK, false), (QUICK_WITH_EXCLUDE, true)] {
-        publish_broca_catalog_slot(&harness, slot);
+    for allow_opencode in [true, false] {
+        publish_broca_catalog_slot(&harness, allow_opencode);
         for provider in PROVIDERS {
             let pin = format!("{provider}/{MODEL}");
             let request = json!({
@@ -415,7 +447,7 @@ async fn broca_completion_slot_excludes_pinned_opencode_routes() {
                 "requirements":{"iq":0}, "runners":["broca"], "pin":pin
             });
             let (ty, answer) = route.call("route.select", &request).await;
-            if excludes_opencode {
+            if !allow_opencode {
                 assert_eq!(ty, FrameType::Error, "{pin}: {answer}");
                 assert_eq!(answer["code"], "pin_unavailable", "{pin}: {answer}");
                 assert_eq!(
@@ -432,7 +464,7 @@ async fn broca_completion_slot_excludes_pinned_opencode_routes() {
 }
 
 #[tokio::test]
-async fn broca_head_choices_excludes_opencode_routes_from_catalog_slot() {
+async fn broca_head_choices_uses_opencode_membership_from_the_serves_list() {
     let _clock = crate::InjectedClock::set(NOW);
     const MODEL: &str = "deepseek-v4-flash";
     let facts = [
@@ -445,8 +477,8 @@ async fn broca_head_choices_excludes_opencode_routes_from_catalog_slot() {
     let ordinary = ("anthropic", METERED_MODEL);
     let all = [ordinary, ("opencode", MODEL), ("opencode-go", MODEL)];
 
-    for (slot, expected) in [(QUICK, all.as_slice()), (QUICK_WITH_EXCLUDE, &all[..1])] {
-        publish_broca_catalog_slot(&harness, slot);
+    for (allow_opencode, expected) in [(true, all.as_slice()), (false, &all[..1])] {
+        publish_broca_catalog_slot(&harness, allow_opencode);
         let (ty, answer) = route
             .call("route.head_choices", &json!({"runner_module":"broca"}))
             .await;
