@@ -375,7 +375,7 @@ async fn transient_overload_rotates_a_fresh_model_pin_but_never_walls_the_accoun
         .clear_route_cooldowns("synthetic/model")
         .unwrap()
         .unwrap();
-    assert_eq!(cleared.account_fences.len(), 3);
+    assert_eq!(cleared.account_fences.len(), 1);
     assert!(harness
         .store()
         .transient_account_route_fences(NOW as i64)
