@@ -533,6 +533,59 @@ async fn panel_constraints_filter_vision_context_and_excluded_routes() {
 }
 
 #[tokio::test]
+async fn panel_package_ceiling_matches_budget_quote_for_placeholder_output() {
+    for (output, expected_ceiling) in [(16_000, 16_768), (65_536, 8_768)] {
+        let (h, route, mut request) = configured().await;
+        h.edit_config(|c| {
+            c["panels"]["audit"] = json!({"top_k":1,"by":"iq","extra":0,"floor":0});
+        });
+        let only_route = request["available_routes"][0].clone();
+        request["available_routes"] = json!([only_route]);
+        request.as_object_mut().unwrap().remove("temperatures");
+        let mut fact = h
+            .store()
+            .get_facts()
+            .unwrap()
+            .into_iter()
+            .find(|f| f.model_id == "panel-0")
+            .unwrap();
+        fact.context_window = Some(65_536.0);
+        fact.max_output_tokens = Some(output);
+        h.store()
+            .upsert_fact(
+                &fact,
+                striatum_core::route_state_store::FactSource::Override,
+            )
+            .unwrap();
+
+        request["package_tokens"] = json!(expected_ceiling);
+        let answer = panel(&route, &request).await;
+        assert_eq!(answer.seats.len(), 1, "output {output}: {answer:?}");
+        let seat = &answer.seats[0].answer;
+        assert_eq!(seat.context_window, 65_536);
+        assert_eq!(seat.max_output_tokens, output);
+        let quote = budget::quote(&[budget::BudgetSeat::from_select_answer(seat)], None).unwrap();
+        assert_eq!(quote.package.tokens, expected_ceiling);
+
+        request["package_tokens"] = json!(expected_ceiling + 1);
+        let answer = panel(&route, &request).await;
+        assert!(answer.seats.is_empty(), "output {output}: {answer:?}");
+        let shortfall = answer.shortfall.unwrap();
+        assert_eq!(shortfall.code, ShortfallCode::PackageUnmeetable);
+        let detail = shortfall.typed_detail().unwrap().unwrap();
+        let cause = detail
+            .causes
+            .iter()
+            .find(|cause| cause.model == only_route.as_str().unwrap())
+            .unwrap();
+        assert_eq!(
+            cause.typed_detail().unwrap().unwrap().budget_tokens,
+            quote.package.tokens
+        );
+    }
+}
+
+#[tokio::test]
 async fn panel_athena_and_spec_match_frozen_seats_variants_and_budgets() {
     let frozen: Value =
         serde_json::from_str(include_str!("../../fixtures/replay/panels.golden.json")).unwrap();

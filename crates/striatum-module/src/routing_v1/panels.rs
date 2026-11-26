@@ -955,11 +955,16 @@ async fn candidates(
             true
         }
     });
-    // Zero is an unknown output limit in the public budget rules, not a zero
-    // reserve. Preserve the raw fact in the select answer, but score packages
-    // with the same unknown-capacity reserve as budget::quote.
+    // Zero and limits at or above a known context window are placeholders for
+    // unknown output capacity. Preserve the raw limit in the select answer,
+    // but score packages with the same unknown-capacity reserve as budget::quote.
     for fact in &mut facts {
-        if fact.max_output_tokens == Some(0) {
+        if fact.max_output_tokens.is_some_and(|output| {
+            output == 0
+                || fact.context_window.is_some_and(|window| {
+                    window.is_finite() && window >= 1.0 && output >= window as u64
+                })
+        }) {
             fact.max_output_tokens = None;
         }
     }
