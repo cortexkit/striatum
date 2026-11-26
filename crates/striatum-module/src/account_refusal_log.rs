@@ -101,6 +101,31 @@ fn exclusions(detail: &Value) -> String {
         .join(",")
 }
 
+fn all_offered_accounts_at_limit(params: &Value, detail: &Value) -> bool {
+    let (Some(offered), Some(exclusions)) = (
+        params["candidates"]["accounts"].as_array(),
+        detail["exclusions"].as_array(),
+    ) else {
+        return false;
+    };
+    let mut limited = BTreeMap::new();
+    for row in exclusions {
+        if let Some(account) = row["account_id"].as_str() {
+            let is_limit = matches!(
+                row["reason"].as_str(),
+                Some("below_reserve" | "below_broca_floor" | "scope_exhausted" | "confirmed_fence")
+            );
+            *limited.entry(account).or_insert(true) &= is_limit;
+        }
+    }
+    !offered.is_empty()
+        && offered.iter().all(|candidate| {
+            candidate["account_id"]
+                .as_str()
+                .is_some_and(|id| limited.get(id) == Some(&true))
+        })
+}
+
 pub(crate) fn allocator_refusal(detail: &Value) {
     let summary = exclusions(detail);
     let candidates = detail["exclusions"].as_array().is_some_and(|entries| {
@@ -173,15 +198,26 @@ pub(crate) fn record<R: RefusalReply>(
             TRACE.with(|trace| {
                 let trace = trace.borrow();
                 let trace = trace.as_ref().unwrap();
+                // The allocator runs on the writer thread and cannot update
+                // this trace. Its exclusions can show why no account was admitted.
+                let cause = if op == "route.account_for"
+                    && code == "account_pool_exhausted"
+                    && matches!(trace.reason, "service_tier" | "candidates_filter")
+                    && all_offered_accounts_at_limit(params, &detail)
+                {
+                    "offered_accounts_at_limit"
+                } else {
+                    trace.reason
+                };
                 let reason = detail["field"]
                     .as_str()
-                    .map(|field| format!("{}:{field}", trace.reason));
+                    .map(|field| format!("{cause}:{field}"));
                 emit(
                     op,
                     principal,
                     params,
                     code,
-                    reason.as_deref().unwrap_or(trace.reason),
+                    reason.as_deref().unwrap_or(cause),
                     trace.exclusions.as_deref().unwrap_or(&exclusions(&detail)),
                 );
             });
@@ -259,6 +295,21 @@ pub(crate) fn emit(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn offered_limit_reason_needs_quota_evidence_for_each_offered_account() {
+        let mut params = json!({"candidates":{"accounts":[{"account_id":"limited"}]}});
+        let detail = json!({"exclusions":[
+            {"account_id":"limited", "reason":"confirmed_fence"},
+            {"account_id":"other", "reason":"not_in_runner_candidates"}
+        ]});
+        assert!(all_offered_accounts_at_limit(&params, &detail));
+        params["candidates"]["accounts"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"account_id":"other"}));
+        assert!(!all_offered_accounts_at_limit(&params, &detail));
+    }
 
     #[test]
     fn rate_limit_is_per_actor_and_reason_and_reports_suppression() {
