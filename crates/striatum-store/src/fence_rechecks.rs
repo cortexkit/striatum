@@ -223,6 +223,21 @@ pub(crate) fn sync_on(tx: &crate::AccountTx<'_>, now: i64) -> rusqlite::Result<(
         state.check_source(tx.conn, &origin.kind, &origin.origin_key, &origin.provider)?;
         state.check_clock(tx.conn, &origin.kind, &origin.origin_key)?;
     }
+    let authorizations: Vec<_> = state
+        .authorizations()
+        .filter(|row| {
+            retiring.iter().any(|origin| {
+                origin.kind == "observation"
+                    && origin.origin_key == row.origin_key
+                    && origin.evidence == row.evidence
+                    && origin.evidence_at == row.evidence_at
+            })
+        })
+        .cloned()
+        .collect();
+    for row in authorizations {
+        tx.delete_authorization(&row).map_err(command_error)?;
+    }
     // Validate the whole captured plan before retirement triggers remove any
     // source. Otherwise retiring a provider makes a later route's dependency
     // check mistake this command's own write for external staleness. The
@@ -644,10 +659,11 @@ pub(crate) fn view_origin(r: &rusqlite::Row<'_>, at: usize) -> rusqlite::Result<
 /// walls, including guessed and outage cooldowns, keep the recovery test.
 pub(crate) fn reopens_at_deadline(origin: &ViewOrigin) -> bool {
     origin.quota == Some(false)
-        && (matches!(
-            origin.kind.as_str(),
-            "observation" | "transient_route" | "pool_rate"
-        ) || (matches!(origin.kind.as_str(), "route" | "provider") && origin.rate_limit_retry))
+        && (matches!(origin.kind.as_str(), "observation" | "pool_rate")
+            || (matches!(
+                origin.kind.as_str(),
+                "route" | "provider" | "transient_route"
+            ) && origin.rate_limit_retry))
 }
 
 /// Merge source evidence with the stored clocks. The SQL adapter and the
@@ -695,10 +711,14 @@ pub(crate) fn derive_block(
     prior: Option<(&Block, Option<i64>)>,
     now: i64,
 ) -> rusqlite::Result<Option<Block>> {
-    let deadline = origin.deadline.map(|at| at as i64);
-    if reopens_at_deadline(&origin) && deadline.is_some_and(|at| at <= now) {
+    let reopen = reopens_at_deadline(&origin)
+        && origin
+            .deadline
+            .is_some_and(|deadline| deadline <= now as f64);
+    if reopen {
         return Ok(None);
     }
+    let deadline = origin.deadline.map(|at| at as i64);
     if let Some((block, cleared)) = prior {
         if block.evidence == origin.evidence {
             return Ok(cleared.is_none().then(|| block.clone()));
@@ -3110,10 +3130,7 @@ mod tests {
                         tx.claim_fence_rechecks(std::slice::from_ref(clock), clock.due_at())
                     })
                     .unwrap();
-                if matches!(
-                    clock.kind.as_str(),
-                    "observation" | "transient_route" | "pool_rate"
-                ) {
+                if matches!(clock.kind.as_str(), "observation" | "pool_rate") {
                     assert!(!claimed, "{} must reopen without a claim", clock.kind);
                     assert!(store
                         .fence_rechecks()

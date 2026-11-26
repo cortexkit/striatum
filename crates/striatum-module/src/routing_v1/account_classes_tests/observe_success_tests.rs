@@ -343,7 +343,7 @@ async fn observe_success_quota_is_shared_by_credentials_but_not_accounts() {
 }
 
 #[tokio::test]
-async fn expired_transient_backoff_reopens_all_credentials() {
+async fn observe_success_backoff_probe_heals_exact_credential() {
     let _clock = crate::InjectedClock::set(NOW);
     let h = paid_anthropic_harness();
     for credential in KEYS {
@@ -366,11 +366,12 @@ async fn expired_transient_backoff_reopens_all_credentials() {
     );
     let answer = observed(&route, &success_observation("backoff-probe", true)).await;
     assert!(
-        !answer["effects"].to_string().contains("transient_route"),
+        answer["effects"].to_string().contains("transient_route"),
         "{answer}"
     );
     let origins = h.store().fence_rechecks().unwrap();
-    assert!(origins.is_empty(), "{origins:?}");
+    assert_eq!(origins.len(), 1);
+    assert_eq!(origins[0].credential_id.as_deref(), Some(KEYS[1]));
 }
 
 async fn assert_sole_offered_block_is_timed(kind: &str) {
@@ -606,12 +607,44 @@ fn observation_rows(h: &Harness, table: &str, account: &str) -> i64 {
     .unwrap()
 }
 
+fn transient_route_rows(h: &Harness, table: &str, credential: &str) -> i64 {
+    let conn = rusqlite::Connection::open(h.store_path()).unwrap();
+    let source = if table == "block" {
+        " AND is_origin=1 AND source_present=1"
+    } else {
+        ""
+    };
+    conn.query_row(
+        &format!(
+            "SELECT count(*) FROM {table} WHERE kind='transient_route' AND origin_key=?1{source}"
+        ),
+        [json!([POOL, credential, MODEL]).to_string()],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
 #[tokio::test]
 async fn expired_observation_retires_origin_without_probe_authorizations() {
     let _clock = crate::InjectedClock::set(NOW);
     let h = paid_anthropic_harness();
     let evidence_at = NOW as i64 - 2 * 86_400_000;
     observation_backoff(&h, "live-shaped-backoff", KEYS[0], evidence_at);
+    h.store()
+        .with_writer_for_test(|conn| {
+            let (kind, key, evidence, at): (String, String, String, i64) = conn.query_row(
+                "SELECT kind,origin_key,evidence,evidence_at FROM block WHERE kind='observation'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?;
+            conn.execute(
+                "INSERT INTO probe_authorization(owner,kind,origin_key,evidence,evidence_at,claimed_at,claim_generation)
+                 VALUES ('legacy-owner',?1,?2,?3,?4,?5,1)",
+                rusqlite::params![kind, key, evidence, at, at + 1],
+            )
+        })
+        .unwrap();
+    assert_eq!(observation_rows(&h, "probe_authorization", KEYS[0]), 1);
     let route = h.bind(reserved("broca"), None).await;
     result(
         route
@@ -643,7 +676,7 @@ async fn expired_observation_retires_origin_without_probe_authorizations() {
 }
 
 #[tokio::test]
-async fn expired_observation_needs_no_claim_or_exact_credential() {
+async fn observe_success_transient_route_requires_claim_and_exact_credential() {
     let _clock = crate::InjectedClock::set(NOW);
     let h = paid_anthropic_harness();
     let route = h.bind(reserved("broca"), None).await;
@@ -654,7 +687,16 @@ async fn expired_observation_needs_no_claim_or_exact_credential() {
     );
     // Delayed evidence is older than both admissions, but only the second
     // admission is authorized to test it.
-    observation_backoff(&h, "delayed-backoff", KEYS[0], NOW as i64 - 6_000);
+    h.store()
+        .record_transient_account_route_fence(&striatum_store::AccountRouteFence {
+            provider: POOL.into(),
+            credential_id: KEYS[0].into(),
+            model: MODEL.into(),
+            until_ms: NOW as i64 - 1_000,
+            decision_id: "delayed-refusal".into(),
+            recorded_at: NOW as i64 - 6_000,
+        })
+        .unwrap();
     let _later = crate::InjectedClock::set(NOW + 1);
     result(
         route
@@ -663,6 +705,7 @@ async fn expired_observation_needs_no_claim_or_exact_credential() {
     );
     let mut wrong_credential = success_observation("actual-probe", true);
     wrong_credential["credential_id"] = json!(KEYS[1]);
+    // A different admission's successful run is not evidence for this fence.
     observed(&route, &wrong_credential).await;
     let mut sibling = single_key_request("other-credential");
     sibling["candidates"]["accounts"][0] = json!({"account_id":KEYS[1], "credential_id":KEYS[1]});
@@ -671,22 +714,23 @@ async fn expired_observation_needs_no_claim_or_exact_credential() {
     sibling_success["served_account_id"] = json!(KEYS[1]);
     sibling_success["credential_id"] = json!(KEYS[1]);
     observed(&route, &sibling_success).await;
-    observed(&route, &success_observation("not-a-probe", true)).await;
-    assert_eq!(observation_rows(&h, "retirement_tombstone", KEYS[0]), 1);
-    assert_eq!(observation_rows(&h, "block", KEYS[0]), 0);
+    assert_eq!(transient_route_rows(&h, "block", KEYS[0]), 1);
+    assert!(transient_route_rows(&h, "probe_authorization", KEYS[0]) > 0);
     assert_eq!(
         h.store()
             .fence_rechecks()
             .unwrap()
             .iter()
-            .filter(|origin| origin.kind == "observation")
+            .filter(|origin| origin.kind == "transient_route")
             .count(),
-        0
+        1
     );
     let mut valid = success_observation("actual-probe", true);
     valid["event_id"] = json!("actual-probe-valid");
     observed(&route, &valid).await;
-    assert_eq!(observation_rows(&h, "retirement_tombstone", KEYS[0]), 1);
+    assert_eq!(transient_route_rows(&h, "block", KEYS[0]), 0);
+    assert_eq!(transient_route_rows(&h, "probe_authorization", KEYS[0]), 0);
+    assert_eq!(observation_rows(&h, "retirement_tombstone", KEYS[0]), 0);
 }
 
 #[tokio::test]

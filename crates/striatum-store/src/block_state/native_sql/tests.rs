@@ -29,8 +29,8 @@ pub(super) fn origins(conn: &Connection) -> rusqlite::Result<Vec<ViewOrigin>> {
                      = 'credential-quota:'||src.origin_key||':'
                ) ELSE src.quota END,
                src.deadline,src.reset_at,
-               CASE WHEN src.kind IN ('route','provider') AND src.wall_class='transient'
-                 AND src.cooldown_until IS NOT NULL THEN 1 ELSE 0 END
+               CASE WHEN src.kind IN ('route','provider','transient_route')
+                 AND src.reason='provider_retry' THEN 1 ELSE 0 END
              FROM block src
              WHERE src.source_present=1 AND src.is_origin=1
                AND (src.cleared_by IS NULL OR src.cleared_by='kept')

@@ -70,6 +70,7 @@ pub(super) fn search_effects(
                 // Only a provider-supplied rate-limit delay expires into open
                 // admission. The default remains a probe-gated guessed pause.
                 update.wall_class = Some(RouteWallClass::Transient);
+                update.provider_retry = true;
             }
         }
         AttemptStatus::Unavailable => {

@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+//! This in-memory model does not model reopening after the provider-supplied retry time.
 //! In-memory copy of the block tables: the eleven `fence_origin` source
 //! tables, the probe clocks, route clears, probe authorizations, success
 //! pools and account eligibility.
@@ -621,16 +622,6 @@ fn decode(table: usize, r: &Row<'_>) -> rusqlite::Result<(i64, String, Option<He
             class.as_deref(),
         ))
     };
-    let mark_rate_limit =
-        |origin: &mut ViewOrigin, class_at: usize, cooldown_at: usize| -> rusqlite::Result<()> {
-            if matches!(origin.kind.as_str(), "route" | "provider") {
-                let class: Option<String> = r.get(class_at)?;
-                let cooldown: Option<f64> = r.get(cooldown_at)?;
-                origin.rate_limit_retry =
-                    class.as_deref() == Some("transient") && cooldown.is_some();
-            }
-            Ok(())
-        };
     let source = |origins: Vec<Option<ViewOrigin>>, link: Link, raw: Raw, always: bool| {
         let origins: Vec<ViewOrigin> = origins.into_iter().flatten().collect();
         (always || !origins.is_empty()).then_some(Held::Source { origins, link, raw })
@@ -702,10 +693,7 @@ fn decode(table: usize, r: &Row<'_>) -> rusqlite::Result<(i64, String, Option<He
             true,
         ),
         PROVIDER_TABLE => {
-            let mut origins = vec![slot(2)?];
-            for origin in origins.iter_mut().flatten() {
-                mark_rate_limit(origin, 22, 20)?;
-            }
+            let origins = vec![slot(2)?];
             source(
                 origins,
                 Link::Provider {
@@ -718,10 +706,7 @@ fn decode(table: usize, r: &Row<'_>) -> rusqlite::Result<(i64, String, Option<He
             )
         }
         ROUTE_TABLE => {
-            let mut origins = vec![slot(2)?, slot(17)?];
-            for origin in origins.iter_mut().flatten() {
-                mark_rate_limit(origin, 37, 35)?;
-            }
+            let origins = vec![slot(2)?, slot(17)?];
             source(
                 origins,
                 Link::Route {

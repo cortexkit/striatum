@@ -774,26 +774,26 @@ fn result(reply: (FrameType, Value)) -> Value {
 }
 
 #[tokio::test]
-async fn expired_backoff_needs_no_report_recovery_after_completed_run() {
-    assert_expired_backoff_ignores_report_recovery("completed", "unique").await;
+async fn completed_report_heals_its_admission_probe_after_completed_run() {
+    assert_later_report_heals("completed", "unique").await;
 }
 
 #[tokio::test]
-async fn expired_backoff_needs_no_report_recovery_after_interrupted_run() {
-    assert_expired_backoff_ignores_report_recovery("interrupted", "unique").await;
+async fn completed_report_heals_its_admission_probe_after_interrupted_run() {
+    assert_later_report_heals("interrupted", "unique").await;
 }
 
 #[tokio::test]
-async fn expired_backoff_ignores_ambiguous_admission_reports() {
-    assert_expired_backoff_ignores_report_recovery("completed", "ambiguous").await;
+async fn completed_report_with_ambiguous_admissions_heals_nothing() {
+    assert_later_report_heals("completed", "ambiguous").await;
 }
 
 #[tokio::test]
-async fn expired_backoff_ignores_other_login_reports() {
-    assert_expired_backoff_ignores_report_recovery("completed", "other-login").await;
+async fn completed_report_with_another_login_heals_nothing() {
+    assert_later_report_heals("completed", "other-login").await;
 }
 
-async fn assert_expired_backoff_ignores_report_recovery(earlier: &str, shape: &str) {
+async fn assert_later_report_heals(earlier: &str, shape: &str) {
     let _clock = crate::InjectedClock::set(NOW);
     let harness = paid_anthropic_harness();
     let owner = harness.bind(reserved(OWNER), None).await;
@@ -811,7 +811,11 @@ async fn assert_expired_backoff_ignores_report_recovery(earlier: &str, shape: &s
     let decision = selected["decision_id"].as_str().unwrap();
     let mut first = single_key_request("earlier-run");
     first["decision_id"] = json!(decision);
-    result(broca.call("route.account_for", &first).await);
+    let first_account = result(broca.call("route.account_for", &first).await);
+    let serving_credential = first_account["account"]["credential_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     served_attempt_and_completed_run(&broca, "earlier-run").await;
     result(
         owner
@@ -826,14 +830,17 @@ async fn assert_expired_backoff_ignores_report_recovery(earlier: &str, shape: &s
     );
 
     let _refusal = crate::InjectedClock::set(NOW + 1_000);
-    observe_ok(
-        &broca,
-        &json!({
-            "event_id":"old-transient","kind":"transient_backoff",
-            "admission_id":"earlier-run","retry_at_ms":NOW + 2_000
-        }),
-    )
-    .await;
+    harness
+        .store()
+        .record_transient_account_route_fence(&striatum_store::AccountRouteFence {
+            provider: POOL.into(),
+            credential_id: serving_credential.clone(),
+            model: MODEL.into(),
+            until_ms: NOW as i64 + 2_000,
+            decision_id: decision.into(),
+            recorded_at: NOW as i64 + 1_000,
+        })
+        .unwrap();
     let _probe = crate::InjectedClock::set(NOW + 3_000);
     let mut request = single_key_request("later-probe");
     request["decision_id"] = json!(decision);
@@ -843,7 +850,9 @@ async fn assert_expired_backoff_ignores_report_recovery(earlier: &str, shape: &s
         .store()
         .account_read(|tx| {
             let rechecks = tx.fence_rechecks()?;
-            assert!(rechecks.is_empty(), "{rechecks:?}");
+            assert_eq!(rechecks.len(), 1);
+            assert_eq!(rechecks[0].kind, "transient_route");
+            assert_eq!(rechecks[0].last_claimed_at, Some(NOW as i64 + 3_000));
             Ok(())
         })
         .unwrap();
@@ -887,8 +896,11 @@ async fn assert_expired_backoff_ignores_report_recovery(earlier: &str, shape: &s
         .account_read(|tx| {
             let remaining = tx.fence_rechecks()?;
             assert!(
-                remaining.iter().all(|origin| origin.kind != "observation"),
-                "the expired backoff was already retired before the report after {earlier}"
+                remaining
+                    .iter()
+                    .any(|origin| origin.kind == "transient_route")
+                    == (shape != "unique"),
+                "only an unambiguous serving run can settle its admission probe after {earlier}"
             );
             assert_eq!(
                 tx.report_credential_refusals()?.len(),
@@ -900,12 +912,17 @@ async fn assert_expired_backoff_ignores_report_recovery(earlier: &str, shape: &s
         .unwrap();
     if shape == "unique" {
         let _newer = crate::InjectedClock::set(NOW + 4_000);
-        observe_ok(
-            &broca,
-            &json!({"event_id":"new-transient","kind":"transient_backoff",
-                "admission_id":"later-probe","retry_at_ms":NOW+5_000}),
-        )
-        .await;
+        harness
+            .store()
+            .record_transient_account_route_fence(&striatum_store::AccountRouteFence {
+                provider: POOL.into(),
+                credential_id: serving_credential,
+                model: MODEL.into(),
+                until_ms: NOW as i64 + 5_000,
+                decision_id: decision.into(),
+                recorded_at: NOW as i64 + 4_000,
+            })
+            .unwrap();
         result(owner.call("route.report", &report).await);
         harness
             .store()
@@ -913,7 +930,7 @@ async fn assert_expired_backoff_ignores_report_recovery(earlier: &str, shape: &s
                 assert!(
                     tx.fence_rechecks()?
                         .iter()
-                        .any(|origin| origin.kind == "observation"),
+                        .any(|origin| origin.kind == "transient_route"),
                     "duplicate report delivery cannot heal new evidence"
                 );
                 Ok(())

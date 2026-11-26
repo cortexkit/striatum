@@ -18,7 +18,7 @@ impl World {
                 store,
                 POOL_PROVIDER,
                 &credential,
-                PoolWallKind::RateLimited,
+                PoolWallKind::Billing,
                 now + 5_000,
                 "capacity",
                 now,
@@ -43,15 +43,19 @@ impl World {
         let PoolAcquireOutcome::Leased(lease) = outcome else {
             panic!("due pool probe did not get a lease: {outcome:?}");
         };
-        self.command("pool/expired rate limit has no probe clock", move |tx| {
+        self.command("pool/claimed clock is durable", move |tx| {
             let clocks = tx.working_blocks()?.unwrap().blocks(now).unwrap().blocks;
             assert!(
-                clocks.iter().all(|clock| clock.kind != "pool_rate"),
-                "the expired pool rate limit still holds a probe clock: {clocks:?}"
+                clocks.iter().any(|clock| {
+                    clock.scope.provider == POOL_PROVIDER
+                        && clock.last_claimed_at == Some(now)
+                        && clock.claim_generation > 0
+                }),
+                "the granted pool lease holds no probe generation: {clocks:?}"
             );
             Ok(())
         });
-        self.witness("pool_rate_reopen");
+        self.witness("probe_claim");
         self.witness("pool_lease_claim");
         self.ok(Caller::Operator,"route.pool_renew",json!({"provider":POOL_PROVIDER,"session":session,"leaseId":lease.lease_id,"credentialId":lease.credential_id})).await;
         let serving_credential = lease.credential_id.clone();
@@ -67,6 +71,67 @@ impl World {
             )
         });
         self.adapter("pool/release claimed lease", |store| {
+            writer::pool_release(
+                store,
+                POOL_PROVIDER,
+                &session,
+                Some(&lease.lease_id),
+                true,
+                now,
+            )
+        });
+        self.pool_rate_reopen_group(nonce).await;
+    }
+
+    async fn pool_rate_reopen_group(&mut self, nonce: u64) {
+        let now = i64::try_from(self.now).unwrap();
+        let listed = self
+            .catalog
+            .accounts
+            .iter()
+            .find(|row| row.provider == POOL_PROVIDER)
+            .unwrap();
+        let (credential, account) = (listed.credential_id.clone(), listed.account_id.clone());
+        self.adapter("pool/rate-limit retry-after", |store| {
+            writer::pool_wall(
+                store,
+                POOL_PROVIDER,
+                &credential,
+                PoolWallKind::RateLimited,
+                now + 5_000,
+                "capacity",
+                now,
+            )
+        });
+        self.advance(5_001);
+        let now = i64::try_from(self.now).unwrap();
+        let session = format!("native-pool-reopen-{nonce}-{}", self.sequence);
+        let owned_session = session.clone();
+        let outcome = self.command("pool/acquire after rate-limit expiry", move |tx| {
+            let keys = [PoolKey::new(&credential, Some(&account), "active")];
+            tx.pool_acquire(&PoolAcquire {
+                provider: POOL_PROVIDER,
+                session_id: &owned_session,
+                keys: &keys,
+                now_ms: now,
+                lease_ms: 120_000,
+                affinity_idle_ms: 120_000,
+            })
+        });
+        let PoolAcquireOutcome::Leased(lease) = outcome else {
+            panic!("expired rate limit did not reopen the pool: {outcome:?}");
+        };
+        self.command("pool/rate-limit expiry left no probe", move |tx| {
+            let clocks = tx.working_blocks()?.unwrap().blocks(now).unwrap().blocks;
+            assert!(
+                clocks.iter().all(|clock| clock.kind != "pool_rate"),
+                "the expired pool rate limit still holds a probe clock: {clocks:?}"
+            );
+            Ok(())
+        });
+        self.witness("pool_rate_reopen");
+        self.witness("pool_lease_claim");
+        self.adapter("pool/release reopened lease", |store| {
             writer::pool_release(
                 store,
                 POOL_PROVIDER,

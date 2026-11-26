@@ -494,11 +494,19 @@ impl BlockState {
     /// Whether an expiring provider-supplied pause needs the writer's
     /// retirement pass. Ordinary admissions avoid that work entirely.
     pub fn has_expired_rate_limit(&self, now: i64) -> bool {
-        self.source_origins().into_iter().any(|origin| {
-            crate::fence_rechecks::reopens_at_deadline(&origin)
-                && origin
+        self.block_rows().any(|row| {
+            row.source_present
+                && row.is_origin()
+                && row.block.lifetime == striatum_core::blocks::LifetimeClass::NonQuota
+                && (matches!(row.block.kind.as_str(), "observation" | "pool_rate")
+                    || (matches!(
+                        row.block.kind.as_str(),
+                        "route" | "provider" | "transient_route"
+                    ) && row.reason.as_deref()
+                        == Some(crate::block_storage::PROVIDER_RETRY_REASON)))
+                && row
                     .deadline
-                    .is_some_and(|deadline| deadline <= now as f64)
+                    .is_some_and(|deadline| deadline.as_f64() <= now as f64)
         })
     }
 

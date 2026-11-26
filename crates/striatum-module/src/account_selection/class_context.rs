@@ -73,8 +73,6 @@ pub(crate) enum ProbeBinding {
 #[derive(Clone, Debug)]
 pub(crate) struct AccountBlock {
     pub reset_at_ms: Option<i64>,
-    /// When to check again if another request is testing whether the account can serve traffic.
-    pub test_check_at_ms: Option<i64>,
     pub lifetime: striatum_core::blocks::LifetimeClass,
     pub credential_code: Option<String>,
 }
@@ -82,9 +80,6 @@ pub(crate) struct AccountBlock {
 impl AccountBlock {
     pub(crate) fn retry_at_ms(&self) -> Option<i64> {
         self.reset_at_ms
-            .into_iter()
-            .chain(self.test_check_at_ms)
-            .min()
     }
 }
 

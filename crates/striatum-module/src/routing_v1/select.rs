@@ -2231,12 +2231,6 @@ async fn select_at_tier_attempt(
                     ));
                 }
             }
-            let test_in_flight = no_route.earliest_reset_route.as_ref().is_some_and(|key| {
-                account_blocks.get(key).is_some_and(|block| {
-                    block.test_check_at_ms.map(|at| at as f64) == no_route.earliest_reset
-                        && block.test_check_at_ms.is_some()
-                })
-            });
             // Account preflight is separate from model scoring. Only name an
             // account block when an otherwise adequate, policy-allowed model
             // would have been selected without that block. One such route is
@@ -2310,18 +2304,13 @@ async fn select_at_tier_attempt(
                         reset
                     },
                 );
-                if test_in_flight {
-                    refusal.message = IN_FLIGHT_TEST_MESSAGE.into();
-                } else if no_route.earliest_reset.is_some() {
+                if no_route.earliest_reset.is_some() {
                     refusal.message =
                         format!("{}: {}", refusal.message, no_route.refusal_message());
                 }
                 return Err(refusal);
             }
-            let mut refusal = no_route_refusal(&no_route, now);
-            if test_in_flight {
-                refusal.message = IN_FLIGHT_TEST_MESSAGE.into();
-            }
+            let refusal = no_route_refusal(&no_route, now);
             return Err(refusal);
         }
     };
@@ -3476,7 +3465,6 @@ impl<'a> Selection<'a> {
             }
             let reserve_limited =
                 code == "subscription_reserve" || cause.as_deref() == Some("subscription_reserve");
-            let mut test_in_flight = false;
             let (mut reason, mut reset) =
                 pin_reason(code, &snapshot, &pin_key, &pin_capacity, self.now);
             let unknown = reason == PinUnavailableReason::NotAvailable;
@@ -3501,8 +3489,6 @@ impl<'a> Selection<'a> {
                 );
                 if let Some(block) = recovery {
                     reason = account_block_pin_reason(&block);
-                    test_in_flight = block.test_check_at_ms.is_some()
-                        && block.test_check_at_ms == block.reset_at_ms;
                     reset = block
                         .reset_at_ms
                         .and_then(|reset| u64::try_from(reset).ok());
@@ -3518,9 +3504,6 @@ impl<'a> Selection<'a> {
                 // Availability's specific cause lives in the private refusal's
                 // message, not its generic code. Keep it even without a retry time.
                 refusal.message = message;
-            }
-            if test_in_flight {
-                refusal.message = IN_FLIGHT_TEST_MESSAGE.into();
             }
             refusal
         };
@@ -3602,10 +3585,6 @@ impl<'a> Selection<'a> {
                         self.priced_per_token,
                     )
                 });
-                let test_in_flight = block.as_ref().is_some_and(|block| {
-                    block.test_check_at_ms.is_some()
-                        && block.test_check_at_ms.map(|at| at as u64) == refusal.wait_until_ms()
-                });
                 let mut pin_refusal = Refusal::pin_unavailable(
                     pin,
                     block
@@ -3617,9 +3596,6 @@ impl<'a> Selection<'a> {
                 pin_refusal.message = "No account can serve the pinned route right now. \
                     The detail gives the reason and, when known, the time to retry."
                     .into();
-                if test_in_flight {
-                    pin_refusal.message = IN_FLIGHT_TEST_MESSAGE.into();
-                }
                 return Err(pin_refusal);
             }
         }
@@ -3833,19 +3809,14 @@ impl<'a> Selection<'a> {
                         self.priced_per_token,
                     )
                 });
-                let test_check = block.as_ref().and_then(|block| block.test_check_at_ms);
-                let reset = refusal.reset_at_ms.into_iter().chain(test_check).min();
-                let mut refusal = if block.as_ref().is_some_and(|block| {
+                let reset = refusal.reset_at_ms;
+                let refusal = if block.as_ref().is_some_and(|block| {
                     block.lifetime == striatum_core::blocks::LifetimeClass::NonQuota
                 }) {
                     account_limit_refusal(None, reset)
                 } else {
                     quota_account_limit_refusal(None, reset, self.now as u64)
                 };
-                if test_check.is_some() && test_check.map(|at| at as u64) == refusal.wait_until_ms()
-                {
-                    refusal.message = IN_FLIGHT_TEST_MESSAGE.into();
-                }
                 refusal
             } else {
                 provider_refusal(&refusal.code, refusal.message)
@@ -3923,9 +3894,6 @@ fn clone_scoring_snapshot(snapshot: &ModelRouteStateSnapshot) -> ModelRouteState
     tests::SCORING_SNAPSHOT_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     snapshot.clone()
 }
-
-pub(super) const IN_FLIGHT_TEST_MESSAGE: &str =
-    "An account that can serve this request is being tested. Check again shortly.";
 
 /// Select exposes account limits as route refusals; account admission's private
 /// codes and diagnostic messages are not a retry protocol for select callers.

@@ -22,15 +22,13 @@ impl ClassContext {
             {
                 if code == "account_pool_exhausted" {
                     let reset = detail.and_then(|detail| detail["reset_at_ms"].as_i64());
-                    let mut block = self.account_block_at(
+                    let block = self.account_block_at(
                         provider,
                         model,
                         priced,
                         reset,
                         striatum_core::blocks::LifetimeClass::NonQuota,
                     );
-                    block.test_check_at_ms =
-                        self.in_flight_test_check_at(provider, model, priced, policy, None);
                     return Some(block);
                 }
             }
@@ -64,15 +62,13 @@ impl ClassContext {
         let reset = reset.into_iter().chain(fenced.values().copied()).min();
         // The allocator recovery above comes only from typed quota exclusions.
         // A route or credential origin at that recovery may instead be non-quota.
-        let mut block = self.account_block_at(
+        let block = self.account_block_at(
             provider,
             model,
             priced,
             reset,
             striatum_core::blocks::LifetimeClass::Quota,
         );
-        block.test_check_at_ms =
-            self.in_flight_test_check_at(provider, model, priced, policy, None);
         Some(block)
     }
 
@@ -157,7 +153,8 @@ impl ClassContext {
                             })
                             .collect();
                         !origin.quota
-                            && (admission.is_none() || matches!(origin.kind.as_str(), "route"))
+                            && (admission.is_none()
+                                || matches!(origin.kind.as_str(), "route" | "transient_route"))
                             && origin.due_at() > self.now_ms
                             && !(self.probe_owner.is_some()
                                 && (origin.claim_owner == self.probe_owner
@@ -226,7 +223,6 @@ impl ClassContext {
         use striatum_core::blocks::LifetimeClass;
         let mut block = AccountBlock {
             reset_at_ms,
-            test_check_at_ms: None,
             lifetime: fallback,
             credential_code: None,
         };

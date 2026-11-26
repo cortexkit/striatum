@@ -8,6 +8,9 @@ use striatum_core::blocks::Block;
 
 pub(crate) mod keyed_updates;
 
+/// Stored only when the provider supplied the exact rate-limit retry time.
+pub(crate) const PROVIDER_RETRY_REASON: &str = "provider_retry";
+
 // Keep SQL's loaded-row boundary identical to StoredBlock::held(). Inactive
 // audit history must never be decoded by an admission or periodic state check.
 pub(crate) const HELD_SQL: &str =
@@ -277,7 +280,9 @@ fn source_insert_sql(kind: &str) -> String {
         evidence=excluded.evidence,observation_id=excluded.observation_id,pool_key_json=excluded.pool_key_json,
         deadline=excluded.deadline,reset_at=excluded.reset_at,observed_at=excluded.observed_at,created_at=excluded.created_at,
         recorded_at=excluded.recorded_at,last_reported_at=excluded.last_reported_at,cooldown_until=excluded.cooldown_until,
-        quota_exhausted_until=excluded.quota_exhausted_until,reason=excluded.reason,code=excluded.code,
+        quota_exhausted_until=excluded.quota_exhausted_until,
+        reason=CASE WHEN excluded.kind IN ('route','provider') THEN COALESCE(excluded.reason,block.reason) ELSE excluded.reason END,
+        code=excluded.code,
         wall_class=excluded.wall_class,wall_unscoped=excluded.wall_unscoped,scope_error=excluded.scope_error,
         listing_fingerprint=excluded.listing_fingerprint,recovery_set_json=excluded.recovery_set_json,
         source_metadata_json=excluded.source_metadata_json,cleared_reason=excluded.cleared_reason,
@@ -449,7 +454,7 @@ impl StoredBlock {
             last_reported_at: None,
             cooldown_until: rate_limit_cooldown.map(SqlReal::from),
             quota_exhausted_until: None,
-            reason: None,
+            reason: rate_limit_retry.then(|| PROVIDER_RETRY_REASON.into()),
             code: None,
             wall_class: rate_limit_retry.then(|| "transient".into()),
             is_origin: true,
@@ -494,9 +499,10 @@ impl StoredBlock {
             quota: Some(self.block.lifetime == striatum_core::blocks::LifetimeClass::Quota),
             deadline: self.deadline.map(Deadline::as_f64),
             reset_at: self.reset_at.map(SqlReal::as_f64),
-            rate_limit_retry: matches!(self.block.kind.as_str(), "route" | "provider")
-                && self.wall_class.as_deref() == Some("transient")
-                && self.cooldown_until.is_some(),
+            rate_limit_retry: matches!(
+                self.block.kind.as_str(),
+                "route" | "provider" | "transient_route"
+            ) && self.reason.as_deref() == Some(PROVIDER_RETRY_REASON),
         }
     }
 }
@@ -715,6 +721,10 @@ pub(crate) fn account_route_source(
     row.recorded_at = Some(fence.recorded_at);
     row.last_reported_at = reported;
     row.wall_class = Some(class.into());
+    if kind == "transient_route" {
+        // No current producer of this kind carries a provider retry time.
+        row.reason = Some(String::new());
+    }
     row.meta = Meta::Route(RouteMeta {
         decision_id: fence.decision_id.clone(),
     });
@@ -733,6 +743,8 @@ pub(crate) struct WallSource<'a> {
     pub error: Option<&'a str>,
     pub class: Option<&'a str>,
     pub unscoped: bool,
+    pub provider_retry: bool,
+    pub new_wall: bool,
 }
 
 pub(crate) fn wall_source(
@@ -762,6 +774,7 @@ pub(crate) fn wall_source(
         evidence_at: wall.observed_at,
         quota: Some(false),
         deadline: Some(deadline.as_f64()),
+        rate_limit_retry: wall.provider_retry,
         ..Default::default()
     })?;
     row.deadline = Some(deadline);
@@ -771,6 +784,13 @@ pub(crate) fn wall_source(
     row.scope_error = wall.error.map(str::to_owned);
     row.wall_class = wall.class.map(str::to_owned);
     row.wall_unscoped = wall.unscoped;
+    if wall.new_wall {
+        row.reason = Some(if wall.provider_retry {
+            PROVIDER_RETRY_REASON.into()
+        } else {
+            String::new()
+        });
+    }
     Ok(Some(row))
 }
 

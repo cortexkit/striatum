@@ -1091,18 +1091,24 @@ impl crate::AccountTx<'_> {
                     let wall_observed=if new_wall {Some(updated_at)} else {inherited.wall_observed_at};
                     let error=last_error.as_deref().or(inherited.last_error.as_deref());
                     let error_at=if last_error.is_some() {Some(updated_at)} else {inherited.last_error_at};
-                    let class=update.wall_class.map(RouteWallClass::as_str).or(inherited.wall_class.as_deref());
+                    let class = if new_wall && update.overwrite_wall_class {
+                        update.wall_class.map(RouteWallClass::as_str)
+                    } else {
+                        update.wall_class.map(RouteWallClass::as_str).or(inherited.wall_class.as_deref())
+                    };
                     let unscoped=if new_wall {update.unscoped_wall} else {inherited.wall_unscoped};
                     if fence_rechecks::quarantined_row(unscoped,error,class) {
                         tx.execute("DELETE FROM block WHERE kind='route' AND is_origin=1 AND origin_key=json_array(?1)",[&inherited.route_key])?;
                     } else if let Some(row)=block_storage::wall_source(tx,block_storage::WallSource {
                         kind:"route",key:&inherited.route_key,provider:&provider_key,model:Some(&inherited.model_id),cooldown:cooldown_until,exhausted:quota_exhausted_until,
                         wall_observed,observed_at:wall_observed.or(error_at).unwrap_or(updated_at),error,class,unscoped,
+                        provider_retry:update.provider_retry,new_wall,
                     })? {block_storage::write_source(tx,&row)?;}
                 }
                 if let Some(row)=block_storage::wall_source(tx,block_storage::WallSource {
                     kind:"provider",key:&provider_key,provider:&provider_key,model:None,cooldown:cooldown_until,exhausted:quota_exhausted_until,
                     wall_observed,observed_at:source_at,error:last_error.as_deref(),class:wall_class.map(RouteWallClass::as_str),unscoped,
+                    provider_retry:update.provider_retry,new_wall,
                 })? {block_storage::write_source(tx,&row)?;}
                 let inherited=serde_json::to_string(&inherited.iter().map(|row|&row.route_key).collect::<Vec<_>>()).map_err(|e|rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
                 // A repeated refusal replaces the previous provider deadlines
@@ -1289,6 +1295,7 @@ impl crate::AccountTx<'_> {
                     kind:"route",key:route_key,provider:&provider_id,model:Some(&model_id),cooldown:cooldown_until,exhausted:quota_exhausted_until,
                     wall_observed,observed_at:wall_observed.or(last_error_at).unwrap_or(observed_at),error:last_error.as_deref(),
                     class:wall_class.map(RouteWallClass::as_str),unscoped,
+                    provider_retry:update.provider_retry,new_wall,
                 })? {block_storage::write_source(tx,&row)?;}
                 if new_wall {
                     tx.execute("UPDATE model_route_state SET wall_observed_at=?2 WHERE route_key=?1",params![route_key,observed_at])?;
@@ -1425,6 +1432,7 @@ impl crate::AccountTx<'_> {
                         if let Some(row)=block_storage::wall_source(tx,block_storage::WallSource {
                             kind:"route",key:&route_key,provider:&provider_id,model:Some(&model_id),cooldown:None,exhausted:Some(quota_exhausted_until),
                             wall_observed:Some(update.observed_at_ms),observed_at:update.observed_at_ms,error:Some(&surfaced_error),class:prior_class.as_deref(),unscoped:true,
+                            provider_retry:false,new_wall:true,
                         })? {block_storage::write_source(tx,&row)?;}
                     }
                 }

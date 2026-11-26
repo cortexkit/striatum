@@ -124,6 +124,9 @@ pub struct RouteStateUpdate {
     /// Replace the previous wall class with `wall_class` when this update
     /// carries new wall evidence, rather than inheriting a missing class.
     pub overwrite_wall_class: bool,
+    /// The provider supplied this exact rate-limit retry deadline. Legacy
+    /// cooldown reports never set this: their duration is only a local guess.
+    pub provider_retry: bool,
     pub quota_pressure: Option<f64>,
     pub latency_ema_ms: Option<f64>,
     pub success_ema: Option<f64>,

@@ -493,7 +493,7 @@ fn result(reply: OpReply) -> Value {
 }
 
 #[test]
-fn established_affinity_reopens_to_a_distinct_request_after_transient_deadline() {
+fn established_affinity_prepared_before_a_transient_claim_cannot_double_send() {
     let rig = fixture("established-transient-interleaving");
     let mut request = admit_params("first", "established-transient", "broca");
     request["candidates"] = json!({"view_digest":"runner-view","accounts":[{
@@ -539,11 +539,15 @@ fn established_affinity_reopens_to_a_distinct_request_after_transient_deadline()
     let origins = rig.store().fence_rechecks().unwrap();
     assert!(origins
         .iter()
-        .all(|origin| origin.kind != "transient_route"));
+        .any(|o| o.kind == "transient_route" && o.due_at() == NOW));
+    assert!(rig
+        .store()
+        .account_transaction(|tx| tx.grant_fence_rechecks(&origins, NOW, Some("winner")))
+        .unwrap());
     request["admission_id"] = json!("distinct-second");
     request["expected_pin"] = first["pin"].clone();
     let parsed = parse_account_for(&request).unwrap();
-    let admitted = rig
+    let reply = rig
         .store()
         .account_transaction(|tx| {
             serve(
@@ -557,19 +561,27 @@ fn established_affinity_reopens_to_a_distinct_request_after_transient_deadline()
             )
         })
         .unwrap();
-    let admitted = result(admitted);
-    assert_eq!(admitted["account"]["account_id"], ACCOUNT_A);
-    assert_eq!(admitted["pin"]["id"], first["pin"]["id"]);
-    assert_eq!(admitted["pin"]["generation"], first["pin"]["generation"]);
-    assert!(rig
-        .store()
-        .account_read(|tx| tx.admission(BROCA, "distinct-second"))
-        .unwrap()
-        .is_some());
+    match reply {
+            OpReply::Error { code, detail, .. } => {
+                assert_eq!(code, "account_hold");
+                let held = detail.unwrap();
+                assert_eq!(held["account"]["account_id"], ACCOUNT_A);
+                assert_eq!(held["reset_at"], rfc3339(NOW+3_600_000));
+                assert_eq!(held["pin"], json!({"id":first["pin"]["id"],"generation":first["pin"]["generation"]}));
+            }
+            other => panic!("the unchanged started affinity must hold after another request claims its due origin: {other:?}"),
+        }
+    assert!(
+        rig.store()
+            .account_read(|tx| tx.admission(BROCA, "distinct-second"))
+            .unwrap()
+            .is_none(),
+        "the losing interleaving cannot commit a second admission"
+    );
 }
 
 #[test]
-fn established_affinity_reopens_all_decisions_after_transient_deadline() {
+fn established_affinity_consumes_its_decisions_transient_probe_once() {
     use striatum_core::{DecisionInput, RouteStateStore};
 
     for class_aware in [true, false] {
@@ -614,9 +626,11 @@ fn established_affinity_reopens_all_decisions_after_transient_deadline() {
         let decision = rig.store().record_decision(&input).unwrap();
         let other_decision = rig.store().record_decision(&input).unwrap();
         let origins = rig.store().fence_rechecks().unwrap();
-        assert!(origins
-            .iter()
-            .all(|origin| origin.kind != "transient_route"));
+        assert_eq!(origins.len(), 1);
+        assert!(rig
+            .store()
+            .account_transaction(|tx| tx.grant_fence_rechecks(&origins, NOW, Some(&decision)))
+            .unwrap());
         let shared = Arc::new(Mutex::new(
             crate::broca_credentials::BrocaCredentials::api_test_credentials(&[fact]),
         ));
@@ -646,8 +660,11 @@ fn established_affinity_reopens_all_decisions_after_transient_deadline() {
         request["expected_pin"] = first["pin"].clone();
         request["admission_id"] = json!("other-owner");
         request["model_decision_id"] = json!(other_decision);
-        let other = result(rig.call(&ctx, ACCOUNT_FOR_OP, BROCA, request.clone()));
-        assert_eq!(other["account"]["account_id"], ACCOUNT_A);
+        assert_eq!(
+            rig.call(&ctx, ACCOUNT_FOR_OP, BROCA, request.clone())
+                .code(),
+            Some("account_hold"),
+        );
 
         request["model_decision_id"] = json!(decision);
         request["admission_id"] = json!("owned-probe");
@@ -655,22 +672,26 @@ fn established_affinity_reopens_all_decisions_after_transient_deadline() {
         assert_eq!(admitted["account"]["account_id"], ACCOUNT_A);
         assert_eq!(admitted["pin"]["id"], first["pin"]["id"]);
         assert_eq!(admitted["pin"]["generation"], first["pin"]["generation"]);
-        assert!(rig
-            .store()
-            .fence_rechecks()
-            .unwrap()
-            .iter()
-            .all(|origin| origin.kind != "transient_route"));
+        assert!(rig.store().fence_rechecks().unwrap()[0]
+            .claim_owner
+            .is_none());
         request["admission_id"] = json!("owned-probe-again");
-        let repeated = result(rig.call(&ctx, ACCOUNT_FOR_OP, BROCA, request));
-        assert_eq!(repeated["account"]["account_id"], ACCOUNT_A);
-        for id in ["other-owner", "owned-probe", "owned-probe-again"] {
+        assert_eq!(
+            rig.call(&ctx, ACCOUNT_FOR_OP, BROCA, request).code(),
+            Some("account_hold"),
+        );
+        for id in ["other-owner", "owned-probe-again"] {
             assert!(rig
                 .store()
                 .account_read(|tx| tx.admission(BROCA, id))
                 .unwrap()
-                .is_some());
+                .is_none());
         }
+        assert!(rig
+            .store()
+            .account_read(|tx| tx.admission(BROCA, "owned-probe"))
+            .unwrap()
+            .is_some());
     }
 }
 
