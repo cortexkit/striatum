@@ -217,3 +217,9 @@ also exercises a copy of the exhaustion body without the two reset members.
 | --- | --- |
 | `route-limit-fable-v1/admission_started.json` | `6c5cde0c334d0e1781b52f7025c116afe40f9ec815626aaa126f6a8bb5bd4f9a` |
 | `route-limit-fable-v1/account_limit_exhausted.json` | `e340131fd015890770c01c77d4d7fe91d9eb06138d67ae6c6346506112a4955d` |
+
+## Fusiform models.dev v2 reader check
+
+| Imported path | Source | SHA-256 |
+| --- | --- | --- |
+| `served-payloads-710f929f.json` | Fusiform `710f929f`, `crates/fusiform-module/fixtures/served-payloads.json` | `cdb5589a6d054ff5a0e1887dcaa7f78025f0b96ab0903f7eb0a74d6404eb2ce9` |

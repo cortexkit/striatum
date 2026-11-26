@@ -8,6 +8,10 @@ use std::{
 };
 use tokio::time::Instant;
 
+#[cfg(test)]
+#[path = "served_payload_tests.rs"]
+mod served_payload_tests;
+
 static READ_WARNING: Once = Once::new();
 static UNSUPPORTED_WARNING: Once = Once::new();
 const RETRY_AFTER: Duration = Duration::from_secs(30);
