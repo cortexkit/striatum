@@ -24,15 +24,15 @@ in a `result` or `error` envelope.
 
 | Filename stem | Declaration / request | Answer |
 | --- | --- | --- |
-| `basal-flow` | Basal declares `basal.flow` with `placement: {module: "broca"}` and no demand default. Per-call IQ 50, `tools: "none"`, and exact `eligible_routes` narrow the call. | Broca, even though another runner appears first in settings. No `runner.harness`: today's harness-less Broca shape. |
-| `pinned` | The same declared Basal demand, explicitly pinned to `example-provider/model-a`. | The pinned route on Broca, with `pin_outcome: "pinned"`. |
-| `magic-context-summary` | Magic Context declares `magic-context.summary`, IQ 40 and `placement: "caller_runner"`. The request omits IQ and sends `tools: "none"` and `runners: ["broca"]`. | The non-runner attested caller `reserved:magic-context` resolves to the single catalog runner Broca. Resolved IQ is 40. |
+| `basal-flow` | The flow consumer declares `basal.flow` with `placement: {module: "broca"}` and no demand default. Per-call IQ 50, `tools: "none"`, and exact `eligible_routes` narrow the call. | The worker runner, even though another runner appears first in settings. No `runner.harness`: the declaration has no harness facts. |
+| `pinned` | The same declared flow-consumer demand, explicitly pinned to `example-provider/model-a`. | The pinned route on the worker runner, with `pin_outcome: "pinned"`. |
+| `magic-context-summary` | Magic Context declares `magic-context.summary`, IQ 40 and `placement: "caller_runner"`. The request omits IQ and sends `tools: "none"` and `runners: ["broca"]`. | The non-runner attested caller `reserved:magic-context` resolves to the single catalog worker runner. Resolved IQ is 40. |
 | `price-metered` | Pin `example-provider/model-a`. | `basis: "metered"`, catalog list rates, no multiplier. |
 | `price-subscription-5m-1h` | Pin `example-subscription/model-c`, with twenty completed tasks in real usage history for `example_summary` at IQ 50. | `basis: "subscription_equivalent"`, multiplier 22, `5m` / `1h` cache-write lifetimes, and `estimated_task_usd: 0.009272727272727273` together. |
 | `price-subscription-30m-12h` | The same subscription route, with different stand-in catalog rates. | Multiplier 22 and `30m` / `12h` lifetimes, preserving catalog lifetime names. |
 | `price-unpriced` | Pin the metered route with all catalog rates removed. | No `price`, not a zero-price quote. A dollar-capped caller must refuse to send without a price. |
 | `decision-harness` | Request `harness: "sample-harness"` on a runner declaring that harness. | `runner.module: "sample-harness-runner"`, `runner.harness: "sample-harness"`. |
-| `broca-harness` | The same Basal demand as `basal-flow`, with Broca's real after-slot installed verbatim from `crates/striatum-module/src/routing_v1/runners/broca-runner-slot.after.json`. | `runner.module: "broca"`, `runner.harness: "broca"`. This is the shape core sees once Broca switches its harness facts on. |
+| `broca-harness` | The same flow-consumer demand as `basal-flow`, with the worker runner's real after-slot installed verbatim from `crates/striatum-module/src/routing_v1/runners/broca-runner-slot.after.json`. | `runner.module: "broca"`, `runner.harness: "broca"`. This is the shape the caller sees when the worker runner publishes harness facts. |
 | `caller-runner-unresolved` | Magic Context's declared `caller_runner` consumer, selected by its owner with `runners: []`. | Error frame: `no_route`, `detail.reason: "caller_runner_unresolved"`, no `reset_at_ms`. |
 | `consumer-not-owned` | The same owned consumer, selected by `reserved:unrelated-caller`, which is neither the owner nor a declared selector. | Error frame: `consumer_not_owned`. |
 
@@ -61,8 +61,7 @@ case: the attested caller is not a runner. This identity comes from the bound
 route, not from any request-body claim.
 
 The annotated tag for this set is `route-select-declared-vectors-v1.0`, following
-the `route-head-choices-vectors-v1.1` naming scheme. The maintainer sets it on
-merged main during deployment checks. This slice does not create the tag.
+the `route-head-choices-vectors-v1.1` naming scheme.
 
 ## Regeneration and verification
 
@@ -73,8 +72,7 @@ UPDATE_ROUTE_SELECT_DECLARED_VECTORS=1 cargo nextest run --locked -p striatum-mo
 ```
 
 For a remote build with read-only synced sources, run regeneration in a writable
-scratch copy. Copy the twenty-two JSON files and `SHA256SUMS` to a new output
-directory, return those paths, then install the files here locally. Only the
+checkout and copy the twenty-two JSON files and `SHA256SUMS` into this directory. Only the
 update environment variable permits writing generated files; it does not rewrite
 this README. Without it, the same test generates samples in memory and fails on
 any byte or digest difference, and rejects unlisted files by name.

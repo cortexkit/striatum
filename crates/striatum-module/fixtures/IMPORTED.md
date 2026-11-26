@@ -1,7 +1,7 @@
 # Imported consumer fixtures
 
 These byte-for-byte contract snapshots keep routing tests independent of the
-former workspace. Source: prefrontal commit
+producer checkout. Source: the agent runtime's repository at commit
 `3de63a65ddde07b09128808f24d0f8a54da60072`. The root `test-vectors/route-*`
 folders are routing-produced samples; these are frozen consumer inputs.
 
@@ -29,51 +29,51 @@ folders are routing-produced samples; these are frozen consumer inputs.
 
 ## Captured daemon catalog
 
-`2026-11-10-daemon-catalog.json` is trimmed to only colliculus's complete module
-entry, copied verbatim from the `ck --json catalog` capture supplied on
-10 November 2026, around 13:06 UTC. The original source artifact is
-`.cortexkit/internal-docs/research/2026-11-10-daemon-catalog.json`, with SHA-256
+`2026-11-10-daemon-catalog.json` is trimmed to only the voice module's complete
+module entry, copied verbatim from the `ck --json catalog` capture supplied on
+10 November 2026, around 13:06 UTC. The original source artifact had SHA-256
 `2e15ab501a348b95e60d827394cd3b52fcc9ecb1609fc2e085af3c26917b36e9`.
 The entry is wrapped in a full `catalog.list` reply envelope with fixture
 generation 1 and an empty daemon-operation list (`subc_ops`). The engine
 regression decodes that reply through the pinned catalog client's actual reply
-type before replacing routing's catalog and selecting both colliculus
+type before replacing routing's catalog and selecting both voice-module
 transcription engines. No other module entries are retained.
 
-## Colliculus realtime dictation and voice-front declarations
+## Voice-module realtime dictation and voice-front declarations
 
 `colliculus-5b/` preserves the supplied declaration snapshots byte for byte from
-Colliculus commit `5ccd00f69eb93d7515b4e3b45938ca751bf00098`. The source directory was
-`CortexKit-scratch/shared-striatum-readers/colliculus-5b/`. Its `PROVENANCE.txt`
+the voice module's repository at commit `5ccd00f69eb93d7515b4e3b45938ca751bf00098`.
+Its `PROVENANCE.txt`
 records generation by `service::sets::tests::write_declaration_goldens`, using the
 real handler and manifest with priced, keyed model rows,
 including `gpt-realtime-2.1`.
 
 Before import, the supplied `SHA256SUMS` was verified against the independently
 provided digest below, then every artifact was checked against that manifest.
-The manifest and provenance are retained alongside the JSON inputs.
+The manifest and provenance are retained alongside the JSON inputs. The prose
+provenance and manifest were edited for publication; the JSON samples are
+unchanged (upstream provenance SHA-256 `34332247a2606f54598ae67a89929f990af41a79fdcaf0b84efa42fc55457b0c`,
+upstream manifest SHA-256 `4c74fa6cff5438da8e0b98a87e80a1365e778aa2063d098d647a9d24ebcd574a`).
 
 | Imported path | SHA-256 |
 | --- | --- |
 | `colliculus-5b/routing-v1-declaration.json` | `be5266ca59b114e19dc9bebead17d816f7a30268c7bdce67b55b10068ac1a508` |
 | `colliculus-5b/media-role-describe.json` | `4f9856a6c68ac918e645b2cef2419b17625469b61cfbc64b11723a6991d5e7cd` |
-| `colliculus-5b/PROVENANCE.txt` | `34332247a2606f54598ae67a89929f990af41a79fdcaf0b84efa42fc55457b0c` |
-| `colliculus-5b/SHA256SUMS` | `4c74fa6cff5438da8e0b98a87e80a1365e778aa2063d098d647a9d24ebcd574a` |
+| `colliculus-5b/PROVENANCE.txt` | `706fae69ed30820beffb783265f9e742c24d10f653804d169fd25ddf748b22bb` |
+| `colliculus-5b/SHA256SUMS` | `e24016bdf95ee408cfab6c8c9aa2a6015b44ce34790da95767492768093378fd` |
 
-## Thalamus parent-linked phone-call forks
+## Token-relay parent-linked phone-call forks
 
 `thalamus-route-fork-of-v1/` copies the supplied relay request and hold-envelope
-samples byte for byte from Thalamus commit
-`07093f5525ca78b2341cf65dbc0e1c7268dfd328`. The source directory is
-`.cortexkit/internal-docs/investigations/thalamus-route-fork-of-v1/`; its README
+samples byte for byte from the token relay's repository at commit
+`07093f5525ca78b2341cf65dbc0e1c7268dfd328`. Its provenance
 records capture by
 `routing::tests::fork_of::fork_of_uses_the_newest_parent_and_inherits_its_head_turn`.
 The data is synthetic. The request is the exact compact params body, not a
 method envelope; the hold sample wraps the error body in `error`.
 
-Before import, the manifest's own SHA-256 was checked against the prefix
-`73031db3` that THALAMUS quoted in its handoff message, and then both files
-were verified against the manifest.
+Before import, the manifest's own SHA-256 was checked against the independently
+supplied prefix `73031db3`, and then both files were verified against the manifest.
 The reader tests send the request bytes unchanged through routing's v1 handler.
 
 | Imported path | SHA-256 |
@@ -82,10 +82,9 @@ The reader tests send the request bytes unchanged through routing's v1 handler.
 | `thalamus-route-fork-of-v1/hold-answer.json` | `94b1c12960b67c9841db267888af00a66fe847bf9a2911ea0c85c7ff395c54f8` |
 | `thalamus-route-fork-of-v1/SHA256SUMS` | `73031db341c99611a1a92e71b8fea6fdec1bf7ef72fdbcbe9d74b5b731ffe4ac` |
 
-## Thalamus capacity wait
+## Token-relay capacity wait
 
-THALAMUS (Agent Runner) supplied the `route.account_for` bodies in the shared
-scratch folder `CortexKit-scratch/shared-routing-capacity-v1/`.
+The token relay supplied the `route.account_for` bodies preserved here.
 `thalamus-capacity-wait-v1/` copies the bodies byte for byte, dropping the
 `route.account_for.` prefix from the filenames. The source `SHA256SUMS` has SHA-256
 `730b2a806ef90d1c03c7ca1a64bb9a73a4dc75fe5255bbcea06a4cb3392ab6d6`.
@@ -103,15 +102,14 @@ after the reset with a fresh admission ID.
 byte, supplied by its owner from Fusiform commit `a4e36712`, source path
 `crates/fusiform-module/fixtures/quality-grades-prefix-v1/`. The older-prefix
 refusal is the owner's additional live older-Fusiform capture. The supplied
-research copy was `.cortexkit/internal-docs/research/quality-grades-prefix-v1/`.
+manifest was verified before import.
 Its updated `SHA256SUMS` covers all four JSON files and has SHA-256
 `8831211c65f0bfabe3e6d9fb6642659f07602108481b2a8e64325801b9c58fc8`.
 The byte-pinned decoder tests retain the grade spelling `72.50` in the fixture.
 
 `colliculus-voice-message-demand/routing-v1-declaration.json` is the supplied
-output of Colliculus's own routing/v1 declaration serializer, copied unchanged
-from `.cortexkit/internal-docs/research/colliculus-voice-message-demand/`, together
-with its `SHA256SUMS`. Its SHA-256 is
+output of the voice module's own routing/v1 declaration serializer, copied unchanged
+together with its `SHA256SUMS`. Its SHA-256 is
 `2fa96a8a79cdfa1213d8560e2df73bdcb200cd672fb47ee29029972feff466ba`.
 The declaration sets `colliculus.voice_message` to IQ 75 without a mode member;
 the approved-values ranking test loads these bytes through the real reader.
@@ -123,12 +121,11 @@ digest is `1ad59d65a4d7306f9462fc5f849c97bdc54cb58d902450f988787d56aa2bf4d1`.
 `catalog_fixture_port_changes_only_the_media_grade_key` reverses that rename and
 checks the original capture's digest, proving that no other fields changed.
 
-## Broca route-fact observations
+## Worker-runner route-fact observations
 
 `broca-route-fact-1119/` contains byte-for-byte copies of the publications from
-Broca's own publisher for `admission_started_body` and `run_finished_body` on
-account `box_test`. They were supplied in
-`.cortexkit/internal-docs/research/broca-route-fact-1119/`. Before import, the
+the worker runner's own publisher for `admission_started_body` and `run_finished_body` on
+account `box_test`. Before import, the
 manifest's SHA-256 was checked against the digest prefix `fe0c7bee24ea1441`
 provided with the captures, then the original files were verified against the
 manifest.
@@ -138,11 +135,10 @@ manifest.
 | `broca-route-fact-1119/admission-started.json` | `822af034833b1a778faba2874f88fe9a3b06e2ef3e9f7b703cc1627bd1cbba3b` |
 | `broca-route-fact-1119/run-finished.json` | `6a610abf8ceea85ad3c953a7ea9f41fb844248a1f9cd7184f301867bbeeb9a87` |
 
-## Thalamus route-fact observations
+## Token-relay route-fact observations
 
 `thalamus-bus-route-fact-v1/` and `thalamus-bus-route-fact-v2/` copy the supplied
-Thalamus bus observation bodies byte for byte from the matching directories
-under `.cortexkit/internal-docs/research/`. Each body was verified against its
+token-relay bus observation bodies byte for byte. Each body was verified against its
 source `SHA256SUMS`; the tests use those body digests as the transport headers.
 
 | Imported path | SHA-256 |
@@ -151,12 +147,12 @@ source `SHA256SUMS`; the tests use those body digests as the transport headers.
 | `thalamus-bus-route-fact-v2/mixed-headers.json` | `389e3b7dde17afc7995b98729ca2ac01d2a833b21f245faca63cd76bea0c4009` |
 | `thalamus-bus-route-fact-v2/all-headers-dropped.json` | `880027a45706c78c2c9fafdab55c19c90e9672b93b304f0d5f96aa9a8a995ecb` |
 
-## SUBC project settings views
+## Daemon project settings views
 
 `subc-project-views-v1/` preserves the byte-for-byte capture from a real
 `ck-subc` built from commit `f55cc24e5062e46cb790dabcaf7430b82bbc4b93` on Linux.
 The rig used the daemon's `crates/subc-client-rs/tests/real_daemon/project_config.rs`
-helpers and an invented `example-router` module in scratch state. The capture
+helpers and an invented `example-router` module in isolated test state. The capture
 README identifies the exchange for each frame, and `SHA256SUMS` was verified
 before import. The tests use the frames without rewriting their module or project
 IDs.
@@ -165,21 +161,19 @@ IDs.
 
 `claustrum-list-scoped-v2/list-scoped-v2.json` copies the vault's
 `credential.list_scoped` vectors byte for byte from Claustrum commit
-`d85f4a01` (`list-scoped-vectors-v2.3`), as supplied under
-`.cortexkit/internal-docs/contract-ref/`.
+`d85f4a01` (`list-scoped-vectors-v2.3`).
 The `learned_org` case includes a top-level `org_id` on an Anthropic API key
 with no account identity. SHA-256:
 `4ff7e45c2839f71873c1ca12ffe5ea3e15d35897e3610bb884a26a6f0329b691`.
 
-## Broca split output-cap harness
+## Worker-runner split output-cap harness
 
-`broca-output-cap-harness-1124/` preserves both supplied files byte for byte
-from `.cortexkit/internal-docs/samples/broca-output-cap-harness-1124/`.
+`broca-output-cap-harness-1124/` preserves both supplied files byte for byte.
 `routing-slot.json` is the exact proposed `routing/v1` role declaration slot
-supplied by Broca. `current-live-routing-slot.json` was captured from
+supplied by the worker runner. `current-live-routing-slot.json` was captured from
 `modules[broca].role_declarations["routing/v1"]` in `ck --json catalog` at
 23:28 UTC on 24 November 2026. The baseline was re-serialized as compact JSON;
-its value matches what the daemon served, but its bytes are not Broca's
+its value matches what the daemon served, but its bytes are not the worker runner's
 original serialization.
 
 Both source files were checked against the supplied byte counts and SHA-256
@@ -190,23 +184,20 @@ prefixes before import.
 | `broca-output-cap-harness-1124/routing-slot.json` | 2191 | `168755640c483cbd479e915a103a8f335d39f0d4cc8ab4579da1140c6d6b9987` |
 | `broca-output-cap-harness-1124/current-live-routing-slot.json` | 1277 | `6c54624ca04c67c6a6d295849837ccbff28ac0cc9fe840f0298cc51a46a1fa5d` |
 
-## Broca completion workload declaration
+## Worker-runner completion workload declaration
 
-`broca-routing-consumer-quick-1125/` preserves the slots supplied by BROCA on
-25 November 2026, byte for byte from
-`.cortexkit/internal-docs/samples/broca-routing-consumer-quick-1125/`.
-Both were verified against the supplied `SHA256SUMS`.
+`broca-routing-consumer-quick-1125/` preserves the slots supplied by the worker runner
+on 25 November 2026. Both were verified against the supplied `SHA256SUMS`.
 
 | Imported path | SHA-256 |
 | --- | --- |
 | `broca-routing-consumer-quick-1125/routing-slot.json` | `34c635f021e83df3ddb4509757bcfa3a2cbee53e1c113c38ac449f699e330158` |
 | `broca-routing-consumer-quick-1125/routing-slot-with-exclude.json` | `f484398f92aed37e95cec7854bbbf53c2e8eb33538c9c782bd5233b10948e510` |
 
-## Thalamus Claude Fable limit refusal
+## Token-relay Claude Fable limit refusal
 
-`route-limit-fable-v1/` copies both route-fact bodies byte for byte from
-`.cortexkit/internal-docs/samples/route-limit-fable-v1/`. The supplied README
-identifies Thalamus commit `913828d41` as the relay source and
+`route-limit-fable-v1/` copies both route-fact bodies byte for byte. The supplied README
+identifies the token relay's repository at commit `913828d41` as the relay source and
 `routing::tests::record_route_fact_limit_samples` as the recorder. The source
 `SHA256SUMS` (`13f4f22650476d2bcf51e752b2273ce7a32a5c5afa8c7d49cfa95c9db2aac217`)
 was verified before import. The admission ID is synthetic and the reader test
@@ -228,15 +219,15 @@ also exercises a copy of the exhaustion body without the two reset members.
 
 | Imported path | Source | SHA-256 |
 | --- | --- | --- |
-| `served-payloads-dd928ca5.json` | Fusiform (FUSI) commit `dd928ca5`, supplied served-payload golden | `e1d000b295b29ed53db4effb134586d0391624eba9ee39891378e0fc316a1ac6` |
+| `served-payloads-dd928ca5.json` | Fusiform commit `dd928ca5`, supplied served-payload golden | `e1d000b295b29ed53db4effb134586d0391624eba9ee39891378e0fc316a1ac6` |
 
-## Broca unpinned llm_classify routing request
+## Worker-runner unpinned llm_classify routing request
 
-The select envelope was copied byte for byte from BROCA's capture and verified
+The select envelope was copied byte for byte from the worker runner's capture and verified
 against its supplied SHA256SUMS. It has no explicit model pin, leaving routing
 to choose a model. The other captures are caller-facing results, not routing
 inputs.
 
 | Imported path | Source | SHA-256 |
 | --- | --- | --- |
-| `broca-llm-classify-unpinned-1126/routing-select.json` | BROCA `.cortexkit/internal-docs/samples/broca-llm-classify-unpinned-1126/routing-select.json` | `7c4ed39b6f639758aa040c53d6148154b57318f8e63fd3ee399e761715468978` |
+| `broca-llm-classify-unpinned-1126/routing-select.json` | Worker-runner capture | `7c4ed39b6f639758aa040c53d6148154b57318f8e63fd3ee399e761715468978` |

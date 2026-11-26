@@ -1,115 +1,115 @@
-# Striatum
+# Striatum (AI Model Routing)
 
-Striatum picks the model and the account for every model call in the CortexKit fleet.
+Striatum is CortexKit's AI model routing module. For each model call, it chooses the
+provider/model route and the account that should serve it, using the model
+catalog, configured policy, account availability, quota evidence, price and
+observed outcomes. Consumers ask for a route and act on the answer rather than
+duplicating routing policy.
 
-It runs as the `striatum` module under subc, with binary `ck-striatum` and store at `~/.local/share/cortexkit/striatum/store.db` (or `$XDG_DATA_HOME/cortexkit/striatum/store.db`). Its crates are `striatum-core`, `striatum-store` and `striatum-module`.
+The module registers as `striatum`, serves the `routing/v1` role and its
+`route.*` operations, and runs as the `ck-striatum` binary under the `ck`
+daemon. Its crates are `striatum-core`, `striatum-store` and `striatum-module`.
+Decisions and routing state are stored in
+`$XDG_DATA_HOME/cortexkit/striatum/store.db` (by default,
+`~/.local/share/cortexkit/striatum/store.db`).
 
-User settings live at `$XDG_CONFIG_HOME/cortexkit/striatum.jsonc` (default `~/.config/cortexkit/striatum.jsonc`). Project and workspace settings use `.cortexkit/striatum.jsonc` under each root. Routing reads only `striatum.jsonc`, with no fallback to older filenames. `--check-config` validates and names the user file. Missing or malformed edits to a previously loaded user file retain the last good configuration. A deleted project or workspace file retains its last good tier settings, but its runner overrides stop applying on the next request. Replace a file with an empty JSON object (`{}`) to intentionally clear all of its settings.
+## Runtime requirements
 
-A project can choose its own ordered runner list for a consumer and its dotted descendants. Entries can name only runners already enrolled by the user or auto-enrolled as first-party. For example, in a scratch project's `.cortexkit/striatum.jsonc`:
+A normal CortexKit installation uses `ck setup` to install and supervise the
+daemon and modules. Routing has these companion-module dependencies:
+
+- **Required for normal routing:** Fusiform supplies the model catalog and
+  Claustrum (the vault) supplies credential metadata for available logins.
+  Routing never reads login secrets. Catalog and credential-dependent
+  operations need these inputs; a slow companion does not have to block module
+  startup.
+- **Optional:** Insula supplies quota readings, Astrocyte supplies measured
+  subscription-plan values, and the CortexKit bus delivers asynchronous quota
+  notices. Routing retains its configured fallbacks when these optional inputs
+  are absent.
+
+## Settings
+
+The daemon manages settings and supplies workspace and project views to
+routing. The optional user file is
+`$XDG_CONFIG_HOME/cortexkit/striatum.jsonc` (by default,
+`~/.config/cortexkit/striatum.jsonc`). Run `ck-striatum --check-config` to
+validate and print the user file's path. Routing reads only `striatum.jsonc`;
+it does not fall back to older filenames.
+
+Workspace and project layers use `.cortexkit/striatum.jsonc` under their
+respective roots. The daemon validates and merges defaults, user, workspace and
+project settings. Routing selects the project view using the project identity
+attested on the caller's daemon route; a request body cannot switch projects.
+Only consumer runner placement and service-tier settings may vary by project.
+
+For example, a project can choose an ordered runner list for a consumer and its
+dotted descendants:
 
 ```jsonc
 {
   "consumers": {
-    "prefrontal.mason": {"runners": [
-      {"module": "thalamus-harness", "harness": "opencode2"},
-      {"module": "thalamus-harness", "harness": "claude-code"},
-      {"module": "thalamus-harness", "harness": "pi"}
-    ]},
-    "prefrontal.sidekick": {"runners": [
-      {"module": "thalamus-harness", "harness": "opencode2"},
-      {"module": "thalamus-harness", "harness": "claude-code"},
-      {"module": "thalamus-harness", "harness": "pi"}
-    ]}
+    "example.consumer": {
+      "runners": [{"module": "example-runner"}]
+    }
   }
 }
 ```
 
-Routing reads the file of the project the request comes from, as the daemon records it on the caller's connection; a request body can't choose another project. A matching project list replaces the workspace and user lists; otherwise the workspace list can replace the user list. Requests in other projects without their own overrides keep using the user settings. See [the routing spec](docs/specs/model-routing.md#runner-placement) for validation and precedence.
+Replace the example names with a registered consumer and a runner enrolled in
+the user settings or auto-enrolled as first-party. An empty list allows no
+runner. See [the routing specification](docs/specs/model-routing.md#runner-placement)
+for validation and precedence.
 
-Tracing warnings and errors go to stderr, one event per line, as `LEVEL message key=value`.
-The daemon adds timestamps and the module prefix. The default threshold is `warn`.
-`STRIATUM_LOG` overrides `RUST_LOG`; either accepts comma-separated global levels
-(`off`, `error`, `warn`, `info`, `debug`, `trace`) and `target=level` directives, such
-as `warn,striatum_store=debug,ck_striatum=info`. The longest target prefix wins;
-invalid directives are ignored. Span lifecycle events and span fields are not printed.
-Existing operator messages, including the `--check-config` success report, are unchanged.
+Tracing warnings and errors go to stderr. The default threshold is `warn`.
+`STRIATUM_LOG` overrides `RUST_LOG`; both accept global levels and
+comma-separated `target=level` directives, such as
+`warn,striatum_store=debug,ck_striatum=info`.
 
 ## Build and test
 
+A clean checkout needs the Rust toolchain pinned in `rust-toolchain.toml`
+(Rust 1.100.0, with rustfmt and Clippy), Python 3.10 or newer, and
+[cargo-nextest](https://nexte.st/). Install the toolchain and nextest with your
+usual Rust tooling, then run:
+
 ```sh
 cargo build --locked --release -p striatum-module
-bash scripts/rust-test-gate.sh
+scripts/rust-test-gate.sh
 ```
 
-The `rust-test-gate.sh` script needs Rust 1.100.0, Python 3.10 or newer, and cargo-nextest. It runs the source checks and the whole test suite, with no sibling checkout.
+The gate runs the Python and Rust source checks before the complete standalone
+test suite. It does not require sibling checkouts or a running daemon. Use
+`cargo nextest run --locked` with a package and test filter for focused
+development; for example:
 
-Six real-daemon tests are ignored by default because they build `../subconscious` and `../insula`, with `../commons` beside them. Run them on a machine that has those checkouts:
+```sh
+cargo nextest run --locked -p striatum-module --bin ck-striatum \
+  -E 'test(/route_fence_pool_tests::/)'
+```
+
+### Optional sibling end-to-end tests
+
+Six real-daemon end-to-end tests are ignored by default. They are optional and
+are not part of a normal clean-checkout build. They expect Subconscious and
+Insula source checkouts plus the shared support checkout in the sibling
+locations `../subconscious`, `../insula` and `../commons`.
+`AI_PROVIDER_QUOTA_REPO` can override the Insula checkout location. On a machine
+with those optional dependencies, run:
 
 ```sh
 cargo nextest run --locked -p striatum-module --test it --run-ignored only \
   -E 'test(/^(both_modules_e2e|real_daemon_e2e)::/)'
 ```
 
-## Deploy
+## More documentation
 
-The identity switch is a coordinated window: stop and disable `prefrontal-routing`
-before enabling `striatum`; never run both routing providers together. While both
-are stopped, preview `script/move-store-to-striatum.sh --dry-run`, then run it
-without the flag. It backs up the old data directory, moves the store and boot
-ledger, and removes the old engram catalog. The new module writes its own catalog
-at startup. The script does not stop, start, enable or deploy either module. Keep
-them stopped throughout the move; on failure follow its printed restore instructions.
+See [ARCHITECTURE.md](ARCHITECTURE.md), [STRUCTURE.md](STRUCTURE.md), the
+[routing specification](docs/specs/model-routing.md), and the
+[`route.what_if` operator query](docs/route-what-if.md). Scripts under
+`script/` include optional operator tooling; they are not needed to build or
+test the module.
 
-The default backup is an APFS copy-on-write clone of the **whole** old directory
-to an exclusively created timestamped sibling. It uses `clonefile(2)` directly:
-`cp -cR` can silently fall back to a full copy when cloning is unsupported, but
-the script refuses instead. It compares every backup file's path/type/size with
-the source and records the listing beside the clone. `--backup-mode=tar` opts
-into a slow, uncompressed tar backup for non-APFS hosts; it is never an automatic
-fallback. `--base-dir` overrides the CortexKit data directory for rehearsal;
-never rehearse against the live data directory.
+## License
 
-The outage path checkpoints the WAL with `TRUNCATE` (refusing if busy), performs
-same-filesystem no-overwrite link/unlink moves, and verifies that the moved
-`store.db` retains its source device, inode and size. It does **not** scan rows or
-run `quick_check`/`integrity_check` by default. Every step prints elapsed seconds.
-After `striatum` is serving, optional full confirmation runs separately:
-
-```sh
-script/move-store-to-striatum.sh --verify-full /path/to/prefrontal-routing-backup-TIMESTAMP-ID
-```
-
-This mode only opens the recorded private clone, never the live store, and does
-not require either module to be stopped. It counts every application table and
-runs `PRAGMA integrity_check`, saving a report beside the clone. SQLite opens the
-private copy read-write so it can recover its own WAL/SHM files if needed; the
-report states that fact. Counts describe the frozen backup, not the now-changing
-live store. A tar archive must be restored separately; `--verify-full` accepts
-only a recorded clone directory. `--dry-run` previews either mode without
-opening SQLite or writing files (the move preview still checks module status).
-
-### Compacting the store
-
-The retention pass deletes old rows and compacts old decisions' scoring detail
-in place, which frees pages inside `store.db` but never shrinks the file.
-`script/compact-store.sh` rebuilds it offline: with `striatum` stopped and
-outside the nightly backup capture by Engram, CortexKit's backup module, which
-reads `store.db` live between 10:45 and 12:00 UTC (the script refuses that
-window, so a capture never sees a half-swapped store),
-it checkpoints the WAL, runs `VACUUM INTO` a sibling file, checks the copy
-(`quick_check`, an empty `foreign_key_check`, the same schema, `user_version`
-and row counts, a smaller `page_count`), puts it in WAL mode, and swaps it in by
-rename. The previous file stays beside it as `store.db.pre-compact-TIMESTAMP`
-with the restore command printed. `--dry-run` previews the steps without opening
-SQLite; `--store-dir` and `--ck` point it at a copy and a stub for rehearsal.
-Let the retention pass finish its backlog first: on the first deployment it
-compacts about 500 decisions a minute.
-
-```sh
-sh script/deploy-module.sh routing
-```
-
-This builds, signs and places the binary, checks the settings file, and restarts the module. It stops if the running process doesn't serve the placed file or the module doesn't report healthy. It needs the installed `ck` and `subc-probe` tools.
-
-See [ARCHITECTURE.md](ARCHITECTURE.md), [STRUCTURE.md](STRUCTURE.md) and the [routing specification](docs/specs/model-routing.md).
+Striatum is available under the [MIT License](LICENSE).

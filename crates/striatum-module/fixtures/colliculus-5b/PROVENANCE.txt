@@ -1,1 +1,1 @@
-Generated at colliculus commit 5ccd00f69eb93d7515b4e3b45938ca751bf00098 by the ignored test service::sets::tests::write_declaration_goldens (real handler and manifest; every batch-1 and live row priced and keyed, including gpt-realtime-2.1).
+Generated in the voice module's repository at commit 5ccd00f69eb93d7515b4e3b45938ca751bf00098 by the ignored test service::sets::tests::write_declaration_goldens (real handler and manifest; every batch-1 and live row priced and keyed, including gpt-realtime-2.1).
