@@ -547,7 +547,7 @@ async fn migrated_priority_case(legacy: bool, prune_binding: bool) {
         crate::routing_v1::account_classes_tests::setup_at_version("synthetic", false, Some(93));
     let decision = striatum_store::V1Decision {
         decision_id: "old-mason".into(),
-        principal: "reserved:prefrontal-core".into(),
+        principal: "reserved:prefrontal".into(),
         consumer: "mason".into(),
         allowed_account_class: Default::default(),
         project_id: None,
@@ -569,8 +569,8 @@ async fn migrated_priority_case(legacy: bool, prune_binding: bool) {
     crate::routing_v1::account_classes_tests::catalog_fact(&harness, &fact);
     harness.set_credentials(credentials);
     harness.edit_config(|config| {
-        config["consumers"] = json!({"prefrontal-core.mason":{"owner":"prefrontal-core"}});
-        config["consumer_priorities"] = json!({"prefrontal-core.mason":"blocking"});
+        config["consumers"] = json!({"prefrontal.mason":{"owner":"prefrontal"}});
+        config["consumer_priorities"] = json!({"prefrontal.mason":"blocking"});
     });
     if prune_binding {
         let pruned = harness
@@ -607,7 +607,7 @@ async fn migrated_priority_case(legacy: bool, prune_binding: bool) {
                 .unwrap()
                 .unwrap()
                 .target_agent,
-            "prefrontal-core.mason"
+            "prefrontal.mason"
         );
     } else {
         assert_eq!(
@@ -617,7 +617,7 @@ async fn migrated_priority_case(legacy: bool, prune_binding: bool) {
                 .unwrap()
                 .unwrap()
                 .consumer,
-            "prefrontal-core.mason"
+            "prefrontal.mason"
         );
     }
 }

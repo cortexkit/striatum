@@ -44,9 +44,9 @@ async fn configured() -> (Arc<Harness>, Route) {
     harness.edit_config(|config| {
         config["panels"]["audit"] =
             json!({"top_k":2,"by":"iq","extra":1,"extra_by":"random","floor":0});
-        config["consumers"][fixture::SUMMARY] = json!({"owner":"prefrontal-core"});
+        config["consumers"][fixture::SUMMARY] = json!({"owner":"prefrontal"});
     });
-    let route = harness.bind(reserved("prefrontal-core"), None).await;
+    let route = harness.bind(reserved("prefrontal"), None).await;
     (harness, route)
 }
 
@@ -402,7 +402,7 @@ async fn panel_estimate_retains_project_settings_and_refuses_foreign_stamp() {
         let (_, live) = route.call("route.select_panel", &params).await;
         assert_eq!(estimate["result"], without_ids(live["result"].clone()));
         let scoped = harness
-            .bind(reserved("prefrontal-core"), Some("other-project"))
+            .bind(reserved("prefrontal"), Some("other-project"))
             .await;
         params["estimate"] = json!(true);
         let (_, refused) = scoped.call("route.select_panel", &params).await;

@@ -37,8 +37,8 @@ neither of the two accounts is blocked.
   synthetic accounts are filled via the same real admissions as above. This keeps
   the public sample free of real catalog routes, including in refusal diagnostics.
 * `panel-all-full.request.json` / `panel-all-full.reply.json`: attested
-  `reserved:prefrontal-core` asks for an `audit` panel for consumer
-  `prefrontal-core.athena`, matching the Athena caller and class in panel tests.
+  `reserved:prefrontal` asks for an `audit` panel for consumer
+  `prefrontal.athena`, matching the Athena caller and class in panel tests.
   The synthetic policy requests three seats, without extras. All three candidate
   accounts are full. Routing returns an answer with zero seats and a
   `size_reduced` shortfall, not a refusal.

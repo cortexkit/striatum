@@ -244,7 +244,7 @@ pub(super) fn authorize_legacy_policy_fixture(params: &serde_json::Value, config
             .consumer_owners()
             .get(target)
             .cloned()
-            .unwrap_or_else(|| "prefrontal-core".into());
+            .unwrap_or_else(|| "prefrontal".into());
         routing_v1::consumers::replace_catalog(&json!([{
             "module_id": owner, "nonce_verified": true,
             "role_declarations": {"routing/v1": {"consumers": [{"name": target}]}}

@@ -21,9 +21,9 @@ class ConvertConsumerNames(unittest.TestCase):
   "default_variants": {"mason": "sidekick"} /* athena */\r
 }\r
 '''
-        expected = source.replace('"consumers": {"mason"', '"consumers": {"prefrontal-core.mason"')
-        expected = expected.replace('["sidekick"]', '["prefrontal-core.sidekick"]')
-        expected = expected.replace('["athena.gather"]', '["prefrontal-core.athena.gather"]')
+        expected = source.replace('"consumers": {"mason"', '"consumers": {"prefrontal.mason"')
+        expected = expected.replace('["sidekick"]', '["prefrontal.sidekick"]')
+        expected = expected.replace('["athena.gather"]', '["prefrontal.athena.gather"]')
         expected = expected.replace('["flow"]', '["basal.flow"]')
         converted, counts, unknown = convert(source)
         self.assertEqual(converted, expected)
@@ -79,7 +79,7 @@ class ConvertConsumerNames(unittest.TestCase):
 
     def test_collision_and_duplicate_keys_are_refused(self):
         for source in [
-            '{"consumers":{"mason":{},"prefrontal-core.mason":{}}}',
+            '{"consumers":{"mason":{},"prefrontal.mason":{}}}',
             '{"consumers":{"mason":{},"mason":{}}}',
             '{"consumers":{"mc_dream_verify":{},"magic-context.dream.verify-broad":{}}}',
         ]:
@@ -110,7 +110,7 @@ class ConvertConsumerNames(unittest.TestCase):
                 blocked = Path(directory) / "blocked.jsonc"
                 self.assertEqual(CONVERTER["main"]([str(source), "--write", str(blocked)]), 1)
                 self.assertFalse(blocked.exists())
-            self.assertEqual(first, original.replace(b'"mason"', b'"prefrontal-core.mason"'))
+            self.assertEqual(first, original.replace(b'"mason"', b'"prefrontal.mason"'))
 
 
 if __name__ == "__main__":

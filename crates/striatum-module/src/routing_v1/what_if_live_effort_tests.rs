@@ -8,11 +8,11 @@ const KIMI: &str = "example-provider/kimi-k3.1-pro";
 const CARBON: &str = "example-provider/gemini-4-carbon";
 const GROK: &str = "example-provider/grok-4.7";
 const OPUS: &str = "example-provider/claude-opus-5-5";
-const SIDEKICK: &str = "prefrontal-core.sidekick";
-const ATHENA: &str = "prefrontal-core.athena";
-const GATHER: &str = "prefrontal-core.athena.gather";
-const CHAIR: &str = "prefrontal-core.athena.synthesizer";
-const MASON: &str = "prefrontal-core.mason";
+const SIDEKICK: &str = "prefrontal.sidekick";
+const ATHENA: &str = "prefrontal.athena";
+const GATHER: &str = "prefrontal.athena.gather";
+const CHAIR: &str = "prefrontal.athena.synthesizer";
+const MASON: &str = "prefrontal.mason";
 const CODEMODE: &str = "basal.codemode";
 const FLOW: &str = "basal.flow";
 

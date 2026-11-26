@@ -3,7 +3,7 @@
 //! production daemon runs both, and routing refuses `route.select` until its
 //! first billing-plane load.
 //!
-//! Shared source: routing's real-daemon tests and prefrontal-core's routing
+//! Shared source: routing's real-daemon tests and prefrontal's routing
 //! e2e both include this file by path, so the two rigs serve routing the same
 //! catalog. Each rig registers the services with [`serve_routing_fixtures`]
 //! and then waits for routing's health to report both reached, with its own

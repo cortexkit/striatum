@@ -108,8 +108,6 @@ mod metered_tests;
 #[cfg(test)]
 mod order_tests;
 #[cfg(test)]
-mod prefrontal_rename_tests;
-#[cfg(test)]
 mod profile_tests;
 #[cfg(test)]
 pub(crate) mod replay_tests;
@@ -270,10 +268,7 @@ impl Caller {
     fn module_identity_is_current(&self) -> bool {
         self.binding_is_current()
             || self.event_module.as_ref().is_some_and(|module| {
-                striatum_core::module_identity::equal(
-                    &self.principal,
-                    &format!("reserved:{module}"),
-                )
+                self.principal.strip_prefix("reserved:") == Some(module.as_str())
             })
     }
 
@@ -286,8 +281,7 @@ impl Caller {
                 .ok()
                 .is_some_and(|principals| {
                     principals.get(&channel).is_some_and(|(bound, principal)| {
-                        *bound == epoch
-                            && striatum_core::module_identity::equal(principal, &self.principal)
+                        *bound == epoch && principal == &self.principal
                     })
                 })
                 && crate::route_scope_authority(channel, epoch) == self.scope_authority

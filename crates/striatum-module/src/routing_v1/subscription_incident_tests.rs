@@ -21,7 +21,7 @@ use super::conformance_tests::{reserved, Harness, Route};
 use crate::account_quota::{AccountQuotaState, RosterIdentity, StoredReading, VaultRoster};
 
 const MODEL: &str = "anthropic/claude-opus-5-5";
-const WORKER: &str = "prefrontal-core.mason";
+const WORKER: &str = "prefrontal.mason";
 
 fn pi_fixture() -> Value {
     serde_json::from_str(include_str!(
@@ -161,8 +161,8 @@ fn setup(fixture: &Value, api: bool) -> (Arc<Harness>, impl Drop, SubscriptionPo
             fixture["keep_free_percent"].clone();
         config["head_agents"] = json!(["head"]);
         config["consumers"] = json!({
-            WORKER:{"owner":"prefrontal-core", "mode":"demand"},
-            "head":{"owner":"prefrontal-core", "mode":"demand"}
+            WORKER:{"owner":"prefrontal", "mode":"demand"},
+            "head":{"owner":"prefrontal", "mode":"demand"}
         });
         config["runners"] = json!([{"module":"broca", "via_vault":true}]);
     });
@@ -179,7 +179,7 @@ async fn bind(harness: &Arc<Harness>, host: Option<&str>) -> Route {
         "op":"route.bind", "route_channel":channel, "epoch":1,
         "target":{"kind":"management_surface", "module_id":"striatum"},
         "identity":{"project_root":cortexkit_test_support::scratch_root(), "session":format!("incident-{channel}"), "harness":host.unwrap_or("unhosted")},
-        "principal":reserved("prefrontal-core")
+        "principal":reserved("prefrontal")
     });
     harness.bind_frame(request, channel, 1).await
 }

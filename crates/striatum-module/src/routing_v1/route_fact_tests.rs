@@ -205,41 +205,40 @@ fn assert_publisher(handler: &Handler, module: &str, counts: [u64; 4], last_appl
 }
 
 #[tokio::test]
-async fn prefrontal_rename_new_subject_reports_old_decision_and_counts_one_publisher() {
+async fn route_fact_uses_its_exact_publisher_principal() {
     let (harness, _) = super::dispatch_tests::configured().await;
     harness.edit_config(|config| {
-        config["consumers"]["prefrontal-core.mason"] = json!({"owner":"prefrontal-core"})
+        config["consumers"]["prefrontal.mason"] = json!({"owner":"prefrontal"})
     });
-    let route = harness.bind(reserved("prefrontal-core"), None).await;
-    let answer = result(route.call("route.select", &json!({"consumer":"prefrontal-core.mason","requirements":{"iq":50},"pin":"example-subscription/model-c"})).await);
+    let route = harness.bind(reserved("prefrontal"), None).await;
+    let answer = result(route.call("route.select", &json!({"consumer":"prefrontal.mason","requirements":{"iq":50},"pin":"example-subscription/model-c"})).await);
     let handler = harness.fact_handler();
     let (bus, mut cursor) = bus(&handler).await;
     cursor.expect_finished = false;
     let body = json!({"op":"route.report","params":{"decision_id":answer["decision_id"],"outcome":"completed"}});
-    for module in ["prefrontal", "prefrontal-core"] {
+    for module in ["prefrontal-core", "prefrontal"] {
         let bytes = publish(&bus, module, module, &body).await;
         consume(&handler, &mut cursor, &bytes).await;
     }
-    assert_eq!((cursor.acks, cursor.terms), (2, 0));
+    assert_eq!((cursor.acks, cursor.terms), (1, 1));
     let cache = handler.quota_cache.lock().unwrap();
     let publishers = &cache.consumer.route_facts.publishers;
-    assert_eq!(publishers.len(), 1);
-    assert_eq!(publishers["prefrontal-core"].applied, 1);
-    assert_eq!(publishers["prefrontal-core"].duplicate, 1);
+    assert_eq!(publishers["prefrontal"].applied, 1);
+    assert_eq!(publishers["prefrontal-core"].refused, 1);
 }
 
 #[test]
-fn prefrontal_rename_new_subject_is_a_complete_durable_filter() {
+fn prefrontal_subject_is_in_the_durable_filter_set() {
     let names = AccountNames::derive("box_test").unwrap();
-    let old = route_facts::fact_subjects(&names);
-    let new: Vec<_> = old
-        .iter()
-        .map(|s| s.replace("event.prefrontal-core.", "event.prefrontal."))
-        .collect();
-    assert_ne!(old, new);
-    assert!(route_facts::filters_ready(&names, Some("m_striatum"), &new));
-    assert!(route_facts::filters_ready(&names, Some("m_striatum"), &old));
-    let reader_only: Vec<_> = old
+    let subjects = route_facts::fact_subjects(&names);
+    let prefrontal = names.event_subject("prefrontal", "route_fact", 1).unwrap();
+    assert!(subjects.contains(&prefrontal));
+    assert!(route_facts::filters_ready(
+        &names,
+        Some("m_striatum"),
+        &subjects
+    ));
+    let reader_only: Vec<_> = subjects
         .iter()
         .map(|subject| format!("{subject}.striatum"))
         .collect();
@@ -248,10 +247,7 @@ fn prefrontal_rename_new_subject_is_a_complete_durable_filter() {
         Some("m_striatum"),
         &reader_only
     ));
-    let incomplete: Vec<_> = new
-        .into_iter()
-        .filter(|s| !s.contains("event.prefrontal."))
-        .collect();
+    let incomplete: Vec<_> = subjects.into_iter().filter(|s| s != &prefrontal).collect();
     assert!(!route_facts::filters_ready(
         &names,
         Some("m_striatum"),

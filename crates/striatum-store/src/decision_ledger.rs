@@ -522,7 +522,7 @@ impl SqliteRouteStateStore {
                          SELECT id, created_at, selected_route_key, decision_kind, rejected_json
                          FROM model_route_decisions
                          WHERE (?1 IS NULL OR send_id=?1)
-                            AND (?2 IS NULL OR target_agent IN (?2, ?7))
+                           AND (?2 IS NULL OR target_agent=?2)
                            AND (?3 IS NULL OR selected_route_key=?3)
                            AND (?4 IS NULL OR created_at>=?4)
                            AND (?5 IS NULL OR created_at<=?5)
@@ -568,7 +568,6 @@ impl SqliteRouteStateStore {
                         filter.since_ms,
                         filter.until_ms,
                         limit,
-                        filter.target_agent.as_deref().map(striatum_core::module_identity::alternate).as_deref(),
                     ],
                     |row| {
                         let top_rejection_count = row.get::<_, i64>(5)?;

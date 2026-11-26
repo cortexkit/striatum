@@ -762,12 +762,12 @@ fn call_counts_keep_partial_window_across_restart_and_sum_staggered_instances() 
         .with_conn(|c| c.execute("UPDATE routing_call_window SET started_at_ms=100", []))
         .unwrap();
     store
-        .record_routing_call("route.select", "legacy", "reserved:prefrontal-core")
+        .record_routing_call("route.select", "legacy", "reserved:prefrontal")
         .unwrap();
     drop(store);
     let store = SqliteRouteStateStore::open(&descriptor).unwrap();
     store
-        .record_routing_call("route.select", "legacy", "reserved:prefrontal-core")
+        .record_routing_call("route.select", "legacy", "reserved:prefrontal")
         .unwrap();
     let first = store.routing_call_counts().unwrap();
     assert_eq!(first.started_at_ms, 100);

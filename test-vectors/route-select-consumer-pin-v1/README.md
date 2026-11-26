@@ -5,8 +5,8 @@ handler. The catalog, credentials, clock and decision IDs are deterministic
 test fixtures; the replies are not normalized or rewritten after capture.
 
 The fixture has Opus 5.5 and Fable 5.2 on an eligible runner, with equal
-capability and quality. Opus is `pin_only_for: ["prefrontal-core.athena"]`. The operator sets
-`consumers["prefrontal-core.athena.synthesizer"].pin` to
+capability and quality. Opus is `pin_only_for: ["prefrontal.athena"]`. The operator sets
+`consumers["prefrontal.athena.synthesizer"].pin` to
 `{model: "anthropic/claude-opus-5-5", variant: "medium"}`. No request carries
 a pin.
 

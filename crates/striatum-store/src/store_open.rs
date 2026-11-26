@@ -368,7 +368,7 @@ pub(super) mod tests {
         }
         assert_eq!(
             restarted
-                .v1_affinity_decision("owner", "prefrontal-core.mason", "conversation")
+                .v1_affinity_decision("owner", "prefrontal.mason", "conversation")
                 .unwrap()
                 .unwrap()
                 .decision_id,

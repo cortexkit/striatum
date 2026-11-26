@@ -28,8 +28,8 @@ fn assert_vector(name: &str, value: &Value) {
 async fn diagnostics_findings_v1_vectors_match_serving_replies() {
     let _clock = crate::InjectedClock::set(NOW);
     let harness = Harness::new("diagnostics-v1-vectors");
-    hosts(&[("prefrontal-core", true)]);
-    let head = scoped(&harness, "bridge-relay", head_scope("prefrontal-core")).await;
+    hosts(&[("prefrontal", true)]);
+    let head = scoped(&harness, "bridge-relay", head_scope("prefrontal")).await;
     for (name, params, window) in [
         ("request-empty.json", json!({}), 21_600_000),
         ("request-window.json", json!({"window_ms": 60_000}), 60_000),
@@ -100,7 +100,7 @@ fn head_scope(owner: &str) -> Value {
 }
 
 fn flow_scope(owner_authorized: bool) -> Value {
-    json!({"owner":reserved("prefrontal-core"),"ref":"flow-scope","scope_epoch":4,"kind":"head",
+    json!({"owner":reserved("prefrontal"),"ref":"flow-scope","scope_epoch":4,"kind":"head",
            "owner_authorized":owner_authorized,"attributes":{"flow_id":"routing-watch"}})
 }
 
@@ -108,9 +108,9 @@ fn flow_scope(owner_authorized: bool) -> Value {
 async fn head_routes_and_flow_scopes_read_findings_and_everyone_else_is_refused() {
     let _clock = crate::InjectedClock::set(NOW);
     let harness = Harness::new("diagnostics-admission");
-    hosts(&[("prefrontal-core", true), ("plain-module", false)]);
+    hosts(&[("prefrontal", true), ("plain-module", false)]);
 
-    let head = scoped(&harness, "bridge-relay", head_scope("prefrontal-core")).await;
+    let head = scoped(&harness, "bridge-relay", head_scope("prefrontal")).await;
     let reply = head.call(OP, &json!({})).await;
     assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
     assert_eq!(
@@ -142,7 +142,7 @@ async fn head_routes_and_flow_scopes_read_findings_and_everyone_else_is_refused(
             scoped(
                 &harness,
                 "bridge-relay",
-                json!({"owner":reserved("prefrontal-core"),"ref":"e","scope_epoch":1,
+                json!({"owner":reserved("prefrontal"),"ref":"e","scope_epoch":1,
                        "kind":"ephemeral","owner_authorized":true}),
             )
             .await,
@@ -168,7 +168,7 @@ async fn head_routes_and_flow_scopes_read_findings_and_everyone_else_is_refused(
 async fn a_flow_scoped_route_reaches_only_the_allowlisted_ops() {
     let _clock = crate::InjectedClock::set(NOW);
     let harness = Harness::new("diagnostics-flow-fence");
-    hosts(&[("prefrontal-core", true)]);
+    hosts(&[("prefrontal", true)]);
     let flow = scoped(&harness, "broca", flow_scope(true)).await;
     // The exact refusal Basal maps as final and never retries.
     let (ty, body) = flow.call_raw("route.decisions_list", &json!({})).await;
@@ -201,7 +201,7 @@ async fn a_flow_scoped_route_reaches_only_the_allowlisted_ops() {
     let reply = flow.call(OP, &json!({})).await;
     assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
     // A head route is not fenced.
-    let head = scoped(&harness, "bridge-relay", head_scope("prefrontal-core")).await;
+    let head = scoped(&harness, "bridge-relay", head_scope("prefrontal")).await;
     let reply = head.call("route.decisions_list", &json!({})).await;
     assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
 }
@@ -280,7 +280,7 @@ fn the_manifest_declares_flow_scope_support() {
 async fn the_diagnosis_reads_the_live_store() {
     let _clock = crate::InjectedClock::set(NOW);
     let harness = Harness::new("diagnostics-store");
-    hosts(&[("prefrontal-core", true)]);
+    hosts(&[("prefrontal", true)]);
     harness
         .store()
         .record_credential_entitlement_fence(
@@ -293,7 +293,7 @@ async fn the_diagnosis_reads_the_live_store() {
             NOW as i64 - 3 * 60 * 60 * 1000,
         )
         .unwrap();
-    let head = scoped(&harness, "bridge-relay", head_scope("prefrontal-core")).await;
+    let head = scoped(&harness, "bridge-relay", head_scope("prefrontal")).await;
     let reply = head.call(OP, &json!({})).await;
     assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
     let findings = reply.1["result"]["findings"].as_array().unwrap();

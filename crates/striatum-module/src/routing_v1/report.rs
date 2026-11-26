@@ -60,9 +60,10 @@ pub(super) fn report_at(
         .store
         .v1_decision(&request.decision_id)
         .map_err(store_refusal)?;
-    if decision.as_ref().is_none_or(|decision| {
-        !striatum_core::module_identity::equal(&decision.principal, &caller.principal)
-    }) {
+    if decision
+        .as_ref()
+        .is_none_or(|decision| decision.principal != caller.principal)
+    {
         return Err(Refusal::unknown_decision());
     }
     let decision = decision.unwrap();

@@ -1,13 +1,13 @@
 {
   // Consumer rules leave model-b as the only eligible example-provider model.
   "consumers": {
-    "prefrontal-core.mason": {"pin": {"model": "example-provider/model-b"}},
-    "prefrontal-core.sidekick": {"pin": {"model": "example-provider/model-b"}},
-    "prefrontal-core.athena": {"pin": {"model": "example-provider/model-b"}},
-    "prefrontal-core.athena.gather": {"pin": {"model": "example-provider/model-b"}},
-    "prefrontal-core.athena.synthesizer": {"pin": {"model": "example-provider/model-b"}},
-    "prefrontal-core.lab": {"pin": {"model": "example-provider/model-b"}},
-    "prefrontal-core.wake": {"pin": {"model": "example-provider/model-b"}},
+    "prefrontal.mason": {"pin": {"model": "example-provider/model-b"}},
+    "prefrontal.sidekick": {"pin": {"model": "example-provider/model-b"}},
+    "prefrontal.athena": {"pin": {"model": "example-provider/model-b"}},
+    "prefrontal.athena.gather": {"pin": {"model": "example-provider/model-b"}},
+    "prefrontal.athena.synthesizer": {"pin": {"model": "example-provider/model-b"}},
+    "prefrontal.lab": {"pin": {"model": "example-provider/model-b"}},
+    "prefrontal.wake": {"pin": {"model": "example-provider/model-b"}},
     "basal.codemode": {"pin": {"model": "example-provider/model-b"}},
     "basal.flow": {"pin": {"model": "example-provider/model-b"}},
     "magic-context.summary": {"pin": {"model": "example-provider/model-b"}},
@@ -22,10 +22,10 @@
     "magic-context.dream.verify": {"pin": {"model": "example-provider/model-b"}}, "magic-context.dream.verify-broad": {"pin": {"model": "example-provider/model-b"}},
   },
   "providers": {
-    "example-provider": {"pin_only": false, "subscription": true, "only_for": ["prefrontal-core.mason", "prefrontal-core.sidekick", "prefrontal-core.athena", "prefrontal-core.athena.synthesizer", "prefrontal-core.lab", "prefrontal-core.wake", "basal.codemode", "basal.flow", "magic-context.summary", "magic-context.dream", "magic-context.dream.classify-memories", "magic-context.dream.curate", "magic-context.dream.compress-cues", "magic-context.dream.review-user-memories", "magic-context.dream.map-memories", "magic-context.dream.refresh-primers", "magic-context.dream.reflect-events", "magic-context.dream.verify", "magic-context.dream.verify-broad"]}
+    "example-provider": {"pin_only": false, "subscription": true, "only_for": ["prefrontal.mason", "prefrontal.sidekick", "prefrontal.athena", "prefrontal.athena.synthesizer", "prefrontal.lab", "prefrontal.wake", "basal.codemode", "basal.flow", "magic-context.summary", "magic-context.dream", "magic-context.dream.classify-memories", "magic-context.dream.curate", "magic-context.dream.compress-cues", "magic-context.dream.review-user-memories", "magic-context.dream.map-memories", "magic-context.dream.refresh-primers", "magic-context.dream.reflect-events", "magic-context.dream.verify", "magic-context.dream.verify-broad"]}
   },
   "models": {
-    "example-provider/model-a": {"not_for": ["prefrontal-core.mason", "prefrontal-core.sidekick", "prefrontal-core.athena", "prefrontal-core.athena.synthesizer", "prefrontal-core.lab", "prefrontal-core.wake", "basal.codemode", "basal.flow", "magic-context.summary", "magic-context.dream", "magic-context.dream.classify-memories", "magic-context.dream.curate", "magic-context.dream.compress-cues", "magic-context.dream.review-user-memories", "magic-context.dream.map-memories", "magic-context.dream.refresh-primers", "magic-context.dream.reflect-events", "magic-context.dream.verify", "magic-context.dream.verify-broad"]},
-    "unused-provider/manual": {"pin_only_for": ["prefrontal-core.mason", "prefrontal-core.sidekick", "prefrontal-core.athena", "prefrontal-core.athena.synthesizer", "prefrontal-core.lab", "prefrontal-core.wake", "basal.codemode", "basal.flow", "magic-context.summary", "magic-context.dream", "magic-context.dream.classify-memories", "magic-context.dream.curate", "magic-context.dream.compress-cues", "magic-context.dream.review-user-memories", "magic-context.dream.map-memories", "magic-context.dream.refresh-primers", "magic-context.dream.reflect-events", "magic-context.dream.verify", "magic-context.dream.verify-broad"]}
+    "example-provider/model-a": {"not_for": ["prefrontal.mason", "prefrontal.sidekick", "prefrontal.athena", "prefrontal.athena.synthesizer", "prefrontal.lab", "prefrontal.wake", "basal.codemode", "basal.flow", "magic-context.summary", "magic-context.dream", "magic-context.dream.classify-memories", "magic-context.dream.curate", "magic-context.dream.compress-cues", "magic-context.dream.review-user-memories", "magic-context.dream.map-memories", "magic-context.dream.refresh-primers", "magic-context.dream.reflect-events", "magic-context.dream.verify", "magic-context.dream.verify-broad"]},
+    "unused-provider/manual": {"pin_only_for": ["prefrontal.mason", "prefrontal.sidekick", "prefrontal.athena", "prefrontal.athena.synthesizer", "prefrontal.lab", "prefrontal.wake", "basal.codemode", "basal.flow", "magic-context.summary", "magic-context.dream", "magic-context.dream.classify-memories", "magic-context.dream.curate", "magic-context.dream.compress-cues", "magic-context.dream.review-user-memories", "magic-context.dream.map-memories", "magic-context.dream.refresh-primers", "magic-context.dream.reflect-events", "magic-context.dream.verify", "magic-context.dream.verify-broad"]}
   }
 }
