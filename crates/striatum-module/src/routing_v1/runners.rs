@@ -945,7 +945,8 @@ pub(crate) fn service_tiers_from_describe(
     value: &serde_json::Value,
 ) -> Option<cortexkit_role_llm_runner::service_tier::ServiceTiers> {
     let value = value.get("result").unwrap_or(value);
-    if !value["capabilities"]
+    if !value
+        .get("capabilities")?
         .as_array()?
         .iter()
         .any(|capability| capability == "service_tier")
@@ -959,7 +960,8 @@ pub(crate) fn service_tiers_from_describe(
 
 pub(crate) fn routed_accounts_from_describe(value: &serde_json::Value) -> Option<Vec<String>> {
     let value = value.get("result").unwrap_or(value);
-    if !value["capabilities"]
+    if !value
+        .get("capabilities")?
         .as_array()?
         .iter()
         .any(|capability| capability == "routed_accounts")

@@ -141,26 +141,34 @@ impl DescribeCache {
         // A late describe can refresh tiers, but cannot revive an already
         // expired routing declaration without a new trusted catalog row.
         self.expire(credentials, now);
-        let Some(describe) = describe.filter(|describe| {
-            let describe = describe.get("result").unwrap_or(describe);
-            describe["capabilities"].as_array().is_some_and(|groups| {
-                (!groups.iter().any(|group| group == "service_tier")
-                    || super::service_tiers_from_describe(describe).is_some())
-                    && (!groups.iter().any(|group| group == "routed_accounts")
-                        || super::routed_accounts_from_describe(describe).is_some())
-            })
-        }) else {
+        let Some(describe) = describe else {
             self.missed(module, "describe", credentials, now);
             self.expire(credentials, now);
             return false;
         };
         let describe = describe.get("result").unwrap_or(describe);
-        let accepts_serves = if describe["capabilities"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|group| group == cortexkit_role_llm_runner::capabilities::SERVES)
+        let Some(groups) = describe
+            .get("capabilities")
+            .and_then(Value::as_array)
+            .filter(|groups| groups.iter().all(Value::is_string))
+        else {
+            // With no valid capability advertisement, even a previously read
+            // serves list cannot place models. Tier observations still age out
+            // as they do after any malformed describe.
+            credentials.runner_serves.remove(module);
+            self.failed.insert(module.to_owned());
+            warn_invalid_capabilities_once(module);
+            return false;
+        };
+        let has = |capability: &str| groups.iter().any(|group| group == capability);
+        if (has("service_tier") && super::service_tiers_from_describe(describe).is_none())
+            || (has("routed_accounts") && super::routed_accounts_from_describe(describe).is_none())
         {
+            self.missed(module, "describe", credentials, now);
+            self.expire(credentials, now);
+            return false;
+        }
+        let accepts_serves = if has(cortexkit_role_llm_runner::capabilities::SERVES) {
             describe.get("serves").is_some_and(|raw| {
                 let credentials = &mut **credentials;
                 let declared = credentials
@@ -278,6 +286,18 @@ impl DescribeCache {
     }
 }
 
+fn warn_invalid_capabilities_once(module: &str) {
+    static WARNED: std::sync::Mutex<BTreeSet<String>> = std::sync::Mutex::new(BTreeSet::new());
+    if WARNED
+        .lock()
+        .is_ok_and(|mut warned| warned.insert(module.to_owned()))
+    {
+        crate::warn_operator(format!(
+            "runner {module:?} role.describe has missing or invalid capabilities; treating it as serving no models"
+        ));
+    }
+}
+
 fn view_event(credentials: &mut BrocaCredentials, module: &str, cause: &str, now: i64) {
     if let Some(suppressed) = credentials.runner_describe_logs.admit(module, cause, now) {
         let last_observed_at_ms = credentials.runner_describe_observed.get(module);
@@ -313,6 +333,37 @@ mod tests {
             "harnesses":["runner-a"],
             "harness_limits":{"runner-a":{"capabilities":["one_off"]}}
         }}}}])
+    }
+
+    #[test]
+    fn malformed_capabilities_clear_serves_and_warn_once() {
+        let module = "runner-with-invalid-capabilities";
+        let mut cache = DescribeCache::default();
+        let mut credentials = BrocaCredentials::default();
+        let serves =
+            json!({"generation":"ready","entries":[{"provider":"example","models":"all"}]});
+        let valid = json!({"capabilities":["serves"],"serves":serves});
+        crate::take_operator_warnings();
+        for malformed in [
+            json!({"serves":serves}),
+            json!({"result":{"capabilities":"x","serves":serves}}),
+            json!({"capabilities":["serves",false],"serves":serves}),
+        ] {
+            assert!(cache.reply(module, Some(&valid), &mut credentials, 0));
+            assert!(credentials.runner_serves.contains_key(module));
+            assert!(!cache.reply(module, Some(&malformed), &mut credentials, 1));
+            assert!(!credentials.runner_serves.contains_key(module));
+        }
+        let warnings = crate::take_operator_warnings();
+        assert_eq!(
+            warnings
+                .iter()
+                .filter(|line| line.contains("missing or invalid capabilities")
+                    && line.contains(module))
+                .count(),
+            1,
+            "{warnings:?}"
+        );
     }
 
     #[test]
