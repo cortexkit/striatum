@@ -92,6 +92,20 @@ fn caller_local_cost() -> Option<FactNumber> {
     Some(FactNumber(0.0))
 }
 
+fn catalog_provider<'a>(
+    joined: &'a super::consumers::MediaRoutes,
+    candidate: &'a EngineCandidate<EvalScore, FactNumber>,
+) -> &'a str {
+    // Borrow catalog facts for module declarations, not route identity or
+    // caller-owned offers. Policy and accounting still use the engine provider.
+    let provider = &candidate.engine.provider;
+    if candidate.selected.caller_local {
+        provider
+    } else {
+        joined.catalog_provider(provider)
+    }
+}
+
 pub(super) fn select_media(
     params: &Value,
     caller: &Caller,
@@ -334,26 +348,16 @@ fn select_request(
         )
     };
     let mut candidates: Vec<EngineCandidate<EvalScore, FactNumber>> = Vec::new();
-    let catalog = deps
-        .broca_credentials
-        .lock()
-        .map_err(store_refusal)?
-        .catalog_snapshot
-        .clone();
+    let credentials = deps.broca_credentials.lock().map_err(store_refusal)?;
+    let catalog = credentials.catalog_snapshot.clone();
+    let joined = evaluation.as_ref().map_or_else(
+        || super::consumers::media_routes(&credentials),
+        |view| view.joined.clone(),
+    );
     #[cfg(test)]
-    let media_facts = deps
-        .broca_credentials
-        .lock()
-        .map_err(store_refusal)?
-        .engine_test_facts
-        .clone();
-    let joined = media.map(|_| {
-        evaluation.as_ref().map_or_else(
-            || super::consumers::media_routes(catalog.as_ref()),
-            |view| view.joined.clone(),
-        )
-    });
-    if let Some(joined) = &joined {
+    let media_facts = credentials.engine_test_facts.clone();
+    drop(credentials);
+    if media.is_some() {
         for route in joined
             .by_kind
             .get(request.kind.as_str())
@@ -404,31 +408,30 @@ fn select_request(
                 .map(|fact| (fact.provider_id.as_str(), fact.model_id.as_str())),
         )
         .collect();
-    // Withdrawal applies to media and caller-local engines before ranking.
-    // Resolved facts also carry it when a credential uses a different provider
-    // name from the catalog's provider name.
+    // Check both the catalog withdrawal and any stored facts for the declared
+    // route before ranking. Neither should make the engine change identity.
     candidates.retain(|candidate| {
-        if speed_twins.contains(&(
-            candidate.engine.provider.as_str(),
-            candidate.engine.model.as_str(),
-        )) {
+        let provider = candidate.engine.provider.as_str();
+        let model = candidate.engine.model.as_str();
+        let catalog_provider = catalog_provider(&joined, candidate);
+        if speed_twins.contains(&(provider, model))
+            || speed_twins.contains(&(catalog_provider, model))
+        {
             if evaluation.is_some() && candidate.engine.kind == request.kind {
-                let key = format!("{}/{}", candidate.engine.provider, candidate.engine.model);
+                let key = format!("{provider}/{model}");
                 excluded.insert(key, "service tier of another model".to_owned());
             }
             return false;
         }
-        let key = format!("{}/{}", candidate.engine.provider, candidate.engine.model);
-        let allowed = !catalog
-            .as_ref()
-            .is_some_and(|catalog| catalog.is_decommissioned(&key))
-            && !inputs.facts.iter().any(|fact| {
-                fact.decommissioned
-                    && fact.provider_id == candidate.engine.provider
-                    && fact.model_id == candidate.engine.model
-            });
+        let allowed = !catalog.as_ref().is_some_and(|catalog| {
+            catalog.is_decommissioned(&format!("{catalog_provider}/{model}"))
+        }) && !inputs.facts.iter().any(|fact| {
+            fact.decommissioned
+                && (fact.provider_id == provider || fact.provider_id == catalog_provider)
+                && fact.model_id == model
+        });
         if !allowed && evaluation.is_some() && candidate.engine.kind == request.kind {
-            excluded.insert(key, "decommissioned".to_owned());
+            excluded.insert(format!("{provider}/{model}"), "decommissioned".to_owned());
         }
         allowed
     });
@@ -468,6 +471,7 @@ fn select_request(
     };
     let mut media_prices = std::collections::BTreeMap::new();
     for candidate in &mut candidates {
+        let catalog_provider = catalog_provider(&joined, candidate);
         candidate.cost = if media.is_some() {
             // Caller-owned execution has zero routing cost, but never a quoted
             // dollar price: no module account is charged for the offer.
@@ -485,7 +489,7 @@ fn select_request(
                                 catalog,
                                 &request,
                                 media.and_then(|media| media.requirements.input_characters),
-                                &candidate.engine.provider,
+                                catalog_provider,
                                 &candidate.engine.model,
                             )
                         })
@@ -498,11 +502,7 @@ fn select_request(
                 .as_ref()
                 .filter(|_| media.is_none() || !candidate.selected.caller_local)
                 .and_then(|catalog| {
-                    catalog.engine_cost(
-                        &request,
-                        &candidate.engine.provider,
-                        &candidate.engine.model,
-                    )
+                    catalog.engine_cost(&request, catalog_provider, &candidate.engine.model)
                 })
                 .map(FactNumber)
         };
@@ -681,19 +681,19 @@ fn select_request(
             if candidate.engine.kind != request.kind {
                 return true;
             }
-            let key = format!("{}/{}", candidate.engine.provider, candidate.engine.model);
             let facts = (!candidate.selected.caller_local)
                 .then(|| {
-                    catalog
-                        .as_ref()
-                        .and_then(|catalog| catalog.video_facts(&key))
+                    catalog.as_ref().and_then(|catalog| {
+                        let provider = catalog_provider(&joined, candidate);
+                        catalog.video_facts(&format!("{provider}/{}", candidate.engine.model))
+                    })
                 })
                 .flatten();
             if let Some(fact) = failed_video_requirement(media, facts) {
                 failed_fact.get_or_insert(fact);
                 if evaluation.is_some() {
                     excluded.insert(
-                        key,
+                        format!("{}/{}", candidate.engine.provider, candidate.engine.model),
                         format!("catalog fact {fact} does not satisfy the request"),
                     );
                 }
@@ -770,9 +770,8 @@ fn select_request(
         }
     }
     measurements::apply_evaluations(&request, &mut candidates, &evaluations);
-    let mut media_grades = joined
-        .as_ref()
-        .and_then(|joined| joined.by_kind.get(request.kind.as_str()))
+    let mut media_grades = media
+        .and_then(|_| joined.by_kind.get(request.kind.as_str()))
         .map(|kind| kind.grades.clone())
         .unwrap_or_default();
     if media.is_some() {
@@ -871,8 +870,8 @@ fn select_request(
     if evaluation.is_some() {
         let empty = Default::default();
         let grades = joined
-            .as_ref()
-            .and_then(|joined| joined.by_kind.get(request.kind.as_str()))
+            .by_kind
+            .get(request.kind.as_str())
             .map(|kind| &kind.grades)
             .unwrap_or(&empty);
         return Ok(media_candidate(winner, grades));

@@ -93,13 +93,10 @@ pub(super) fn what_if(params: &Value, caller: &Caller, deps: &Deps<'_>) -> Resul
         &inputs.catalog_snapshot.facts,
         engines::now(deps) as i64,
     )?;
-    let joined = super::super::consumers::media_routes(
-        credentials
-            .lock()
-            .map_err(store_refusal)?
-            .catalog_snapshot
-            .as_ref(),
-    );
+    let joined = {
+        let credentials = credentials.lock().map_err(store_refusal)?;
+        super::super::consumers::media_routes(&credentials)
+    };
     let identities: Vec<_> = joined
         .by_kind
         .get(request.kind.as_str())

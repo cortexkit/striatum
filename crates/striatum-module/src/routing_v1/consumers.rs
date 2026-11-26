@@ -53,10 +53,19 @@ pub(super) struct MediaKind {
 pub(super) struct MediaRoutes {
     pub by_kind: BTreeMap<String, MediaKind>,
     pub issues: Vec<String>,
+    catalog_targets: BTreeMap<String, String>,
+}
+
+impl MediaRoutes {
+    pub(super) fn catalog_provider<'a>(&'a self, provider: &'a str) -> &'a str {
+        striatum_core::score_alias::alias_target(&self.catalog_targets, provider)
+            .unwrap_or(provider)
+    }
 }
 
 struct MediaJoin {
     source: Option<Arc<crate::fusiform_catalog::CatalogSnapshot>>,
+    credential_view: Option<String>,
     routes: Arc<MediaRoutes>,
 }
 
@@ -82,8 +91,10 @@ pub(crate) fn replace_catalog(modules: &Value) {
 }
 
 pub(super) fn media_routes(
-    source: Option<&Arc<crate::fusiform_catalog::CatalogSnapshot>>,
+    credentials: &crate::broca_credentials::CredentialData,
 ) -> Arc<MediaRoutes> {
+    let source = credentials.catalog_snapshot.as_ref();
+    let credential_view = credentials.listing_version().map(|(view, _)| view);
     let catalog = CATALOG.get_or_init(Default::default).read().unwrap();
     let mut cached = catalog.media.lock().unwrap();
     if let Some(join) = cached.as_ref() {
@@ -92,20 +103,34 @@ pub(super) fn media_routes(
             (None, None) => true,
             _ => false,
         };
-        if unchanged {
+        if unchanged && join.credential_view.as_deref() == credential_view {
             return join.routes.clone();
         }
     }
     // Only module declarations are joined here. Caller-local offers arrive per
     // request and read cached grades under local:<provider>/<model> keys rather
     // than catalog row identities.
-    let mut routes = MediaRoutes::default();
+    // The served snapshot can have media or search rows that are not stored for
+    // chat. Use its provider index with the same vault resolver as chat.
+    let mut routes = MediaRoutes {
+        catalog_targets: source.map_or_else(BTreeMap::new, |snapshot| {
+            let (_, providers) = snapshot.provider_index();
+            credentials
+                .catalog_resolution_for_providers(&providers)
+                .targets
+        }),
+        ..Default::default()
+    };
     for (module, slot) in &catalog.engines {
         for engine in &slot.engines {
             let kind = engine.kind.as_str();
             let route = format!("{}/{}", engine.provider, engine.model);
+            let catalog_key =
+                striatum_core::score_alias::catalog_key(&routes.catalog_targets, &route);
             let joined = routes.by_kind.entry(kind.into()).or_default();
-            if let Some(grade) = source.and_then(|snapshot| snapshot.media_grade(kind, &route)) {
+            if let Some(grade) =
+                source.and_then(|snapshot| snapshot.media_grade(kind, &catalog_key))
+            {
                 joined.grades.insert(route, grade);
             }
             joined.routes.push(MediaRoute {
@@ -117,9 +142,11 @@ pub(super) fn media_routes(
     for (module, slot) in &catalog.search {
         for route in &slot.routes {
             let key = format!("{}/{}", route.provider, route.model);
+            let catalog_key =
+                striatum_core::score_alias::catalog_key(&routes.catalog_targets, &key);
             if !source.is_some_and(|snapshot| {
                 snapshot
-                    .model(&key)
+                    .model(&catalog_key)
                     .is_some_and(|row| row.present && row.model_type.as_deref() == Some("search"))
             }) {
                 routes.issues.push(format!(
@@ -128,7 +155,9 @@ pub(super) fn media_routes(
                 continue;
             }
             let joined = routes.by_kind.entry("search".into()).or_default();
-            if let Some(grade) = source.and_then(|snapshot| snapshot.media_grade("search", &key)) {
+            if let Some(grade) =
+                source.and_then(|snapshot| snapshot.media_grade("search", &catalog_key))
+            {
                 joined.grades.insert(key, grade);
             }
             joined.routes.push(MediaRoute {
@@ -147,6 +176,7 @@ pub(super) fn media_routes(
     let routes = Arc::new(routes);
     *cached = Some(MediaJoin {
         source: source.cloned(),
+        credential_view: credential_view.map(str::to_owned),
         routes: routes.clone(),
     });
     routes

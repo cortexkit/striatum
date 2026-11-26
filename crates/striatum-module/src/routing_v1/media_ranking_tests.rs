@@ -406,27 +406,22 @@ async fn media_ranking_top_obeys_static_keys_policy_privacy_and_requirements() {
 fn media_ranking_join_is_reused_and_invalidated_by_either_catalog() {
     let engines = vec![engine("a", false)];
     let h = setup(engines.clone());
-    let snapshot = catalog(&h, &[("a", "transcription", Some(80.0), None)]);
-    let joined = super::super::super::consumers::media_routes(Some(&snapshot));
+    catalog(&h, &[("a", "transcription", Some(80.0), None)]);
+    let join = || super::super::super::consumers::media_routes(&h.credentials().lock().unwrap());
+    let joined = join();
     assert_eq!(joined.by_kind["transcribe"].grades["media-vendor/a"], 80.0);
-    assert!(Arc::ptr_eq(
-        &joined,
-        &super::super::super::consumers::media_routes(Some(&snapshot))
-    ));
+    assert!(Arc::ptr_eq(&joined, &join()));
     declare("transcribe", &engines);
-    assert!(Arc::ptr_eq(
-        &joined,
-        &super::super::super::consumers::media_routes(Some(&snapshot))
-    ));
-    let next = catalog(&h, &[("a", "transcription", Some(90.0), None)]);
-    let regraded = super::super::super::consumers::media_routes(Some(&next));
+    assert!(Arc::ptr_eq(&joined, &join()));
+    catalog(&h, &[("a", "transcription", Some(90.0), None)]);
+    let regraded = join();
     assert!(!Arc::ptr_eq(&joined, &regraded));
     assert_eq!(
         regraded.by_kind["transcribe"].grades["media-vendor/a"],
         90.0
     );
     declare("transcribe", &[engine("b", false)]);
-    let redeclared = super::super::super::consumers::media_routes(Some(&next));
+    let redeclared = join();
     assert!(!Arc::ptr_eq(&regraded, &redeclared));
     assert_eq!(redeclared.by_kind["transcribe"].routes[0].engine.model, "b");
     assert!(redeclared.by_kind["transcribe"].grades.is_empty());

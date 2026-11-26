@@ -6,6 +6,9 @@ use cortexkit_role_routing::select_media::{check_answer, SelectMediaAnswer};
 #[path = "media_ranking_tests.rs"]
 mod ranking;
 
+#[path = "media_catalog_alias_tests.rs"]
+mod catalog_alias;
+
 #[path = "media_pricing_tests.rs"]
 mod pricing;
 

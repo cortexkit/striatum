@@ -75,6 +75,47 @@ async fn refused(route: &Route, params: &Value, code: &str, field: Option<&str>)
 }
 
 #[tokio::test]
+async fn search_catalog_alias_refreshes_the_join_without_changing_the_catalog() {
+    use cortexkit_claustrum_client::{ListedCredential, ScopedCredentialListing};
+
+    let h = Harness::new("search-catalog-alias");
+    let mut slots = declarations();
+    slots[0]["role_declarations"]["search-provider/v1"]["routes"][0]["provider"] =
+        json!("search-platform");
+    super::consumers::replace_catalog(&slots);
+    install(&h, &catalog(400));
+    let route = h.bind(reserved("plexus"), None).await;
+    let mut params = request();
+    params["eligible_routes"][0]["provider"] = json!("search-platform");
+    params["allowance_left"][0]["provider"] = json!("search-platform");
+    assert_eq!(selected(&route, &params).await["engine"]["model"], "paid");
+
+    // Search does not use the vault's media-account inventory for admission.
+    h.credentials().lock().unwrap().apply_listing(
+        &ScopedCredentialListing {
+            view: "search-alias".into(),
+            credentials: vec![ListedCredential {
+                id: "search-key".into(),
+                categories: vec!["llm-provider".into()],
+                state: "active".into(),
+                provider_ids: vec!["search-platform".into()],
+                serves: vec!["search-fixture".into()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        NOW,
+    );
+    let answer = selected(&route, &params).await;
+    assert_eq!(answer["engine"]["provider"], "search-platform");
+    assert_eq!(answer["engine"]["model"], "allowance");
+    assert_eq!(
+        answer["price"],
+        json!({"basis":"metered","rates":{"request.per_request":{"rate":0.01}}})
+    );
+}
+
+#[tokio::test]
 async fn allowance_wins_only_after_the_quality_level_and_keeps_catalog_price() {
     let h = setup(400);
     let route = h.bind(reserved("plexus"), None).await;
