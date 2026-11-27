@@ -118,13 +118,12 @@ test the module.
 ## Releases
 
 [GitHub Releases](https://github.com/cortexkit/striatum/releases) will provide
-`ck-striatum-<target>.zip` archives for `darwin-arm64`, `darwin-x64`, `linux-x64`,
-`linux-arm64` and `windows-x64`. Each archive contains the `ck-striatum` binary
+`ck-striatum-<target>.zip` archives for `darwin-arm64`, `linux-x64`,
+`linux-arm64`, `windows-x64` and `windows-arm64`. Each archive contains the `ck-striatum` binary
 (`ck-striatum.exe` on Windows); the macOS binaries are signed with Developer ID
 and notarized. Each release also includes a `release-manifest.json` with the
 build's Git revision and the minimum supported core version. A release is only
-published from a commit whose test suite passed natively on Linux, macOS and
-Windows.
+published from a commit whose test suite passed natively on all five targets.
 
 Download the ZIP and its `.zip.sha256` sidecar to the same directory, then verify
 the ZIP before extracting it. For example:

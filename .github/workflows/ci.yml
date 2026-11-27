@@ -17,8 +17,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - platform: ubuntu
+          - platform: linux-x64
             runner: ubuntu-latest
+          - platform: linux-arm64
+            runner: ubuntu-24.04-arm
           - platform: macOS
             runner: macos-latest
     steps:
@@ -38,11 +40,19 @@ jobs:
         run: bash scripts/rust-test-gate.sh
 
   windows-test:
-    name: Test (windows)
-    runs-on: windows-latest
+    name: Test (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
     # A cold Windows build of the workspace and its tests takes far longer
     # than the Linux or macOS gate.
     timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-x64
+            runner: windows-latest
+          - platform: windows-arm64
+            runner: windows-11-arm
     steps:
       - uses: actions/checkout@v5
         with:
