@@ -468,3 +468,52 @@ fn check_config_binary_prints_five_anonymous_count_lines_offline() {
         assert!(!counts.join("\n").contains("private"));
     }
 }
+
+#[cfg(windows)]
+#[test]
+fn check_config_binary_reads_the_store_in_windows_data_home_without_home() {
+    let home = Home::new();
+    let appdata = home.0.join("Test AppData");
+    let profile = home.0.join("Test User Profile");
+    let override_home = home.0.join("Test XDG Data");
+    let seed = |data: &Path, count| {
+        let directory = data.join("cortexkit").join("striatum");
+        std::fs::create_dir_all(&directory).unwrap();
+        let conn = rusqlite::Connection::open(directory.join("store.db")).unwrap();
+        conn.execute_batch("CREATE TABLE model_facts(id INTEGER PRIMARY KEY)")
+            .unwrap();
+        for id in 0..count {
+            conn.execute("INSERT INTO model_facts VALUES (?1)", [id])
+                .unwrap();
+        }
+    };
+    seed(&appdata, 1);
+    seed(&profile.join("AppData").join("Roaming"), 2);
+    seed(&override_home, 3);
+
+    let run = |appdata: Option<&Path>, xdg: Option<&Path>, count| {
+        let mut command = home.command(true);
+        command
+            .env_remove("HOME")
+            .env_remove("XDG_DATA_HOME")
+            .env("USERPROFILE", &profile)
+            .arg("--check-config");
+        if let Some(appdata) = appdata {
+            command.env("APPDATA", appdata);
+        }
+        if let Some(xdg) = xdg {
+            command.env("XDG_DATA_HOME", xdg);
+        }
+        let output = command.output().unwrap();
+        let text = String::from_utf8(output.stderr).unwrap();
+        assert!(output.status.success(), "{text}");
+        assert!(
+            text.lines()
+                .any(|line| line == format!("catalog_facts={count}")),
+            "{text}"
+        );
+    };
+    run(Some(&appdata), None, 1);
+    run(None, None, 2);
+    run(Some(&appdata), Some(&override_home), 3);
+}

@@ -440,29 +440,38 @@ fn checkpoint_files<E>(
 }
 
 async fn checkpoint_loop(store: SharedStore, period: std::time::Duration) {
+    let mut ticks = checkpoint_ticks(period);
+    loop {
+        checkpoint_tick(&mut ticks, &store).await;
+    }
+}
+
+fn checkpoint_ticks(period: std::time::Duration) -> tokio::time::Interval {
     let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    loop {
-        ticks.tick().await;
-        let store = Arc::clone(&store);
-        match striatum_store::job_timing::run(
-            "wal_checkpoint",
-            crate::stage_timing::spawn_job_blocking(move || {
-                checkpoint_files(|| store.checkpoint_wal(), || store.checkpoint_history_wal())
-            }),
-        )
-        .await
-        {
-            Ok((state, history)) => {
-                if let Err(error) = state {
-                    tracing::warn!(%error, "state WAL checkpoint failed; retrying next tick");
-                }
-                if let Err(error) = history {
-                    tracing::warn!(%error, "history WAL checkpoint failed; retrying next tick");
-                }
+    ticks
+}
+
+async fn checkpoint_tick(ticks: &mut tokio::time::Interval, store: &SharedStore) {
+    ticks.tick().await;
+    let store = Arc::clone(store);
+    match striatum_store::job_timing::run(
+        "wal_checkpoint",
+        crate::stage_timing::spawn_job_blocking(move || {
+            checkpoint_files(|| store.checkpoint_wal(), || store.checkpoint_history_wal())
+        }),
+    )
+    .await
+    {
+        Ok((state, history)) => {
+            if let Err(error) = state {
+                tracing::warn!(%error, "state WAL checkpoint failed; retrying next tick");
             }
-            Err(error) => tracing::warn!(%error, "WAL checkpoint worker failed"),
+            if let Err(error) = history {
+                tracing::warn!(%error, "history WAL checkpoint failed; retrying next tick");
+            }
         }
+        Err(error) => tracing::warn!(%error, "WAL checkpoint worker failed"),
     }
 }
 
@@ -718,7 +727,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn checkpoint_timer_allows_next_write_to_cap_an_over_limit_wal() {
         let dir = cortexkit_test_support::ScratchDir::new("wal-checkpoint-timer");
         let store = Arc::new(
@@ -732,26 +741,19 @@ mod tests {
         store.put_quota_snapshot(&payload, 0).unwrap();
         let bytes = || std::fs::metadata(dir.join("store.db-wal")).unwrap().len();
         assert!(bytes() > striatum_store::WAL_SIZE_CAP_BYTES);
-        let timer = tokio::spawn(checkpoint_loop(
-            Arc::clone(&store),
-            std::time::Duration::from_millis(10),
-        ));
-        let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            let mut sequence = 0;
-            while bytes() > striatum_store::WAL_SIZE_CAP_BYTES {
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                // Change a value each time: an identical UPSERT may write no
-                // pages and therefore need no WAL restart.
-                sequence += 1;
-                store
-                    .put_quota_snapshot("next writer commit", sequence)
-                    .unwrap();
-            }
-        })
-        .await;
-        timer.abort();
-        let _ = timer.await;
-        result.unwrap();
+        let period = std::time::Duration::from_secs(15);
+        let started = tokio::time::Instant::now();
+        let mut ticks = checkpoint_ticks(period);
+        // Wait for the blocking pass to finish. A passive checkpoint is allowed
+        // to leave frames behind if it races with a writer.
+        checkpoint_tick(&mut ticks, &store).await;
+        assert!(started.elapsed() >= period);
+        store.put_quota_snapshot("next writer commit", 1).unwrap();
+        let after = bytes();
+        assert!(
+            after <= striatum_store::WAL_SIZE_CAP_BYTES,
+            "next write left {after} bytes in the WAL after the checkpoint tick"
+        );
     }
 
     #[tokio::test]
