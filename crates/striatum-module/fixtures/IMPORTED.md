@@ -235,6 +235,19 @@ capture commits, the shipping HELLO writer, and the OpenCode catalog test.
 | `thalamus-routing-runner-serves-v1/describe-serves.json` | `48356960c5ced2483c6a2f93e46a5d4c9526cfbb530374cf9a95a655b9d23496` |
 | `thalamus-routing-runner-serves-v1/SHA256SUMS` | `0dc8f5cc0882e44b87a568e03c221461753d121dea0b9d8da8c57078931de768` |
 
+## Thalamus per-harness `role.describe` bodies
+
+`thalamus-describe-530d6c9f9/` copies Thalamus's pinned describe fixtures from
+`crates/thalamus-harness-module/src/runner/fixtures/describe/` byte for byte.
+The supplied README and all three bodies were verified against `SHA256SUMS`
+before import. The bodies omit `serves`; the reader test also adds the complete
+`serves` member from `thalamus-routing-runner-serves-v1/describe-serves.json`
+to each body to reproduce the opt-in response.
+
+| Imported path | SHA-256 |
+| --- | --- |
+| `thalamus-describe-530d6c9f9/SHA256SUMS` | `80c0a899ff531b9f33b84d8b32b94d509dcb283fb250bff528d49e505e9d652a` |
+
 ## Broca runner serves lists
 
 `broca-runner-serves-1126/` copies the supplied Broca HELLO slot and

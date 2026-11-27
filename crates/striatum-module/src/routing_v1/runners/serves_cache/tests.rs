@@ -12,6 +12,10 @@ use cortexkit_role_routing_conformance::fixture;
 use subc_protocol::FrameType;
 
 const MODULE: &str = "thalamus-harness";
+const THALAMUS_HELLO: &[u8] =
+    include_bytes!("../../../../fixtures/thalamus-routing-runner-serves-v1/all-harnesses.json");
+const THALAMUS_DESCRIBE_SERVES: &[u8] =
+    include_bytes!("../../../../fixtures/thalamus-routing-runner-serves-v1/describe-serves.json");
 
 fn declaration(credentials: &mut BrocaCredentials, runner: Value) {
     credentials.runner_declarations.insert(
@@ -32,17 +36,12 @@ fn describe(list: Value) -> Value {
 
 #[test]
 fn imported_agent_runner_hello_and_describe_use_the_real_readers() {
-    let all =
-        include_bytes!("../../../../fixtures/thalamus-routing-runner-serves-v1/all-harnesses.json");
     let one = include_bytes!(
         "../../../../fixtures/thalamus-routing-runner-serves-v1/opencode2-only.json"
     );
-    let reply = include_bytes!(
-        "../../../../fixtures/thalamus-routing-runner-serves-v1/describe-serves.json"
-    );
     for (bytes, hash) in [
         (
-            all.as_slice(),
+            THALAMUS_HELLO,
             "2ccb7b9d5041a4c5fe995151b809458624ac3d6220645eabc934b4b161a350e2",
         ),
         (
@@ -50,7 +49,7 @@ fn imported_agent_runner_hello_and_describe_use_the_real_readers() {
             "45b8141f858ec34d9c53cb51ee1647ec07d6f2599b255aa4ac876ee3535ebf6f",
         ),
         (
-            reply.as_slice(),
+            THALAMUS_DESCRIBE_SERVES,
             "48356960c5ced2483c6a2f93e46a5d4c9526cfbb530374cf9a95a655b9d23496",
         ),
     ] {
@@ -65,7 +64,10 @@ fn imported_agent_runner_hello_and_describe_use_the_real_readers() {
             .unwrap(),
         ["opencode2"]
     );
-    declaration(&mut credentials, serde_json::from_slice(all).unwrap());
+    declaration(
+        &mut credentials,
+        serde_json::from_slice(THALAMUS_HELLO).unwrap(),
+    );
     assert_eq!(
         credentials.runner_declarations[MODULE]
             .harnesses
@@ -73,7 +75,7 @@ fn imported_agent_runner_hello_and_describe_use_the_real_readers() {
             .unwrap(),
         ["opencode2", "pi", "claude-code"]
     );
-    let reply = serde_json::from_slice(reply).unwrap();
+    let reply = serde_json::from_slice(THALAMUS_DESCRIBE_SERVES).unwrap();
     assert!(DescribeCache::default().reply(MODULE, Some(&reply), &mut credentials, 100));
     let lists: std::collections::BTreeMap<_, _> =
         credentials.runner_serves[MODULE].lists(100).collect();
@@ -88,6 +90,148 @@ fn imported_agent_runner_hello_and_describe_use_the_real_readers() {
         assert!(go.placement(model).is_some());
     }
     assert!(go.placement("unsupported").is_none());
+}
+
+#[test]
+fn imported_thalamus_describe_bodies_keep_the_opt_in_serves_placements() {
+    use super::ListStatus;
+    use cortexkit_claustrum_client::{ListedCredential, ScopedCredentialListing};
+    use std::collections::{BTreeMap, HashSet};
+
+    const NOW: i64 = 100;
+    const HARNESSES: [&str; 3] = ["opencode2", "claude-code", "pi"];
+    const PROVIDER: &str = "opencode-go";
+
+    let current: Value = serde_json::from_slice(THALAMUS_DESCRIBE_SERVES).unwrap();
+    let serves = &current["serves"];
+    let models: HashSet<String> =
+        serde_json::from_value(serves["harnesses"]["opencode2"][0]["models"].clone()).unwrap();
+    assert!(!models.is_empty());
+    let facts: Vec<_> = models
+        .iter()
+        .map(String::as_str)
+        .chain(["unsupported"])
+        .map(|model| crate::tests::fact(PROVIDER, model))
+        .collect();
+
+    let check = |sample: &str, reply: &Value, with_serves: bool| {
+        let mut credentials = BrocaCredentials::default();
+        declaration(
+            &mut credentials,
+            serde_json::from_slice(THALAMUS_HELLO).unwrap(),
+        );
+        credentials.apply_listing(
+            &ScopedCredentialListing {
+                view: "thalamus-opencode-go".into(),
+                credentials: vec![ListedCredential {
+                    id: "test-opencode-go-key".into(),
+                    provider_ids: vec![PROVIDER.into()],
+                    categories: vec!["llm-provider".into()],
+                    state: "active".into(),
+                    auth_method: Some("apikey".into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            NOW as u64,
+        );
+
+        crate::take_operator_warnings();
+        assert_eq!(
+            DescribeCache::default().reply(MODULE, Some(reply), &mut credentials, NOW),
+            with_serves,
+            "{sample}, with serves: {with_serves}"
+        );
+        assert_eq!(credentials.runner_describe_observed.get(MODULE), Some(&NOW));
+        let warnings = crate::take_operator_warnings();
+        assert_eq!(warnings.len(), 1, "{sample}: {warnings:?}");
+        assert!(
+            warnings[0].contains("cause=observed_describe_without_tiers"),
+            "{sample}: {warnings:?}"
+        );
+
+        if with_serves {
+            let lists: BTreeMap<_, _> = credentials.runner_serves[MODULE].lists(NOW).collect();
+            assert_eq!(lists.len(), HARNESSES.len(), "{sample}");
+            let [go] = lists[&Some("opencode2")] else {
+                panic!("{sample}: expected one OpenCode 2 provider");
+            };
+            assert_eq!(go.provider, PROVIDER, "{sample}");
+            assert!(!go.all && !go.keyless, "{sample}: {go:?}");
+            assert_eq!(go.ids, models, "{sample}");
+            assert!(lists[&Some("claude-code")].is_empty(), "{sample}");
+            assert!(lists[&Some("pi")].is_empty(), "{sample}");
+        } else {
+            assert!(!credentials.runner_serves.contains_key(MODULE), "{sample}");
+        }
+
+        for harness in HARNESSES {
+            let registry = Registry::build_for_harness(
+                policy(),
+                &credentials,
+                &facts,
+                NOW as u64,
+                Some(harness),
+            );
+            let runner = registry.get(MODULE).unwrap();
+            assert!(runner.starts_sessions, "{sample}: {harness}");
+            let status = runner.serves_status[&Some(harness.into())];
+            assert!(
+                matches!(
+                    (with_serves, status),
+                    (true, ListStatus::Ready) | (false, ListStatus::Missing)
+                ),
+                "{sample}: {harness}, with serves: {with_serves}, got {status:?}"
+            );
+            for fact in &facts {
+                let route = format!("{PROVIDER}/{}", fact.model_id);
+                assert_eq!(
+                    registry.runs(MODULE, &route, &route),
+                    with_serves && harness == "opencode2" && fact.model_id != "unsupported",
+                    "{sample}: {harness}, with serves: {with_serves}, model {route}"
+                );
+            }
+        }
+    };
+
+    check("current", &current, true);
+    for (harness, bytes, hash) in [
+        (
+            "opencode2",
+            include_bytes!(
+                "../../../../fixtures/thalamus-describe-530d6c9f9/role-describe-opencode2.json"
+            )
+            .as_slice(),
+            "80a83f8d9a2ff00039c2e40539ed5547fabb1b4ee6692a150a2a846ddb517da8",
+        ),
+        (
+            "claude-code",
+            include_bytes!(
+                "../../../../fixtures/thalamus-describe-530d6c9f9/role-describe-claude-code.json"
+            )
+            .as_slice(),
+            "4213dd487460a6b25d75cf772c545584286ced9c4f4c4815993d9b8d5310077d",
+        ),
+        (
+            "pi",
+            include_bytes!(
+                "../../../../fixtures/thalamus-describe-530d6c9f9/role-describe-pi.json"
+            )
+            .as_slice(),
+            "738526b0fedb8c8420b1efea9ec4b945f6dd231fbc02a3363cc8455031c82c51",
+        ),
+    ] {
+        assert_eq!(format!("{:x}", Sha256::digest(bytes)), hash, "{harness}");
+        let mut reply: Value = serde_json::from_slice(bytes).unwrap();
+        check(harness, &reply, false);
+        // The opt-in response includes the whole runner's harness map.
+        assert!(reply
+            .as_object_mut()
+            .unwrap()
+            .insert("serves".into(), serves.clone())
+            .is_none());
+        check(harness, &reply, true);
+    }
 }
 
 #[test]
