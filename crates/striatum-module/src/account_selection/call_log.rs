@@ -208,17 +208,16 @@ impl AccountCall {
             let cap = caps.cap(&provider, &account, &params.model).limit;
             let count =
                 tx.inflight_count_for_model(caps, &provider, &account, &params.model, ctx.now_ms);
-            let adds = params.mode != RequestMode::Renew
-                || !tx.inflight_conversation(
-                    caps,
-                    &provider,
-                    &account,
-                    &params.model,
-                    principal,
-                    hash,
-                    ctx.now_ms,
-                );
-            room |= !adds || cap.is_none_or(|cap| (count as u64) < cap);
+            let holds_slot = tx.inflight_conversation(
+                caps,
+                &provider,
+                &account,
+                &params.model,
+                principal,
+                hash,
+                ctx.now_ms,
+            );
+            room |= holds_slot || cap.is_none_or(|cap| (count as u64) < cap);
             accounts.push(json!({"account_id":account,"count":count,"cap":cap}));
         }
         if !room {

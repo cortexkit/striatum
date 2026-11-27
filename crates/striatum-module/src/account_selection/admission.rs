@@ -2167,8 +2167,8 @@ fn serve_with_pin_diagnostic(
     }
     match &decision.outcome {
         Outcome::Admit(admission) => {
-            // Read before the insert: afterwards every request of the
-            // conversation would look like a renewal of a holder.
+            // Check before inserting the reservation, which would make the
+            // conversation look like it already held a slot.
             let taken = gate.slot_taken(
                 tx,
                 ctx,

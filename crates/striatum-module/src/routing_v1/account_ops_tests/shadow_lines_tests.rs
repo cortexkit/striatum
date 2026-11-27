@@ -149,6 +149,7 @@ async fn account_shadow_counts_ten_calls_but_not_head_replay_renew_or_allocator_
     let head = harness.bind(reserved("class-runner"), Some("head")).await;
     response(&head.call("route.account_for", &request("head")).await);
     let mut legacy = request("legacy-head-route");
+    legacy["conversation_key"] = json!("legacy-head-route");
     legacy["caller"] = json!({"runner":"class-runner","harness":"pi"});
     response(&head.call("route.account_for", &legacy).await);
     let mut refused = request("no-candidates");
@@ -176,6 +177,12 @@ async fn account_shadow_kept_affinity_is_full_even_with_a_free_eligible_sibling(
     let mut first = request("first");
     first["candidates"] = json!({"view_digest":"oauth-only","accounts":[{"account_id":"oauth-account","credential_id":"oauth:test"}]});
     response(&runner.call("route.account_for", &first).await);
+    enforcement_tests::start_admission(&runner, "first", "first-run").await;
+    enforcement_tests::finish_admission(&runner, "first", "first-run").await;
+    let mut holder = first;
+    holder["admission_id"] = json!("holder");
+    holder["conversation_key"] = json!("holder");
+    response(&runner.call("route.account_for", &holder).await);
     events();
     let retained = runner.call("route.account_for", &request("retained")).await;
     assert_eq!(
@@ -209,6 +216,33 @@ async fn account_shadow_kept_affinity_is_full_even_with_a_free_eligible_sibling(
             {"account_id":"apikey-account","count":1,"cap":1},
             {"account_id":"oauth-account","count":3,"cap":1}
         ])
+    );
+}
+
+#[tokio::test]
+async fn account_shadow_does_not_report_pressure_for_an_open_runs_next_admit() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, _) = setup("synthetic", false);
+    caps(&harness);
+    let runner = harness.bind(reserved("class-runner"), None).await;
+    response(&runner.call("route.account_for", &request("first")).await);
+    enforcement_tests::start_admission(&runner, "first", "first-run").await;
+    events();
+
+    response(&runner.call("route.account_for", &request("next")).await);
+    let (calls, pressure) = events();
+    assert_eq!(calls.len(), 1);
+    assert!(pressure.is_empty(), "{pressure:?}");
+
+    enforcement_tests::start_admission(&runner, "next", "first-run").await;
+    let mut other = request("other");
+    other["conversation_key"] = json!("other");
+    response(&runner.call("route.account_for", &other).await);
+    let (_, pressure) = events();
+    assert_eq!(pressure.len(), 1, "{pressure:?}");
+    assert_eq!(
+        pressure[0]["accounts"],
+        json!([{"account_id":"oauth-account","count":1,"cap":1}])
     );
 }
 

@@ -58,6 +58,37 @@ fn model_count(harness: &Harness, model: &str) -> usize {
 }
 
 #[tokio::test]
+async fn model_cap_allows_a_second_admit_for_an_open_run() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, _) = setup("synthetic", false);
+    catalog_caps(&harness, true);
+    let runner = harness.bind(reserved("class-runner"), None).await;
+    for id in ["first", "second"] {
+        let admitted = admitted_on(&runner, &model_request("model", id)).await;
+        assert_eq!(admitted["account"]["account_id"], A);
+        start_admission(&runner, id, id).await;
+    }
+    assert_eq!(model_count(&harness, "model"), 2);
+
+    let mut next = model_request("model", "first-next");
+    next["conversation_key"] = json!("first");
+    next["mode"] = json!("admit");
+    assert_eq!(
+        admitted_on(&runner, &next).await["account"]["account_id"],
+        A
+    );
+    start_admission(&runner, "first-next", "first").await;
+    assert_eq!(model_count(&harness, "model"), 2);
+
+    assert_concurrency_full(
+        &runner
+            .call("route.account_for", &model_request("model", "third"))
+            .await,
+        NOW + 30_000,
+    );
+}
+
+#[tokio::test]
 async fn catalog_per_model_admission_limits_fallback_and_override_without_changing_shadow_replies()
 {
     let _clock = crate::InjectedClock::set(NOW);
