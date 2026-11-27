@@ -1,0 +1,33 @@
+{
+  "result": [
+    {
+      "provider": "opencodego",
+      "apiProvider": "opencode-go",
+      "credentialRef": "apikey:opencode-go",
+      "source": "vault",
+      "fetchedAt": "2026-11-27T13:41:27Z",
+      "usage": {
+        "primary": {
+          "modelScope": "all",
+          "windowKind": "five_hour",
+          "windowMinutes": 300,
+          "usedPercent": 0.0,
+          "resetsAt": "2026-11-27T17:29:35Z"
+        },
+        "secondary": {
+          "modelScope": "all",
+          "windowKind": "weekly",
+          "windowMinutes": 10080,
+          "usedPercent": 0.0,
+          "resetsAt": "2026-11-30T00:00:00Z"
+        },
+        "tertiary": {
+          "modelScope": "all",
+          "windowKind": "monthly",
+          "usedPercent": 0.0,
+          "resetsAt": "2026-12-22T14:17:08Z"
+        }
+      }
+    }
+  ]
+}

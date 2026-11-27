@@ -1530,6 +1530,7 @@ pub type SharedAccountQuota = Arc<Mutex<AccountQuotaState>>;
 pub struct CredentialIdentity {
     pub account_id: String,
     pub active: bool,
+    pub bare_api_key: bool,
     pub plan_tier: Option<String>,
 }
 
@@ -1548,6 +1549,7 @@ fn credential_identities(
                 .clone()
                 .unwrap_or_else(|| credential.id.clone()),
             active: credential.state == "active",
+            bare_api_key: credential.account_id.is_none() && credential.credential_type == "apikey",
             plan_tier: credential.plan_tier.clone(),
         };
         if let Some(previous) = identities.get(&credential.id) {

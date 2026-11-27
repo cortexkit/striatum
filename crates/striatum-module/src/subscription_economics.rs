@@ -407,7 +407,20 @@ fn account(
         .iter()
         .filter(|(name, _)| *name != weekly_name)
         .filter_map(|(name, window)| {
-            let bound = constraint(window)?;
+            let bound = if window["windowKind"] == "monthly" && window["windowMinutes"].is_null() {
+                if expired(window) {
+                    return None;
+                }
+                // Use headroom alone: a billing month has no fixed duration
+                // to discount pressure as the reset approaches.
+                QuotaConstraint {
+                    window_minutes: 0,
+                    remaining_points: 100.0 - used(window)?,
+                    remaining_fraction: 1.0,
+                }
+            } else {
+                constraint(window)?
+            };
             observe(name, window, None, false);
             Some(bound)
         })
@@ -1017,6 +1030,11 @@ fn overlay_pools_with_values(
             } else {
                 for account in &mut plan.accounts {
                     let age = |window: &mut QuotaConstraint| {
+                        // A durationless window has utilization pressure only.
+                        // Keep it until the next observation rather than inventing decay.
+                        if window.window_minutes == 0 {
+                            return false;
+                        }
                         window.remaining_fraction -=
                             (elapsed * 60.0) / window.window_minutes as f64;
                         window.remaining_fraction <= f64::EPSILON

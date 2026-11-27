@@ -94,6 +94,8 @@ pub struct QuotaAccount {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct QuotaConstraint {
+    /// Nominal duration used to group like windows. Zero groups billing-month
+    /// windows that have no fixed duration.
     pub window_minutes: i64,
     pub remaining_points: f64,
     pub remaining_fraction: f64,

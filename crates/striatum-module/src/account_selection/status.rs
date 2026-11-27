@@ -93,9 +93,12 @@ pub(crate) fn account_status(params: &Value, ctx: &Ctx<'_>) -> OpReply {
                 .iter()
                 .any(|account| account.account_id == parsed.account_id)
         });
-        if !known {
-            return WarmReason::AccountUnknown;
-        }
+        // Bare API keys have no refresh identity. Only their exact, currently
+        // listed credential may establish status from an account-less reading.
+        let bare_key = state
+            .credential_identities
+            .get(&parsed.account_id)
+            .is_some_and(|identity| identity.active && identity.bare_api_key);
         // Readings are keyed by producer (for example `codex`), while the
         // requested routing provider is the entry's apiProvider (`openai`).
         let Some(stored) = state
@@ -105,6 +108,10 @@ pub(crate) fn account_status(params: &Value, ctx: &Ctx<'_>) -> OpReply {
             .filter(|reading| {
                 reading.account_id == parsed.account_id
                     && reading.routing_provider() == Some(provider.as_str())
+                    && (known
+                        || (bare_key
+                            && reading.entry["account"].is_null()
+                            && reading.entry["credentialRef"] == parsed.account_id))
             })
             .filter(|reading| reading.tombstoned_at_ms.is_none())
             .max_by_key(|reading| {
@@ -118,7 +125,11 @@ pub(crate) fn account_status(params: &Value, ctx: &Ctx<'_>) -> OpReply {
                 )
             })
         else {
-            return WarmReason::ReadingMissing;
+            return if known {
+                WarmReason::ReadingMissing
+            } else {
+                WarmReason::AccountUnknown
+            };
         };
         let Ok(entry) = serde_json::from_value::<AccountEntry>(stored.entry.clone()) else {
             return WarmReason::ReadingMissing;

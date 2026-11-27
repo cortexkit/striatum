@@ -34,7 +34,13 @@ fn reset_time(text: Option<&str>) -> ResetTime {
 }
 
 pub(super) fn quota_window(window: &RateWindow) -> Option<QuotaWindow> {
-    let minutes = u32::try_from(window.window_minutes?).ok()?;
+    let minutes = match window.window_minutes {
+        Some(minutes) => u32::try_from(minutes).ok().filter(|&minutes| minutes > 0)?,
+        // The billing anchor gives a reset, not a fixed length for a month.
+        // Retain the limit and mark its duration unknown for the allocator.
+        None if window.window_kind.as_deref() == Some("monthly") => 0,
+        None => return None,
+    };
     Some(QuotaWindow {
         used_percent: window.used_percent,
         // Insula's `rawUsedPercent` is the poll's percent before the account's
@@ -79,10 +85,7 @@ pub(super) fn quota_reading_from_entry(
         .iter()
         .filter_map(|(_, window)| quota_window(window))
         .collect();
-    let invalid_topology = reported.len() != general_windows.len()
-        || general_windows
-            .iter()
-            .any(|window| window.window_minutes == 0);
+    let invalid_topology = reported.len() != general_windows.len();
     let general = |minutes: u32| {
         general_windows
             .iter()

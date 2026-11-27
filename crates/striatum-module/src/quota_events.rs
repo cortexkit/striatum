@@ -384,6 +384,21 @@ pub(crate) fn store_test_samples(
     }
 }
 
+#[cfg(test)]
+pub(crate) async fn store_test_snapshot(
+    store: SharedStore,
+    accounts: account_quota::SharedAccountQuota,
+    body: Vec<u8>,
+) {
+    let live = LiveQuota {
+        cache: Default::default(),
+        accounts,
+        store,
+        snapshot_baseline: Default::default(),
+    };
+    live.store_body(body, false).await.unwrap();
+}
+
 #[async_trait::async_trait]
 trait InsulaRoute: Send {
     async fn fetch(

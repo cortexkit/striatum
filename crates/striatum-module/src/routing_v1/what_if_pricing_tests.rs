@@ -326,6 +326,148 @@ fn route_pressure(answer: &Value, index: usize, route: &str) -> f64 {
         .unwrap()
 }
 
+#[tokio::test]
+async fn account_status_and_what_if_use_the_polled_key_only_monthly_window() {
+    const SNAPSHOT: &str = include_str!("../../fixtures/synthetic-insula-usage-opencode-go.json");
+    let mut snapshot: Value = serde_json::from_str(SNAPSHOT).unwrap();
+    let provider = snapshot["result"][0]["apiProvider"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let credential = snapshot["result"][0]["credentialRef"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let now = crate::account_quota::parse_rfc3339_ms("2026-11-27T13:41:27Z").unwrap();
+    let _clock = crate::InjectedClock::set(now as u64);
+    let harness = Harness::new("key-only-quota");
+    let mut fact = kimi_fact();
+    fact.provider_id.clone_from(&provider);
+    fact.model_id = "muse-spark".into();
+    let route_key = format!("{}/{}", fact.provider_id, fact.model_id);
+    harness.edit_config(|config| {
+        config["runners"] = json!([{"module":"broca"}]);
+        config["providers"][&provider] = json!({"subscription":true,"models":[fact.model_id]});
+        config["consumers"]["prefrontal.mason"] = json!({
+            "owner":fixture::CONSUMER.trim_start_matches("reserved:"),"mode":"demand",
+        });
+    });
+    harness.install_facts(std::slice::from_ref(&fact));
+    let listing = cortexkit_claustrum_client::ScopedCredentialListing {
+        view: "key-only".into(),
+        credentials: vec![cortexkit_claustrum_client::ListedCredential {
+            id: credential.clone(),
+            state: "active".into(),
+            categories: vec!["llm-provider".into()],
+            provider_ids: vec![provider.clone()],
+            credential_type: "apikey".into(),
+            auth_method: Some("apikey".into()),
+            plan_tier: Some("go".into()),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let shared = harness.credentials();
+    {
+        let mut credentials = shared.lock().unwrap();
+        credentials.apply_listing(&listing, now as u64);
+        credentials.set_watch_confirmed(Some(&listing.view));
+        credentials.refresh_serving_methods(&Default::default(), &[fact], now, &[]);
+    }
+    let accounts = crate::ACCOUNT_QUOTA.get().unwrap();
+    crate::account_quota::apply_roster_listing(&mut accounts.lock().unwrap(), &listing, now)
+        .unwrap();
+
+    let route = operator(&harness).await;
+    let status_params = json!({"provider":provider,"account_id":credential});
+    let profile_key = route_key.clone();
+    let profiles =
+        move |_: &str, _: f64, _: &[striatum_core::ModelFact]| crate::select::TaskProfileLookup {
+            profiles: [(
+                profile_key.clone(),
+                TaskProfile {
+                    tokens: TokenVector {
+                        fresh_input: 1_000.0,
+                        output_excluding_reasoning: 500.0,
+                        ..Default::default()
+                    },
+                    level: ProfileLevel::OwnCell,
+                    task_count: 30,
+                    own_task_count: 30,
+                    own_weight: 1.0,
+                    keeps_tokenizer: true,
+                },
+            )]
+            .into(),
+            providers_without_cache_write_reports: Default::default(),
+        };
+    let mut statuses = Vec::new();
+    let mut pressure = Vec::new();
+    for used in [0.0, 80.0, 100.0] {
+        snapshot["result"][0]["usage"]["tertiary"]["usedPercent"] = json!(used);
+        crate::quota_events::store_test_snapshot(
+            harness.store().clone(),
+            accounts.clone(),
+            serde_json::to_vec(&snapshot).unwrap(),
+        )
+        .await;
+        let (ty, reply) = route.call("route.account_status", &status_params).await;
+        assert_eq!(ty, FrameType::Response, "{reply}");
+        statuses.push(reply["result"].clone());
+        if used < 100.0 {
+            let pools = crate::subscription_economics::test_account_pools(
+                &accounts.lock().unwrap(),
+                &Value::Null,
+                now,
+            );
+            let _pools = crate::subscription_economics::test_pools(pools);
+            let answer = route
+                .what_if_with_profiles(
+                    &json!({"consumer":"prefrontal.mason","iqs":[50]}),
+                    &profiles,
+                )
+                .await
+                .unwrap();
+            pressure.push(
+                answer["results"][0]["adequate"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|row| row["route"] == route_key)
+                    .and_then(|row| row["task_pricing"]["pressure"].as_f64()),
+            );
+        }
+    }
+    assert!(
+        statuses[0]["limit_state"] == "available"
+            && pressure[0].zip(pressure[1]).is_some_and(|(idle, used)| used > idle),
+        "expected key headroom and rising pressure from monthly usage alone; status: {}; pressures: {pressure:?}",
+        statuses[0]
+    );
+    assert_eq!(statuses[0]["windows"].as_array().unwrap().len(), 3);
+    for (index, (kind, minutes, reset)) in [
+        ("five_hour", json!(300), "2026-11-27T17:29:35Z"),
+        ("weekly", json!(10080), "2026-11-30T00:00:00Z"),
+        ("monthly", Value::Null, "2026-12-22T14:17:08Z"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_eq!(
+            statuses[0]["windows"][index],
+            json!({
+                "kind":kind,"used_percent":0.0,"resets_at":reset,"window_minutes":minutes,
+            })
+        );
+    }
+    assert_eq!(statuses[2]["limit_state"], "limited");
+    assert_eq!(
+        statuses[2]["reason"],
+        json!({"code":"within_reserve","window":"monthly"})
+    );
+    assert_eq!(statuses[2]["windows"][2]["used_percent"], 100.0);
+}
+
 fn kimi_join_report() -> Value {
     json!({"latest": [{
         "quota_provider": "kimi-for-coding",

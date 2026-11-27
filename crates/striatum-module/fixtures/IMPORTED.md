@@ -31,6 +31,7 @@ folders are routing-produced samples; these are frozen consumer inputs.
 - `synthetic-routing-config.jsonc`: synthetic legacy `model_routing`/`account_selection` JSONC settings for converter and account-class tests.
 - `synthetic-head-choices-broca-inputs.json`: synthetic catalog, billing-plane, settings, runner-tier, and vault inputs that reproduce the published `route.head_choices` reply.
 - `synthetic-insula-usage-claude.json`: synthetic Insula `usage.get` reply with five accounts and short, weekly, and per-model windows.
+- `synthetic-insula-usage-opencode-go.json`: synthetic Insula `usage.get` reply for a bare OpenCode Go key, with a monthly window that names its period without declaring a fixed duration.
 - `synthetic-claude-head-reserve.json`: synthetic weekly quota and saved resets for worker admission at the head reserve.
 - `synthetic-pi-worker-subscription-reserve.json`: synthetic weekly quota and worker requirements for comparing `route.select` across harnesses.
 - `synthetic-routing-reserve-outage.json`: synthetic Insula usage entries and a competing provider wall for pooled reserve pricing.

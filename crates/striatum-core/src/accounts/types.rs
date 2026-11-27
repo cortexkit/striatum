@@ -90,6 +90,7 @@ pub struct QuotaWindow {
     /// allocator itself never confirms from a view (see `evidence`).
     pub raw_utilization: Option<f64>,
     pub resets_at: ResetTime,
+    /// Zero for a named monthly window whose duration is not fixed.
     pub window_minutes: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window_kind: Option<String>,
