@@ -264,8 +264,8 @@ JSON samples were verified against the supplied manifest before import.
 
 `astrocyte-spend-multiplier-report-v2/` copies Astrocyte's
 `crates/astrocyte-module/test-vectors/spend-multiplier-report-v2/` byte for
-byte, from its `quota-pools` campaign commit `c64dfc41` (tag
-`spend-multiplier-report-v2` when that campaign lands). Its README describes the
+byte, from Astrocyte commit `c64dfc41` (tag `spend-multiplier-report-v2`).
+Its README describes the
 cases; the pool ids and plans are synthetic. The files were checked against the
 supplied manifest before import; the manifest itself has SHA-256
 `d7c7cba095cfe8da67352de2e9c8cad60383542f6888faf7039e32386373114c`, and each file's

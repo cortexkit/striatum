@@ -16,8 +16,9 @@ fn one_probe_account() -> Arc<Harness> {
 fn account_with_models(models: &[&str]) -> Arc<Harness> {
     let harness = Harness::new("transient-backoff-select");
     let mut credentials = BrocaCredentials::default();
-    // Only these OpenAI routes adequate for this demand exist here, so a
-    // refusal can come only from the account test held on them.
+    // Only these OpenAI routes can serve this demand, so a refusal can come
+    // only from a block on their one account whose recovery test another
+    // request has claimed.
     rusqlite::Connection::open(harness.store_path())
         .unwrap()
         .execute("DELETE FROM model_facts", [])

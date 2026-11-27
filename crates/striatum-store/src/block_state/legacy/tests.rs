@@ -1,8 +1,9 @@
 #![allow(dead_code)]
-//! This in-memory model does not model reopening after the provider-supplied retry time.
 //! In-memory copy of the block tables: the eleven `fence_origin` source
 //! tables, the probe clocks, route clears, probe authorizations, success
-//! pools and account eligibility.
+//! pools and account eligibility. It predates short rate-limit pauses that
+//! lift for every request at the provider's retry time, so it never drops
+//! such a block at its deadline; live code does.
 //!
 //! The SQL statements stay the only definition of every write. The writer
 //! connection's update hook records each row a command changes in these

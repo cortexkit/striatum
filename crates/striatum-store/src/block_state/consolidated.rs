@@ -483,16 +483,18 @@ impl BlockState {
     }
 
     /// Every current source, including a route hidden by its provider's
-    /// covering wall. Expiry retires both generations together so the covered
-    /// route cannot reappear after its provider is retired.
+    /// covering wall. Expiry retires the provider's source and the hidden
+    /// route's source together, so the route cannot reappear once its provider
+    /// is retired.
     pub(crate) fn source_origins(&self) -> Vec<ViewOrigin> {
         self.block_rows()
             .filter_map(|row| self.view_origin(row))
             .collect()
     }
 
-    /// Whether an expiring provider-supplied pause needs the writer's
-    /// retirement pass. Ordinary admissions avoid that work entirely.
+    /// Whether a provider-supplied pause has passed its retry time, so the
+    /// writer must retire its block rows before admitting. Admissions with no
+    /// such pause skip that write entirely.
     pub fn has_expired_rate_limit(&self, now: i64) -> bool {
         self.block_rows().any(|row| {
             row.source_present
