@@ -2079,16 +2079,13 @@ mod tests {
     use sha2::{Digest, Sha256};
     const NOW: i64 = 1791507600000;
 
-    // Captured from the read-only spend.multiplier.report on 2026-10-09, with
-    // both providers' latest observations and daily series. This pins the actual
-    // api_nanos/delta_percent fields used to compute USD per pooled quota point.
-    // Schema source: astrocyte/crates/astrocyte-core/src/multiplier.rs and
-    // crates/astrocyte-module/src/main.rs at
-    // 4a89d881101c9a666d8acf9cc3aeae7b4532b0c8. Synthetic observations below
-    // vary numeric values; the captured fixture preserves the served structure.
+    // This synthetic fixture follows the served v1 spend.multiplier.report
+    // shape, with both providers' latest observations and daily series.
     fn report() -> Value {
-        serde_json::from_str::<Value>(include_str!("../fixtures/astrocyte-multiplier-report.json"))
-            .unwrap()["result"]
+        serde_json::from_str::<Value>(include_str!(
+            "../fixtures/synthetic-astrocyte-multiplier-report-v1.json"
+        ))
+        .unwrap()["result"]
             .clone()
     }
     fn report_v2() -> Value {
@@ -2365,15 +2362,15 @@ mod tests {
         assert!(account_plan(&json!({"latest":[],"series":[]}), "a", None)
             .unwrap()
             .is_none());
-        let captured = report();
-        assert!(captured["latest"].is_array());
-        assert!(account_plan(&captured, "a", None).unwrap().is_none());
-        assert!(captured["latest"]
+        let report = report();
+        assert!(report["latest"].is_array());
+        assert!(account_plan(&report, "a", None).unwrap().is_none());
+        assert!(report["latest"]
             .as_array()
             .unwrap()
             .iter()
             .all(|row| measured(row).is_none()));
-        let pool = build(&state(30.0, Some("max_20x")), &captured, &prices(), NOW)
+        let pool = build(&state(30.0, Some("max_20x")), &report, &prices(), NOW)
             .pools
             .remove("anthropic")
             .unwrap();

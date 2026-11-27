@@ -34,6 +34,7 @@ folders are routing-produced samples; these are frozen consumer inputs.
 - `synthetic-claude-head-reserve.json`: synthetic weekly quota and saved resets for worker admission at the head reserve.
 - `synthetic-pi-worker-subscription-reserve.json`: synthetic weekly quota and worker requirements for comparing `route.select` across harnesses.
 - `synthetic-routing-reserve-outage.json`: synthetic Insula usage entries and a competing provider wall for pooled reserve pricing.
+- `synthetic-astrocyte-multiplier-report-v1.json`: synthetic `spend.multiplier.report` in the served v1 shape, with two provider observations and their daily series.
 - `synthetic-astrocyte-account-multiplier-report-v2.json`: synthetic `spend.multiplier.report` v2 with five account-joined plans.
 - `synthetic-astrocyte-account-multiplier-report-v2.README.md`: notes on the synthetic account-joined report cases.
 - `synthetic-astrocyte-credential-multiplier-report-v2.json`: synthetic `spend.multiplier.report` v2 with seven plans, including two credential-only joins.
@@ -89,7 +90,7 @@ The reader tests send the request bytes unchanged through routing's v1 handler.
 ## Token-relay capacity wait
 
 `thalamus-capacity-wait-v1/request.json` and `thalamus-capacity-wait-v1/re-ask.json`
-are imported `route.account_for` params with synthetic admission IDs.
+are imported `route.account_for` params with synthetic admission IDs and a synthetic conversation key.
 The [README](thalamus-capacity-wait-v1/README.md) describes the retry case;
 `thalamus-capacity-wait-v1/SHA256SUMS` pins the updated bodies.
 
