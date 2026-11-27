@@ -1304,7 +1304,7 @@ mod tests {
             "without quota, Antigravity Gemini is the route that wins"
         );
 
-        // Live account heidi: gemini-5h exhausted, gemini-weekly not.
+        // Gemini 5-hour quota is exhausted, but the weekly quota is not.
         let reset = "2030-01-01T01:19:00Z";
         let entry = antigravity_account(
             "only",

@@ -45,24 +45,20 @@ fn fixture() -> (Arc<Harness>, crate::broca_credentials::BrocaCredentials) {
     credentials.apply_listing(
         &ScopedCredentialListing {
             view: "phone-call".into(),
-            credentials: [
-                PARENT,
-                "oauth:anthropic:alice",
-                "oauth:anthropic:carol",
-            ]
-            .into_iter()
-            .map(|id| ListedCredential {
-                id: id.into(),
-                account_id: Some(id.into()),
-                state: "active".into(),
-                categories: vec!["llm-provider".into()],
-                provider_ids: vec!["anthropic".into()],
-                serves: vec!["anthropic".into()],
-                credential_type: "oauth".into(),
-                auth_method: Some("oauth".into()),
-                ..Default::default()
-            })
-            .collect(),
+            credentials: [PARENT, "oauth:anthropic:alice", "oauth:anthropic:carol"]
+                .into_iter()
+                .map(|id| ListedCredential {
+                    id: id.into(),
+                    account_id: Some(id.into()),
+                    state: "active".into(),
+                    categories: vec!["llm-provider".into()],
+                    provider_ids: vec!["anthropic".into()],
+                    serves: vec!["anthropic".into()],
+                    credential_type: "oauth".into(),
+                    auth_method: Some("oauth".into()),
+                    ..Default::default()
+                })
+                .collect(),
             ..Default::default()
         },
         NOW,

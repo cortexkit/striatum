@@ -623,11 +623,19 @@ async fn a_carbon_limit_refusal_walls_only_the_gemini_pool() {
     assert_eq!(model_account(&context, CARBON), None);
 
     // The Gemini pool reads under 100%: the block clears and Carbon is back.
-    let gemini_back = readings(NOW + 180_000, open_spent_windows(), grace_windows(99.5, 3.0));
+    let gemini_back = readings(
+        NOW + 180_000,
+        open_spent_windows(),
+        grace_windows(99.5, 3.0),
+    );
     refresh_blocks(&harness, &gemini_back, NOW + 210_000);
     assert_memory_matches_store(&harness, "Gemini pool recovered");
     assert_eq!(account_blocks(&harness), Vec::<Value>::new());
-    let gemini_open = readings(NOW + 240_000, open_spent_windows(), grace_windows(10.0, 3.0));
+    let gemini_open = readings(
+        NOW + 240_000,
+        open_spent_windows(),
+        grace_windows(10.0, 3.0),
+    );
     let context = load(&harness, &gemini_open, NOW + 240_000);
     assert_eq!(
         model_account(&context, CARBON).as_deref(),
