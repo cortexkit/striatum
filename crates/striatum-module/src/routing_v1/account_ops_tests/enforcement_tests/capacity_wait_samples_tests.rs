@@ -95,10 +95,17 @@ async fn thalamus_capacity_wait_reasks_with_a_fresh_admission_id() {
     assert_eq!(&recorded, answer);
     assert!(replay(first_id).is_none());
 
-    // The grant now holds the slot. The original ID is refused again, but the
-    // new reset and decision row show that routing evaluated it anew.
-    let before = rows(&harness);
+    // The grant now holds the slot for this conversation. The original ID
+    // can use it, but must receive its own admission, not replay either reply.
+    assert_eq!(holds(reset as i64), 1);
     let retried = recorded_ask(&runner, REQUEST, "Original admission ID retried").await;
-    assert_concurrency_full(&retried, reset + 30_000);
-    assert_only_a_refusal_row(&harness, &before, first_id);
+    let retried = response(&retried);
+    assert_eq!(retried["account"]["account_id"], ACCOUNT);
+    assert_eq!(retried["admission"]["id"], first_id);
+    assert_ne!(
+        retried["reason"]["decision_id"],
+        answer["reason"]["decision_id"]
+    );
+    let recorded: Value = serde_json::from_str(&replay(first_id).unwrap().answer_json).unwrap();
+    assert_eq!(&recorded, retried);
 }

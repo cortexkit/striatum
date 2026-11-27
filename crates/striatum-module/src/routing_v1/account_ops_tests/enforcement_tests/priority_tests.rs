@@ -261,7 +261,9 @@ async fn a_waiter_kept_on_its_affinity_account_waits_on_that_count_alone() {
         config["concurrency"]["accounts"] = json!({format!("synthetic/{B}"):{"limit":2}})
     });
     running(&runner, A, "x-first").await;
-    // X's conversation is kept on A, which X's own run fills.
+    finish(&runner, "x-first").await;
+    running(&runner, A, "holder").await;
+    // X keeps its affinity to A, where the other run holds the only slot.
     let mut x = fresh("x");
     x["conversation_key"] = json!("x-first");
     assert_concurrency_full(&runner.call("route.account_for", &x).await, NOW + 30_000);
@@ -294,7 +296,7 @@ async fn a_waiter_kept_on_its_affinity_account_waits_on_that_count_alone() {
         [(Blocking, 0, vec![A.to_owned()])]
     );
     // A slot on the count it waits on ends the wait.
-    finish(&runner, "x-first").await;
+    finish(&runner, "holder").await;
     let back = admitted_on(&runner, &again("x-first", "x-back", on(A, "x-back"))).await;
     assert_eq!(back["account"]["account_id"], A);
     assert!(waiters(&harness, NOW + 5_000).is_empty());
@@ -302,13 +304,45 @@ async fn a_waiter_kept_on_its_affinity_account_waits_on_that_count_alone() {
 
     // A renewal by a waiting conversation that already holds the count adds
     // no hold, so it leaves the conversation waiting.
-    let (harness, runner, _owner) = enforced().await;
-    let held = admitted_on(&runner, &on(A, "x")).await;
-    let mut x = fresh("x-again");
-    x["conversation_key"] = json!("x");
-    assert_concurrency_full(&runner.call("route.account_for", &x).await, NOW + 30_000);
+    let (harness, runner, held) = waiting_holder().await;
     let renewed = admitted_on(&runner, &renew("x", "x-renew", &held)).await;
     assert_eq!(renewed["account"]["account_id"], A);
+    assert_eq!(count(&harness, A, NOW), 1);
+    assert_eq!(waiters(&harness, NOW), [(Worker, 0, vec![A.to_owned()])]);
+}
+
+async fn waiting_holder() -> (Arc<Harness>, Route, Value) {
+    let (harness, runner, _owner) = enforced().await;
+    running(&runner, A, "holder").await;
+    let x = on(A, "x");
+    assert_concurrency_full(&runner.call("route.account_for", &x).await, NOW + 30_000);
+    finish(&runner, "holder").await;
+
+    // X waited on the account count, so admitting it under a per-model cap
+    // leaves the old wait intact. Switching back puts the hold and wait on
+    // the same count.
+    harness.edit_config(|config| {
+        config["concurrency"]["providers"]["synthetic"]["scope"] = json!("account_model");
+    });
+    let held = admitted_on(&runner, &x).await;
+    start_admission(&runner, "x", "x-run").await;
+    harness.edit_config(|config| {
+        config["concurrency"]["providers"]["synthetic"]["scope"] = json!("account");
+    });
+    assert_eq!(waiters(&harness, NOW), [(Worker, 0, vec![A.to_owned()])]);
+    (harness, runner, held)
+}
+
+#[tokio::test]
+async fn an_admit_using_its_open_runs_slot_does_not_clear_a_waiter() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, runner, _) = waiting_holder().await;
+    let next = again("x", "x-next", on(A, "x"));
+    assert_eq!(
+        admitted_on(&runner, &next).await["account"]["account_id"],
+        A
+    );
+    start_admission(&runner, "x-next", "x-run").await;
     assert_eq!(count(&harness, A, NOW), 1);
     assert_eq!(waiters(&harness, NOW), [(Worker, 0, vec![A.to_owned()])]);
 }

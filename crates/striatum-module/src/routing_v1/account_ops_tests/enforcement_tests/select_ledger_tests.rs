@@ -160,7 +160,10 @@ async fn select_ledger_ignores_affinity_but_excludes_full_with_blocked_sibling()
     caps(&harness, 1, true);
     let runner = harness.bind(reserved("class-runner"), None).await;
     let consumer = harness.bind(reserved("class-owner"), None).await;
-    fill(&runner, A, "a", 1).await;
+    admitted_on(&runner, &on(A, "a-0")).await;
+    start_admission(&runner, "a-0", "a-0-run").await;
+    finish_admission(&runner, "a-0", "a-0-run").await;
+    admitted_on(&runner, &on(A, "holder")).await;
     for legacy in [false] {
         let mut body = select_body(legacy);
         if !legacy {

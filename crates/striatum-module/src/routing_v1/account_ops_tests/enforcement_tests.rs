@@ -278,9 +278,12 @@ async fn enforced_kept_affinity_is_refused_and_blocked_siblings_neither_free_nor
     caps(&harness, 1, true);
     let runner = harness.bind(reserved("class-runner"), None).await;
     admitted_on(&runner, &on(A, "kept")).await;
+    start_admission(&runner, "kept", "kept-run").await;
+    finish_admission(&runner, "kept", "kept-run").await;
+    admitted_on(&runner, &on(A, "holder")).await;
     let before = super::super::what_if_tests::rows(&harness);
-    // The same conversation again: its affinity keeps it on full A although B
-    // has room, and the refusal leaves that affinity as it was.
+    // The finished run left affinity on A but no hold. Its next admission
+    // needs a slot on A and is refused without moving to B or changing affinity.
     let mut again = fresh("kept-again");
     again["conversation_key"] = json!("kept");
     assert_concurrency_full(
@@ -389,6 +392,55 @@ async fn enforced_head_calls_take_room_first_keep_affinity_and_never_wait() {
 async fn observe(route: &Route, body: Value) {
     let reply = route.call("route.account_observe", &body).await;
     assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
+}
+
+pub(super) async fn start_admission(route: &Route, id: &str, run: &str) {
+    observe(
+        route,
+        json!({"event_id":format!("{id}-start"),"kind":"admission_started",
+            "admission_id":id,"run_id":run}),
+    )
+    .await;
+}
+
+pub(super) async fn finish_admission(route: &Route, id: &str, run: &str) {
+    observe(
+        route,
+        json!({"event_id":format!("{id}-finish"),"kind":"run_finished",
+            "admission_id":id,"run_id":run}),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn account_cap_allows_a_second_admit_for_an_open_run() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, _) = setup("synthetic", false);
+    caps(&harness, 2, true);
+    let runner = harness.bind(reserved("class-runner"), None).await;
+    for id in ["first", "second"] {
+        assert_eq!(
+            admitted_on(&runner, &on(A, id)).await["account"]["account_id"],
+            A
+        );
+        start_admission(&runner, id, id).await;
+    }
+    assert_eq!(count(&harness, A, NOW), 2);
+
+    let mut next = on(A, "first-next");
+    next["conversation_key"] = json!("first");
+    next["mode"] = json!("admit");
+    assert_eq!(
+        admitted_on(&runner, &next).await["account"]["account_id"],
+        A
+    );
+    start_admission(&runner, "first-next", "first").await;
+    assert_eq!(count(&harness, A, NOW), 2);
+
+    assert_concurrency_full(
+        &runner.call("route.account_for", &on(A, "third")).await,
+        NOW + 30_000,
+    );
 }
 
 fn renew(conversation: &str, id: &str, admitted: &Value) -> Value {

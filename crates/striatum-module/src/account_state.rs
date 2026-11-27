@@ -494,6 +494,8 @@ impl AccountCommand<'_> {
         })
     }
 
+    /// Whether the conversation already holds a live slot in the same
+    /// effective scope used by `inflight_count_for_model`.
     pub(crate) fn inflight_conversation(
         &self,
         caps: &crate::concurrency_caps::ResolvedCaps,

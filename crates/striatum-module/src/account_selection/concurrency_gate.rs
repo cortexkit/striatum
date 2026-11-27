@@ -99,19 +99,17 @@ impl Gate {
         let Some(cap) = caps.cap(provider, account, &params.model).limit else {
             return Check::Room;
         };
-        // A renewal of a conversation that already holds a slot in this cap
-        // count adds no hold, so it is never checked against the cap.
-        if params.mode == RequestMode::Renew
-            && tx.inflight_conversation(
-                caps,
-                provider,
-                account,
-                &params.model,
-                principal,
-                hash,
-                ctx.now_ms,
-            )
-        {
+        // A conversation already counted in this cap's scope needs no new
+        // slot, so neither the cap nor a waiter can block its next step.
+        if tx.inflight_conversation(
+            caps,
+            provider,
+            account,
+            &params.model,
+            principal,
+            hash,
+            ctx.now_ms,
+        ) {
             return Check::Room;
         }
         let count = tx.inflight_count_for_model(caps, provider, account, &params.model, ctx.now_ms);
@@ -428,8 +426,8 @@ impl Gate {
     }
 
     /// The count an admission of this request on `account` takes a slot on,
-    /// when it adds a hold there. A renewal of a conversation that already
-    /// holds the count adds none, so it ends no wait.
+    /// if the conversation does not already hold a slot there. A request that
+    /// uses an existing slot ends no wait.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn slot_taken(
         &self,
@@ -442,17 +440,16 @@ impl Gate {
         account: &str,
     ) -> Option<CapCount> {
         let caps = &ctx.concurrency_caps;
-        let renews = params.mode == RequestMode::Renew
-            && tx.inflight_conversation(
-                caps,
-                provider,
-                account,
-                &params.model,
-                principal,
-                hash,
-                ctx.now_ms,
-            );
-        (!renews).then(|| cap_count(caps, provider, account, &params.model))
+        let holds_slot = tx.inflight_conversation(
+            caps,
+            provider,
+            account,
+            &params.model,
+            principal,
+            hash,
+            ctx.now_ms,
+        );
+        (!holds_slot).then(|| cap_count(caps, provider, account, &params.model))
     }
 }
 
