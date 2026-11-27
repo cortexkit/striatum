@@ -67,6 +67,15 @@ jobs:
 
       - uses: taiki-e/install-action@cargo-nextest
 
+      # Real-time malware scanning inspects every file the tests create. The
+      # suite opens thousands of scratch SQLite stores, which makes the hosted
+      # Windows runners several times slower than their core count explains.
+      - name: Stop real-time scanning on this throwaway runner
+        shell: pwsh
+        run: |
+          try { Set-MpPreference -DisableRealtimeMonitoring $true; Write-Host 'real-time scanning off' }
+          catch { Write-Host "real-time scanning left on: $_" }
+
       - name: Check all workspace targets
         run: cargo check --locked --workspace --all-targets
 

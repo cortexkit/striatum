@@ -14,8 +14,10 @@ filter = '''
         test(/::routing_v1_(conformance_kit_matches_served_checks|explicit_harness_needs_conformance_case|fork_of_undeclared_conformance_case)$/)
         | test(/::whole_writer::generated_request_groups_compare_all_state_after_every_real_step$/)
         | test(/::order_tests::every_(legacy_)?admission_fact_order_has_the_in_order_end_state$/)
-    )) | (package(=striatum-store) and
-        test(=block_state::tests::the_route_state_snapshot_from_memory_equals_sql_over_generated_route_writes))
+    )) | (package(=striatum-store) and (
+        test(=block_state::tests::the_route_state_snapshot_from_memory_equals_sql_over_generated_route_writes)
+        | test(=block_storage::tests::registered_block_migration_opens_fresh_and_older_chains_without_leaving_its_function)
+    ))
 '''
 slow-timeout = { period = "120s", terminate-after = 6, grace-period = "60s" }
 
