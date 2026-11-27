@@ -17,9 +17,9 @@ concurrency:
 env:
   # Set to the oldest public core that accepts Striatum's registration.
   STRIATUM_REQUIRES_CORE: ''
-  # Turn on only after the suite has passed natively on Windows. Missing
-  # Windows archives make ck setup report release-incomplete on that target.
-  STRIATUM_PUBLISH_WINDOWS: 'false'
+  # Every first public release ships Windows, built and tested natively: the
+  # verify job below requires the push CI run's native Windows test job.
+  STRIATUM_PUBLISH_WINDOWS: 'true'
 
 jobs:
   verify:
@@ -71,16 +71,16 @@ jobs:
             --event push --status success --limit 100 --json databaseId,headBranch \
             --jq '.[] | select(.headBranch == "main") | .databaseId')
           for run in $runs; do
-            # Skipped jobs can leave the workflow green without running the gate
-            # on either platform or compiling the Windows targets.
+            # Skipped jobs can leave the workflow green without running the
+            # tests on every platform.
             green=$(gh run view "$run" --repo "$GITHUB_REPOSITORY" --json status,conclusion,jobs \
-              --jq '[select(.status == "completed" and .conclusion == "success") | .jobs[] | select(.conclusion == "success") | .name] | sort == ["Check (windows)", "Test (macOS)", "Test (ubuntu)"]')
+              --jq '[select(.status == "completed" and .conclusion == "success") | .jobs[] | select(.conclusion == "success") | .name] | sort == ["Test (macOS)", "Test (ubuntu)", "Test (windows)"]')
             if [[ "$green" == true ]]; then
               echo "Verified push CI run $run for $REVISION"
               exit 0
             fi
           done
-          echo "::error::no ci.yml push run on main for $REVISION passed both test gates and the Windows check"
+          echo "::error::no ci.yml push run on main for $REVISION passed the tests on Linux, macOS and Windows"
           exit 1
 
   build:

@@ -37,10 +37,12 @@ jobs:
       - name: Run the routing test gate
         run: bash scripts/rust-test-gate.sh
 
-  windows-check:
-    name: Check (windows)
+  windows-test:
+    name: Test (windows)
     runs-on: windows-latest
-    timeout-minutes: 60
+    # A cold Windows build of the workspace and its tests takes far longer
+    # than the Linux or macOS gate.
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v5
         with:
@@ -49,5 +51,12 @@ jobs:
       - name: Install the pinned Rust toolchain
         run: rustup toolchain install --profile minimal
 
+      - uses: taiki-e/install-action@cargo-nextest
+
       - name: Check all workspace targets
         run: cargo check --locked --workspace --all-targets
+
+      # The gate script's source checks are platform-neutral and already run on
+      # Linux and macOS; Windows runs the same test suite natively.
+      - name: Run the routing tests
+        run: cargo nextest run --locked --workspace --lib --bins --tests --no-fail-fast
