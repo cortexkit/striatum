@@ -940,7 +940,7 @@ async fn what_if_panel_seed_decides_the_random_extra_seat_deterministically() {
     );
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 #[tokio::test]
 async fn what_if_all_panel_classes_keep_the_floor_when_strong_families_are_walled() {
     use super::request_cpu_bench::{representative_fixture, FixtureCounts, FIXTURE_NOW};

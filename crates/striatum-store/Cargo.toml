@@ -20,6 +20,9 @@ blake3 = { workspace = true }
 # Logs same-model score disagreements found while resolving shared scores.
 tracing = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.61.2", features = ["Win32_System_Threading"] }
+
 [features]
 test-support = []
 

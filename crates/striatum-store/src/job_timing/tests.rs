@@ -110,7 +110,7 @@ fn batch_holder_names_all_static_ops_and_unlabelled_writer_has_source() {
     });
     assert_eq!(lines.len(), 2);
     assert!(lines[0].contains("holder=account_batch[catalog_apply,observe]"));
-    assert!(lines[1].contains("holder=crates/striatum-store/src/job_timing/tests.rs:"));
+    assert!(lines[1].contains(&format!("holder={}:", file!())));
 }
 
 #[test]
@@ -129,6 +129,19 @@ fn blocking_and_account_writer_counters_return_to_the_named_pass() {
                 let started = Instant::now();
                 while started.elapsed() < Duration::from_millis(4) {
                     std::hint::spin_loop();
+                }
+                #[cfg(windows)]
+                {
+                    // Windows CPU accounting can update less often than the
+                    // wall clock. Wait for a CPU sample, not just a wall tick.
+                    let cpu = thread_cpu_ns();
+                    while thread_cpu_ns().saturating_sub(cpu) < 1_000_000 {
+                        assert!(
+                            started.elapsed() < Duration::from_secs(1),
+                            "thread CPU did not advance"
+                        );
+                        std::hint::spin_loop();
+                    }
                 }
                 Ok(())
             })

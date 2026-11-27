@@ -252,7 +252,37 @@ pub(crate) fn thread_cpu_ns() -> u64 {
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(windows)]
+pub(crate) fn thread_cpu_ns() -> u64 {
+    use windows_sys::Win32::{
+        Foundation::FILETIME,
+        System::Threading::{GetCurrentThread, GetThreadTimes},
+    };
+
+    let mut created = FILETIME::default();
+    let mut exited = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    // SAFETY: GetCurrentThread supplies a valid pseudo-handle, and the four
+    // output pointers refer to distinct writable FILETIME values.
+    if unsafe {
+        GetThreadTimes(
+            GetCurrentThread(),
+            &mut created,
+            &mut exited,
+            &mut kernel,
+            &mut user,
+        )
+    } == 0
+    {
+        return 0;
+    }
+    let ticks =
+        |time: FILETIME| (u64::from(time.dwHighDateTime) << 32) | u64::from(time.dwLowDateTime);
+    (ticks(kernel) + ticks(user)) * 100
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 pub(crate) fn thread_cpu_ns() -> u64 {
     0
 }

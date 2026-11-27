@@ -111,7 +111,7 @@ impl RequestFixture {
 }
 
 // Include the blocking request workers, not only the async caller's thread.
-// Both OS interfaces report process CPU at 10 ms resolution; aggregate enough
+// The Unix interfaces report process CPU at 10 ms resolution; aggregate enough
 // operations to make that quantization small relative to the measured work.
 pub(crate) fn cpu_us() -> i64 {
     #[cfg(target_os = "linux")]
@@ -141,6 +141,14 @@ pub(crate) fn cpu_us() -> i64 {
             .map(|(n, part)| part.parse::<f64>().unwrap() * 60_f64.powi(n as i32))
             .sum();
         (seconds * 1_000_000.0).round() as i64
+    }
+    #[cfg(windows)]
+    {
+        let process = subc_os::Process::open(std::process::id())
+            .expect("open current process")
+            .expect("current process is running");
+        let milliseconds = process.cumulative_cpu_ms().expect("read process CPU time");
+        i64::try_from(milliseconds).unwrap() * 1_000
     }
 }
 
