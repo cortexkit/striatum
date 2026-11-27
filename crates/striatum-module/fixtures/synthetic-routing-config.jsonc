@@ -1,0 +1,32 @@
+{
+  "model_routing": {
+    // The minus prefix restores a model after excluding its provider.
+    "exclude": {
+      "all": ["opencode-go", "-opencode-go/deepseek-v4.1-flash", "meta", "openai/gpt-6-sol"],
+      "mason": ["openai/gpt-6-luna", "anthropic-platform", "inception/mercury-3"],
+      "sidekick": ["anthropic-platform", "-anthropic-platform/claude-haiku-5-5"],
+      "athena": ["anthropic/claude-opus-5-5"],
+      "lab": ["opencode-go/deepseek-v4.1-flash"],
+      "core": ["inception/mercury-3"]
+    },
+    "pins": {
+      "synthesizer": {"model": "anthropic-platform/claude-opus-5-5", "variant": "medium"},
+      "lab_planner": {"model": "anthropic-platform/claude-opus-5-5"}
+    },
+    // Archived settings cover both per-consumer and per-model overrides.
+    "variants": {
+      "mason": {"meta/muse-spark-1.3-contributor": "high"},
+      "sidekick": {"meta/muse-spark-1.3-contributor": "medium"},
+      "athena": {"openai/gpt-6-astra": "xhigh"}
+    },
+    "score_alias": {"anthropic-platform": "anthropic"},
+    "subscription": ["-xai", "xai/grok-4.7", "kimi-for-coding", "alibaba-token-plan"],
+    "subscription_multipliers": {"xai": 5, "alibaba-token-plan": 10},
+    "models": {
+      "inception/mercury-3": {"elo": 1700, "eq": 1600},
+      "ollama-cloud/glm-5.2": {"speed_multiplier": 0.5},
+      "meta/muse-wonder-full-1.0": {"cost_per_mtok_out": 10}
+    }
+  },
+  "account_selection": {"enabled": true}
+}

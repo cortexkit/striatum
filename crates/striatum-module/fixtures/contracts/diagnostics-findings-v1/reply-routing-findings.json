@@ -5,21 +5,21 @@
         "check": "credential_fences",
         "count": 1,
         "first_seen_ms": 1799999400000,
-        "hint": "Top up the credential's paid balance, then lift the fence with route.clear_credential_fences {\"credentialId\":\"apikey:inception:main\"}. Non-quota refusals permit one probe after at most 1h; quota holds recheck every 15m without a fresh reading.",
-        "key": "inception/apikey:inception:main",
+        "hint": "Top up the credential's paid balance, then lift the fence with route.clear_credential_fences {\"credentialId\":\"apikey:inception:test-credential\"}. Non-quota refusals permit one probe after at most 1h; quota holds recheck every 15m without a fresh reading.",
+        "key": "inception/apikey:inception:test-credential",
         "last_seen_ms": 1800000000000,
         "samples": [
           {
             "age_ms": 600000,
             "code": "billing_exhausted",
-            "credential_id": "apikey:inception:main",
+            "credential_id": "apikey:inception:test-credential",
             "kind": "billing",
             "observed_at_ms": 1799999400000,
             "provider_id": "inception"
           }
         ],
         "severity": "warning",
-        "summary": "inception is fenced on credential apikey:inception:main (billing: billing_exhausted), last confirmed 10m ago; routing will not use inception through that credential"
+        "summary": "inception is fenced on credential apikey:inception:test-credential (billing: billing_exhausted), last confirmed 10m ago; routing will not use inception through that credential"
       }
     ],
     "generated_at_ms": 1800000000000,

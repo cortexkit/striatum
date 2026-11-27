@@ -1,0 +1,9 @@
+{
+  "runner": {
+    "follows_account_choice": true,
+    "harnesses": ["broca"],
+    "harness_limits": {
+      "broca": {"capabilities": ["one_off", "fork_answer", "submit_tool", "final_text", "plans"]}
+    }
+  }
+}

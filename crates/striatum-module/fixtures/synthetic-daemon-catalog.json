@@ -1,0 +1,63 @@
+{
+  "op": "catalog.list",
+  "generation": 1,
+  "modules": [
+    {
+      "capabilities": {"must_never_reach": [], "provides": ["media-provider/v1"], "requires": []},
+      "control_ops": ["route.bind", "route.status", "health.check"],
+      "module_id": "colliculus",
+      "module_version": "1.0.0",
+      "nonce_verified": true,
+      "operation_payload": {"media.upload_append": {"max_bytes": 2000000}},
+      "provenance": {
+        "build_git_sha": "1111111111111111111111111111111111111111",
+        "launch_nonce_source": "fd",
+        "wire_crate_version": "1.0.0"
+      },
+      "ready": true,
+      "role_declarations": {
+        "media-provider/v1": {
+          "engines": [
+            {
+              "bias_limit": {"max": 10, "unit": "phrase"},
+              "formats": ["audio/mp4", "audio/wav"],
+              "kind": "transcribe",
+              "languages": ["en"],
+              "latency_class": "interactive",
+              "local": false,
+              "max_duration_ms": 600000,
+              "max_input_bytes": 10000000,
+              "model": "test-short-transcription",
+              "provider": "openai"
+            },
+            {
+              "bias_limit": {"max": 20, "unit": "phrase"},
+              "formats": ["audio/wav"],
+              "kind": "transcribe",
+              "languages": ["en"],
+              "latency_class": "interactive",
+              "local": false,
+              "max_duration_ms": 1200000,
+              "max_input_bytes": 5000000,
+              "model": "test-long-transcription",
+              "provider": "google"
+            }
+          ],
+          "groups": ["jobs", "usage_feed", "bias_packs"],
+          "jobs_survive_restart": true
+        }
+      },
+      "roles": [
+        {
+          "concurrency": "module_managed",
+          "config_schema": {},
+          "identity_scope": [],
+          "observability": [],
+          "operations": [{"kind": "mutate", "name": "media.submit"}, {"kind": "query", "name": "media.status"}],
+          "role": "management_surface"
+        }
+      ]
+    }
+  ],
+  "subc_ops": []
+}

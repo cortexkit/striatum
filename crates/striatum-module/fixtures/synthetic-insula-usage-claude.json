@@ -1,0 +1,286 @@
+{
+  "completeProviders": [
+    "claude"
+  ],
+  "result": [
+    {
+      "account": "test-claude-1",
+      "accountInfo": {
+        "email": "test-claude-1@example.com",
+        "orgName": "Test org 1"
+      },
+      "apiProvider": "anthropic",
+      "fetchedAt": "2027-01-15T08:00:00Z",
+      "provider": "claude",
+      "source": "vault",
+      "usage": {
+        "extraRateWindows": [
+          {
+            "id": "Fable",
+            "title": "7 Day (Fable)",
+            "window": {
+              "resetsAt": "2027-01-15T16:00:00Z",
+              "usedPercent": 30.0,
+              "windowMinutes": 10080
+            }
+          }
+        ],
+        "primary": {
+          "resetsAt": "2027-01-15T09:00:00Z",
+          "usedPercent": 10.0,
+          "windowMinutes": 300
+        },
+        "secondary": {
+          "breakdown": {
+            "asOf": "2027-01-15T08:00:00Z",
+            "rows": [
+              {
+                "key": "claude_code",
+                "sharePercent": 80.0
+              },
+              {
+                "key": "chat",
+                "sharePercent": 10.0
+              },
+              {
+                "key": "cowork",
+                "sharePercent": 5.0
+              },
+              {
+                "key": "other",
+                "sharePercent": 5.0
+              }
+            ],
+            "windowStartedAt": "2027-01-08T15:00:00Z"
+          },
+          "resetsAt": "2027-01-15T15:00:00Z",
+          "usedPercent": 100.0,
+          "windowMinutes": 10080
+        }
+      }
+    },
+    {
+      "account": "test-claude-2",
+      "accountInfo": {
+        "email": "test-claude-2@example.com",
+        "orgName": "Test org 2"
+      },
+      "apiProvider": "anthropic",
+      "fetchedAt": "2027-01-15T07:59:00Z",
+      "provider": "claude",
+      "source": "vault",
+      "usage": {
+        "extraRateWindows": [
+          {
+            "id": "Fable",
+            "title": "7 Day (Fable)",
+            "window": {
+              "resetsAt": "2027-01-15T13:00:00Z",
+              "usedPercent": 30.0,
+              "windowMinutes": 10080
+            }
+          }
+        ],
+        "primary": {
+          "usedPercent": 0.0,
+          "windowMinutes": 300
+        },
+        "secondary": {
+          "breakdown": {
+            "asOf": "2027-01-15T07:59:00Z",
+            "rows": [
+              {
+                "key": "claude_code",
+                "sharePercent": 80.0
+              },
+              {
+                "key": "chat",
+                "sharePercent": 10.0
+              },
+              {
+                "key": "cowork",
+                "sharePercent": 5.0
+              },
+              {
+                "key": "other",
+                "sharePercent": 5.0
+              }
+            ],
+            "windowStartedAt": "2027-01-08T12:00:00Z"
+          },
+          "resetsAt": "2027-01-15T12:00:00Z",
+          "usedPercent": 100.0,
+          "windowMinutes": 10080
+        }
+      }
+    },
+    {
+      "account": "test-claude-3",
+      "accountInfo": {
+        "email": "test-claude-3@example.com",
+        "orgName": "Test org 3"
+      },
+      "apiProvider": "anthropic",
+      "fetchedAt": "2027-01-15T07:58:00Z",
+      "provider": "claude",
+      "source": "vault",
+      "usage": {
+        "extraRateWindows": [
+          {
+            "id": "Fable",
+            "title": "7 Day (Fable)",
+            "window": {
+              "resetsAt": "2027-01-15T22:00:00Z",
+              "usedPercent": 50.0,
+              "windowMinutes": 10080
+            }
+          }
+        ],
+        "primary": {
+          "resetsAt": "2027-01-15T11:00:00Z",
+          "usedPercent": 20.0,
+          "windowMinutes": 300
+        },
+        "secondary": {
+          "breakdown": {
+            "asOf": "2027-01-15T07:58:00Z",
+            "rows": [
+              {
+                "key": "claude_code",
+                "sharePercent": 80.0
+              },
+              {
+                "key": "chat",
+                "sharePercent": 10.0
+              },
+              {
+                "key": "cowork",
+                "sharePercent": 5.0
+              },
+              {
+                "key": "other",
+                "sharePercent": 5.0
+              }
+            ],
+            "windowStartedAt": "2027-01-08T21:00:00Z"
+          },
+          "resetsAt": "2027-01-15T21:00:00Z",
+          "usedPercent": 90.0,
+          "windowMinutes": 10080
+        }
+      }
+    },
+    {
+      "account": "test-claude-4",
+      "accountInfo": {
+        "email": "test-claude-4@example.com",
+        "orgName": "Test org 4"
+      },
+      "apiProvider": "anthropic",
+      "fetchedAt": "2027-01-15T07:57:00Z",
+      "provider": "claude",
+      "source": "vault",
+      "usage": {
+        "extraRateWindows": [
+          {
+            "id": "Fable",
+            "title": "7 Day (Fable)",
+            "window": {
+              "resetsAt": "2027-01-15T20:00:00Z",
+              "usedPercent": 0.0,
+              "windowMinutes": 10080
+            }
+          }
+        ],
+        "primary": {
+          "resetsAt": "2027-01-15T14:00:00Z",
+          "usedPercent": 20.0,
+          "windowMinutes": 300
+        },
+        "secondary": {
+          "breakdown": {
+            "asOf": "2027-01-15T07:57:00Z",
+            "rows": [
+              {
+                "key": "claude_code",
+                "sharePercent": 80.0
+              },
+              {
+                "key": "chat",
+                "sharePercent": 10.0
+              },
+              {
+                "key": "cowork",
+                "sharePercent": 5.0
+              },
+              {
+                "key": "other",
+                "sharePercent": 5.0
+              }
+            ],
+            "windowStartedAt": "2027-01-08T19:00:00Z"
+          },
+          "resetsAt": "2027-01-15T19:00:00Z",
+          "usedPercent": 95.0,
+          "windowMinutes": 10080
+        }
+      }
+    },
+    {
+      "account": "test-claude-5",
+      "accountInfo": {
+        "email": "test-claude-5@example.com",
+        "orgName": "Test org 5"
+      },
+      "apiProvider": "anthropic",
+      "fetchedAt": "2027-01-15T07:56:00Z",
+      "provider": "claude",
+      "source": "vault",
+      "usage": {
+        "extraRateWindows": [
+          {
+            "id": "Fable",
+            "title": "7 Day (Fable)",
+            "window": {
+              "resetsAt": "2027-01-15T18:00:00Z",
+              "usedPercent": 10.0,
+              "windowMinutes": 10080
+            }
+          }
+        ],
+        "primary": {
+          "resetsAt": "2027-01-15T10:00:00Z",
+          "usedPercent": 30.0,
+          "windowMinutes": 300
+        },
+        "secondary": {
+          "breakdown": {
+            "asOf": "2027-01-15T07:56:00Z",
+            "rows": [
+              {
+                "key": "claude_code",
+                "sharePercent": 80.0
+              },
+              {
+                "key": "chat",
+                "sharePercent": 10.0
+              },
+              {
+                "key": "cowork",
+                "sharePercent": 5.0
+              },
+              {
+                "key": "other",
+                "sharePercent": 5.0
+              }
+            ],
+            "windowStartedAt": "2027-01-08T17:00:00Z"
+          },
+          "resetsAt": "2027-01-15T17:00:00Z",
+          "usedPercent": 95.0,
+          "windowMinutes": 10080
+        }
+      }
+    }
+  ]
+}

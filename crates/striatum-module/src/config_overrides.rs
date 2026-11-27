@@ -92,7 +92,7 @@ mod heap_measurements {
     fn repository_settings_heap() {
         use crate::memory_measurements::{operation, profiler, release};
         let document = crate::test_config::convert_archived(include_str!(
-            "../fixtures/routing-config-live-2026-10-24.jsonc"
+            "../fixtures/synthetic-routing-config.jsonc"
         ))
         .to_string();
         println!(

@@ -21,10 +21,10 @@ const CHATGPT_MODEL: &str = "gpt-6.1-sol";
 const METERED_MODEL: &str = "claude-sonnet-4-5";
 const CURRENT: Slot = Slot {
     bytes: include_bytes!(
-        "../../fixtures/broca-output-cap-harness-1124/current-live-routing-slot.json"
+        "../../fixtures/broca-output-cap-harness-1124/synthetic-unsplit-routing-slot.json"
     ),
-    size: 1277,
-    sha256: "6c54624ca04c67c6a6d295849837ccbff28ac0cc9fe840f0298cc51a46a1fa5d",
+    size: 214,
+    sha256: "62d274540e42a86127119d8bf4edd9f1cfcb7d98e48872fe154974cc8fa5cfe0",
     split: false,
 };
 const PROPOSED: Slot = Slot {
@@ -55,12 +55,7 @@ fn install_slot(
 ) {
     assert_eq!(bytes.len(), size);
     assert_eq!(format!("{:x}", Sha256::digest(bytes)), sha256);
-    let slot: Value = if split {
-        serde_json::from_slice(QUICK).unwrap()
-    } else {
-        json!({"runner":{"harnesses":["broca"],"follows_account_choice":true,
-            "harness_limits":{"broca":{"capabilities":["one_off","fork_answer","submit_tool","final_text","plans"]}}}})
-    };
+    let slot: Value = serde_json::from_slice(if split { QUICK } else { bytes }).unwrap();
     let declarations = declarations_from_catalog(&json!([{
         "module_id":"broca", "nonce_verified":true, "role_declarations":{"routing/v1":slot}
     }]));

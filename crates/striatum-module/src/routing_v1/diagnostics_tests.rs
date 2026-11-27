@@ -50,7 +50,7 @@ async fn diagnostics_findings_v1_vectors_match_serving_replies() {
         .record_credential_entitlement_fence(
             &CredentialRefusal {
                 provider_id: "inception".into(),
-                credential_id: "apikey:inception:main".into(),
+                credential_id: "apikey:inception:test-credential".into(),
                 code: "billing_exhausted".into(),
             },
             None,

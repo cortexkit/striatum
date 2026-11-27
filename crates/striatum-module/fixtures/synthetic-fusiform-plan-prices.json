@@ -1,0 +1,178 @@
+{
+  "prices": [
+    {
+      "provider_id": "anthropic",
+      "tier": "max_20x",
+      "boundary_at_ms": 1700000000000,
+      "established_at_ms": 1700100000000,
+      "established_by": "test-publisher",
+      "source_ref": "https://example.com/test-plan-prices",
+      "review_by_ms": 1810000000000,
+      "price": {
+        "currency": "USD",
+        "exponent": 2,
+        "minor_units": 25000,
+        "period": "month"
+      },
+      "quota_value": {
+        "review_by_ms": 1810000000000,
+        "state": "measured",
+        "as_of_ms": 1710000000000,
+        "established_by": "test-observer",
+        "basis": "Invented pooled fee per quota point",
+        "low": {
+          "units": 30,
+          "exponent": 0
+        },
+        "high": {
+          "units": 40,
+          "exponent": 0
+        },
+        "source_ref": "https://example.com/test-quota-value",
+        "token_mix": "Synthetic half fresh, half cached"
+      }
+    },
+    {
+      "provider_id": "anthropic",
+      "tier": "max_5x",
+      "boundary_at_ms": 1700000000000,
+      "established_at_ms": 1700100000000,
+      "established_by": "test-publisher",
+      "source_ref": "https://example.com/test-plan-prices",
+      "review_by_ms": 1810000000000,
+      "price": {
+        "currency": "USD",
+        "exponent": 2,
+        "minor_units": 12000,
+        "period": "month"
+      },
+      "quota_value": {
+        "review_by_ms": 1810000000000,
+        "state": "not_established",
+        "refusal_reason": "No synthetic measurement for this tier."
+      }
+    },
+    {
+      "provider_id": "anthropic",
+      "tier": "pro",
+      "boundary_at_ms": 1700000000000,
+      "established_at_ms": 1700100000000,
+      "established_by": "test-publisher",
+      "source_ref": "https://example.com/test-plan-prices",
+      "review_by_ms": 1810000000000,
+      "price": {
+        "currency": "USD",
+        "exponent": 2,
+        "minor_units": 2500,
+        "period": "month"
+      },
+      "quota_value": {
+        "review_by_ms": 1810000000000,
+        "state": "not_established",
+        "refusal_reason": "No synthetic measurement for this tier."
+      }
+    },
+    {
+      "provider_id": "openai",
+      "tier": "plus",
+      "boundary_at_ms": 1700000000000,
+      "established_at_ms": 1700100000000,
+      "established_by": "test-publisher",
+      "source_ref": "https://example.com/test-plan-prices",
+      "review_by_ms": 1810000000000,
+      "price": {
+        "currency": "USD",
+        "exponent": 2,
+        "minor_units": 3000,
+        "period": "month"
+      },
+      "quota_value": {
+        "review_by_ms": 1810000000000,
+        "state": "not_established",
+        "refusal_reason": "No synthetic measurement for this tier."
+      }
+    },
+    {
+      "provider_id": "openai",
+      "tier": "pro",
+      "boundary_at_ms": 1700000000000,
+      "established_at_ms": 1700100000000,
+      "established_by": "test-publisher",
+      "source_ref": "https://example.com/test-plan-prices",
+      "review_by_ms": 1810000000000,
+      "refusal_reason": "Generic API label; no unique plan fee."
+    },
+    {
+      "provider_id": "openai",
+      "tier": "pro_100",
+      "boundary_at_ms": 1700000000000,
+      "established_at_ms": 1700100000000,
+      "established_by": "test-publisher",
+      "source_ref": "https://example.com/test-plan-prices",
+      "review_by_ms": 1810000000000,
+      "price": {
+        "currency": "USD",
+        "exponent": 2,
+        "minor_units": 12000,
+        "period": "month"
+      },
+      "quota_value": {
+        "review_by_ms": 1810000000000,
+        "state": "not_established",
+        "refusal_reason": "No synthetic measurement for this tier."
+      }
+    },
+    {
+      "provider_id": "openai",
+      "tier": "pro_200",
+      "boundary_at_ms": 1700000000000,
+      "established_at_ms": 1700100000000,
+      "established_by": "test-publisher",
+      "source_ref": "https://example.com/test-plan-prices",
+      "review_by_ms": 1810000000000,
+      "price": {
+        "currency": "USD",
+        "exponent": 2,
+        "minor_units": 24000,
+        "period": "month"
+      },
+      "quota_value": {
+        "review_by_ms": 1810000000000,
+        "state": "measured",
+        "as_of_ms": 1710000000000,
+        "established_by": "test-observer",
+        "basis": "Invented pooled fee per quota point",
+        "low": {
+          "units": 30,
+          "exponent": 0
+        },
+        "high": {
+          "units": 40,
+          "exponent": 0
+        },
+        "source_ref": "https://example.com/test-quota-value",
+        "token_mix": "Synthetic half fresh, half cached"
+      }
+    },
+    {
+      "provider_id": "openai",
+      "tier": "pro_500",
+      "boundary_at_ms": 1700000000000,
+      "established_at_ms": 1700100000000,
+      "established_by": "test-publisher",
+      "source_ref": "https://example.com/test-plan-prices",
+      "review_by_ms": 1810000000000,
+      "price": {
+        "currency": "USD",
+        "exponent": 2,
+        "minor_units": 55000,
+        "period": "month"
+      },
+      "quota_value": {
+        "review_by_ms": 1810000000000,
+        "state": "not_established",
+        "refusal_reason": "No synthetic measurement for this tier."
+      }
+    }
+  ]
+}

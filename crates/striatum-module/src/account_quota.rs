@@ -2307,21 +2307,12 @@ mod tests {
         );
     }
 
-    /// A live Insula reply to `usage.get {"provider":"claude"}`, captured
-    /// read-only on 2026-09-30 with
-    /// `ck-striatum --account-quota-dry-run --capture`, with identities
-    /// replaced: each account UUID became `00000000-0000-4000-8000-00000000000N`
-    /// and each email `account-N@example.invalid` (N = 1..5 in reply order, the
-    /// same substitution everywhere, org names included). Every other byte
-    /// (utilization, resets, window ids, durations, structure) is as captured.
-    /// The unredacted capture's sha256 was
-    /// ecb4d60c4e42403ccc5f199460c69f9d58fe4dc295723634e0dde4f2877c51b4; it is
-    /// kept outside the repository.
-    const LIVE_CLAUDE_REPLY: &[u8] =
-        include_bytes!("../fixtures/insula-usage-get-claude-20260930.json");
-    /// sha256 of the redacted fixture above.
-    const LIVE_CLAUDE_REPLY_SHA256: &str =
-        "c25f21f8c78a3c1a180667f72bab9cf81e3437ea0aaaf1ab56d8966566c639de";
+    // The synthetic `usage.get` reply has five accounts, a full weekly
+    // window, Fable windows, and an idle five-hour window without a reset.
+    const CLAUDE_REPLY: &[u8] = include_bytes!("../fixtures/synthetic-insula-usage-claude.json");
+    const CLAUDE_REPLY_SHA256: &str =
+        "24822d506dca639889cd4028cf0762057187116a51bd9f8fece11edfb5fe3e02";
+    const CLAUDE_POLL_MS: i64 = 1_800_000_120_000; // 2027-01-15T08:02:00Z
     /// 2026-09-29T12:00:00Z.
     const NOON_MS: i64 = 1_790_683_200_000;
 
@@ -2557,28 +2548,28 @@ mod tests {
     }
 
     #[test]
-    fn live_insula_reply_decodes_whole_envelope_with_every_account_field() {
+    fn insula_reply_decodes_whole_envelope_with_every_account_field() {
         assert_eq!(
-            hex(&Sha256::digest(LIVE_CLAUDE_REPLY)),
-            LIVE_CLAUDE_REPLY_SHA256,
-            "the fixture must stay the exact captured bytes"
+            hex(&Sha256::digest(CLAUDE_REPLY)),
+            CLAUDE_REPLY_SHA256,
+            "the synthetic reply bytes are pinned"
         );
-        let envelope = decode_usage_envelope(LIVE_CLAUDE_REPLY).expect("live reply decodes");
+        let envelope = decode_usage_envelope(CLAUDE_REPLY).expect("synthetic reply decodes");
         assert_eq!(envelope.complete_providers, vec!["claude".to_string()]);
         assert_eq!(envelope.entries.len(), 5);
         assert_eq!(envelope.unkeyed_entries, 0);
         assert!(envelope.undecodable_entries.is_empty());
 
         let mut readings = AccountReadings::default();
-        let outcome = merge_provider_poll(&mut readings, "claude", &envelope, NOON_MS);
+        let outcome = merge_provider_poll(&mut readings, "claude", &envelope, CLAUDE_POLL_MS);
         assert_eq!(outcome.updated.len(), 5);
-        let now = parse_rfc3339_ms("2026-09-30T00:46:00Z").unwrap();
+        let now = CLAUDE_POLL_MS;
         let listed = build_roster(
             &listing(
                 &[(
                     "oauth:anthropic",
-                    "00000000-0000-4000-8000-000000000001",
-                    "account-1@example.invalid",
+                    "test-claude-1",
+                    "test-claude-1@example.com",
                 )],
                 &[("anthropic-native", "list")],
             ),
@@ -2594,34 +2585,25 @@ mod tests {
         assert_eq!(report.accounts.len(), 5);
         assert!(report.providers[0].last_poll_complete);
 
-        let account = view(&report, "00000000-0000-4000-8000-000000000001");
-        assert_eq!(account.email.as_deref(), Some("account-1@example.invalid"));
-        assert_eq!(
-            account.fetched_at.as_deref(),
-            Some("2026-09-30T00:44:44.672943000+00:00")
-        );
+        let account = view(&report, "test-claude-1");
+        assert_eq!(account.email.as_deref(), Some("test-claude-1@example.com"));
+        assert_eq!(account.fetched_at.as_deref(), Some("2027-01-15T08:00:00Z"));
         assert_eq!(account.age.band, AgeBand::Full);
-        assert_eq!(account.age.age_ms, Some(now - 1_790_729_084_672));
+        assert_eq!(account.age.age_ms, Some(120_000));
         assert_eq!(account.stale, None);
         assert_eq!(account.error_class, None);
         let five = account.five_hour.as_ref().expect("5h window");
-        assert_eq!((five.slot, five.used_percent), ("primary", 2.0));
-        assert_eq!(
-            five.resets_at.as_deref(),
-            Some("2026-09-30T01:39:59.575908+00:00")
-        );
+        assert_eq!((five.slot, five.used_percent), ("primary", 10.0));
+        assert_eq!(five.resets_at.as_deref(), Some("2027-01-15T09:00:00Z"));
         let seven = account.seven_day.as_ref().expect("7d window");
         assert_eq!((seven.slot, seven.used_percent), ("secondary", 100.0));
-        assert_eq!(
-            seven.resets_at.as_deref(),
-            Some("2026-09-30T13:59:59.575931+00:00")
-        );
+        assert_eq!(seven.resets_at.as_deref(), Some("2027-01-15T15:00:00Z"));
         assert_eq!(account.scoped_listing, ScopedListing::Present);
         assert_eq!(account.scoped_windows.len(), 1);
         let fable = &account.scoped_windows[0];
         assert_eq!(fable.id.as_deref(), Some("Fable"));
         assert_eq!(fable.window_minutes, Some(SEVEN_DAY_MINUTES));
-        assert_eq!(fable.used_percent, Some(25.0));
+        assert_eq!(fable.used_percent, Some(30.0));
         assert_eq!(fable.family, Some("fable"));
         assert_eq!(account.family_scopes[0].state, FamilyScopeState::Mapped);
         assert!(account.vault.joined);
@@ -2636,7 +2618,7 @@ mod tests {
         );
 
         // A five-hour window with no reset is still a valid reading.
-        let idle = view(&report, "00000000-0000-4000-8000-000000000002");
+        let idle = view(&report, "test-claude-2");
         assert_eq!(idle.five_hour.as_ref().unwrap().resets_at, None);
         // The four accounts the roster does not list are gaps.
         assert_eq!(report.gaps.insula_only.len(), 4);
@@ -2749,19 +2731,15 @@ mod tests {
             let store = open();
             let mut state = AccountQuotaState::default();
             let (rows, completeness) =
-                apply_provider_reply(&mut state, "claude", LIVE_CLAUDE_REPLY, NOON_MS).unwrap();
+                apply_provider_reply(&mut state, "claude", CLAUDE_REPLY, CLAUDE_POLL_MS).unwrap();
             store.put_account_quota_poll(&rows, &completeness).unwrap();
             let roster_row = apply_roster_listing(
                 &mut state,
                 &listing(
-                    &[(
-                        "oauth:anthropic",
-                        "00000000-0000-4000-8000-000000000001",
-                        "x",
-                    )],
+                    &[("oauth:anthropic", "test-claude-1", "x")],
                     &[("anthropic-native", "list")],
                 ),
-                NOON_MS,
+                CLAUDE_POLL_MS,
             )
             .unwrap();
             store.put_account_vault_roster(&roster_row).unwrap();
@@ -2778,12 +2756,12 @@ mod tests {
         assert_eq!(restored.roster, before.roster);
 
         // The first poll after the restart is partial and names one account.
-        let one = serde_json::from_slice::<Value>(LIVE_CLAUDE_REPLY).unwrap()["result"][0].clone();
+        let one = serde_json::from_slice::<Value>(CLAUDE_REPLY).unwrap()["result"][0].clone();
         let (rows, completeness) = apply_provider_reply(
             &mut restored,
             "claude",
             &reply(vec![one], &[]),
-            NOON_MS + 60_000,
+            CLAUDE_POLL_MS + 60_000,
         )
         .unwrap();
         store.put_account_quota_poll(&rows, &completeness).unwrap();

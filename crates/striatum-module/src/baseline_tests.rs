@@ -3,27 +3,23 @@
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-const CONFIG: &str = include_str!("../fixtures/routing-config-live-2026-10-24.jsonc");
+const CONFIG: &str = include_str!("../fixtures/synthetic-routing-config.jsonc");
 const BASELINE: &str = include_str!("../fixtures/routing-baseline-2026-10-24.json");
 
 fn baseline() -> Value {
     serde_json::from_str(BASELINE).expect("the baseline fixture is JSON")
 }
 
-/// The checked-in config is byte-for-byte the copy the owner supplied
-/// (238 lines, sha256 9447e7e8b5803b1b...), and the baseline names it.
+/// Pin the archived settings example and verify that the baseline names it.
 #[test]
-fn baseline_config_is_the_owner_supplied_live_copy() {
+fn baseline_config_matches_the_pinned_synthetic_settings() {
     let baseline = baseline();
     let digest = Sha256::digest(CONFIG.as_bytes());
     let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
     assert_eq!(hex, baseline["config"]["sha256"].as_str().unwrap());
-    assert!(hex.starts_with("9447e7e8b5803b1b"));
-    assert_eq!(CONFIG.lines().count(), 238);
-    assert_eq!(
-        baseline["config"]["file"],
-        "routing-config-live-2026-10-24.jsonc"
-    );
+    assert!(hex.starts_with("dae2d634de847148f"));
+    assert_eq!(CONFIG.lines().count(), 32);
+    assert_eq!(baseline["config"]["file"], "synthetic-routing-config.jsonc");
 }
 
 /// The baseline covers one request per configured slot pin, and every

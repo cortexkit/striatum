@@ -1218,7 +1218,7 @@ mod tests {
     const KIMI_NOW: i64 = 1_795_046_400_000;
     const KIMI_PROVIDER: &str = "kimi-for-coding";
     const KIMI_PLAN: &str = "kimi-code-plan-global/allegro";
-    const KIMI_CREDENTIAL: &str = "apikey:fixture-kimi-for-coding";
+    const KIMI_CREDENTIAL: &str = "apikey:test-kimi-for-coding";
     const KIMI_LAST_ELIGIBLE: &str = "astrocyte last eligible 2026-11-14";
 
     fn kimi_multiplier_report() -> Value {
@@ -1547,7 +1547,7 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .multiplier,
-            21.452711840768313
+            20.0
         );
         runtime.bucket_item(
             cortexkit_bus_client::BucketItem::Delete {
@@ -1681,7 +1681,7 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .multiplier,
-            21.452711840768313
+            20.0
         );
         assert_eq!(runtime.multipliers.health()["planCount"], 1);
     }
@@ -1751,7 +1751,7 @@ mod tests {
     fn credential_fixture() -> (Value, BTreeMap<String, BTreeSet<String>>, i64) {
         use cortexkit_claustrum_client::{ListedCredential, ScopedCredentialListing};
         let report = serde_json::from_str::<Value>(include_str!(
-            "../fixtures/astrocyte-multiplier-report-v2-2026-10-29.json"
+            "../fixtures/synthetic-astrocyte-credential-multiplier-report-v2.json"
         ))
         .unwrap()["result"]
             .clone();
@@ -1768,8 +1768,8 @@ mod tests {
             &ScopedCredentialListing {
                 view: "credential-plans".into(),
                 credentials: [
-                    ("apikey:fixture-opencode-go", "opencode-go"),
-                    ("apikey:fixture-kimi-for-coding", "kimi-for-coding"),
+                    ("apikey:test-opencode-go", "opencode-go"),
+                    ("apikey:test-kimi-for-coding", "kimi-for-coding"),
                 ]
                 .into_iter()
                 .map(|(id, provider)| ListedCredential {
@@ -1842,7 +1842,7 @@ mod tests {
         let (mut report, credentials, now) = credential_fixture();
         assert_eq!(
             credentials["opencode-go"],
-            BTreeSet::from(["apikey:fixture-opencode-go".to_string()])
+            BTreeSet::from(["apikey:test-opencode-go".to_string()])
         );
         for row in report["latest"].as_array_mut().unwrap() {
             if ["opencodego", "kimi-for-coding"].contains(&row["quota_provider"].as_str().unwrap())
@@ -2017,7 +2017,7 @@ mod tests {
         unmatched
             .get_mut("opencode-go")
             .unwrap()
-            .insert("apikey:fixture-opencode-go".into());
+            .insert("apikey:test-opencode-go".into());
         assert!(!build_with_credentials(
             &AccountQuotaState::default(),
             &report,
@@ -2041,10 +2041,7 @@ mod tests {
                 .filter(|row| row["plan_prices"][0]["credential_ref"].is_string())
                 .cloned(),
         );
-        credentials.insert(
-            "openai".into(),
-            ["apikey:fixture-opencode-go".into()].into(),
-        );
+        credentials.insert("openai".into(), ["apikey:test-opencode-go".into()].into());
         let state = v2_state(now);
         let accounts = build(&state, &report, &Value::Null, now).pools;
         assert!(accounts["openai"]
@@ -2068,12 +2065,13 @@ mod tests {
     }
 
     #[test]
-    fn subscription_credential_live_fixture_is_digest_pinned() {
-        let bytes = include_bytes!("../fixtures/astrocyte-multiplier-report-v2-2026-10-29.json");
-        assert_eq!(bytes.len(), 991_100);
+    fn subscription_credential_fixture_is_digest_pinned() {
+        let bytes =
+            include_bytes!("../fixtures/synthetic-astrocyte-credential-multiplier-report-v2.json");
+        assert_eq!(bytes.len(), 10_741);
         assert_eq!(
             format!("{:x}", Sha256::digest(bytes)),
-            "3c9d952bdc3fa9387e39d38cb71367443a3cdf07ba8dc52dc8002b30332c24d4"
+            "fc6e18041dc406b3887f5e13de322591f7ff7f71275a5b1af4fefe247fe9f70e"
         );
     }
 
@@ -2095,17 +2093,18 @@ mod tests {
     }
     fn report_v2() -> Value {
         serde_json::from_str::<Value>(include_str!(
-            "../fixtures/astrocyte-multiplier-report-v2.json"
+            "../fixtures/synthetic-astrocyte-account-multiplier-report-v2.json"
         ))
         .unwrap()["result"]
             .clone()
     }
     fn prices() -> Value {
-        // Adapter tests use the saved upstream plan response, including prices
-        // and the quota_value fields that routing must ignore.
-        // Source: crates/fusiform-module/fixtures/served-payloads.json at commit 2e689aab.
-        // Fixture SHA-256: 95a576e57ab51182853ce52aff0240c4026f6fcf6d4104c997d9ee68cf410a45.
-        serde_json::from_str(include_str!("../fixtures/fusiform-plan-prices.json")).unwrap()
+        // Keep measured quota_value fields distinct from the plan fees: routing
+        // reads the fees but must not apply those fields as multipliers.
+        serde_json::from_str(include_str!(
+            "../fixtures/synthetic-fusiform-plan-prices.json"
+        ))
+        .unwrap()
     }
     fn state(raw: f64, tier: Option<&str>) -> AccountQuotaState {
         let mut state = AccountQuotaState::default();
@@ -2439,26 +2438,28 @@ mod tests {
             "multiplier":99.0, "interval_end_ms":NOW, "observation_day":"2026-10-09"});
         let report = json!({"latest":[row]});
         assert!(measured(&report["latest"][0]).is_none());
-        assert!(account_plan(&report, "acct-10", None).unwrap().is_none());
-        assert!(astro_fee(&report["latest"][0], "acct-10", None, NOW).is_none());
+        assert!(account_plan(&report, "test-account-10", None)
+            .unwrap()
+            .is_none());
+        assert!(astro_fee(&report["latest"][0], "test-account-10", None, NOW).is_none());
     }
 
     fn v2_state(now: i64) -> AccountQuotaState {
         let mut state = AccountQuotaState::default();
         let mut identities = Vec::new();
         for (quota_provider, provider, tier, account_id) in [
-            ("antigravity", "antigravity", "ultra_5x", "acct-1"),
-            ("claude", "anthropic", "max_20x", "acct-2"),
-            ("claude", "anthropic", "max_20x", "acct-3"),
-            ("claude", "anthropic", "max_20x", "acct-4"),
-            ("claude", "anthropic", "max_20x", "acct-5"),
-            ("claude", "anthropic", "max_20x", "acct-6"),
-            ("claude", "anthropic", "max_20x", "acct-7"),
-            ("claude", "anthropic", "max_20x", "acct-8"),
-            ("codex", "openai", "pro_100", "acct-9"),
-            ("codex", "openai", "pro_200", "acct-10"),
-            ("codex", "openai", "pro_200", "acct-11"),
-            ("muse", "meta", "power_usage", "acct-12"),
+            ("antigravity", "antigravity", "ultra_5x", "test-account-1"),
+            ("claude", "anthropic", "max_20x", "test-account-2"),
+            ("claude", "anthropic", "max_20x", "test-account-3"),
+            ("claude", "anthropic", "max_20x", "test-account-4"),
+            ("claude", "anthropic", "max_20x", "test-account-5"),
+            ("claude", "anthropic", "max_20x", "test-account-6"),
+            ("claude", "anthropic", "max_20x", "test-account-7"),
+            ("claude", "anthropic", "max_20x", "test-account-8"),
+            ("codex", "openai", "pro_100", "test-account-9"),
+            ("codex", "openai", "pro_200", "test-account-10"),
+            ("codex", "openai", "pro_200", "test-account-11"),
+            ("muse", "meta", "power_usage", "test-account-12"),
         ] {
             identities.push(RosterIdentity {
                 refresh_adapter: quota_provider.into(),
@@ -2532,7 +2533,7 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .multiplier,
-            21.452711840768313
+            20.0
         );
         report["latest"].as_array_mut().unwrap().reverse();
         let reversed = build(&state, &report, &Value::Null, now).pools;
@@ -2584,7 +2585,7 @@ mod tests {
                 if provider == "openai" {
                     assert!(
                         (price.value_multiplier
-                            - 1.0 / ((1.0 / 3.0) / fallback + (2.0 / 3.0) / 21.452711840768313))
+                            - 1.0 / ((1.0 / 3.0) / fallback + (2.0 / 3.0) / 20.0))
                             .abs()
                             < 1e-12
                     );
@@ -2593,7 +2594,7 @@ mod tests {
                     assert_eq!(price.plan_values[0].weight, 1.0 / 3.0);
                     assert_eq!(price.plan_values[0].plan.as_deref(), Some("openai/pro_100"));
                     assert_eq!(price.plan_values[1].source, "measured");
-                    assert_eq!(price.plan_values[1].value_multiplier, 21.452711840768313);
+                    assert_eq!(price.plan_values[1].value_multiplier, 20.0);
                     assert_eq!(price.plan_values[1].weight, 2.0 / 3.0);
                     assert_eq!(price.plan_values[1].plan.as_deref(), Some("openai/pro_200"));
                 } else {
@@ -2609,19 +2610,25 @@ mod tests {
     fn subscription_astro_fee_is_matched_by_plan_and_account() {
         let mut report = report_v2();
         let now = report["latest"][0]["interval_end_ms"].as_i64().unwrap();
-        let pro100 = account_plan(&report, "acct-9", None).unwrap().unwrap();
-        let pro200 = account_plan(&report, "acct-10", None).unwrap().unwrap();
-        assert_eq!(astro_fee(pro100, "acct-9", None, now), Some(100.0));
-        assert_eq!(astro_fee(pro200, "acct-10", None, now), Some(200.0));
-        assert_eq!(astro_fee(pro100, "acct-10", None, now), None);
+        let pro100 = account_plan(&report, "test-account-9", None)
+            .unwrap()
+            .unwrap();
+        let pro200 = account_plan(&report, "test-account-10", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(astro_fee(pro100, "test-account-9", None, now), Some(120.0));
+        assert_eq!(astro_fee(pro200, "test-account-10", None, now), Some(240.0));
+        assert_eq!(astro_fee(pro100, "test-account-10", None, now), None);
         report["latest"].as_array_mut().unwrap().reverse();
-        let pro200 = account_plan(&report, "acct-10", None).unwrap().unwrap();
-        assert_eq!(astro_fee(pro200, "acct-10", None, now), Some(200.0));
+        let pro200 = account_plan(&report, "test-account-10", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(astro_fee(pro200, "test-account-10", None, now), Some(240.0));
         let built = build(&v2_state(now), &report, &Value::Null, now);
-        assert_eq!(built.pools["openai"].plans[0].fee_usd, 100.0);
-        assert_eq!(built.pools["openai"].plans[1].fee_usd, 200.0);
-        assert_eq!(built.pools["antigravity"].plans[0].fee_usd, 99.99);
-        assert_eq!(built.pools["meta"].plans[0].fee_usd, 50.0);
+        assert_eq!(built.pools["openai"].plans[0].fee_usd, 120.0);
+        assert_eq!(built.pools["openai"].plans[1].fee_usd, 240.0);
+        assert_eq!(built.pools["antigravity"].plans[0].fee_usd, 80.0);
+        assert_eq!(built.pools["meta"].plans[0].fee_usd, 60.0);
         let row = report["latest"]
             .as_array_mut()
             .unwrap()
@@ -2629,7 +2636,7 @@ mod tests {
             .find(|r| r["plan"] == "openai/pro_200")
             .unwrap();
         row["plan_prices"][0]["review_by_ms"] = json!(now - 1);
-        assert_eq!(astro_fee(row, "acct-10", None, now), None);
+        assert_eq!(astro_fee(row, "test-account-10", None, now), None);
     }
 
     #[test]
@@ -2643,13 +2650,14 @@ mod tests {
             .find(|row| row["plan"] == "openai/pro_100")
             .unwrap();
         pro100["plan_prices"].as_array_mut().unwrap().push(json!({
-            "account_ref":"acct-10", "plan":"openai/pro_100", "monthly_nanos":100_000_000_000i64
+            "account_ref":"test-account-10", "plan":"openai/pro_100", "monthly_nanos":120_000_000_000i64
         }));
-        assert!(account_plan(&report, "acct-10", None).is_err());
+        assert!(account_plan(&report, "test-account-10", None).is_err());
         report["latest"].as_array_mut().unwrap().reverse();
-        assert!(account_plan(&report, "acct-10", None).is_err());
+        assert!(account_plan(&report, "test-account-10", None).is_err());
         let mut state = v2_state(now);
-        let mut unlisted = state.readings.readings[&("codex".into(), "acct-11".into())].clone();
+        let mut unlisted =
+            state.readings.readings[&("codex".into(), "test-account-11".into())].clone();
         unlisted.account_id = "not-listed".into();
         unlisted.entry["account"] = json!("not-listed");
         state
@@ -2660,7 +2668,7 @@ mod tests {
         let mut identity = roster
             .identities
             .iter()
-            .find(|id| id.account_id == "acct-11")
+            .find(|id| id.account_id == "test-account-11")
             .unwrap()
             .clone();
         identity.account_id = "not-listed".into();
@@ -2691,19 +2699,19 @@ mod tests {
             .unwrap()
             .lock()
             .unwrap()
-            .contains("acct-10"));
+            .contains("test-account-10"));
     }
 
     #[test]
-    fn subscription_v2_redacted_fixture_is_digest_pinned() {
+    fn subscription_v2_fixture_is_digest_pinned() {
         assert_eq!(
             format!(
                 "{:x}",
                 Sha256::digest(include_bytes!(
-                    "../fixtures/astrocyte-multiplier-report-v2.json"
+                    "../fixtures/synthetic-astrocyte-account-multiplier-report-v2.json"
                 ))
             ),
-            "240a76e305a9db4979bbf1d6bec7dd9e0e988b3576722f96cea0a27003455501"
+            "a1e71e656f42b50d46e92238d8315880541436be0fb1488581de4686fe3eff79"
         );
     }
 
@@ -2735,11 +2743,13 @@ mod tests {
     fn fusiform_plan_prices_fixture_is_digest_pinned() {
         let digest = format!(
             "{:x}",
-            Sha256::digest(include_bytes!("../fixtures/fusiform-plan-prices.json"))
+            Sha256::digest(include_bytes!(
+                "../fixtures/synthetic-fusiform-plan-prices.json"
+            ))
         );
         assert_eq!(
             digest,
-            "95a576e57ab51182853ce52aff0240c4026f6fcf6d4104c997d9ee68cf410a45"
+            "2ded6d2a50d150ef0f9ab9038c17a2a4adf186167d31924b68cad0463c523a61"
         );
     }
 
@@ -2748,7 +2758,7 @@ mod tests {
         let p = prices();
         let row = price_row(&p, "anthropic", "max_20x").unwrap();
         assert_eq!(row["quota_value"]["state"], "measured");
-        for tier in [None, Some("max_20x")] {
+        for (tier, expected_fee) in [(None, 200.0), (Some("max_20x"), 250.0)] {
             let built = build(&state(3.0, tier), &Value::Null, &p, NOW);
             let pool = &built.pools["anthropic"];
             let price = pool.price(1.0, None, 0.0, false).unwrap();
@@ -2757,7 +2767,7 @@ mod tests {
             let price = pool.price(1.0, Some(6.0), 0.0, false).unwrap();
             assert_eq!(price.value_multiplier, 6.0);
             assert_eq!(price.value_source, "operator override");
-            assert_eq!(pool.plans[0].fee_usd, 200.0);
+            assert_eq!(pool.plans[0].fee_usd, expected_fee);
         }
     }
 
@@ -2982,12 +2992,10 @@ mod tests {
     }
 
     fn outage_fixture() -> (AccountQuotaState, Value) {
-        // Numeric readings precede the October 10 worker-selection request with
-        // an IQ requirement of 90, identified in the fixture's source_decision.
-        // Account aliases omit personal identities; the producer fetchedAt is
-        // preserved so receipt of a stale reading does not make it fresh.
+        // Vary producer fetch times independently of the poll receipt time so
+        // the readings retain their own freshness in the selection snapshot.
         let fixture: Value = serde_json::from_str(include_str!(
-            "../fixtures/routing-reserve-outage-2026-10-10.json"
+            "../fixtures/synthetic-routing-reserve-outage.json"
         ))
         .unwrap();
         let now = fixture["now_ms"].as_i64().unwrap();
@@ -3100,19 +3108,19 @@ mod tests {
             .any(|r| r.route_key == "xai/grok-4.7" && r.reason == "quota_exhausted"));
         let pricing = selected.score.objective.subscription_pricing.unwrap();
         // Neither provider has a measured or operator value, so both use M = 1.
-        // Sol wins without the old Fusiform subsidy; saved resets remain unused.
+        // Sol wins with unmeasured value; saved resets remain unused.
         assert_eq!(pricing.value_multiplier, 1.0);
         assert_eq!(pricing.value_source, "unmeasured");
         assert_eq!(pricing.plan_tier.as_deref(), Some("pro_100"));
         assert_eq!(pricing.banked_resets_applied, 0);
-        assert_eq!(pricing.available_points, Some(90.0));
+        assert_eq!(pricing.available_points, Some(80.0));
         assert!(!selected
             .rejected
             .iter()
             .any(|r| r.route_key == "anthropic/claude-opus-5-5"));
 
-        // Claude remains admitted with 285 live points minus the fixed 100-point
-        // margin, even though it no longer wins the price comparison.
+        // The five Claude accounts contribute 60 + 60 + 70 + 0 + 5
+        // points after their per-account margin, but still lose on price.
         let (state, fixture) = outage_fixture();
         let pools = build(
             &state,
@@ -3122,7 +3130,7 @@ mod tests {
         )
         .pools;
         let claude = pools["anthropic"].price(20.0, None, 20.0, false).unwrap();
-        assert_eq!(claude.available_points, Some(185.0));
+        assert_eq!(claude.available_points, Some(195.0));
         assert_eq!(claude.banked_resets_applied, 0);
     }
 }
