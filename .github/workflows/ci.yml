@@ -2,7 +2,8 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # check-* branches let a head run the full hosted suite before main moves.
+    branches: [main, 'check-*']
   pull_request:
 
 permissions:
