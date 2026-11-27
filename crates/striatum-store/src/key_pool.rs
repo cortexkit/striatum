@@ -465,7 +465,7 @@ impl SqliteRouteStateStore {
             // or claimed a newer refusal since the read.
             let changed = crate::fence_rechecks::needs_sync(conn).map_err(err)?;
             if changed {
-                crate::fence_rechecks::sync_on(&crate::AccountTx::sql(conn), crate::now_ms())
+                crate::fence_rechecks::sync_on(&crate::AccountTx::sql(conn), now_ms)
                     .map_err(err)?;
             }
             let states = read_key_states(conn, &provider, now_ms, None).map_err(err)?;
@@ -484,7 +484,7 @@ impl crate::AccountTx<'_> {
         now_ms: i64,
         excluded_lease: Option<&str>,
     ) -> rusqlite::Result<BTreeMap<String, PoolKeyState>> {
-        crate::fence_rechecks::sync_on(self, crate::now_ms())?;
+        crate::fence_rechecks::sync_on(self, now_ms)?;
         let state = self
             .working_blocks()
             .map_err(|error| rusqlite::Error::ToSqlConversionFailure(error.0.into()))?;
@@ -567,6 +567,7 @@ impl crate::AccountTx<'_> {
                     quota: Some(false),
                     deadline: Some(until_ms as f64),
                     reset_at: None,
+                    rate_limit_retry: false,
                 })
                 .map_err(err)?;
             row.deadline = Some(crate::block_storage::Deadline::Integer(until_ms));
@@ -654,7 +655,13 @@ mod wall_generation_tests {
                 .pool_wall("p", "key", kind, 1100, "first refusal", 100)
                 .unwrap();
         }
-        let clocks = store.fence_rechecks().unwrap();
+        let clocks: Vec<_> = store
+            .load_blocks(100)
+            .unwrap()
+            .blocks
+            .iter()
+            .map(crate::FenceRecheck::from)
+            .collect();
         assert_eq!(
             clocks.len(),
             2,
@@ -679,6 +686,13 @@ mod wall_generation_tests {
         let store = SqliteRouteStateStore::open(&descriptor).unwrap();
         let origins = store.fence_rechecks().unwrap();
         let probe_at = origins.iter().map(|origin| origin.due_at()).max().unwrap();
+        let origins: Vec<_> = store
+            .load_blocks(probe_at)
+            .unwrap()
+            .blocks
+            .iter()
+            .map(crate::FenceRecheck::from)
+            .collect();
         assert!(store
             .account_transaction(|tx| tx.grant_fence_rechecks(&origins, probe_at, Some("probe")))
             .unwrap());
@@ -895,7 +909,7 @@ impl crate::AccountTx<'_> {
                     let Some(credential_id) = credential_id else {
                         return Ok(None);
                     };
-                    crate::fence_rechecks::sync_on(self, crate::now_ms())?;
+                    crate::fence_rechecks::sync_on(self, now_ms)?;
                     // The refusal below and the grant both rest on the
                     // provider's rows as the state shows them.
                     self.check_lease_inputs(&[provider])?;

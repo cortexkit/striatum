@@ -64,7 +64,7 @@ fn origin(harness: &Harness) -> striatum_store::FenceRecheck {
         .fence_rechecks()
         .unwrap()
         .into_iter()
-        .find(|origin| origin.kind == "observation")
+        .find(|origin| origin.kind == "non_quota_route")
         .unwrap()
 }
 
@@ -80,15 +80,12 @@ async fn backoff(route: &Route, id: &str, at: u64, retry_at: u64) {
     let reply = observe(
         route,
         id,
-        "transient_backoff",
+        "account_limit_exhausted",
         at,
-        json!({"retry_at_ms":retry_at}),
+        json!({"retry_at_ms":retry_at, "limit_window":"credit"}),
     )
     .await;
-    assert_eq!(
-        reply["effects"][0]["effect"], "transient_backoff",
-        "{reply}"
-    );
+    assert_eq!(reply["effects"][0]["effect"], "fence", "{reply}");
 }
 
 async fn claim(route: &Route, harness: &Harness) -> striatum_store::FenceRecheck {
@@ -288,7 +285,7 @@ fn assert_no_backoff(harness: &Harness) {
         .fence_rechecks()
         .unwrap()
         .iter()
-        .all(|origin| origin.kind != "observation"));
+        .all(|origin| origin.kind != "non_quota_route"));
 }
 
 fn assert_ordinary((frame, reply): (FrameType, Value)) {

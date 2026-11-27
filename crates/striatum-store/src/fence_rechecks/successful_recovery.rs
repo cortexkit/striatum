@@ -273,7 +273,7 @@ impl AccountTx<'_> {
         let _writer_entry = crate::writer_entry_trace::enter(
             "account_tx::fence_rechecks::successful_recovery::heal_serving_fences_in_scope",
         );
-        let origins = self.fence_rechecks()?;
+        let origins = self.fence_rechecks_at(now)?;
         let origins: Vec<_> = origins
             .into_iter()
             .filter(|origin| {
@@ -1074,9 +1074,11 @@ mod tests {
             store.account_route_fences(200).unwrap()[0].credential_id,
             "sibling"
         );
-        assert_eq!(
-            store.transient_account_route_fences(200).unwrap()[0].credential_id,
-            "sibling"
-        );
+        let remaining = store.transient_account_route_fences(200).unwrap();
+        let credentials: Vec<_> = remaining
+            .iter()
+            .map(|fence| fence.credential_id.as_str())
+            .collect();
+        assert_eq!(credentials, vec!["sibling"], "{remaining:?}");
     }
 }

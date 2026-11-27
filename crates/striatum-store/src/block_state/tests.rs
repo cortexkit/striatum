@@ -1942,7 +1942,7 @@ fn a_periodic_full_comparison_finds_a_missed_change_in_place() {
     // origin (a decision would check the row and catch the change itself).
     rig.store
         .account_command(AccountCommandKind::Maintenance, |tx| {
-            tx.sync_fence_rechecks()
+            tx.sync_fence_rechecks(crate::now_ms())
         })
         .unwrap();
     UNSEEN.with(|unseen| unseen.set(true));
@@ -2618,7 +2618,7 @@ fn the_route_state_snapshot_from_memory_equals_sql_over_generated_route_writes()
                 2 => {
                     rig.store
                         .account_command(AccountCommandKind::Maintenance, |tx| {
-                            tx.sync_fence_rechecks()
+                            tx.sync_fence_rechecks(crate::now_ms())
                         })
                         .unwrap();
                     "sync clocks"
@@ -2629,7 +2629,7 @@ fn the_route_state_snapshot_from_memory_equals_sql_over_generated_route_writes()
                     let owner = format!("probe-{index}");
                     rig.store
                         .account_command(AccountCommandKind::Maintenance, move |tx| {
-                            tx.sync_fence_rechecks()?;
+                            tx.sync_fence_rechecks(crate::now_ms())?;
                             let origins = tx.fence_rechecks()?;
                             tx.grant_fence_rechecks(&origins, now, Some(&owner))
                         })
@@ -3339,7 +3339,7 @@ fn stale_sync_drop_migration_representability_probe() {
     after
         .store
         .account_command(AccountCommandKind::Maintenance, |tx| {
-            tx.sync_fence_rechecks()
+            tx.sync_fence_rechecks(crate::now_ms())
         })
         .unwrap();
     assert_eq!(
@@ -3927,7 +3927,7 @@ fn stale_sync_case(name: &str, before: impl Fn(&Rig), change: impl Fn(&Rig)) {
     state
         .store
         .account_command(AccountCommandKind::Maintenance, |tx| {
-            tx.sync_fence_rechecks()
+            tx.sync_fence_rechecks(crate::now_ms())
         })
         .unwrap();
     assert_eq!(
@@ -4864,7 +4864,7 @@ fn a_missed_change_in_place_is_found_within_one_full_comparison_interval_per_sto
                 .unwrap();
             rig.store
                 .account_command(AccountCommandKind::Maintenance, |tx| {
-                    tx.sync_fence_rechecks()
+                    tx.sync_fence_rechecks(crate::now_ms())
                 })
                 .unwrap();
         }

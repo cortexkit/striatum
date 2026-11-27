@@ -63,6 +63,7 @@ pub(super) fn record_cooldown_update(
         cooldown_until: params.cooldown_until,
         quota_exhausted_until: params.quota_exhausted_until,
         wall_class: params.wall_class,
+        overwrite_wall_class: true,
         quota_pressure: params.quota_pressure,
         last_error: params.last_error.clone(),
         increment_quota_error: params.increment_quota_error,

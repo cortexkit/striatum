@@ -8,6 +8,7 @@ fn expected_witnesses() -> BTreeSet<String> {
     let mut expected: BTreeSet<String> = [
         "admission_replay",
         "probe_claim",
+        "pool_rate_reopen",
         "probe_expiry",
         "fresh_headroom",
         "tombstone",

@@ -60,16 +60,16 @@ impl AccountTx<'_> {
         })?;
         self.release_expired_admission_probes(now_ms)?;
         self.release_expired_continuations(now_ms)?;
-        self.sync_fence_rechecks()
+        self.sync_fence_rechecks(now_ms)
     }
 
     /// The part of a Tick that synchronizes fence rechecks, for a caller that
     /// applies the admission and continuation expiries itself.
-    pub fn sync_fence_rechecks(&self) -> RouteStateResult<()> {
+    pub fn sync_fence_rechecks(&self, now_ms: i64) -> RouteStateResult<()> {
         #[cfg(any(test, feature = "test-support"))]
         let _writer_entry =
             crate::writer_entry_trace::enter("account_tx::account_writer::sync_fence_rechecks");
-        crate::fence_rechecks::sync_on(self, crate::now_ms()).map_err(err)
+        crate::fence_rechecks::sync_on(self, now_ms).map_err(err)
     }
 }
 

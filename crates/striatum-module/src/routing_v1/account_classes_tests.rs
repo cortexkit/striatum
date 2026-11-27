@@ -195,7 +195,7 @@ async fn a_legacy_transient_wall_mislabeled_quota_never_refuses_a_model_pin() {
 }
 
 #[tokio::test]
-async fn transient_overload_rotates_a_fresh_model_pin_but_never_walls_the_account_pool() {
+async fn transient_overload_deadline_probe_does_not_wall_the_account_pool() {
     let _clock = crate::InjectedClock::set(NOW);
     let (harness, mut credentials) = setup("synthetic", false);
     credentials.apply_listing(
@@ -337,7 +337,7 @@ async fn transient_overload_rotates_a_fresh_model_pin_but_never_walls_the_accoun
         .await;
     assert_eq!(selected.0, FrameType::Response, "{}", selected.1);
     request["decision_id"] = selected.1["result"]["decision_id"].clone();
-    request["admission_id"] = json!("all-transient-single-probe");
+    request["admission_id"] = json!("all-transient-deadline-probe");
     let admitted = runner.call("route.account_for", &request).await;
     assert_eq!(admitted.0, FrameType::Response, "{}", admitted.1);
 
@@ -6147,7 +6147,7 @@ fn bind_and_launch_claims_check_the_rows_that_chose_their_clocks() {
         .unwrap();
         harness
             .store()
-            .account_transaction(|tx| tx.sync_fence_rechecks())
+            .account_transaction(|tx| tx.sync_fence_rechecks(crate::account_selection::now_ms()))
             .unwrap();
         let mut context = s4b_load(&harness, NOW as i64);
         context
@@ -6229,7 +6229,7 @@ fn due_provider_block(harness: &Harness) {
     .unwrap();
     harness
         .store()
-        .account_transaction(|tx| tx.sync_fence_rechecks())
+        .account_transaction(|tx| tx.sync_fence_rechecks(crate::account_selection::now_ms()))
         .unwrap();
 }
 
@@ -6396,7 +6396,7 @@ fn a_block_on_the_launch_login_gives_a_non_pinning_launch_one_timed_wait_either_
 }
 
 /// A transient retry block the selection read is let pass to admission
-/// (`transient_overload_rotates_a_fresh_model_pin_but_never_walls_the_account_pool`).
+/// (`transient_overload_deadline_probe_does_not_wall_the_account_pool`).
 /// One recorded after the selection read is a timed wait at the bind,
 /// until the retry time, and nothing more: no account is walled, and a
 /// selection that reads it afterwards binds.

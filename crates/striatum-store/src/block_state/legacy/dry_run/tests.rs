@@ -110,6 +110,7 @@ impl BlockState {
                     quota: Some(true),
                     deadline: None,
                     reset_at: evidence.pointer("/reset/at_ms").and_then(|v| v.as_f64()),
+                    rate_limit_retry: false,
                 };
                 self.insert_private(
                     ACCOUNT_FENCE_TABLE,

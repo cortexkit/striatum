@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+//! This in-memory model does not model reopening after the provider-supplied retry time.
 //! In-memory copy of the block tables: the eleven `fence_origin` source
 //! tables, the probe clocks, route clears, probe authorizations, success
 //! pools and account eligibility.
@@ -691,27 +692,33 @@ fn decode(table: usize, r: &Row<'_>) -> rusqlite::Result<(i64, String, Option<He
             },
             true,
         ),
-        PROVIDER_TABLE => source(
-            vec![slot(2)?],
-            Link::Provider {
-                key: r.get(17)?,
-                quarantined: quarantined(18)?,
-                wall: wall(18)?,
-            },
-            Raw::Provider(crate::route_snapshot::provider_row_at(r, 24)?),
-            true,
-        ),
-        ROUTE_TABLE => source(
-            vec![slot(2)?, slot(17)?],
-            Link::Route {
-                key: r.get(39)?,
-                provider: r.get(32)?,
-                quarantined: quarantined(33)?,
-                wall: wall(33)?,
-            },
-            Raw::Route(crate::route_snapshot::route_row_at(r, 40)?),
-            true,
-        ),
+        PROVIDER_TABLE => {
+            let origins = vec![slot(2)?];
+            source(
+                origins,
+                Link::Provider {
+                    key: r.get(17)?,
+                    quarantined: quarantined(18)?,
+                    wall: wall(18)?,
+                },
+                Raw::Provider(crate::route_snapshot::provider_row_at(r, 24)?),
+                true,
+            )
+        }
+        ROUTE_TABLE => {
+            let origins = vec![slot(2)?, slot(17)?];
+            source(
+                origins,
+                Link::Route {
+                    key: r.get(39)?,
+                    provider: r.get(32)?,
+                    quarantined: quarantined(33)?,
+                    wall: wall(33)?,
+                },
+                Raw::Route(crate::route_snapshot::route_row_at(r, 40)?),
+                true,
+            )
+        }
         CLOCK_TABLE => {
             let (block, cleared) = fence_rechecks::clock_row(r, 2)?;
             Some(Held::Clock(block, cleared))

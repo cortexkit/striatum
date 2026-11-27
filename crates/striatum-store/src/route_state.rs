@@ -1042,7 +1042,11 @@ impl crate::AccountTx<'_> {
                 let cooldown_until = if new_wall {update.cooldown_until} else {existing.cooldown_until};
                 let quota_exhausted_until = if new_wall {update.quota_exhausted_until} else {existing.quota_exhausted_until};
                 let quota_pressure = update.quota_pressure.or(existing.quota_pressure);
-                let wall_class = update.wall_class.or(existing.wall_class);
+                let wall_class = if new_wall && update.overwrite_wall_class {
+                    update.wall_class
+                } else {
+                    update.wall_class.or(existing.wall_class)
+                };
                 let (last_error, last_error_at) = match &update.last_error {
                     Some(error) => (Some(error.clone()), Some(observed_at)),
                     None if (update.cooldown_until.is_some()
@@ -1087,19 +1091,23 @@ impl crate::AccountTx<'_> {
                     let wall_observed=if new_wall {Some(updated_at)} else {inherited.wall_observed_at};
                     let error=last_error.as_deref().or(inherited.last_error.as_deref());
                     let error_at=if last_error.is_some() {Some(updated_at)} else {inherited.last_error_at};
-                    let class=update.wall_class.map(RouteWallClass::as_str).or(inherited.wall_class.as_deref());
+                    let class = if new_wall && update.overwrite_wall_class {
+                        update.wall_class.map(RouteWallClass::as_str)
+                    } else {
+                        update.wall_class.map(RouteWallClass::as_str).or(inherited.wall_class.as_deref())
+                    };
                     let unscoped=if new_wall {update.unscoped_wall} else {inherited.wall_unscoped};
                     if fence_rechecks::quarantined_row(unscoped,error,class) {
                         tx.execute("DELETE FROM block WHERE kind='route' AND is_origin=1 AND origin_key=json_array(?1)",[&inherited.route_key])?;
-                    } else if let Some(row)=block_storage::wall_source(tx,block_storage::WallSource {
+                    } else if let Some(row)=block_storage::wall_source_with_retry(tx,block_storage::WallSource {
                         kind:"route",key:&inherited.route_key,provider:&provider_key,model:Some(&inherited.model_id),cooldown:cooldown_until,exhausted:quota_exhausted_until,
                         wall_observed,observed_at:wall_observed.or(error_at).unwrap_or(updated_at),error,class,unscoped,
-                    })? {block_storage::write_source(tx,&row)?;}
+                    },update.provider_retry,new_wall)? {block_storage::write_source(tx,&row)?;}
                 }
-                if let Some(row)=block_storage::wall_source(tx,block_storage::WallSource {
+                if let Some(row)=block_storage::wall_source_with_retry(tx,block_storage::WallSource {
                     kind:"provider",key:&provider_key,provider:&provider_key,model:None,cooldown:cooldown_until,exhausted:quota_exhausted_until,
                     wall_observed,observed_at:source_at,error:last_error.as_deref(),class:wall_class.map(RouteWallClass::as_str),unscoped,
-                })? {block_storage::write_source(tx,&row)?;}
+                },update.provider_retry,new_wall)? {block_storage::write_source(tx,&row)?;}
                 let inherited=serde_json::to_string(&inherited.iter().map(|row|&row.route_key).collect::<Vec<_>>()).map_err(|e|rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
                 // A repeated refusal replaces the previous provider deadlines
                 // inherited by these routes, even migrated deadlines over an hour.
@@ -1239,10 +1247,14 @@ impl crate::AccountTx<'_> {
                     .quota_pressure
                     .or(ex.quota_pressure)
                     .or(provider.quota_pressure);
-                let wall_class = update
-                    .wall_class
-                    .or(ex.wall_class)
-                    .or(provider.wall_class);
+                let wall_class = if new_wall && update.overwrite_wall_class {
+                    update.wall_class
+                } else {
+                    update
+                        .wall_class
+                        .or(ex.wall_class)
+                        .or(provider.wall_class)
+                };
                 let latency_ema_ms = update.latency_ema_ms.or(ex.latency_ema_ms);
                 let success_ema = update.success_ema.or(ex.success_ema);
                 let failure_count = ex.failure_count + if update.increment_failure { 1 } else { 0 };
@@ -1277,11 +1289,11 @@ impl crate::AccountTx<'_> {
                 )?;
                 let wall_observed=if new_wall {Some(observed_at)} else if new_route {provider.wall_observed_at} else {prior_at};
                 let unscoped=if new_wall {update.unscoped_wall} else if new_route {provider.wall_unscoped} else {ex.wall_unscoped};
-                if let Some(row)=block_storage::wall_source(tx,block_storage::WallSource {
+                if let Some(row)=block_storage::wall_source_with_retry(tx,block_storage::WallSource {
                     kind:"route",key:route_key,provider:&provider_id,model:Some(&model_id),cooldown:cooldown_until,exhausted:quota_exhausted_until,
                     wall_observed,observed_at:wall_observed.or(last_error_at).unwrap_or(observed_at),error:last_error.as_deref(),
                     class:wall_class.map(RouteWallClass::as_str),unscoped,
-                })? {block_storage::write_source(tx,&row)?;}
+                },update.provider_retry,new_wall)? {block_storage::write_source(tx,&row)?;}
                 if new_wall {
                     tx.execute("UPDATE model_route_state SET wall_observed_at=?2 WHERE route_key=?1",params![route_key,observed_at])?;
                     fence_rechecks::register_on(self,"route",&serde_json::json!([route_key]).to_string())?;
@@ -1414,10 +1426,10 @@ impl crate::AccountTx<'_> {
                         params![route_key,capacity_key,provider_id,model_id,variant,surfaced_error,update.observed_at_ms],
                     )?;
                     if changed>0 {
-                        if let Some(row)=block_storage::wall_source(tx,block_storage::WallSource {
+                        if let Some(row)=block_storage::wall_source_with_retry(tx,block_storage::WallSource {
                             kind:"route",key:&route_key,provider:&provider_id,model:Some(&model_id),cooldown:None,exhausted:Some(quota_exhausted_until),
                             wall_observed:Some(update.observed_at_ms),observed_at:update.observed_at_ms,error:Some(&surfaced_error),class:prior_class.as_deref(),unscoped:true,
-                        })? {block_storage::write_source(tx,&row)?;}
+                        },false,true)? {block_storage::write_source(tx,&row)?;}
                     }
                 }
                 let existing: Option<(i64, Option<f64>, Option<String>,i64,Option<i64>)> = tx

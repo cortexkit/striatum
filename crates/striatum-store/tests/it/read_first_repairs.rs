@@ -62,7 +62,13 @@ fn pool_repair_rechecks_newer_writer_without_repeating_row_changes() {
         })
         .unwrap();
     assert_eq!(states["c"].cooldown_until_ms, Some(3_600_500));
-    let clocks = store.fence_rechecks().unwrap();
+    let clocks: Vec<_> = store
+        .load_blocks(200)
+        .unwrap()
+        .blocks
+        .iter()
+        .map(striatum_store::FenceRecheck::from)
+        .collect();
     assert_eq!(clocks.len(), 1);
     assert_eq!(clocks[0].evidence_at, 500);
     assert_eq!(clocks[0].due_at(), 3_600_500);

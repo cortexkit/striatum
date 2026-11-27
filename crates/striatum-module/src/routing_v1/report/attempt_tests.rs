@@ -671,7 +671,7 @@ async fn effect_case(status: Option<&str>, outcome: &str, extra: Value, seed: bo
         // Do that through normal synchronization before taking either snapshot.
         harness
             .store()
-            .account_transaction(|tx| tx.sync_fence_rechecks())
+            .account_transaction(|tx| tx.sync_fence_rechecks(crate::account_selection::now_ms()))
             .unwrap();
         let managed: i64 = harness.store().with_reader_for_test(|conn| conn.query_row(
             "SELECT managed FROM block WHERE kind='account_route' AND origin_key=json_array('example-subscription',?1,'model-c') AND source_present=1",

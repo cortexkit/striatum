@@ -1473,11 +1473,15 @@ impl AccountCommand<'_> {
             .expired_probe_admissions(owners, now)
             .is_empty();
         let offers = state.admissions.has_expired_offers(now);
+        let retire_rate_limits = state.blocks.has_expired_rate_limit(now);
         if probes {
             self.release_expired_admission_probes(now)?;
         }
         if offers {
             self.release_expired_continuations(now)?;
+        }
+        if retire_rate_limits {
+            self.sql.sync_fence_rechecks(now)?;
         }
         Ok(())
     }
@@ -1493,7 +1497,7 @@ impl AccountCommand<'_> {
         if let Some(state) = self.state.as_deref_mut() {
             state.inflight.expire_lapsed(now_ms);
         }
-        self.sql.sync_fence_rechecks()
+        self.sql.sync_fence_rechecks(now_ms)
     }
     #[cfg(test)]
     pub(crate) fn prune_account_admissions(

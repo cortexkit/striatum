@@ -54,13 +54,26 @@ pub(super) fn search_effects(
     let mut update = RouteStateUpdate {
         observed_at_ms: Some(now.min(i64::MAX as u64) as i64),
         unscoped_wall: true,
+        overwrite_wall_class: true,
         ..Default::default()
     };
     match attempt.status {
         AttemptStatus::Served | AttemptStatus::ServedEmpty => {
             update.success_ema = Some(1.0);
         }
-        AttemptStatus::Throttled | AttemptStatus::Unavailable => {
+        AttemptStatus::Throttled => {
+            let wait = attempt
+                .retry_after_ms
+                .unwrap_or(striatum_core::account_wall::TRANSIENT_BACKOFF_MS as u64);
+            update.cooldown_until = Some(now.saturating_add(wait) as f64);
+            if attempt.retry_after_ms.is_some() {
+                // Only a provider-supplied rate-limit delay expires into open
+                // admission. The default remains a probe-gated guessed pause.
+                update.wall_class = Some(RouteWallClass::Transient);
+                update.provider_retry = true;
+            }
+        }
+        AttemptStatus::Unavailable => {
             let wait = attempt
                 .retry_after_ms
                 .unwrap_or(striatum_core::account_wall::TRANSIENT_BACKOFF_MS as u64);

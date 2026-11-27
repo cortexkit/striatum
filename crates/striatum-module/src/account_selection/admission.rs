@@ -1360,7 +1360,10 @@ pub(crate) fn preflight_model_for_class_with_reset(
     // decision never mixes two generations.
     let fences = match &state {
         Some(state) if state.blocks.enabled() => load_fences(
-            &crate::account_state::Published::State(std::sync::Arc::clone(state)),
+            &crate::account_state::Published::State {
+                state: std::sync::Arc::clone(state),
+                now_ms: ctx.now_ms,
+            },
             provider,
         ),
         _ => crate::account_state::published(ctx.store, ctx.now_ms)

@@ -37,7 +37,7 @@ fn changed_evidence_migration_preserves_generation_and_rejects_an_aba_stale_proo
     native
         .account_transaction(|tx| {
             tx.reconcile_account_route_fence(&back_to_a, now + 60000, now - 1000)?;
-            tx.sync_fence_rechecks()?;
+            tx.sync_fence_rechecks(crate::now_ms())?;
             let origins = tx.load_block_state()?.fence_rechecks(probe_at)?;
             assert_eq!(origins.len(), 1);
             assert!(tx.grant_fence_rechecks(&origins, probe_at, Some("new-aba-owner"))?);

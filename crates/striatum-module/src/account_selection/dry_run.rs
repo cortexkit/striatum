@@ -51,7 +51,10 @@ impl Sweep {
         if let Some(oracle) = &self.oracle {
             return Published::Sql(oracle);
         }
-        Published::State(Arc::new(self.state.lock().unwrap().clone()))
+        Published::State {
+            state: Arc::new(self.state.lock().unwrap().clone()),
+            now_ms: crate::account_selection::now_ms(),
+        }
     }
 
     /// The route-state snapshot this sweep judges every evaluation against:
