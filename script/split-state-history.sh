@@ -1,5 +1,6 @@
 #!/bin/sh
 # Run on a cleanly closed offline copy, never on the live store.
+# This upgrade tool is Unix-only because no Windows routing install predates the history split.
 set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 exec python3 - "$root" "$@" <<'PY'

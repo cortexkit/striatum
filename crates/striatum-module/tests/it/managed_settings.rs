@@ -1,9 +1,9 @@
 //! Drive the routing binary with the daemon's channel-0 settings exchanges.
 
 use std::{
-    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::Stdio,
+    sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
 
@@ -36,7 +36,7 @@ impl Rig {
         let scratch = ScratchDir::new("routing-settings-wire");
         let root = scratch.path();
         let xdg = root.join("conf");
-        let config = xdg.join("cortexkit/striatum.jsonc");
+        let config = xdg.join("cortexkit").join("striatum.jsonc");
         std::fs::create_dir_all(config.parent().unwrap()).unwrap();
         std::fs::write(&config, file).unwrap();
         let binary = stage_test_binary(Path::new(env!("CARGO_BIN_EXE_ck-striatum")));
@@ -176,21 +176,19 @@ pub(super) async fn launch_with_ack(
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let key = [7_u8; 32];
     let daemon = [0_u8; 16];
-    let connection = root.join("connection.json");
-    std::fs::write(
-        &connection,
-        json!({
-            "schema": 1,
-            "endpoints": [{"host": "127.0.0.1", "port": listener.local_addr().unwrap().port()}],
-            "key": key,
-            "daemon_id": daemon,
-            "pid": std::process::id(),
-            "daemon_ver": "0.50.17"
-        })
-        .to_string(),
-    )
-    .unwrap();
-    std::fs::set_permissions(&connection, std::fs::Permissions::from_mode(0o600)).unwrap();
+    static NEXT_CONNECTION: AtomicU64 = AtomicU64::new(0);
+    let seq = NEXT_CONNECTION.fetch_add(1, Ordering::Relaxed);
+    let connection = root.join(format!("connection-{seq}.json"));
+    let metadata = json!({
+        "schema": 1,
+        "endpoints": [{"host": "127.0.0.1", "port": listener.local_addr().unwrap().port()}],
+        "key": key,
+        "daemon_id": daemon,
+        "pid": std::process::id(),
+        "daemon_ver": "0.50.17"
+    })
+    .to_string();
+    super::connection_file::write_private(&connection, metadata.as_bytes());
     let mut child = Command::from(command)
         .current_dir(root)
         .arg("--subc")
@@ -202,7 +200,10 @@ pub(super) async fn launch_with_ack(
         .unwrap();
     let (mut peer, _) = tokio::select! {
         accepted = timeout(DEADLINE, listener.accept()) => accepted.expect("routing did not connect").unwrap(),
-        stopped = child.wait() => panic!("routing stopped before connecting: {stopped:?}"),
+        stopped = child.wait() => {
+            let output = child.wait_with_output().await.unwrap();
+            panic!("routing stopped before connecting: {stopped:?}: {}", String::from_utf8_lossy(&output.stderr));
+        },
     };
     authenticate_server(&mut peer, &key, &daemon, "0.50.17", Duration::from_secs(2))
         .await

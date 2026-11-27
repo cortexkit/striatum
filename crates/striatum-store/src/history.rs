@@ -679,7 +679,7 @@ impl SqliteRouteStateStore {
     }
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(all(unix, any(test, feature = "test-support")))]
 pub fn run_split_for_test(path: &str, now: i64) {
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../script/split-state-history.sh");
     let verifier = std::env::var_os("STRIATUM_SPLIT_VERIFIER")
@@ -698,7 +698,7 @@ pub fn run_split_for_test(path: &str, now: i64) {
     );
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(super) fn complete_test_upgrade(descriptor: &StorageDescriptor, now: i64) {
     drop(SqliteRouteStateStore::open_at_version_for_test(descriptor, 97).unwrap());
     let StorageBackend::Sqlite { path } = &descriptor.backend else {

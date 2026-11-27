@@ -315,7 +315,7 @@ pub(super) async fn health_report_for_with_credentials(
 }
 
 fn set_config_mtime(path: &Path, seconds: u64) {
-    let file = std::fs::OpenOptions::new().read(true).open(path).unwrap();
+    let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
     file.set_times(
         std::fs::FileTimes::new()
             .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds)),

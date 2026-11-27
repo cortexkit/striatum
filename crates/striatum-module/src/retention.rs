@@ -1527,6 +1527,8 @@ mod tests {
         assert_eq!(count(&path, "SELECT count(*) FROM account_affinity"), 0);
         assert_eq!(count(&path, "SELECT count(*) FROM account_pin"), 0);
         assert_eq!(count(&path, "SELECT count(*) FROM account_decision"), 0);
+        drop(connection);
+        drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1588,6 +1590,8 @@ mod tests {
             count(&path, "SELECT count(*) FROM pragma_foreign_key_check"),
             0
         );
+        drop(connection);
+        drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1645,6 +1649,8 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["a", "b"]
         );
+        drop(conn);
+        drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

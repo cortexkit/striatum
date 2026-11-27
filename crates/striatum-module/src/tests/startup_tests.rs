@@ -5,6 +5,8 @@ use std::ffi::OsString;
 use super::*;
 use crate::operator_commands::{capture_account_quota_reply, parse_startup_mode, StartupMode};
 
+// This case uses a POSIX FIFO to make a filesystem write wait for a reader.
+#[cfg(unix)]
 #[tokio::test(flavor = "current_thread")]
 async fn account_quota_capture_keeps_current_thread_worker_free() {
     let scratch = cortexkit_test_support::ScratchDir::new("routing-quota-capture-blocked");
