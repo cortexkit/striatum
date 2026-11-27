@@ -49,7 +49,7 @@ mod panels_estimate_tests;
 mod panels_tests;
 mod reads;
 pub(crate) mod report;
-#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos", windows)))]
 pub(crate) mod request_cpu_bench;
 pub(crate) mod runners;
 #[cfg(test)]
@@ -121,7 +121,7 @@ pub(crate) fn exercise_normal_traffic_for_logging() {
     report_delivery_tests::report_run_repeat_returns_first_answer_and_usage_but_new_runs_count();
 }
 
-#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos", windows)))]
 mod refusal_recovery_tests;
 #[cfg(test)]
 mod report_fence_tests;

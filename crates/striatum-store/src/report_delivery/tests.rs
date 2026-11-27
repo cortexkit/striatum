@@ -851,6 +851,8 @@ fn report_delivery_migration_preserves_opaque_legacy_evidence() {
     assert_eq!(standing, Some(first));
 }
 
+// The split helper upgrades pre-split stores; no Windows install predates the split.
+#[cfg(unix)]
 #[test]
 fn split_restart_report_settles_a_probe_bound_before_the_split() {
     let descriptor = descriptor();

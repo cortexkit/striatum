@@ -48,7 +48,10 @@ fn write_startup_catalog(descriptor: &StorageDescriptor) {
 }
 
 fn write_catalog_at(directory: &Path, bytes: &[u8]) -> io::Result<bool> {
+    #[cfg(unix)]
     std::fs::create_dir_all(directory)?;
+    #[cfg(windows)]
+    subc_os::windows_acl::create_private_dir(directory)?;
     let metadata = std::fs::symlink_metadata(directory)?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err(io::Error::new(
@@ -81,14 +84,18 @@ fn write_catalog_at(directory: &Path, bytes: &[u8]) -> io::Result<bool> {
             ".{CATALOG_FILE_NAME}.tmp-{}-{sequence}",
             std::process::id()
         ));
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
         #[cfg(unix)]
-        {
+        let opened = {
             use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        match options.open(&path) {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+        };
+        #[cfg(windows)]
+        let opened = subc_os::windows_acl::create_private_file(&path);
+        match opened {
             Ok(file) => break (path, file),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error),
@@ -99,7 +106,12 @@ fn write_catalog_at(directory: &Path, bytes: &[u8]) -> io::Result<bool> {
         file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
-        std::fs::rename(&temporary, &destination)
+        #[cfg(unix)]
+        let published = std::fs::rename(&temporary, &destination);
+        #[cfg(windows)]
+        // Windows has no directory fsync; use the library's write-through move.
+        let published = subc_os::durable_replace(&temporary, &destination).map_err(io::Error::from);
+        published
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&temporary);
@@ -209,10 +221,10 @@ mod tests {
         );
     }
 
+    // The split helper upgrades pre-split stores; no Windows install predates the split.
+    #[cfg(unix)]
     #[test]
     fn catalog_excluded_tables_exist_in_the_migrated_routing_store_schema() {
-        let catalog: Value = serde_json::from_slice(CATALOG_BYTES).expect("valid catalog JSON");
-        let entries = catalog["entries"].as_array().expect("entries array");
         let scratch = cortexkit_test_support::ScratchDir::new("routing-engram-catalog-schema");
         let database = scratch.path().join("store.db");
         let descriptor = striatum_store::dev_descriptor(
@@ -227,11 +239,30 @@ mod tests {
         // layout too, or a quota log exclusion against state would falsely pass.
         striatum_store::run_split_for_test(database.to_str().unwrap(), 1_800_000_000_000);
         let store = open_route_state_store(&descriptor).expect("open store after migrations");
+        assert_catalog_excluded_tables(scratch.path());
+        drop(store);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn catalog_excluded_tables_exist_in_a_fresh_split_store() {
+        let scratch = cortexkit_test_support::ScratchDir::new("routing-engram-catalog-schema");
+        let descriptor = striatum_store::dev_descriptor(
+            "routing-engram-catalog-schema",
+            scratch.join("store.db").to_string_lossy(),
+        );
+        let _store = open_route_state_store(&descriptor).expect("open fresh split store");
+        assert_catalog_excluded_tables(scratch.path());
+    }
+
+    fn assert_catalog_excluded_tables(directory: &Path) {
+        let catalog: Value = serde_json::from_slice(CATALOG_BYTES).expect("valid catalog JSON");
+        let entries = catalog["entries"].as_array().expect("entries array");
         for entry in entries
             .iter()
             .filter(|entry| entry["mechanism"] == "page-db")
         {
-            let path = scratch.path().join(entry["path"].as_str().unwrap());
+            let path = directory.join(entry["path"].as_str().unwrap());
             let mut actual = excluded_tables(entry);
             check_exclusions(&path, &actual);
             let expected = match entry["entry_id"].as_str().unwrap() {
@@ -247,7 +278,6 @@ mod tests {
             expected.sort();
             assert_eq!(actual, expected);
         }
-        drop(store);
     }
 
     fn check_exclusions(path: &Path, excluded: &[String]) {
@@ -384,6 +414,16 @@ mod tests {
             committed
         );
         let before = std::fs::metadata(&destination).expect("stat first catalog");
+        #[cfg(windows)]
+        let catalog_handle = {
+            use std::os::windows::fs::OpenOptionsExt;
+            // Without FILE_SHARE_DELETE, replacing the live name would fail.
+            std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(1 | 2) // FILE_SHARE_READ | FILE_SHARE_WRITE
+                .open(&destination)
+                .unwrap()
+        };
         let rewrote = write_catalog_at(&directory, committed).expect("second catalog write");
         assert_eq!(
             std::fs::read(&destination).expect("read second catalog"),
@@ -397,6 +437,24 @@ mod tests {
         }
         assert_eq!(before.modified().unwrap(), after.modified().unwrap());
         assert!(!rewrote, "identical catalog reported a write");
+        #[cfg(windows)]
+        drop(catalog_handle);
         std::fs::remove_dir_all(directory).expect("remove catalog test directory");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn catalog_and_directory_have_owner_only_acls() {
+        let scratch = cortexkit_test_support::ScratchDir::new("routing-catalog-acl");
+        let directory = scratch.join("catalog");
+        assert!(write_catalog_at(&directory, b"original").unwrap());
+        assert!(write_catalog_at(&directory, CATALOG_BYTES).unwrap());
+        let file = std::fs::File::open(directory.join(CATALOG_FILE_NAME)).unwrap();
+        subc_os::windows_acl::verify_private_dir(&directory).unwrap();
+        subc_os::windows_acl::verify_owner_only(&file).unwrap();
+        assert_eq!(
+            std::fs::read(directory.join(CATALOG_FILE_NAME)).unwrap(),
+            CATALOG_BYTES
+        );
     }
 }

@@ -2035,19 +2035,42 @@ pub(super) fn config_path(module_id: &str) -> Result<PathBuf, String> {
         ));
     }
     let filename = format!("{module_id}.jsonc");
-    if module_id.is_empty()
+    let bad_filename = module_id.is_empty()
         || matches!(module_id, "." | "..")
         || module_id.contains(['/', '\\'])
         || !matches!(
             Path::new(&filename).components().next(),
             Some(std::path::Component::Normal(_))
-        )
-    {
+        );
+    #[cfg(windows)]
+    let bad_filename = bad_filename || !windows_settings_filename_supported(&filename);
+    if bad_filename {
         return Err(format!(
             "routing module id {module_id:?} cannot form a settings filename"
         ));
     }
     Ok(home.join("cortexkit").join(filename))
+}
+
+#[cfg(windows)]
+fn windows_settings_filename_supported(filename: &str) -> bool {
+    if filename.contains(|c: char| c <= '\u{1f}' || "<>:\"/\\|?*".contains(c))
+        || filename.ends_with(['.', ' '])
+    {
+        return false;
+    }
+    // DOS device names are reserved even with extensions and ignore ASCII case.
+    let stem = filename.split('.').next().unwrap().trim_end_matches(' ');
+    let stem = stem.to_ascii_uppercase();
+    !matches!(
+        stem.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) && !stem
+        .strip_prefix("COM")
+        .or_else(|| stem.strip_prefix("LPT"))
+        .is_some_and(|suffix| {
+            matches!(suffix.as_bytes(), [b'1'..=b'9']) || matches!(suffix, "¹" | "²" | "³")
+        })
 }
 
 type ModelKey<'a> = (&'a str, &'a str, Option<&'a str>);
@@ -3312,7 +3335,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("striatum.jsonc");
         let set_mtime = |seconds| {
-            let file = std::fs::OpenOptions::new().read(true).open(&path).unwrap();
+            let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
             file.set_times(
                 std::fs::FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(seconds)),
             )
@@ -3406,7 +3429,7 @@ mod tests {
 
         let path = dir.join("striatum.jsonc");
         let set_mtime = |seconds| {
-            let file = std::fs::OpenOptions::new().read(true).open(&path).unwrap();
+            let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
             file.set_times(
                 std::fs::FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(seconds)),
             )
@@ -3493,7 +3516,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("striatum.jsonc");
         let set_mtime = |seconds| {
-            let file = std::fs::OpenOptions::new().read(true).open(&path).unwrap();
+            let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
             file.set_times(
                 std::fs::FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(seconds)),
             )

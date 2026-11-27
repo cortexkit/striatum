@@ -1,32 +1,27 @@
 use super::*;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 struct Rig {
-    dir: PathBuf,
     path: PathBuf,
     revision: u64,
+    scratch: cortexkit_test_support::ScratchDir,
 }
 
 impl Rig {
     fn new() -> Self {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let dir = cortexkit_test_support::scratch_root().join(format!(
-            "routing-schema-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let scratch = cortexkit_test_support::ScratchDir::new("routing-schema");
         Self {
-            path: dir.join("striatum.jsonc"),
-            dir,
+            path: scratch.join("striatum.jsonc"),
             revision: 0,
+            scratch: scratch,
         }
     }
 
     fn write(&mut self, document: &str) {
         self.revision += 1;
         crate::test_config::write(&self.path, document).unwrap();
-        std::fs::File::open(&self.path)
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&self.path)
             .unwrap()
             .set_times(std::fs::FileTimes::new().set_modified(
                 SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000 + self.revision),
@@ -38,7 +33,6 @@ impl Rig {
 impl Drop for Rig {
     fn drop(&mut self) {
         live_configs().lock().unwrap().remove(&self.path);
-        std::fs::remove_dir_all(&self.dir).unwrap();
     }
 }
 
@@ -533,8 +527,8 @@ fn check_config_counts_are_anonymous_and_available_without_variants_or_store() {
         "exclusion_rules=2",
         "runner_route_rules=2",
     ];
-    let missing = rig.dir.join("missing.db");
-    let corrupt = rig.dir.join("corrupt.db");
+    let missing = rig.scratch.join("missing.db");
+    let corrupt = rig.scratch.join("corrupt.db");
     std::fs::write(&corrupt, b"not a sqlite database").unwrap();
     for path in [None, Some(missing.as_path()), Some(corrupt.as_path())] {
         let report = check_config_offline(&rig.path, crate::DEFAULT_MODULE_ID, path).unwrap();
@@ -550,7 +544,7 @@ fn check_config_counts_are_anonymous_and_available_without_variants_or_store() {
         }
         assert!(!counts.join("\n").contains("private"));
     }
-    let store_path = rig.dir.join("counts.db");
+    let store_path = rig.scratch.join("counts.db");
     let connection = rusqlite::Connection::open(&store_path).unwrap();
     connection
         .execute_batch(

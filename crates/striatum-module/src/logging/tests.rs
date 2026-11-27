@@ -13,6 +13,10 @@ fn child(mode: &str, rust_log: Option<&str>, striatum_log: Option<&str>) -> Outp
         &crate::test_exe::current_test_exe().unwrap(),
         &home,
     );
+    #[cfg(windows)]
+    command
+        .env("TEMP", home.join("tmp"))
+        .env("TMP", home.join("tmp"));
     command
         .args([
             "--exact",

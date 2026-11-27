@@ -2,7 +2,6 @@
 
 use std::{
     io,
-    os::unix::fs::PermissionsExt,
     path::Path,
     process::Stdio,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -45,9 +44,9 @@ async fn assert_store_closed(stop: Stop) {
     let key = [7_u8; 32];
     let daemon = [0_u8; 16];
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    std::fs::write(
+    super::connection_file::write_private(
         &connection_file,
-        serde_json::to_vec(&json!({
+        &serde_json::to_vec(&json!({
             "schema": 1,
             "endpoints": [{"host": "127.0.0.1", "port": listener.local_addr().unwrap().port()}],
             "key": key,
@@ -56,9 +55,7 @@ async fn assert_store_closed(stop: Stop) {
             "daemon_ver": "0.40.0",
         }))
         .unwrap(),
-    )
-    .unwrap();
-    std::fs::set_permissions(&connection_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    );
 
     let binary = stage_test_binary(Path::new(env!("CARGO_BIN_EXE_ck-striatum")));
     let mut module = Command::from(fenced_command(&binary, root))

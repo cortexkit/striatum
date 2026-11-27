@@ -83,12 +83,8 @@ pub(super) struct Harness {
     selection_profiles: Arc<Mutex<striatum_core::model_router::RouteTaskProfiles>>,
     subscription_pools: Mutex<Option<Box<dyn Send + Sync>>>,
     settings_connection: Mutex<Option<crate::managed_settings::test_daemon::Connection>>,
-}
-
-impl Drop for Harness {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
-    }
+    // Keep the test directory until the SQLite connections above are dropped.
+    _scratch: cortexkit_test_support::ScratchDir,
 }
 
 impl Harness {
@@ -111,10 +107,9 @@ impl Harness {
         template: Option<&std::path::Path>,
     ) -> Arc<Self> {
         super::consumers::replace_catalog(&json!([]));
-        let n = NEXT_HARNESS.fetch_add(1, Ordering::Relaxed);
-        let dir = cortexkit_test_support::scratch_root()
-            .join(format!("striatum-v1-{label}-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        // Windows may reuse a PID while a previous test's scratch still exists.
+        let scratch = cortexkit_test_support::ScratchDir::new(&format!("striatum-v1-{label}"));
+        let dir = scratch.path().to_owned();
         if let Some(template) = template {
             std::fs::copy(template, dir.join("store.db")).unwrap();
             std::fs::copy(
@@ -171,6 +166,7 @@ impl Harness {
             subscription_pools: Default::default(),
             settings_connection: Default::default(),
             dir,
+            _scratch: scratch,
         });
         harness.edit_config(|config| {
             for policy in config["consumers"].as_object_mut().unwrap().values_mut() {
@@ -2702,6 +2698,7 @@ pub(super) fn upgrade_harness(harness: Arc<Harness>) -> Arc<Harness> {
     Arc::new(state)
 }
 
+#[cfg(unix)]
 fn seed_097_facts(harness: &Harness, facts: &[ModelFact]) {
     // Schema 97 keeps route state and history in one file and predates the
     // catalog columns the current writer requires. Insert the old shape directly.
@@ -2734,6 +2731,7 @@ fn seed_097_facts(harness: &Harness, facts: &[ModelFact]) {
     });
 }
 
+#[cfg(unix)]
 fn seed_097_completion(harness: &Harness, now: i64) {
     // Seed the finished admission and its receipts in the combined state/history
     // store. The stored reply must still replay after history moves to its own file.
@@ -2804,6 +2802,8 @@ fn seed_097_completion(harness: &Harness, now: i64) {
     );
 }
 
+// The split helper upgrades pre-split stores; no Windows install predates the split.
+#[cfg(unix)]
 #[tokio::test]
 async fn split_restart_replays_a_completed_admission_before_and_after_moving_history() {
     use striatum_core::{route_state_store::QuotaReadingLogRow, RouteStateStore};

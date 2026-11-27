@@ -97,7 +97,7 @@ fn default_pin_only(plane: Option<&striatum_core::billing::BillingPlane>) -> boo
     })
 }
 
-#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos", windows)))]
 #[tokio::test]
 async fn panel_policy_memo_matches_uncached_verdicts() {
     use crate::routing_v1::request_cpu_bench::{production_fixture, FIXTURE_NOW};

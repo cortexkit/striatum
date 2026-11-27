@@ -1,8 +1,7 @@
-//! Exercise the real module with an inherited socketpair and a fake daemon.
+//! Exercise the real module's private registration channel with a fake daemon.
 
 use std::{
     collections::HashSet,
-    os::unix::fs::PermissionsExt,
     path::Path,
     process::Stdio,
     sync::{Arc, Mutex},
@@ -11,9 +10,13 @@ use std::{
 use cortexkit_test_support::{fenced_command, stage_test_binary, ScratchDir};
 use serde::Serialize;
 use serde_json::{json, Value};
+use subc_os::registration_channel::DAEMON_PID_ENV;
+#[cfg(unix)]
 use subc_os::registration_channel::{
-    registration_socketpair, ChildDescriptorSlots, DAEMON_PID_ENV, REGISTRATION_FD_ENV,
+    registration_socketpair, ChildDescriptorSlots, REGISTRATION_FD_ENV as HANDOFF_ENV,
 };
+#[cfg(windows)]
+use subc_os::registration_channel::{RegistrationPipe, REGISTRATION_PIPE_ENV as HANDOFF_ENV};
 use subc_protocol::{
     claim::{
         Claim, ClaimMintReply, ClaimMintRequest, ClaimPresentReply, ClaimPresentRequest,
@@ -24,7 +27,7 @@ use subc_protocol::{
 use subc_transport::{authenticate_server, read_frame, write_frame, AuthError};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
-    net::{TcpListener, TcpStream, UnixStream},
+    net::{TcpListener, TcpStream},
     process::{Child, Command},
     task::JoinSet,
     time::{timeout, Duration},
@@ -46,7 +49,7 @@ impl Rig {
         let scratch = ScratchDir::new("routing-registration-channel");
         let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let connection = scratch.path().join("connection.json");
-        std::fs::write(
+        super::connection_file::write_private(
             &connection,
             json!({
                 "schema": 1,
@@ -56,10 +59,9 @@ impl Rig {
                 "pid": std::process::id(),
                 "daemon_ver": DAEMON_VERSION,
             })
-            .to_string(),
-        )
-        .unwrap();
-        std::fs::set_permissions(connection, std::fs::Permissions::from_mode(0o600)).unwrap();
+            .to_string()
+            .as_bytes(),
+        );
         Self { scratch, tcp }
     }
 
@@ -78,15 +80,35 @@ impl Rig {
         command
     }
 
-    fn launch(&self) -> (Child, UnixStream) {
+    #[cfg(unix)]
+    async fn launch(&self) -> (Child, impl Stream) {
         let (peer, inherited, descriptor) = registration_socketpair().unwrap();
         let mut slots = ChildDescriptorSlots::default();
         slots.channel(inherited).unwrap();
         let mut command = self.command();
-        command.env(REGISTRATION_FD_ENV, descriptor);
+        command.env(HANDOFF_ENV, descriptor);
         slots.install(&mut command);
         peer.set_nonblocking(true).unwrap();
-        (spawn(command), UnixStream::from_std(peer).unwrap())
+        (
+            spawn(command),
+            tokio::net::UnixStream::from_std(peer).unwrap(),
+        )
+    }
+
+    #[cfg(windows)]
+    async fn launch(&self) -> (Child, impl Stream) {
+        let pipe = RegistrationPipe::new().unwrap();
+        let mut command = self.command();
+        command.env(HANDOFF_ENV, pipe.name());
+        let child = spawn(command);
+        let pid = child.id().unwrap();
+        let peer = tokio::task::spawn_blocking(move || {
+            pipe.accept_tokio_pipe_server(pid, std::time::Instant::now() + DEADLINE)
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        (child, peer)
     }
 
     async fn ack(&self, peer: &mut (impl AsyncWrite + Unpin), hello: &Frame) {
@@ -173,10 +195,21 @@ async fn stop(child: Child, peer: &mut (impl AsyncWrite + Unpin), ver: u8) {
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn hello_uses_socketpair_without_launch_nonce_or_tcp_dial() {
+    assert_hello_uses_private_channel().await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn hello_uses_named_pipe_without_launch_nonce_or_tcp_dial() {
+    assert_hello_uses_private_channel().await;
+}
+
+async fn assert_hello_uses_private_channel() {
     let rig = Rig::new().await;
-    let (child, mut socket) = rig.launch();
+    let (child, mut socket) = rig.launch().await;
     let hello = timeout(DEADLINE, async {
         tokio::select! {
             _ = rig.tcp.accept() => panic!("module dialed the connection-file endpoint for registration"),
@@ -195,7 +228,7 @@ async fn hello_uses_socketpair_without_launch_nonce_or_tcp_dial() {
 async fn broken_channel_fails_instead_of_dialing_tcp() {
     let rig = Rig::new().await;
     let mut command = rig.command();
-    command.env(REGISTRATION_FD_ENV, "broken");
+    command.env(HANDOFF_ENV, "broken");
     let output = timeout(DEADLINE, async {
         tokio::select! {
             _ = rig.tcp.accept() => panic!("module fell back to the TCP endpoint after a broken handoff"),
@@ -204,8 +237,12 @@ async fn broken_channel_fails_instead_of_dialing_tcp() {
     }).await.unwrap();
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
+    #[cfg(unix)]
+    let reason = "invalid registration metadata";
+    #[cfg(windows)]
+    let reason = "registration channel is not open";
     assert!(
-        stderr.contains("adopt registration channel: invalid registration metadata"),
+        stderr.contains(&format!("adopt registration channel: {reason}")),
         "{stderr}"
     );
 }
@@ -214,7 +251,7 @@ async fn broken_channel_fails_instead_of_dialing_tcp() {
 async fn legacy_hello_still_dials_tcp_and_presents_launch_nonce() {
     let rig = Rig::new().await;
     let mut command = rig.command();
-    command.env_remove(REGISTRATION_FD_ENV);
+    command.env_remove(HANDOFF_ENV);
     let child = spawn(command);
     let (mut peer, hello) = timeout(DEADLINE, async {
         let (mut peer, _) = rig.tcp.accept().await.unwrap();
@@ -347,7 +384,7 @@ async fn accept_claimed(mut peer: TcpStream, issued: Issued) -> Option<Value> {
 #[tokio::test]
 async fn quota_and_sdk_present_minted_claims_before_route_traffic() {
     let rig = Rig::new().await;
-    let (_child, mut socket) = rig.launch();
+    let (_child, mut socket) = rig.launch().await;
     let (mut primary, hello): (Box<dyn Stream>, _) = timeout(DEADLINE, async {
         tokio::select! {
             // Let a TCP-registering implementation start so this test fails on

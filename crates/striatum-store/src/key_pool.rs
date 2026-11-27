@@ -670,6 +670,8 @@ mod wall_generation_tests {
         assert!(clocks.iter().all(|origin| origin.evidence_at == 100));
     }
 
+    // The split helper upgrades pre-split stores; no Windows install predates the split.
+    #[cfg(unix)]
     #[test]
     fn newer_pool_refusal_replaces_a_long_migrated_deadline_with_its_short_retry() {
         let scratch = cortexkit_test_support::ScratchDir::new("migrated-pool-short-retry");

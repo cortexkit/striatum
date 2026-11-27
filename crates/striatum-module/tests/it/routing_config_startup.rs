@@ -4,7 +4,6 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use subc_client_rs::config::CONFIG_GATE_CAPABILITY;
 use subc_protocol::{Flags, Frame, FrameType, Priority, SUBC_MODULE_ID_ENV};
@@ -13,27 +12,21 @@ use tokio::{process::Child, time::timeout};
 
 use super::managed_settings::{launch_with_ack, DEADLINE};
 
-struct Home(PathBuf);
+struct Home(cortexkit_test_support::ScratchDir);
 
 impl Home {
     fn new() -> Self {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let path = cortexkit_test_support::scratch_root().join(format!(
-            "routing-startup-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(path.join("xdg/cortexkit")).unwrap();
-        std::fs::create_dir_all(path.join(".config/cortexkit")).unwrap();
-        Self(path)
+        let home = Self(cortexkit_test_support::ScratchDir::new("routing-startup"));
+        for xdg in [false, true] {
+            std::fs::create_dir_all(home.config_dir(xdg)).unwrap();
+        }
+        home
     }
 
     fn config_dir(&self, xdg: bool) -> PathBuf {
-        self.0.join(if xdg {
-            "xdg/cortexkit"
-        } else {
-            ".config/cortexkit"
-        })
+        self.0
+            .join(if xdg { "xdg" } else { ".config" })
+            .join("cortexkit")
     }
 
     fn run(&self, xdg: bool) -> Output {
@@ -102,7 +95,7 @@ impl Home {
             cortexkit_test_support::stage_test_binary(Path::new(env!("CARGO_BIN_EXE_ck-striatum")));
         let mut command = cortexkit_test_support::fenced_command(&binary, &self.0);
         command
-            .env("HOME", &self.0)
+            .env("HOME", self.0.path())
             .env_remove("XDG_CONFIG_HOME")
             .env_remove("APPDATA")
             .env_remove("USERPROFILE")
@@ -111,12 +104,6 @@ impl Home {
             command.env("XDG_CONFIG_HOME", self.0.join("xdg"));
         }
         command
-    }
-}
-
-impl Drop for Home {
-    fn drop(&mut self) {
-        std::fs::remove_dir_all(&self.0).unwrap();
     }
 }
 
@@ -130,6 +117,12 @@ async fn wait_for_output(child: Child) -> Output {
 fn stderr(output: Output) -> String {
     assert!(!output.status.success());
     String::from_utf8(output.stderr).unwrap()
+}
+
+fn debug_path_fragment(path: &Path) -> String {
+    // main returns a Debug-formatted error, so backslashes are escaped.
+    let quoted = format!("{:?}", path.to_str().unwrap());
+    quoted[1..quoted.len() - 1].to_owned()
 }
 
 async fn invalid_startup(document: &str, token: &str) {
@@ -195,7 +188,7 @@ async fn check_config_refuses_a_consumer_name_the_declared_schema_rejects() {
     home.assert_file_settings_serve(home.command(true)).await;
 
     let message = stderr(home.run_with_args(true, &["--check-config"]));
-    assert!(message.contains(path.to_str().unwrap()), "{message}");
+    assert!(message.contains(&debug_path_fragment(&path)), "{message}");
     assert!(
         message.contains("/consumer_priorities/broca classifier"),
         "{message}"
@@ -247,6 +240,25 @@ async fn non_default_module_id_reads_and_declares_its_own_settings_file() {
     write_frame(&mut peer, &goodbye).await.unwrap();
     let output = wait_for_output(child).await;
     assert!(output.status.success(), "{output:?}");
+}
+
+#[cfg(windows)]
+#[test]
+fn check_config_refuses_windows_device_names_and_invalid_filename_characters() {
+    let home = Home::new();
+    for id in ["cOn", "NUL.backup", "COM1", "LPT²", "foo:bar", "foo?bar"] {
+        let output = home
+            .command(true)
+            .env(SUBC_MODULE_ID_ENV, id)
+            .arg("--check-config")
+            .output()
+            .unwrap();
+        let message = stderr(output);
+        assert!(
+            message.contains("cannot form a settings filename"),
+            "{id}: {message}"
+        );
+    }
 }
 
 #[test]
@@ -327,7 +339,10 @@ async fn striatum_invalid_settings_file_refuses_startup_and_check_config() {
     ] {
         let message = stderr(output);
         assert!(
-            message.contains(&format!("invalid config in {}", primary.display())),
+            message.contains(&format!(
+                "invalid config in {}",
+                debug_path_fragment(&primary)
+            )),
             "{message}"
         );
         assert!(!message.contains("missing-connection-file"), "{message}");
@@ -341,7 +356,7 @@ fn missing_config_home_refuses_relative_fallback_at_startup() {
     let mut command = home.command(false);
     let message = stderr(
         command
-            .current_dir(&home.0)
+            .current_dir(home.0.path())
             .env_remove("XDG_CONFIG_HOME")
             .env_remove("APPDATA")
             .env_remove("USERPROFILE")
@@ -367,7 +382,7 @@ fn relative_xdg_config_home_is_refused_instead_of_falling_back_to_absolute_home(
     let home = Home::new();
     let message = stderr(
         home.command(false)
-            .current_dir(&home.0)
+            .current_dir(home.0.path())
             .env("XDG_CONFIG_HOME", "relative-config")
             .arg("--check-config")
             .output()

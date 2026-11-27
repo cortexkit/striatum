@@ -228,6 +228,11 @@ fn before_begin_for_test(conn: &Connection) {
     let Some(path) = conn.path().map(std::path::PathBuf::from) else {
         return;
     };
+    #[cfg(windows)]
+    let Ok(path) = path.canonicalize() else {
+        // In-memory connections have no filesystem identity to match.
+        return;
+    };
     let hook = {
         let mut hooks = BEFORE_BEGIN.lock().unwrap();
         hooks

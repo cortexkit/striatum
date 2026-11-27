@@ -76,7 +76,9 @@ mod history;
 #[cfg(any(test, feature = "test-support"))]
 pub use fence_rechecks::parity::verify_split_evaluation;
 #[cfg(any(test, feature = "test-support"))]
-pub use history::{open_offline as open_offline_split_copy, run_split_for_test};
+pub use history::open_offline as open_offline_split_copy;
+#[cfg(all(unix, feature = "test-support"))]
+pub use history::run_split_for_test;
 mod route_snapshot;
 mod sql_real;
 mod store_open;
