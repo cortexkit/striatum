@@ -221,7 +221,7 @@ mod tests {
         );
     }
 
-    // The split helper upgrades pre-split stores; no Windows install predates the split.
+    // Unix-only: script/split-state-history.sh upgrades stores from before history moved into history.db, and no Windows install is that old.
     #[cfg(unix)]
     #[test]
     fn catalog_excluded_tables_exist_in_the_migrated_routing_store_schema() {

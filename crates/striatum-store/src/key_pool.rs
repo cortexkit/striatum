@@ -670,7 +670,7 @@ mod wall_generation_tests {
         assert!(clocks.iter().all(|origin| origin.evidence_at == 100));
     }
 
-    // The split helper upgrades pre-split stores; no Windows install predates the split.
+    // Unix-only: script/split-state-history.sh upgrades stores from before history moved into history.db, and no Windows install is that old.
     #[cfg(unix)]
     #[test]
     fn newer_pool_refusal_replaces_a_long_migrated_deadline_with_its_short_retry() {

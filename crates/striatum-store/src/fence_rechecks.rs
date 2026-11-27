@@ -3388,13 +3388,13 @@ mod tests {
             .unwrap());
     }
 
-    // The split helper upgrades pre-split stores; no Windows install predates the split.
+    // Unix-only: script/split-state-history.sh upgrades stores from before history moved into history.db, and no Windows install is that old.
     #[cfg(unix)]
     #[test]
     fn migrated_model_wall_uses_a_new_refusals_short_retry() {
         migrated_wall_short_retry("route");
     }
-    // The split helper upgrades pre-split stores; no Windows install predates the split.
+    // Unix-only: script/split-state-history.sh upgrades stores from before history moved into history.db, and no Windows install is that old.
     #[cfg(unix)]
     #[test]
     fn migrated_provider_wall_uses_a_new_refusals_short_retry() {
@@ -3454,7 +3454,7 @@ mod tests {
         let clocks = store.fence_rechecks().unwrap();
         assert!(clocks.iter().any(|f|f.kind=="route" && f.model.as_deref()==Some("other") && f.evidence_at==now+1 && f.next_recheck_at==now+10_000),"provider fanout must not replace an independent model's refusal generation: {clocks:?}");
     }
-    // The split helper upgrades pre-split stores; no Windows install predates the split.
+    // Unix-only: script/split-state-history.sh upgrades stores from before history moved into history.db, and no Windows install is that old.
     #[cfg(unix)]
     #[test]
     fn migrated_failure_wall_uses_a_new_refusals_short_retry() {
@@ -3676,7 +3676,7 @@ mod tests {
         );
     }
 
-    // The split helper upgrades pre-split stores; no Windows install predates the split.
+    // Unix-only: script/split-state-history.sh upgrades stores from before history moved into history.db, and no Windows install is that old.
     #[cfg(unix)]
     #[test]
     fn outcome_retry_wall_replaces_migrated_horizon_and_refreshes_evidence() {
@@ -4037,7 +4037,7 @@ mod tests {
         );
     }
 
-    // The split helper upgrades pre-split stores; no Windows install predates the split.
+    // Unix-only: script/split-state-history.sh upgrades stores from before history moved into history.db, and no Windows install is that old.
     #[cfg(unix)]
     #[test]
     fn migration_82_converts_quota_now_and_caps_non_quota_once() {

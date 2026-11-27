@@ -2802,7 +2802,7 @@ fn seed_097_completion(harness: &Harness, now: i64) {
     );
 }
 
-// The split helper upgrades pre-split stores; no Windows install predates the split.
+// Unix-only: script/split-state-history.sh upgrades stores from before history moved into history.db, and no Windows install is that old.
 #[cfg(unix)]
 #[tokio::test]
 async fn split_restart_replays_a_completed_admission_before_and_after_moving_history() {

@@ -264,7 +264,7 @@ fn memory_history_uses_scratch_leases_and_never_borrows_state_writer() {
     assert_eq!(leases(crate_dir), preexisting);
 }
 
-// The split helper upgrades pre-split stores; no Windows install predates the split.
+// Unix-only: script/split-state-history.sh upgrades stores from before history moved into history.db, and no Windows install is that old.
 #[cfg(unix)]
 #[test]
 fn split_and_fresh_stores_have_the_same_history_schema_and_ledger() {
@@ -492,7 +492,7 @@ fn missing_archive_after_split_is_not_recreated() {
     assert!(!history.exists());
 }
 
-// The split helper upgrades pre-split stores; no Windows install predates the split.
+// Unix-only: script/split-state-history.sh upgrades stores from before history moved into history.db, and no Windows install is that old.
 #[cfg(unix)]
 #[test]
 fn fresh_and_split_state_have_identical_schema() {
