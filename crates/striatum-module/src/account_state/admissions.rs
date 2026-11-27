@@ -456,6 +456,13 @@ struct Contribution<'a> {
 }
 
 impl AdmissionState {
+    /// Moves out the private open-row index so the heap profile can measure
+    /// and free it like every other map.
+    #[cfg(all(test, feature = "heap-measure"))]
+    pub(crate) fn take_open_by_pin(&mut self) -> ShardedMap<(String, u64), u64> {
+        std::mem::take(&mut self.open_by_pin)
+    }
+
     pub(crate) fn from_rows(rows: AdmissionGroupRows) -> Self {
         let AdmissionGroupRows {
             open,

@@ -435,6 +435,8 @@ fn live_shaped_account_heap() {
     release("blocks_empty", blocks);
     release("selection_salt_empty", selection_salt);
     release("waiters_empty", waiters);
+    let mut admissions = admissions;
+    release("open_by_pin", admissions.take_open_by_pin());
     let AdmissionState {
         open,
         demand,
@@ -449,6 +451,7 @@ fn live_shaped_account_heap() {
         closing,
         signed_out,
         pending,
+        ..
     } = admissions;
     release("open", open);
     release("demand", demand);
