@@ -83,6 +83,7 @@ pub(super) struct Harness {
     selection_profiles: Arc<Mutex<striatum_core::model_router::RouteTaskProfiles>>,
     subscription_pools: Mutex<Option<Box<dyn Send + Sync>>>,
     settings_connection: Mutex<Option<crate::managed_settings::test_daemon::Connection>>,
+    kit_template: Option<Arc<cortexkit_test_support::ScratchDir>>,
     // Keep the test directory until the SQLite connections above are dropped.
     _scratch: cortexkit_test_support::ScratchDir,
 }
@@ -99,6 +100,30 @@ impl Harness {
     /// Copy a migrated scratch database, but start with fresh in-process state.
     pub(super) fn from_template(label: &str, template: &std::path::Path) -> Arc<Self> {
         Self::new_with_template(label, None, Some(template))
+    }
+
+    fn new_kit(label: &str) -> Arc<Self> {
+        let mut harness = Self::new(label);
+        // A reset needs an empty, fully migrated state/archive pair, not the
+        // preceding case's rows. Snapshot both files before the first case.
+        let template = cortexkit_test_support::ScratchDir::new("routing-kit-template");
+        for file in ["store.db", "history.db"] {
+            rusqlite::Connection::open(harness.dir.join(file))
+                .unwrap()
+                .execute("VACUUM INTO ?1", [template.join(file).to_str().unwrap()])
+                .unwrap();
+        }
+        Arc::get_mut(&mut harness).unwrap().kit_template = Some(Arc::new(template));
+        harness
+    }
+
+    fn fresh_kit_case(&self) -> Arc<Self> {
+        let Some(template) = &self.kit_template else {
+            return Self::new("kit");
+        };
+        let mut harness = Self::from_template("kit", &template.join("store.db"));
+        Arc::get_mut(&mut harness).unwrap().kit_template = Some(Arc::clone(template));
+        harness
     }
 
     fn new_with_template(
@@ -165,6 +190,7 @@ impl Harness {
             selection_profiles: Default::default(),
             subscription_pools: Default::default(),
             settings_connection: Default::default(),
+            kit_template: None,
             dir,
             _scratch: scratch,
         });
@@ -1260,6 +1286,14 @@ pub(super) fn selection_facts(
 }
 
 impl KitSubject {
+    fn for_suite(label: &str) -> Self {
+        Self {
+            observe_blocks: Mutex::new(false),
+            media: Mutex::new(Default::default()),
+            harness: Mutex::new(Harness::new_kit(label)),
+        }
+    }
+
     fn harness(&self) -> Arc<Harness> {
         Arc::clone(&self.harness.lock().unwrap())
     }
@@ -1340,7 +1374,8 @@ impl RoutingSubject for KitSubject {
     }
 
     async fn reset(&self) -> Result<(), String> {
-        *self.harness.lock().unwrap() = Harness::new("kit");
+        let mut harness = self.harness.lock().unwrap();
+        *harness = harness.fresh_kit_case();
         *self.media.lock().unwrap() = Default::default();
         Ok(())
     }
@@ -2147,6 +2182,49 @@ fn assert_no_pending_refusal(reply: &Frame, enforced: impl FnOnce() -> bool) {
 // an account session that already moved.
 const ROUTING_EXTENSIONS: &[&str] = &["service_tier_settings", "account_continue_resume"];
 
+#[tokio::test]
+async fn routing_kit_reset_copies_a_pristine_migrated_pair() {
+    let subject = KitSubject::for_suite("kit-template-check");
+    let initial = subject.harness();
+    let pair = [
+        ("store.db", "history_layout"),
+        ("history.db", "history_binding"),
+    ];
+    let split_identity = |conn: &rusqlite::Connection, table| -> String {
+        conn.query_row(&format!("SELECT split_identity FROM {table}"), [], |row| {
+            row.get(0)
+        })
+        .unwrap()
+    };
+    let expected = split_identity(
+        &rusqlite::Connection::open(initial.store_path()).unwrap(),
+        "history_layout",
+    );
+    for (filename, _) in pair {
+        rusqlite::Connection::open(initial.dir.join(filename))
+            .unwrap()
+            .execute_batch("CREATE TABLE case_marker (id INTEGER)")
+            .unwrap();
+    }
+
+    subject.reset().await.unwrap();
+
+    let reset = subject.harness();
+    assert_ne!(initial.store_path(), reset.store_path());
+    for (filename, table) in pair {
+        let conn = rusqlite::Connection::open(reset.dir.join(filename)).unwrap();
+        assert_eq!(split_identity(&conn, table), expected, "{filename}");
+        let has_marker: bool = conn
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM sqlite_schema WHERE name='case_marker')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!has_marker, "the prior case wrote a marker to {filename}");
+    }
+}
+
 /// Every kit check that applies to routing passes; the checks that don't apply
 /// are pinned explicitly in `NOT_APPLICABLE`.
 /// A failing check names the contract rule it holds the provider to.
@@ -2192,11 +2270,7 @@ async fn routing_v1_conformance_kit_matches_served_checks() {
             "served group {group} still marked pending"
         );
     }
-    let subject = KitSubject {
-        observe_blocks: Mutex::new(false),
-        media: Mutex::new(Default::default()),
-        harness: Mutex::new(Harness::new("kit")),
-    };
+    let subject = KitSubject::for_suite("kit");
     for reason in PENDING_REFUSAL_REASONS {
         assert!(cortexkit_role_routing::errors::NoRouteReason::parse(reason).is_known());
         assert!(
@@ -2282,11 +2356,7 @@ async fn routing_v1_conformance_kit_matches_served_checks() {
 
 #[tokio::test]
 async fn routing_v1_explicit_harness_needs_conformance_case() {
-    let subject = KitSubject {
-        observe_blocks: Mutex::new(false),
-        media: Mutex::new(Default::default()),
-        harness: Mutex::new(Harness::new("kit-harness-capabilities")),
-    };
+    let subject = KitSubject::for_suite("kit-harness-capabilities");
     let report = super::describe::with_candidate_capabilities(
         &[cortexkit_role_routing::capabilities::SELECT_HARNESS_CAPABILITIES],
         run_suite(&subject),
@@ -2303,11 +2373,7 @@ async fn routing_v1_explicit_harness_needs_conformance_case() {
 
 #[tokio::test]
 async fn routing_v1_fork_of_undeclared_conformance_case() {
-    let subject = KitSubject {
-        observe_blocks: Mutex::new(false),
-        media: Mutex::new(Default::default()),
-        harness: Mutex::new(Harness::new("kit-fork-undeclared")),
-    };
+    let subject = KitSubject::for_suite("kit-fork-undeclared");
     let report = super::describe::without_capability(
         cortexkit_role_routing::capabilities::ACCOUNT_FORK_OF,
         run_suite(&subject),
