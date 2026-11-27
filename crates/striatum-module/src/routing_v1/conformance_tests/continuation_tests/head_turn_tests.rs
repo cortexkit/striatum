@@ -30,6 +30,15 @@ async fn head_turn_continue_admits_full_replacement_and_holds_a_slot() {
         "candidates":{"view_digest":"replacement-only","accounts":[{
             "account_id":account.account_id,"credential_id":account.credential_id}]}});
     result(runner.call("route.account_for", &body).await);
+
+    // Check the ordinary call before the head turn gives this conversation
+    // a slot on the replacement account.
+    let mut ordinary = request.clone();
+    ordinary["selection_id"] = json!("ordinary-continue");
+    ordinary["head_turn"] = json!(false);
+    let refused = result(runner.call("route.account_for", &ordinary).await);
+    assert_ne!(refused["kind"], "offer", "{refused}");
+
     crate::take_operator_infos();
     request["head_turn"] = json!(true);
     let offer = result(runner.call("route.account_for", &request).await);
@@ -55,8 +64,4 @@ async fn head_turn_continue_admits_full_replacement_and_holds_a_slot() {
         ),
         2
     );
-    request["selection_id"] = json!("ordinary-continue");
-    request["head_turn"] = json!(false);
-    let refused = result(runner.call("route.account_for", &request).await);
-    assert_ne!(refused["kind"], "offer", "{refused}");
 }
