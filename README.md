@@ -115,6 +115,26 @@ See [ARCHITECTURE.md](ARCHITECTURE.md), [STRUCTURE.md](STRUCTURE.md), the
 `script/` include optional operator tooling; they are not needed to build or
 test the module.
 
+## Releases
+
+[GitHub Releases](https://github.com/cortexkit/striatum/releases) will provide
+`ck-striatum-<target>.zip` archives for `darwin-arm64`, `darwin-x64`, `linux-x64`
+and `linux-arm64`. Each archive contains the `ck-striatum` binary; the macOS
+binaries are signed with Developer ID and notarized. Each release also includes a
+`release-manifest.json` with the build's Git revision and the minimum supported
+core version.
+
+The `windows-x64` archive is built and verified but won't be published until the
+native Windows test suite passes. Until then, `ck setup` reports the release as
+incomplete on Windows.
+
+Download the ZIP and its `.zip.sha256` sidecar to the same directory, then verify
+the ZIP before extracting it. For example:
+
+```sh
+shasum -a 256 -c ck-striatum-darwin-arm64.zip.sha256
+```
+
 ## License
 
 Striatum is available under the [MIT License](LICENSE).
