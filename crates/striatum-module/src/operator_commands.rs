@@ -51,7 +51,7 @@ pub(super) async fn async_main(
             let report = config_overrides::check_config_offline(
                 &path,
                 &module_id,
-                config_overrides::default_store_path().as_deref(),
+                Some(&config_overrides::default_store_path()),
             )
             .map_err(ModuleError::Message)?;
             eprintln!("config check passed: {}\n{report}", path.display());

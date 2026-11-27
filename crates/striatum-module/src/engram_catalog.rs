@@ -370,7 +370,7 @@ mod tests {
             .into_iter()
             .find_map(|(entry_id, path)| (entry_id == "striatum/store").then_some(path))
             .expect("route-state entry");
-        let opened_path = crate::config_overrides::default_store_path().expect("store path");
+        let opened_path = crate::config_overrides::default_store_path();
         assert_eq!(opened_path.file_name().unwrap().to_string_lossy(), path);
         assert!(opened_path.ends_with("cortexkit/striatum/store.db"));
         assert_eq!(path, "store.db");

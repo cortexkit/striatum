@@ -8,6 +8,9 @@ on:
 permissions:
   contents: read
 
+env:
+  NEXTEST_PROFILE: ci
+
 jobs:
   test:
     name: Test (${{ matrix.platform }})

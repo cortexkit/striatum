@@ -3587,8 +3587,9 @@ fn retirement_records_sync_time_without_rewriting_source_evidence_time() {
 #[test]
 fn retirement_preflight_rejects_each_stale_input_before_any_tombstone() {
     let observed = crate::now_ms();
-    let deadline = observed + 5_000;
-    let mut cases = Vec::new();
+    // Keep the legacy rows live through migration's real clock regardless of
+    // setup cost, then advance only the synchronization pass past the expiry.
+    let deadline = 4_000_000_000_000i64;
     for (input, stale_index) in ["source", "clock"]
         .into_iter()
         .flat_map(|input| (0..3).map(move |index| (input, index)))
@@ -3641,24 +3642,13 @@ fn retirement_preflight_rejects_each_stale_input_before_any_tombstone() {
             })?;
             conn.execute_batch("CREATE TEMP TRIGGER count_retirement_attempt BEFORE INSERT ON main.retirement_tombstone BEGIN SELECT count_retirement_attempt(); END;")
         });
-        cases.push((rig, stale, attempts, input, stale_index));
-    }
-    assert!(
-        crate::now_ms() < deadline,
-        "all fixtures migrated before expiry"
-    );
-    let remaining = (deadline + 1).saturating_sub(crate::now_ms());
-    if remaining > 0 {
-        std::thread::sleep(std::time::Duration::from_millis(remaining as u64));
-    }
-    for (rig, stale, attempts, input, stale_index) in cases {
         let before = rig.published();
         let error = rig
             .store
             .account_command(AccountCommandKind::Tick, move |tx| {
                 let tick = crate::AccountTx::with_blocks(tx.conn, Some(&stale));
-                let error = tick
-                    .tick(crate::now_ms())
+                let error = fence_rechecks::sync_on(&tick, deadline + 1)
+                    .map_err(err)
                     .expect_err("an external source change must reject the captured plan");
                 Ok(error.to_string())
             })

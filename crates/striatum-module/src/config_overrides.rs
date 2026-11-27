@@ -448,24 +448,12 @@ pub fn reasoning_catalog_for(path: &Path) -> Option<ReasoningCatalog> {
     }
 }
 
-/// Where the module's routing store lives when the daemon manages storage:
-/// `$XDG_DATA_HOME/cortexkit/striatum/store.db`, defaulting
-/// `XDG_DATA_HOME` to `~/.local/share`.
-pub fn default_store_path() -> Option<PathBuf> {
-    let data_home = std::env::var_os("XDG_DATA_HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .filter(|value| !value.is_empty())
-                .map(|home| PathBuf::from(home).join(".local/share"))
-        })?;
-    Some(
-        data_home
-            .join("cortexkit")
-            .join(crate::DEFAULT_MODULE_ID)
-            .join("store.db"),
-    )
+/// The conventional store path for the offline check, using the daemon's
+/// platform data-home rules even when no storage descriptor is available.
+pub fn default_store_path() -> PathBuf {
+    PathBuf::from(cortexkit_store_types::module_store_path(
+        crate::DEFAULT_MODULE_ID,
+    ))
 }
 
 /// Validate the config and report counts from the store at `store_path`, read-only.
