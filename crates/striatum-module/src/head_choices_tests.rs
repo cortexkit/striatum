@@ -182,15 +182,12 @@ fn fixture() -> (Arc<Harness>, BrocaCredentials) {
     (harness, credentials)
 }
 
-fn broca_live_catalog_fixture(
-    mark_speed_twin: bool,
-    antigravity_login_methods: bool,
-) -> Arc<Harness> {
+fn broca_catalog_fixture(mark_speed_twin: bool, antigravity_login_methods: bool) -> Arc<Harness> {
     let input: Value = serde_json::from_str(include_str!(
-        "../fixtures/head-choices-broca-live-inputs-20261114.json"
+        "../fixtures/synthetic-head-choices-broca-inputs.json"
     ))
     .unwrap();
-    let harness = Harness::new("broca-live-head-choices");
+    let harness = Harness::new("broca-head-choices");
     for existing in harness.store().get_facts().unwrap() {
         harness
             .store()
@@ -228,8 +225,8 @@ fn broca_live_catalog_fixture(
         facts.push(model);
     }
     let mut catalog = json!({
-        "catalog_version": input["catalog_version"], "resolved_at_ms": 1794680117849_i64,
-        "quality_scores": {"graded_by":"operator", "graded_at_ms":1794404263000_i64},
+        "catalog_version": input["catalog_version"], "resolved_at_ms": 1_800_000_000_000_i64,
+        "quality_scores": {"graded_by":"operator", "graded_at_ms":1_799_900_000_000_i64},
         "models": input["catalog_models"]
     });
     if antigravity_login_methods {
@@ -271,9 +268,8 @@ fn broca_live_catalog_fixture(
         catalog["models"]["kimi-code-plan-global/k3.1-pro-highspeed"]["model.mode_of"] =
             json!({"mode":"fast", "model_id":"k3.1-pro"});
     }
-    // The captured November 14 catalog has no graded efforts. Supply the
-    // matching facts so the client picker test vectors still contain the
-    // defaults that previously came from routing's store.
+    // Explicit effort grades let the picker distinguish models with a default
+    // variant from models that only advertise a list of allowed variants.
     for (route, effort) in [
         ("anthropic/claude-opus-5-5", "high"),
         ("google/antigravity-gemini-3.8-flash", "high"),
@@ -295,7 +291,7 @@ fn broca_live_catalog_fixture(
     let mut credentials = BrocaCredentials::default();
     credentials.apply_listing(
         &ScopedCredentialListing {
-            view: "broca-live-redacted".into(),
+            view: "broca-synthetic-roster".into(),
             credentials: input["credentials"]
                 .as_array()
                 .unwrap()
@@ -385,15 +381,13 @@ fn broca_live_catalog_fixture(
         .unwrap()
         .unwrap(),
     );
-    // Every provider in this bounded capture had a matching transport and
-    // login under the then-current Broca declaration. Its complete catalog
-    // rows are the sample's effective served set; speed twins are still
-    // filtered independently by the picker.
+    // The fixture providers all have a compatible runner transport and login.
+    // The picker still filters speed twins independently of the serves list.
     publish_runner_serves(
         &mut credentials,
         "broca",
         &json!({
-            "generation":"nov-14-capture", "harnesses":{"broca":[
+            "generation":"test-broca-picker", "harnesses":{"broca":[
                 {"provider":"anthropic","models":"all"}, {"provider":"deepseek","models":"all"},
                 {"provider":"google","models":"all"}, {"provider":"kimi-code-plan-global","models":"all"},
                 {"provider":"openai","models":"all"}, {"provider":"opencode","models":"all"},
@@ -459,7 +453,7 @@ fn ids(reply: &Value) -> Vec<String> {
 
 #[tokio::test]
 async fn broca_head_choices_lists_speed_twin_only_as_base_fast_tier() {
-    let harness = broca_live_catalog_fixture(true, true);
+    let harness = broca_catalog_fixture(true, true);
     let reply = query(&harness, "broca").await;
     assert!(
         !ids(&reply).contains(&"kimi-code-plan-global/k3.1-pro-highspeed".into()),
@@ -1188,8 +1182,8 @@ async fn serving_bytes_match_tagged_vectors() {
         ]);
     });
     let route = harness.bind(reserved("occipital"), None).await;
-    let live_harness = broca_live_catalog_fixture(false, true);
-    let live_route = live_harness.bind(reserved("occipital"), None).await;
+    let broca_harness = broca_catalog_fixture(false, true);
+    let broca_route = broca_harness.bind(reserved("occipital"), None).await;
     let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../test-vectors/route-head-choices-v1");
     let update = std::env::var_os("UPDATE_ROUTE_HEAD_CHOICES_VECTORS").is_some();
@@ -1220,7 +1214,7 @@ async fn serving_bytes_match_tagged_vectors() {
             request["params"]["harness"] = json!(selected_harness);
         }
         let selected_route = if runner == "broca" {
-            &live_route
+            &broca_route
         } else {
             &route
         };
@@ -1247,7 +1241,7 @@ async fn serving_bytes_match_tagged_vectors() {
             }
             if runner == "broca" {
                 let models = body["result"]["models"].as_array().unwrap();
-                assert_eq!(models.len(), 25);
+                assert_eq!(models.len(), 25, "{body}");
                 assert!(models.iter().any(|model| model["pin_only"] == true));
                 assert!(models.iter().any(|model| model["billing"] == "per_token"));
                 assert!(models.iter().any(|model| model["service_tiers"]
@@ -1289,7 +1283,7 @@ async fn serving_bytes_match_tagged_vectors() {
     }
     assert_eq!(std::fs::read_to_string(path).unwrap(), sums);
 
-    let no_login_facts = broca_live_catalog_fixture(false, false);
+    let no_login_facts = broca_catalog_fixture(false, false);
     let mut control = query(&no_login_facts, "broca").await;
     let mut affected = Vec::new();
     for model in control["models"].as_array_mut().unwrap() {
@@ -1304,7 +1298,7 @@ async fn serving_bytes_match_tagged_vectors() {
         affected,
         ["gemini-3.8-flash", "gemini-4-carbon", "gemini-4-hydrogen"]
     );
-    assert_eq!(control, query(&live_harness, "broca").await);
+    assert_eq!(control, query(&broca_harness, "broca").await);
 }
 
 #[tokio::test]

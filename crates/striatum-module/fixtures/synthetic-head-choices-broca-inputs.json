@@ -1,0 +1,4304 @@
+{
+  "provenance": "Synthetic picker inputs. The published vector fixes the catalog version and the wire identities of the offered models.",
+  "catalog_version": 1794680117849,
+  "model_facts": [
+    {
+      "provider_id": "anthropic",
+      "model_id": "claude-haiku-5-5",
+      "family": "claude",
+      "context_window": 200000,
+      "max_output_tokens": 20000,
+      "cost_tier": 0,
+      "cost_per_mtok_out": 10,
+      "supports_vision": 1,
+      "supports_tool_use": 1,
+      "prompt_defaults_json": null,
+      "auth_methods_json": null,
+      "login_methods_documented": 0,
+      "upstream_status": null,
+      "source": "unscored",
+      "scores_json": "{\"elo\":0.0,\"eq\":0.0,\"speed\":0.0}"
+    },
+    {
+      "provider_id": "anthropic",
+      "model_id": "claude-opus-5-5",
+      "family": "claude",
+      "context_window": 200000,
+      "max_output_tokens": 20000,
+      "cost_tier": 4,
+      "cost_per_mtok_out": 10,
+      "supports_vision": 1,
+      "supports_tool_use": 1,
+      "prompt_defaults_json": "{\"variant\":\"high\"}",
+      "auth_methods_json": null,
+      "login_methods_documented": 0,
+      "upstream_status": null,
+      "source": "seed",
+      "scores_json": "{\"elo\":1800,\"eq\":1700,\"speed\":0.0}"
+    },
+    {
+      "provider_id": "anthropic",
+      "model_id": "claude-sonnet-5-5",
+      "family": "claude",
+      "context_window": 200000,
+      "max_output_tokens": 20000,
+      "cost_tier": 3,
+      "cost_per_mtok_out": 10,
+      "supports_vision": 1,
+      "supports_tool_use": 1,
+      "prompt_defaults_json": null,
+      "auth_methods_json": null,
+      "login_methods_documented": 0,
+      "upstream_status": null,
+      "source": "unscored",
+      "scores_json": "{\"elo\":0.0,\"eq\":0.0,\"speed\":0.0}"
+    },
+    {
+      "provider_id": "deepseek",
+      "model_id": "deepseek-flash",
+      "family": "deepseek",
+      "context_window": 200000,
+      "max_output_tokens": 20000,
+      "cost_tier": 1,
+      "cost_per_mtok_out": 10,
+      "supports_vision": 1,
+      "supports_tool_use": 1,
+      "prompt_defaults_json": null,
+      "auth_methods_json": null,
+      "login_methods_documented": 0,
+      "upstream_status": null,
+      "source": "unscored",
+      "scores_json": "{\"elo\":0.0,\"eq\":0.0,\"speed\":0.0}"
+    },
+    {
+      "provider_id": "deepseek",
+      "model_id": "deepseek-v4-pro",
+      "family": "deepseek",
+      "context_window": 200000,
+      "max_output_tokens": 20000,
+      "cost_tier": 1,
+      "cost_per_mtok_out": 10,
+      "supports_vision": 0,
+      "supports_tool_use": 1,
+      "prompt_defaults_json": null,
+      "auth_methods_json": null,
+      "login_methods_documented": 0,
+      "upstream_status": null,
+      "source": "unscored",
+      "scores_json": "{\"elo\":0.0,\"eq\":0.0,\"speed\":0.0}"
+    },
+    {
+      "provider_id": "google",
+      "model_id": "antigravity-claude-opus-5-5",
+      "family": "claude",
+      "context_window": 200000,
+      "max_output_tokens": 20000,
+      "cost_tier": 4,
+      "cost_per_mtok_out": 10,
+      "supports_vision": 1,
+      "supports_tool_use": 1,
+      "prompt_defaults_json": null,
+      "auth_methods_json": null,
+      "login_methods_documented": 0,
+      "upstream_status": null,
+      "source": "unscored",
+      "scores_json": "{\"elo\":0.0,\"eq\":0.0,\"speed\":0.0}"
+    },
+    {
+      "provider_id": "google",
+      "model_id": "antigravity-claude-sonnet-5-5",
+      "family": "claude",
+      "context_window": 200000,
+      "max_output_tokens": 20000,
+      "cost_tier": 3,
+      "cost_per_mtok_out": 10,
+      "supports_vision": 1,
+      "supports_tool_use": 1,
+      "prompt_defaults_json": null,
+      "auth_methods_json": null,
+      "login_methods_documented": 0,
+      "upstream_status": null,
+      "source": "unscored",
+      "scores_json": "{\"elo\":0.0,\"eq\":0.0,\"speed\":0.0}"
+    },
+    {
+      "provider_id": "google",
+      "model_id": "antigravity-gemini-3.8-flash",
+      "family": "gemini",
+      "context_window": 200000,
+      "max_output_tokens": 20000,
+      "cost_tier": 2,
+      "cost_per_mtok_out": 10,
+      "supports_vision": 1,
+      "supports_tool_use": 1,
+      "prompt_defaults_json": "{\"variant\":\"high\"}",
+      "auth_methods_json": null,
+      "login_methods_documented": 0,
+      "upstream_status": null,
+      "source": "seed",
+      "scores_json": "{\"elo\":1800,\"eq\":1700,\"speed\":50}"
+    },
+    {
+      "provider_id": "google",
+      "model_id": "antigravity-gemini-4-carbon",
+      "family": "gemini",
+      "context_window": 200000,
+      "max_output_tokens": 20000,
+      "cost_tier": 3,
+      "cost_per_mtok_out": 10,
+      "supports_vision": 1,
+      "supports_tool_use": 1,
+      "prompt_defaults_json": null,
+      "auth_methods_json": null,
+      "login_methods_documented": 0,
+      "upstream_status": null,
+      "source": "unscored",
+      "scores_json": "{\"elo\":0.0,\"eq\":0.0,\"speed\":0.0}"
+    },
+    {
+      "provider_id": "google",
+      "model_id": "antigravity-gemini-4-hydrogen",
+      "family": "gemini",
+      "context_window": 200000,
+      "max_output_tokens": 20000,
+      "cost_tier": 3,
+      "cost_per_mtok_out": 10,
+      "supports_vision": 1,
+      "supports_tool_use": 1,
+      "prompt_defaults_json": null,
+      "auth_methods_json": null,
+      "login_methods_documented": 0,
+      "upstream_status": null,
+      "source": "unscored",
+      "scores_json": "{\"elo\":0.0,\"eq\":0.0,\"speed\":0.0}"
+    },
+    {
+      "provider_id": "google",
+      "model_id": "gemini-3.8-flash",
+      "family": "gemini",
+      "context_window": 200000,
+      "max_output_tokens": 20000,
+      "cost_tier": 2,
+      "cost_per_mtok_out": 10,
+      "supports_vision": 1,
+      "supports_tool_use": 1,
+      "prompt_defaults_json": null,
+      "auth_methods_json": null,
+      "login_methods_documented": 0,
+      "upstream_status": null,
+      "source": "seed",
+      "scores_json": "{\"elo\":1800,\"eq\":1700,\"speed\":0.0}"
+    },
+    {
+      "provider_id": "google",
+      "model_id": "gemini-4-carbon",
+      "family": "gemini",
+      "context_window": 200000,
+      "max_output_tokens": 20000,
+      "cost_tier": 3,
+      "cost_per_mtok_out": 10,
+      "supports_vision": 1,
+      "supports_tool_use": 1,
+      "prompt_defaults_json": null,
+      "auth_methods_json": null,
+      "login_methods_documented": 0,
+      "upstream_status": null,
+      "source": "unscored",
+      "scores_json": "{\"elo\":0.0,\"eq\":0.0,\"speed\":0.0}"
+    },
+    {
+      "provider_id": "google",
+      "model_id": "gemini-4-hydrogen",
+      "family": "gemini",
+      "context_window": 200000,
+      "max_output_tokens": 20000,
+      "cost_tier": 3,
+      "cost_per_mtok_out": 10,
+      "supports_vision": 1,
+      "supports_tool_use": 1,
+      "prompt_defaults_json": null,
+      "auth_methods_json": null,
+      "login_methods_documented": 0,
+      "upstream_status": null,
+      "source": "unscored",
+      "scores_json": "{\"elo\":0.0,\"eq\":0.0,\"speed\":0.0}"
+    },
+    {
+      "provider_id": "kimi-code-plan-global",
+      "model_id": "k3.1-pro",
+      "family": "kimi",
+      "context_window": 200000,
+      "max_output_tokens": 20000,
+      "cost_tier": 0,
+      "cost_per_mtok_out": 0.0,
+      "supports_vision": 1,
+      "supports_tool_use": 1,
+      "prompt_defaults_json": null,
+      "auth_methods_json": null,
+      "login_methods_documented": 0,
+      "upstream_status": null,
+      "source": "unscored",
+      "scores_json": "{\"elo\":0.0,\"eq\":0.0,\"speed\":0.0}"
+    },
+    {
+      "provider_id": "kimi-code-plan-global",
+      "model_id": "k3.1-pro-highspeed",
+      "family": "kimi",
+      "context_window": 200000,
+      "max_output_tokens": 20000,
+      "cost_tier": 0,
+      "cost_per_mtok_out": 0.0,
+      "supports_vision": 1,
+      "supports_tool_use": 1,
+      "prompt_defaults_json": null,
+      "auth_methods_json": null,
+      "login_methods_documented": 0,
+      "upstream_status": null,
+      "source": "unscored",
+      "scores_json": "{\"elo\":0.0,\"eq\":0.0,\"speed\":0.0}"
+    },
+    {
+      "provider_id": "openai",
+      "model_id": "gpt-6-astra",
+      "family": "gpt",
+      "context_window": 200000,
+      "max_output_tokens": 20000,
+      "cost_tier": 5,
+      "cost_per_mtok_out": 10,
+      "supports_vision": 1,
+      "supports_tool_use": 1,
+      "prompt_defaults_json": "{\"variant\":\"xhigh\"}",
+      "auth_methods_json": "[\"apikey\",\"chatgpt\"]",
+      "login_methods_documented": 1,
+      "upstream_status": null,
+      "source": "override",
+      "scores_json": "{\"elo\":1800,\"eq\":1700,\"speed\":50}"
+    },
+    {
+      "provider_id": "openai",
+      "model_id": "gpt-6-luna",
+      "family": "gpt",
+      "context_window": 200000,
+      "max_output_tokens": 20000,
+      "cost_tier": 0,
+      "cost_per_mtok_out": 10,
+      "supports_vision": 1,
+      "supports_tool_use": 1,
+      "prompt_defaults_json": "{\"variant\":\"xhigh\"}",
+      "auth_methods_json": "[\"apikey\",\"chatgpt\"]",
+      "login_methods_documented": 1,
+      "upstream_status": null,
+      "source": "seed",
+      "scores_json": "{\"elo\":1800,\"eq\":1700,\"speed\":0.0}"
+    },
+    {
+      "provider_id": "openai",
+      "model_id": "gpt-6.1-sol",
+      "family": "gpt",
+      "context_window": 200000,
+      "max_output_tokens": 20000,
+      "cost_tier": 3,
+      "cost_per_mtok_out": 10,
+      "supports_vision": 1,
+      "supports_tool_use": 1,
+      "prompt_defaults_json": "{\"variant\":\"xhigh\"}",
+      "auth_methods_json": "[\"apikey\",\"chatgpt\"]",
+      "login_methods_documented": 1,
+      "upstream_status": null,
+      "source": "seed",
+      "scores_json": "{\"elo\":1800,\"eq\":1700,\"speed\":0.0}"
+    },
+    {
+      "provider_id": "openai",
+      "model_id": "gpt-6.1-terra",
+      "family": "gpt",
+      "context_window": 200000,
+      "max_output_tokens": 20000,
+      "cost_tier": 2,
+      "cost_per_mtok_out": 10,
+      "supports_vision": 1,
+      "supports_tool_use": 1,
+      "prompt_defaults_json": null,
+      "auth_methods_json": "[\"apikey\",\"chatgpt\"]",
+      "login_methods_documented": 1,
+      "upstream_status": null,
+      "source": "unscored",
+      "scores_json": "{\"elo\":0.0,\"eq\":0.0,\"speed\":0.0}"
+    },
+    {
+      "provider_id": "opencode",
+      "model_id": "deepseek-v4.1-flash",
+      "family": "deepseek",
+      "context_window": 200000,
+      "max_output_tokens": 20000,
+      "cost_tier": 1,
+      "cost_per_mtok_out": 10,
+      "supports_vision": 1,
+      "supports_tool_use": 1,
+      "prompt_defaults_json": null,
+      "auth_methods_json": null,
+      "login_methods_documented": 0,
+      "upstream_status": null,
+      "source": "unscored",
+      "scores_json": "{\"elo\":0.0,\"eq\":0.0,\"speed\":0.0}"
+    },
+    {
+      "provider_id": "opencode",
+      "model_id": "gpt-6.1-sol",
+      "family": "gpt",
+      "context_window": 200000,
+      "max_output_tokens": 20000,
+      "cost_tier": 3,
+      "cost_per_mtok_out": 10,
+      "supports_vision": 1,
+      "supports_tool_use": 1,
+      "prompt_defaults_json": null,
+      "auth_methods_json": null,
+      "login_methods_documented": 0,
+      "upstream_status": null,
+      "source": "unscored",
+      "scores_json": "{\"elo\":0.0,\"eq\":0.0,\"speed\":0.0}"
+    },
+    {
+      "provider_id": "opencode",
+      "model_id": "muse-spark-1.3",
+      "family": "llama",
+      "context_window": 200000,
+      "max_output_tokens": 20000,
+      "cost_tier": 2,
+      "cost_per_mtok_out": 10,
+      "supports_vision": 1,
+      "supports_tool_use": 1,
+      "prompt_defaults_json": null,
+      "auth_methods_json": null,
+      "login_methods_documented": 0,
+      "upstream_status": null,
+      "source": "unscored",
+      "scores_json": "{\"elo\":0.0,\"eq\":0.0,\"speed\":0.0}"
+    },
+    {
+      "provider_id": "opencode",
+      "model_id": "muse-wonder-1.0",
+      "family": "llama",
+      "context_window": 200000,
+      "max_output_tokens": 20000,
+      "cost_tier": 4,
+      "cost_per_mtok_out": 10,
+      "supports_vision": 1,
+      "supports_tool_use": 1,
+      "prompt_defaults_json": null,
+      "auth_methods_json": null,
+      "login_methods_documented": 0,
+      "upstream_status": null,
+      "source": "unscored",
+      "scores_json": "{\"elo\":0.0,\"eq\":0.0,\"speed\":0.0}"
+    },
+    {
+      "provider_id": "opencode",
+      "model_id": "grok-4.7",
+      "family": "grok",
+      "context_window": 200000,
+      "max_output_tokens": 20000,
+      "cost_tier": 3,
+      "cost_per_mtok_out": 10,
+      "supports_vision": 1,
+      "supports_tool_use": 1,
+      "prompt_defaults_json": null,
+      "auth_methods_json": null,
+      "login_methods_documented": 0,
+      "upstream_status": null,
+      "source": "unscored",
+      "scores_json": "{\"elo\":0.0,\"eq\":0.0,\"speed\":0.0}"
+    },
+    {
+      "provider_id": "xai",
+      "model_id": "grok-4.7",
+      "family": "grok",
+      "context_window": 200000,
+      "max_output_tokens": 20000,
+      "cost_tier": 3,
+      "cost_per_mtok_out": 10,
+      "supports_vision": 1,
+      "supports_tool_use": 1,
+      "prompt_defaults_json": "{\"variant\":\"xhigh\"}",
+      "auth_methods_json": null,
+      "login_methods_documented": 0,
+      "upstream_status": null,
+      "source": "seed",
+      "scores_json": "{\"elo\":1800,\"eq\":1700,\"speed\":0.0}"
+    }
+  ],
+  "credentials": [
+    {
+      "id": "antigravity:test-credential-1",
+      "account_id": "test-account-1",
+      "state": "active",
+      "categories": [
+        "antigravity-native",
+        "llm-provider"
+      ],
+      "provider_ids": [
+        "google"
+      ],
+      "serves": [
+        "google",
+        "anthropic",
+        "openai"
+      ],
+      "type": "oauth",
+      "auth_method": "antigravity",
+      "plan_tier": "ultra_5x"
+    },
+    {
+      "id": "apikey:test-credential-2",
+      "account_id": null,
+      "state": "active",
+      "categories": [
+        "llm-provider",
+        "web-search"
+      ],
+      "provider_ids": [
+        "deepseek"
+      ],
+      "serves": [
+        "deepseek"
+      ],
+      "type": "apikey",
+      "auth_method": "apikey",
+      "plan_tier": null
+    },
+    {
+      "id": "apikey:test-credential-3",
+      "account_id": null,
+      "state": "active",
+      "categories": [
+        "llm-provider",
+        "media-provider"
+      ],
+      "provider_ids": [
+        "google"
+      ],
+      "serves": [
+        "google"
+      ],
+      "type": "apikey",
+      "auth_method": "apikey",
+      "plan_tier": null
+    },
+    {
+      "id": "apikey:test-credential-4",
+      "account_id": null,
+      "state": "active",
+      "categories": [
+        "llm-provider",
+        "web-search"
+      ],
+      "provider_ids": [
+        "kimi-code-plan-global"
+      ],
+      "serves": [
+        "moonshot"
+      ],
+      "type": "apikey",
+      "auth_method": "apikey",
+      "plan_tier": "allegro"
+    },
+    {
+      "id": "apikey:test-credential-5",
+      "account_id": null,
+      "state": "active",
+      "categories": [
+        "llm-provider"
+      ],
+      "provider_ids": [
+        "openai"
+      ],
+      "serves": [
+        "openai"
+      ],
+      "type": "apikey",
+      "auth_method": "apikey",
+      "plan_tier": null
+    },
+    {
+      "id": "apikey:test-credential-6",
+      "account_id": null,
+      "state": "active",
+      "categories": [
+        "llm-provider"
+      ],
+      "provider_ids": [
+        "opencode"
+      ],
+      "serves": [
+        "anthropic",
+        "openai",
+        "google",
+        "xai",
+        "deepseek",
+        "moonshot",
+        "zhipu",
+        "meta",
+        "qwen",
+        "nvidia",
+        "minimax",
+        "xiaomi"
+      ],
+      "type": "apikey",
+      "auth_method": "apikey",
+      "plan_tier": null
+    },
+    {
+      "id": "chatgpt:test-credential-7",
+      "account_id": "test-account-7",
+      "state": "active",
+      "categories": [
+        "llm-provider",
+        "openai-native"
+      ],
+      "provider_ids": [
+        "openai"
+      ],
+      "serves": [
+        "openai"
+      ],
+      "type": "oauth",
+      "auth_method": "chatgpt",
+      "plan_tier": "pro_200"
+    },
+    {
+      "id": "oauth:test-credential-8",
+      "account_id": "test-account-8",
+      "state": "active",
+      "categories": [
+        "anthropic-native",
+        "llm-provider"
+      ],
+      "provider_ids": [
+        "anthropic"
+      ],
+      "serves": [
+        "anthropic"
+      ],
+      "type": "oauth",
+      "auth_method": "oauth",
+      "plan_tier": "max_20x"
+    },
+    {
+      "id": "oauth:test-credential-9",
+      "account_id": "test-account-9",
+      "state": "active",
+      "categories": [
+        "llm-provider",
+        "xai-native"
+      ],
+      "provider_ids": [
+        "xai"
+      ],
+      "serves": [
+        "xai"
+      ],
+      "type": "oauth",
+      "auth_method": "oauth",
+      "plan_tier": null
+    },
+    {
+      "id": "chatgpt:test-credential-10",
+      "account_id": "test-account-10",
+      "state": "active",
+      "categories": [
+        "llm-provider",
+        "openai-native"
+      ],
+      "provider_ids": [
+        "openai"
+      ],
+      "serves": [
+        "openai"
+      ],
+      "type": "oauth",
+      "auth_method": "chatgpt",
+      "plan_tier": "pro_500"
+    },
+    {
+      "id": "chatgpt:test-credential-11",
+      "account_id": "test-account-11",
+      "state": "active",
+      "categories": [
+        "llm-provider",
+        "openai-native"
+      ],
+      "provider_ids": [
+        "openai"
+      ],
+      "serves": [
+        "openai"
+      ],
+      "type": "oauth",
+      "auth_method": "chatgpt",
+      "plan_tier": "pro_100"
+    }
+  ],
+  "runner_service_tiers": {
+    "anthropic.messages": {
+      "levels": [
+        "fast"
+      ],
+      "served": "reported"
+    },
+    "google.generate_content": {
+      "levels": [
+        "fast"
+      ],
+      "served": "reported"
+    },
+    "openai.chat_completions": {
+      "levels": [
+        "fast",
+        "ultrafast"
+      ],
+      "served": "reported"
+    },
+    "openai.chatgpt_responses": {
+      "levels": [
+        "fast",
+        "ultrafast"
+      ],
+      "served": "reported"
+    },
+    "openai.responses": {
+      "levels": [
+        "fast",
+        "ultrafast"
+      ],
+      "served": "reported"
+    }
+  },
+  "policy": {
+    "head_agents": [
+      "head"
+    ],
+    "models": {
+      "anthropic/claude-opus-5-5": {
+        "only_for": [
+          "test-other-consumer",
+          "head"
+        ],
+        "pin_only": false,
+        "pin_only_for": [
+          "test-other-consumer"
+        ]
+      },
+      "google/antigravity-gemini-4-carbon": {
+        "only_for": [
+          "test-other-consumer",
+          "head"
+        ],
+        "pin_only": false,
+        "pin_only_for": [
+          "head",
+          "test-other-consumer"
+        ]
+      },
+      "kimi-code-plan-global/k3.1-pro": {
+        "elo": 1800,
+        "eq": 1700
+      },
+      "kimi-code-plan-global/k3.1-pro-highspeed": {
+        "elo": 1800,
+        "eq": 1700,
+        "pin_only": true
+      },
+      "openai/gpt-6-astra": {
+        "only_for": [
+          "test-other-consumer",
+          "head"
+        ],
+        "pin_only_for": [
+          "head",
+          "test-other-consumer"
+        ]
+      },
+      "openai/gpt-6-luna": {},
+      "openai/gpt-6.1-sol": {},
+      "xai/grok-4.7": {
+        "subscription": true
+      }
+    },
+    "overqualification": {
+      "mode": "cost_scaled"
+    },
+    "providers": {
+      "anthropic": {
+        "banked_resets": "capacity",
+        "keep_free_percent": 20,
+        "pin_only": true,
+        "subscription_multiplier": 5
+      },
+      "deepseek": {
+        "pin_only": true
+      },
+      "google": {
+        "pin_only": true,
+        "subscription_multiplier": 5
+      },
+      "kimi-code-plan-global": {
+        "subscription": true,
+        "subscription_multiplier": 5
+      },
+      "openai": {
+        "banked_resets": "capacity",
+        "subscription_multiplier": 5
+      },
+      "opencode": {
+        "pin_only": true
+      },
+      "xai": {
+        "subscription": false,
+        "subscription_multiplier": 5
+      }
+    },
+    "runners": [
+      {
+        "module": "broca",
+        "via_vault": true
+      }
+    ]
+  },
+  "catalog_models": {
+    "anthropic/claude-haiku-5-5": {
+      "capability.attachment": true,
+      "capability.input_modalities": [
+        "image",
+        "pdf",
+        "text"
+      ],
+      "capability.reasoning_options": [
+        {
+          "type": "toggle"
+        },
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 200000,
+      "limit.output": 20000,
+      "model.canonical_id": "anthropic/claude-haiku-5-5",
+      "model.lineage": "claude",
+      "model.status": null,
+      "quality.elo": 1800,
+      "quality.eq": 1700,
+      "rate.cache_read": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "rate.cache_write": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "rate.input": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "rate.output": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "wire.api": {
+        "from": "curated",
+        "value": "https://llm.example.com/v1"
+      },
+      "wire.family": "anthropic.messages"
+    },
+    "anthropic/claude-opus-5-5": {
+      "capability.attachment": true,
+      "capability.input_modalities": [
+        "image",
+        "pdf",
+        "text"
+      ],
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 200000,
+      "limit.output": 20000,
+      "model.canonical_id": "anthropic/claude-opus-5-5",
+      "model.lineage": "claude",
+      "model.status": null,
+      "quality.elo": 1800,
+      "quality.eq": 1700,
+      "rate.cache_read": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "rate.cache_read.mode.fast": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 20
+      },
+      "rate.cache_write": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "rate.cache_write.mode.fast": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 20
+      },
+      "rate.input": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "rate.input.mode.fast": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 20
+      },
+      "rate.output": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "rate.output.mode.fast": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 20
+      },
+      "wire.api": {
+        "from": "curated",
+        "value": "https://llm.example.com/v1"
+      },
+      "wire.family": "anthropic.messages"
+    },
+    "anthropic/claude-sonnet-5-5": {
+      "capability.attachment": true,
+      "capability.input_modalities": [
+        "image",
+        "pdf",
+        "text"
+      ],
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 200000,
+      "limit.output": 20000,
+      "model.canonical_id": "anthropic/claude-sonnet-5-5",
+      "model.lineage": "claude",
+      "model.status": null,
+      "quality.elo": 1800,
+      "quality.eq": 1700,
+      "rate.cache_read": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "rate.cache_write": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "rate.input": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "rate.output": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "wire.api": {
+        "from": "curated",
+        "value": "https://llm.example.com/v1"
+      },
+      "wire.family": "anthropic.messages"
+    },
+    "deepseek/deepseek-flash": {
+      "capability.attachment": true,
+      "capability.input_modalities": [
+        "image",
+        "text"
+      ],
+      "capability.reasoning_options": [
+        {
+          "type": "toggle"
+        },
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "high",
+            "max"
+          ]
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 200000,
+      "limit.output": 20000,
+      "model.canonical_id": "deepseek/deepseek-v4.1-flash-1017",
+      "model.lineage": "deepseek",
+      "model.status": null,
+      "quality.elo": 1800,
+      "quality.eq": 1700,
+      "rate.cache_read": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "rate.input": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "rate.output": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "rate.reasoning": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "wire.api": {
+        "from": "provider",
+        "value": "https://llm.example.com/v1"
+      },
+      "wire.family": "openai.chat_completions"
+    },
+    "deepseek/deepseek-v4-pro": {
+      "capability.attachment": false,
+      "capability.input_modalities": [
+        "text"
+      ],
+      "capability.reasoning_options": [
+        {
+          "type": "toggle"
+        },
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "high",
+            "max"
+          ]
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 200000,
+      "limit.output": 20000,
+      "model.canonical_id": "deepseek/deepseek-v4-pro-0813",
+      "model.lineage": "deepseek",
+      "model.status": null,
+      "quality.elo": 1800,
+      "quality.eq": 1700,
+      "rate.cache_read": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "rate.input": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "rate.output": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "rate.reasoning": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "wire.api": {
+        "from": "provider",
+        "value": "https://llm.example.com/v1"
+      },
+      "wire.family": "openai.chat_completions"
+    },
+    "google/antigravity-claude-opus-5-5": {
+      "capability.attachment": true,
+      "capability.input_modalities": [
+        "image",
+        "pdf",
+        "text"
+      ],
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 200000,
+      "limit.output": 20000,
+      "model.canonical_id": "anthropic/claude-opus-5-5",
+      "model.lineage": "claude",
+      "model.status": null,
+      "quality.elo": 1800,
+      "quality.eq": 1700,
+      "rate.cache_read": {
+        "currency": "USD",
+        "exponent": 0,
+        "inherited_from": {
+          "basis": "alias",
+          "family": "claude-opus",
+          "model_id": "claude-opus-5-5",
+          "provider_id": "anthropic"
+        },
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "rate.cache_read.mode.fast": {
+        "currency": "USD",
+        "exponent": 0,
+        "inherited_from": {
+          "basis": "alias",
+          "family": "claude-opus",
+          "model_id": "claude-opus-5-5",
+          "provider_id": "anthropic"
+        },
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 20
+      },
+      "rate.cache_write": {
+        "currency": "USD",
+        "exponent": 0,
+        "inherited_from": {
+          "basis": "alias",
+          "family": "claude-opus",
+          "model_id": "claude-opus-5-5",
+          "provider_id": "anthropic"
+        },
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "rate.cache_write.mode.fast": {
+        "currency": "USD",
+        "exponent": 0,
+        "inherited_from": {
+          "basis": "alias",
+          "family": "claude-opus",
+          "model_id": "claude-opus-5-5",
+          "provider_id": "anthropic"
+        },
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 20
+      },
+      "rate.input": {
+        "currency": "USD",
+        "exponent": 0,
+        "inherited_from": {
+          "basis": "alias",
+          "family": "claude-opus",
+          "model_id": "claude-opus-5-5",
+          "provider_id": "anthropic"
+        },
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "rate.input.mode.fast": {
+        "currency": "USD",
+        "exponent": 0,
+        "inherited_from": {
+          "basis": "alias",
+          "family": "claude-opus",
+          "model_id": "claude-opus-5-5",
+          "provider_id": "anthropic"
+        },
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 20
+      },
+      "rate.output": {
+        "currency": "USD",
+        "exponent": 0,
+        "inherited_from": {
+          "basis": "alias",
+          "family": "claude-opus",
+          "model_id": "claude-opus-5-5",
+          "provider_id": "anthropic"
+        },
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "rate.output.mode.fast": {
+        "currency": "USD",
+        "exponent": 0,
+        "inherited_from": {
+          "basis": "alias",
+          "family": "claude-opus",
+          "model_id": "claude-opus-5-5",
+          "provider_id": "anthropic"
+        },
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 20
+      },
+      "wire.family": "google.code_assist"
+    },
+    "google/antigravity-claude-sonnet-5-5": {
+      "capability.attachment": true,
+      "capability.input_modalities": [
+        "image",
+        "pdf",
+        "text"
+      ],
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 200000,
+      "limit.output": 20000,
+      "model.canonical_id": "anthropic/claude-sonnet-5-5",
+      "model.lineage": "claude",
+      "model.status": null,
+      "quality.elo": 1800,
+      "quality.eq": 1700,
+      "rate.cache_read": {
+        "currency": "USD",
+        "exponent": 0,
+        "inherited_from": {
+          "basis": "alias",
+          "family": "claude-sonnet",
+          "model_id": "claude-sonnet-5-5",
+          "provider_id": "anthropic"
+        },
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "rate.cache_write": {
+        "currency": "USD",
+        "exponent": 0,
+        "inherited_from": {
+          "basis": "alias",
+          "family": "claude-sonnet",
+          "model_id": "claude-sonnet-5-5",
+          "provider_id": "anthropic"
+        },
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "rate.input": {
+        "currency": "USD",
+        "exponent": 0,
+        "inherited_from": {
+          "basis": "alias",
+          "family": "claude-sonnet",
+          "model_id": "claude-sonnet-5-5",
+          "provider_id": "anthropic"
+        },
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "rate.output": {
+        "currency": "USD",
+        "exponent": 0,
+        "inherited_from": {
+          "basis": "alias",
+          "family": "claude-sonnet",
+          "model_id": "claude-sonnet-5-5",
+          "provider_id": "anthropic"
+        },
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "wire.family": "google.code_assist"
+    },
+    "google/antigravity-gemini-3.8-flash": {
+      "capability.attachment": true,
+      "capability.input_modalities": [
+        "audio",
+        "image",
+        "pdf",
+        "text",
+        "video"
+      ],
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 200000,
+      "limit.output": 20000,
+      "model.canonical_id": "google/gemini-3.8-flash",
+      "model.lineage": "gemini",
+      "model.status": null,
+      "quality.elo": 1800,
+      "quality.eq": 1700,
+      "rate.cache_read": {
+        "currency": "USD",
+        "exponent": 0,
+        "inherited_from": {
+          "basis": "alias",
+          "family": "gemini-flash",
+          "model_id": "gemini-3.8-flash",
+          "provider_id": "google"
+        },
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "rate.input": {
+        "currency": "USD",
+        "exponent": 0,
+        "inherited_from": {
+          "basis": "alias",
+          "family": "gemini-flash",
+          "model_id": "gemini-3.8-flash",
+          "provider_id": "google"
+        },
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "rate.output": {
+        "currency": "USD",
+        "exponent": 0,
+        "inherited_from": {
+          "basis": "alias",
+          "family": "gemini-flash",
+          "model_id": "gemini-3.8-flash",
+          "provider_id": "google"
+        },
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "wire.family": "google.code_assist"
+    },
+    "google/antigravity-gemini-4-carbon": {
+      "capability.attachment": true,
+      "capability.input_modalities": [
+        "audio",
+        "image",
+        "pdf",
+        "text",
+        "video"
+      ],
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 200000,
+      "limit.output": 20000,
+      "model.canonical_id": "google/gemini-4-carbon",
+      "model.lineage": "gemini",
+      "model.status": null,
+      "quality.elo": 1800,
+      "quality.eq": 1700,
+      "rate.cache_read": {
+        "currency": "USD",
+        "exponent": 0,
+        "inherited_from": {
+          "basis": "alias",
+          "family": "gemini",
+          "model_id": "gemini-4-carbon",
+          "provider_id": "google"
+        },
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "rate.input": {
+        "currency": "USD",
+        "exponent": 0,
+        "inherited_from": {
+          "basis": "alias",
+          "family": "gemini",
+          "model_id": "gemini-4-carbon",
+          "provider_id": "google"
+        },
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "rate.output": {
+        "currency": "USD",
+        "exponent": 0,
+        "inherited_from": {
+          "basis": "alias",
+          "family": "gemini",
+          "model_id": "gemini-4-carbon",
+          "provider_id": "google"
+        },
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "wire.family": "google.code_assist"
+    },
+    "google/antigravity-gemini-4-hydrogen": {
+      "capability.attachment": true,
+      "capability.input_modalities": [
+        "audio",
+        "image",
+        "pdf",
+        "text",
+        "video"
+      ],
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 200000,
+      "limit.output": 20000,
+      "model.canonical_id": "google/gemini-4-hydrogen",
+      "model.lineage": "gemini",
+      "model.status": null,
+      "quality.elo": 1800,
+      "quality.eq": 1700,
+      "rate.cache_read": {
+        "currency": "USD",
+        "exponent": 0,
+        "inherited_from": {
+          "basis": "alias",
+          "family": "gemini",
+          "model_id": "gemini-4-hydrogen",
+          "provider_id": "google"
+        },
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "rate.input": {
+        "currency": "USD",
+        "exponent": 0,
+        "inherited_from": {
+          "basis": "alias",
+          "family": "gemini",
+          "model_id": "gemini-4-hydrogen",
+          "provider_id": "google"
+        },
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "rate.output": {
+        "currency": "USD",
+        "exponent": 0,
+        "inherited_from": {
+          "basis": "alias",
+          "family": "gemini",
+          "model_id": "gemini-4-hydrogen",
+          "provider_id": "google"
+        },
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "wire.family": "google.code_assist"
+    },
+    "google/gemini-3.8-flash": {
+      "capability.attachment": true,
+      "capability.input_modalities": [
+        "audio",
+        "image",
+        "pdf",
+        "text",
+        "video"
+      ],
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 200000,
+      "limit.output": 20000,
+      "model.canonical_id": "google/gemini-3.8-flash",
+      "model.lineage": "gemini",
+      "model.status": null,
+      "quality.elo": 1800,
+      "quality.eq": 1700,
+      "rate.cache_read": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "rate.input": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "rate.output": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "wire.api": {
+        "from": "curated",
+        "value": "https://llm.example.com/v1"
+      },
+      "wire.family": "google.generate_content"
+    },
+    "google/gemini-4-carbon": {
+      "capability.attachment": true,
+      "capability.input_modalities": [
+        "audio",
+        "image",
+        "pdf",
+        "text",
+        "video"
+      ],
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 200000,
+      "limit.output": 20000,
+      "model.canonical_id": "google/gemini-4-carbon",
+      "model.lineage": "gemini",
+      "model.status": null,
+      "quality.elo": 1800,
+      "quality.eq": 1700,
+      "rate.cache_read": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "rate.input": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "rate.output": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "wire.api": {
+        "from": "curated",
+        "value": "https://llm.example.com/v1"
+      },
+      "wire.family": "google.generate_content"
+    },
+    "google/gemini-4-hydrogen": {
+      "capability.attachment": true,
+      "capability.input_modalities": [
+        "audio",
+        "image",
+        "pdf",
+        "text",
+        "video"
+      ],
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 200000,
+      "limit.output": 20000,
+      "model.canonical_id": "google/gemini-4-hydrogen",
+      "model.lineage": "gemini",
+      "model.status": null,
+      "quality.elo": 1800,
+      "quality.eq": 1700,
+      "rate.cache_read": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "rate.input": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "rate.output": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "wire.api": {
+        "from": "curated",
+        "value": "https://llm.example.com/v1"
+      },
+      "wire.family": "google.generate_content"
+    },
+    "kimi-code-plan-global/k3.1-pro": {
+      "capability.attachment": true,
+      "capability.input_modalities": [
+        "image",
+        "text",
+        "video"
+      ],
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "high",
+            "max"
+          ]
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 200000,
+      "limit.output": 20000,
+      "model.canonical_id": "moonshotai/kimi-k3.1-pro",
+      "model.lineage": "kimi",
+      "model.status": null,
+      "quality.elo": 1800,
+      "quality.eq": 1700,
+      "rate.cache_read": {
+        "state": "stated_zero"
+      },
+      "rate.cache_write": {
+        "state": "stated_zero"
+      },
+      "rate.input": {
+        "state": "stated_zero"
+      },
+      "rate.output": {
+        "state": "stated_zero"
+      },
+      "wire.api": {
+        "from": "provider",
+        "value": "https://llm.example.com/v1"
+      },
+      "wire.family": "openai.chat_completions"
+    },
+    "kimi-code-plan-global/k3.1-pro-highspeed": {
+      "capability.attachment": true,
+      "capability.input_modalities": [
+        "image",
+        "text",
+        "video"
+      ],
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "high",
+            "max"
+          ]
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 200000,
+      "limit.output": 20000,
+      "model.canonical_id": "moonshotai/kimi-k3.1-pro",
+      "model.lineage": "kimi",
+      "model.status": null,
+      "quality.elo": 1800,
+      "quality.eq": 1700,
+      "rate.cache_read": {
+        "state": "stated_zero"
+      },
+      "rate.cache_write": {
+        "state": "stated_zero"
+      },
+      "rate.input": {
+        "state": "stated_zero"
+      },
+      "rate.output": {
+        "state": "stated_zero"
+      },
+      "wire.api": {
+        "from": "provider",
+        "value": "https://llm.example.com/v1"
+      },
+      "wire.family": "openai.chat_completions"
+    },
+    "openai/gpt-6-astra": {
+      "capability.attachment": true,
+      "capability.input_modalities": [
+        "image",
+        "pdf",
+        "text"
+      ],
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 200000,
+      "limit.output": 20000,
+      "model.canonical_id": "openai/gpt-6-astra",
+      "model.lineage": "gpt",
+      "model.status": null,
+      "quality.elo": 1800,
+      "quality.eq": 1700,
+      "rate.cache_read": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "rate.cache_read.mode.fast": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 20
+      },
+      "rate.cache_read.mode.ultrafast": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 20
+      },
+      "rate.cache_write": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "rate.cache_write.mode.fast": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 20
+      },
+      "rate.cache_write.mode.ultrafast": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 20
+      },
+      "rate.input": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "rate.input.mode.fast": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 20
+      },
+      "rate.input.mode.ultrafast": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 20
+      },
+      "rate.output": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "rate.output.mode.fast": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 20
+      },
+      "rate.output.mode.ultrafast": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 20
+      },
+      "wire.api": {
+        "from": "curated",
+        "value": "https://llm.example.com/v1"
+      },
+      "wire.family": "openai.responses"
+    },
+    "openai/gpt-6-luna": {
+      "capability.attachment": true,
+      "capability.input_modalities": [
+        "image",
+        "pdf",
+        "text"
+      ],
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 200000,
+      "limit.output": 20000,
+      "model.canonical_id": "openai/gpt-6-luna",
+      "model.lineage": "gpt",
+      "model.status": null,
+      "quality.elo": 1800,
+      "quality.eq": 1700,
+      "rate.cache_read": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "rate.cache_read.mode.fast": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 20
+      },
+      "rate.cache_write": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "rate.cache_write.mode.fast": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 20
+      },
+      "rate.input": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "rate.input.mode.fast": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 20
+      },
+      "rate.output": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "rate.output.mode.fast": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 20
+      },
+      "wire.api": {
+        "from": "curated",
+        "value": "https://llm.example.com/v1"
+      },
+      "wire.family": "openai.responses"
+    },
+    "openai/gpt-6.1-sol": {
+      "capability.attachment": true,
+      "capability.input_modalities": [
+        "image",
+        "pdf",
+        "text"
+      ],
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 200000,
+      "limit.output": 20000,
+      "model.canonical_id": "openai/gpt-6.1-sol",
+      "model.lineage": "gpt",
+      "model.status": null,
+      "quality.elo": 1800,
+      "quality.eq": 1700,
+      "rate.cache_read": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "rate.cache_read.mode.fast": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 20
+      },
+      "rate.cache_read.mode.ultrafast": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 20
+      },
+      "rate.cache_write": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "rate.cache_write.mode.fast": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 20
+      },
+      "rate.cache_write.mode.ultrafast": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 20
+      },
+      "rate.input": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "rate.input.mode.fast": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 20
+      },
+      "rate.input.mode.ultrafast": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 20
+      },
+      "rate.output": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "rate.output.mode.fast": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 20
+      },
+      "rate.output.mode.ultrafast": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 20
+      },
+      "wire.api": {
+        "from": "curated",
+        "value": "https://llm.example.com/v1"
+      },
+      "wire.family": "openai.responses"
+    },
+    "openai/gpt-6.1-terra": {
+      "capability.attachment": true,
+      "capability.input_modalities": [
+        "image",
+        "pdf",
+        "text"
+      ],
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 200000,
+      "limit.output": 20000,
+      "model.canonical_id": "openai/gpt-6.1-terra",
+      "model.lineage": "gpt",
+      "model.status": null,
+      "quality.elo": 1800,
+      "quality.eq": 1700,
+      "rate.cache_read": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "rate.cache_read.mode.fast": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 20
+      },
+      "rate.cache_write": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "rate.cache_write.mode.fast": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 20
+      },
+      "rate.input": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "rate.input.mode.fast": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 20
+      },
+      "rate.output": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "rate.output.mode.fast": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 20
+      },
+      "wire.api": {
+        "from": "curated",
+        "value": "https://llm.example.com/v1"
+      },
+      "wire.family": "openai.responses"
+    },
+    "opencode/deepseek-v4.1-flash": {
+      "capability.attachment": true,
+      "capability.input_modalities": [
+        "image",
+        "text"
+      ],
+      "capability.reasoning_options": [
+        {
+          "type": "toggle"
+        },
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "high",
+            "max"
+          ]
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 200000,
+      "limit.output": 20000,
+      "model.canonical_id": "deepseek/deepseek-v4.1-flash-1017",
+      "model.lineage": "deepseek",
+      "model.status": null,
+      "quality.elo": 1800,
+      "quality.eq": 1700,
+      "rate.cache_read": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "rate.input": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "rate.output": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "wire.api": {
+        "from": "model",
+        "value": "https://llm.example.com/v1"
+      },
+      "wire.family": "openai.chat_completions"
+    },
+    "opencode/gpt-6.1-sol": {
+      "capability.attachment": true,
+      "capability.input_modalities": [
+        "image",
+        "pdf",
+        "text"
+      ],
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 200000,
+      "limit.output": 20000,
+      "model.canonical_id": "openai/gpt-6.1-sol",
+      "model.lineage": "gpt",
+      "model.status": null,
+      "quality.elo": 1800,
+      "quality.eq": 1700,
+      "rate.cache_read": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "rate.cache_write": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "rate.input": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "rate.output": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "wire.api": {
+        "from": "model",
+        "value": "https://llm.example.com/v1"
+      },
+      "wire.family": "openai.responses"
+    },
+    "opencode/muse-spark-1.3": {
+      "capability.attachment": true,
+      "capability.input_modalities": [
+        "audio",
+        "image",
+        "pdf",
+        "text",
+        "video"
+      ],
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 200000,
+      "limit.output": 20000,
+      "model.canonical_id": "meta/muse-spark-1.3",
+      "model.lineage": "llama",
+      "model.status": null,
+      "quality.elo": 1800,
+      "quality.eq": 1700,
+      "rate.cache_read": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "rate.input": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "rate.output": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "wire.api": {
+        "from": "model",
+        "value": "https://llm.example.com/v1"
+      },
+      "wire.family": "openai.responses"
+    },
+    "opencode/muse-wonder-1.0": {
+      "capability.attachment": true,
+      "capability.input_modalities": [
+        "audio",
+        "image",
+        "pdf",
+        "text",
+        "video"
+      ],
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 200000,
+      "limit.output": 20000,
+      "model.canonical_id": "meta/muse-wonder-1.0",
+      "model.lineage": "llama",
+      "model.status": null,
+      "quality.elo": 1800,
+      "quality.eq": 1700,
+      "rate.cache_read": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "rate.input": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "rate.output": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "wire.api": {
+        "from": "model",
+        "value": "https://llm.example.com/v1"
+      },
+      "wire.family": "openai.responses"
+    },
+    "opencode/grok-4.7": {
+      "capability.attachment": true,
+      "capability.input_modalities": [
+        "image",
+        "pdf",
+        "text"
+      ],
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 200000,
+      "limit.output": 20000,
+      "model.canonical_id": "xai/grok-4.7",
+      "model.lineage": "grok",
+      "model.status": null,
+      "quality.elo": 1800,
+      "quality.eq": 1700,
+      "rate.cache_read": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "rate.input": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "rate.output": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "wire.api": {
+        "from": "model",
+        "value": "https://llm.example.com/v1"
+      },
+      "wire.family": "openai.responses"
+    },
+    "xai/grok-4.7": {
+      "capability.attachment": true,
+      "capability.input_modalities": [
+        "image",
+        "pdf",
+        "text"
+      ],
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 200000,
+      "limit.output": 20000,
+      "model.canonical_id": "xai/grok-4.7",
+      "model.lineage": "grok",
+      "model.status": null,
+      "quality.elo": 1800,
+      "quality.eq": 1700,
+      "rate.cache_read": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "rate.input": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "rate.output": {
+        "currency": "USD",
+        "exponent": 0,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10
+      },
+      "wire.api": {
+        "from": "curated",
+        "value": "https://llm.example.com/v1"
+      },
+      "wire.family": "openai.responses"
+    }
+  },
+  "billing_planes": [
+    {
+      "plane": {
+        "provider_id": "anthropic",
+        "auth_method": "oauth",
+        "kind": "quota_proxy"
+      },
+      "models": {
+        "anthropic/claude-haiku-5-5": {
+          "capability.attachment": true,
+          "capability.input_modalities": [
+            "image",
+            "pdf",
+            "text"
+          ],
+          "capability.reasoning_options": [
+            {
+              "type": "toggle"
+            },
+            {
+              "type": "effort",
+              "values": [
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max"
+              ]
+            }
+          ],
+          "capability.tool_call": true,
+          "existence": "present",
+          "limit.context": 200000,
+          "limit.output": 20000,
+          "model.canonical_id": "anthropic/claude-haiku-5-5",
+          "model.lineage": "claude",
+          "model.status": null,
+          "quality.elo": 1800,
+          "quality.eq": 1700,
+          "rate.cache_read": {
+            "currency": "USD",
+            "exponent": 0,
+            "inherited_from": {
+              "basis": "quota_proxy",
+              "family": "claude-haiku",
+              "provider_id": "anthropic"
+            },
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 10
+          },
+          "rate.cache_write": {
+            "currency": "USD",
+            "exponent": 0,
+            "inherited_from": {
+              "basis": "quota_proxy",
+              "family": "claude-haiku",
+              "provider_id": "anthropic"
+            },
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 10
+          },
+          "rate.input": {
+            "currency": "USD",
+            "exponent": 0,
+            "inherited_from": {
+              "basis": "quota_proxy",
+              "family": "claude-haiku",
+              "provider_id": "anthropic"
+            },
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 10
+          },
+          "rate.output": {
+            "currency": "USD",
+            "exponent": 0,
+            "inherited_from": {
+              "basis": "quota_proxy",
+              "family": "claude-haiku",
+              "provider_id": "anthropic"
+            },
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 10
+          },
+          "wire.api": {
+            "from": "curated",
+            "value": "https://llm.example.com/v1"
+          },
+          "wire.family": "anthropic.messages"
+        },
+        "anthropic/claude-opus-5-5": {
+          "capability.attachment": true,
+          "capability.input_modalities": [
+            "image",
+            "pdf",
+            "text"
+          ],
+          "capability.reasoning_options": [
+            {
+              "type": "effort",
+              "values": [
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max"
+              ]
+            }
+          ],
+          "capability.tool_call": true,
+          "existence": "present",
+          "limit.context": 200000,
+          "limit.output": 20000,
+          "model.canonical_id": "anthropic/claude-opus-5-5",
+          "model.lineage": "claude",
+          "model.status": null,
+          "quality.elo": 1800,
+          "quality.eq": 1700,
+          "rate.cache_read": {
+            "currency": "USD",
+            "exponent": 0,
+            "inherited_from": {
+              "basis": "quota_proxy",
+              "family": "claude-opus",
+              "provider_id": "anthropic"
+            },
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 10
+          },
+          "rate.cache_write": {
+            "currency": "USD",
+            "exponent": 0,
+            "inherited_from": {
+              "basis": "quota_proxy",
+              "family": "claude-opus",
+              "provider_id": "anthropic"
+            },
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 10
+          },
+          "rate.input": {
+            "currency": "USD",
+            "exponent": 0,
+            "inherited_from": {
+              "basis": "quota_proxy",
+              "family": "claude-opus",
+              "provider_id": "anthropic"
+            },
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 10
+          },
+          "rate.output": {
+            "currency": "USD",
+            "exponent": 0,
+            "inherited_from": {
+              "basis": "quota_proxy",
+              "family": "claude-opus",
+              "provider_id": "anthropic"
+            },
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 10
+          },
+          "wire.api": {
+            "from": "curated",
+            "value": "https://llm.example.com/v1"
+          },
+          "wire.family": "anthropic.messages"
+        },
+        "anthropic/claude-sonnet-5-5": {
+          "capability.attachment": true,
+          "capability.input_modalities": [
+            "image",
+            "pdf",
+            "text"
+          ],
+          "capability.reasoning_options": [
+            {
+              "type": "effort",
+              "values": [
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max"
+              ]
+            }
+          ],
+          "capability.tool_call": true,
+          "existence": "present",
+          "limit.context": 200000,
+          "limit.output": 20000,
+          "model.canonical_id": "anthropic/claude-sonnet-5-5",
+          "model.lineage": "claude",
+          "model.status": null,
+          "quality.elo": 1800,
+          "quality.eq": 1700,
+          "rate.cache_read": {
+            "currency": "USD",
+            "exponent": 0,
+            "inherited_from": {
+              "basis": "quota_proxy",
+              "family": "claude-sonnet",
+              "provider_id": "anthropic"
+            },
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 10
+          },
+          "rate.cache_write": {
+            "currency": "USD",
+            "exponent": 0,
+            "inherited_from": {
+              "basis": "quota_proxy",
+              "family": "claude-sonnet",
+              "provider_id": "anthropic"
+            },
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 10
+          },
+          "rate.input": {
+            "currency": "USD",
+            "exponent": 0,
+            "inherited_from": {
+              "basis": "quota_proxy",
+              "family": "claude-sonnet",
+              "provider_id": "anthropic"
+            },
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 10
+          },
+          "rate.output": {
+            "currency": "USD",
+            "exponent": 0,
+            "inherited_from": {
+              "basis": "quota_proxy",
+              "family": "claude-sonnet",
+              "provider_id": "anthropic"
+            },
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 10
+          },
+          "wire.api": {
+            "from": "curated",
+            "value": "https://llm.example.com/v1"
+          },
+          "wire.family": "anthropic.messages"
+        }
+      }
+    },
+    {
+      "plane": {
+        "provider_id": "deepseek",
+        "auth_method": "apikey",
+        "kind": "upstream"
+      },
+      "models": {
+        "deepseek/deepseek-flash": {
+          "capability.attachment": true,
+          "capability.input_modalities": [
+            "image",
+            "text"
+          ],
+          "capability.reasoning_options": [
+            {
+              "type": "toggle"
+            },
+            {
+              "type": "effort",
+              "values": [
+                "low",
+                "high",
+                "max"
+              ]
+            }
+          ],
+          "capability.tool_call": true,
+          "existence": "present",
+          "limit.context": 200000,
+          "limit.output": 20000,
+          "model.canonical_id": "deepseek/deepseek-v4.1-flash-1017",
+          "model.lineage": "deepseek",
+          "model.status": null,
+          "quality.elo": 1800,
+          "quality.eq": 1700,
+          "rate.cache_read": {
+            "currency": "USD",
+            "exponent": 0,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 10
+          },
+          "rate.cache_write": {
+            "state": "billed_as",
+            "key": "rate.input"
+          },
+          "rate.input": {
+            "currency": "USD",
+            "exponent": 0,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 10
+          },
+          "rate.output": {
+            "currency": "USD",
+            "exponent": 0,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 10
+          },
+          "rate.reasoning": {
+            "currency": "USD",
+            "exponent": 0,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 10
+          },
+          "wire.api": {
+            "from": "provider",
+            "value": "https://llm.example.com/v1"
+          },
+          "wire.family": "openai.chat_completions"
+        },
+        "deepseek/deepseek-v4-pro": {
+          "capability.attachment": false,
+          "capability.input_modalities": [
+            "text"
+          ],
+          "capability.reasoning_options": [
+            {
+              "type": "toggle"
+            },
+            {
+              "type": "effort",
+              "values": [
+                "low",
+                "high",
+                "max"
+              ]
+            }
+          ],
+          "capability.tool_call": true,
+          "existence": "present",
+          "limit.context": 200000,
+          "limit.output": 20000,
+          "model.canonical_id": "deepseek/deepseek-v4-pro-0813",
+          "model.lineage": "deepseek",
+          "model.status": null,
+          "quality.elo": 1800,
+          "quality.eq": 1700,
+          "rate.cache_read": {
+            "currency": "USD",
+            "exponent": 0,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 10
+          },
+          "rate.cache_write": {
+            "state": "billed_as",
+            "key": "rate.input"
+          },
+          "rate.input": {
+            "currency": "USD",
+            "exponent": 0,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 10
+          },
+          "rate.output": {
+            "currency": "USD",
+            "exponent": 0,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 10
+          },
+          "rate.reasoning": {
+            "currency": "USD",
+            "exponent": 0,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 10
+          },
+          "wire.api": {
+            "from": "provider",
+            "value": "https://llm.example.com/v1"
+          },
+          "wire.family": "openai.chat_completions"
+        }
+      }
+    },
+    {
+      "plane": {
+        "provider_id": "kimi-code-plan-global",
+        "auth_method": "apikey",
+        "kind": "quota_proxy"
+      },
+      "models": {
+        "kimi-code-plan-global/k3.1-pro": {
+          "capability.attachment": true,
+          "capability.input_modalities": [
+            "image",
+            "text",
+            "video"
+          ],
+          "capability.reasoning_options": [
+            {
+              "type": "effort",
+              "values": [
+                "low",
+                "high",
+                "max"
+              ]
+            }
+          ],
+          "capability.tool_call": true,
+          "existence": "present",
+          "limit.context": 200000,
+          "limit.output": 20000,
+          "model.canonical_id": "moonshotai/kimi-k3.1-pro",
+          "model.lineage": "kimi",
+          "model.status": null,
+          "quality.elo": 1800,
+          "quality.eq": 1700,
+          "rate.cache_read": {
+            "currency": "USD",
+            "exponent": 0,
+            "inherited_from": {
+              "basis": "quota_proxy",
+              "family": "kimi-k3",
+              "model_id": "kimi-k3.1-pro",
+              "provider_id": "moonshotai"
+            },
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 10
+          },
+          "rate.cache_write": {
+            "currency": "USD",
+            "exponent": 0,
+            "inherited_from": {
+              "basis": "quota_proxy",
+              "family": "kimi-k3",
+              "model_id": "kimi-k3.1-pro",
+              "provider_id": "moonshotai"
+            },
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 10
+          },
+          "rate.input": {
+            "currency": "USD",
+            "exponent": 0,
+            "inherited_from": {
+              "basis": "quota_proxy",
+              "family": "kimi-k3",
+              "model_id": "kimi-k3.1-pro",
+              "provider_id": "moonshotai"
+            },
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 10
+          },
+          "rate.output": {
+            "currency": "USD",
+            "exponent": 0,
+            "inherited_from": {
+              "basis": "quota_proxy",
+              "family": "kimi-k3",
+              "model_id": "kimi-k3.1-pro",
+              "provider_id": "moonshotai"
+            },
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 10
+          },
+          "wire.api": {
+            "from": "provider",
+            "value": "https://llm.example.com/v1"
+          },
+          "wire.family": "openai.chat_completions"
+        },
+        "kimi-code-plan-global/k3.1-pro-highspeed": {
+          "capability.attachment": true,
+          "capability.input_modalities": [
+            "image",
+            "text",
+            "video"
+          ],
+          "capability.reasoning_options": [
+            {
+              "type": "effort",
+              "values": [
+                "low",
+                "high",
+                "max"
+              ]
+            }
+          ],
+          "capability.tool_call": true,
+          "existence": "present",
+          "limit.context": 200000,
+          "limit.output": 20000,
+          "model.canonical_id": "moonshotai/kimi-k3.1-pro",
+          "model.lineage": "kimi",
+          "model.status": null,
+          "quality.elo": 1800,
+          "quality.eq": 1700,
+          "rate.cache_read": {
+            "currency": "USD",
+            "exponent": 0,
+            "inherited_from": {
+              "basis": "quota_proxy",
+              "family": "kimi-k3",
+              "model_id": "kimi-k3.1-pro",
+              "provider_id": "moonshotai"
+            },
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 10
+          },
+          "rate.cache_write": {
+            "currency": "USD",
+            "exponent": 0,
+            "inherited_from": {
+              "basis": "quota_proxy",
+              "family": "kimi-k3",
+              "model_id": "kimi-k3.1-pro",
+              "provider_id": "moonshotai"
+            },
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 10
+          },
+          "rate.input": {
+            "currency": "USD",
+            "exponent": 0,
+            "inherited_from": {
+              "basis": "quota_proxy",
+              "family": "kimi-k3",
+              "model_id": "kimi-k3.1-pro",
+              "provider_id": "moonshotai"
+            },
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 10
+          },
+          "rate.output": {
+            "currency": "USD",
+            "exponent": 0,
+            "inherited_from": {
+              "basis": "quota_proxy",
+              "family": "kimi-k3",
+              "model_id": "kimi-k3.1-pro",
+              "provider_id": "moonshotai"
+            },
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 10
+          },
+          "wire.api": {
+            "from": "provider",
+            "value": "https://llm.example.com/v1"
+          },
+          "wire.family": "openai.chat_completions"
+        }
+      }
+    },
+    {
+      "plane": {
+        "provider_id": "openai",
+        "auth_method": "chatgpt",
+        "kind": "quota_proxy"
+      },
+      "models": {
+        "openai/gpt-6-astra": {
+          "capability.attachment": true,
+          "capability.input_modalities": [
+            "image",
+            "pdf",
+            "text"
+          ],
+          "capability.reasoning_options": [
+            {
+              "type": "effort",
+              "values": [
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max"
+              ]
+            }
+          ],
+          "capability.tool_call": true,
+          "existence": "present",
+          "limit.context": 200000,
+          "limit.output": 20000,
+          "model.canonical_id": "openai/gpt-6-astra",
+          "model.lineage": "gpt",
+          "model.status": null,
+          "quality.elo": 1800,
+          "quality.eq": 1700,
+          "rate.cache_read": {
+            "currency": "USD",
+            "exponent": 0,
+            "inherited_from": {
+              "basis": "quota_proxy",
+              "family": "gpt-astra",
+              "provider_id": "openai"
+            },
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 10
+          },
+          "rate.cache_write": {
+            "state": "billed_as",
+            "key": "rate.input"
+          },
+          "rate.input": {
+            "currency": "USD",
+            "exponent": 0,
+            "inherited_from": {
+              "basis": "quota_proxy",
+              "family": "gpt-astra",
+              "provider_id": "openai"
+            },
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 10
+          },
+          "rate.output": {
+            "currency": "USD",
+            "exponent": 0,
+            "inherited_from": {
+              "basis": "quota_proxy",
+              "family": "gpt-astra",
+              "provider_id": "openai"
+            },
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 10
+          },
+          "wire.api": {
+            "from": "curated",
+            "value": "https://llm.example.com/v1"
+          },
+          "wire.family": "openai.chatgpt_responses"
+        },
+        "openai/gpt-6-luna": {
+          "capability.attachment": true,
+          "capability.input_modalities": [
+            "image",
+            "pdf",
+            "text"
+          ],
+          "capability.reasoning_options": [
+            {
+              "type": "effort",
+              "values": [
+                "none",
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max"
+              ]
+            }
+          ],
+          "capability.tool_call": true,
+          "existence": "present",
+          "limit.context": 200000,
+          "limit.output": 20000,
+          "model.canonical_id": "openai/gpt-6-luna",
+          "model.lineage": "gpt",
+          "model.status": null,
+          "quality.elo": 1800,
+          "quality.eq": 1700,
+          "rate.cache_read": {
+            "currency": "USD",
+            "exponent": 0,
+            "inherited_from": {
+              "basis": "quota_proxy",
+              "family": "gpt-luna",
+              "provider_id": "openai"
+            },
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 10
+          },
+          "rate.cache_write": {
+            "state": "billed_as",
+            "key": "rate.input"
+          },
+          "rate.input": {
+            "currency": "USD",
+            "exponent": 0,
+            "inherited_from": {
+              "basis": "quota_proxy",
+              "family": "gpt-luna",
+              "provider_id": "openai"
+            },
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 10
+          },
+          "rate.output": {
+            "currency": "USD",
+            "exponent": 0,
+            "inherited_from": {
+              "basis": "quota_proxy",
+              "family": "gpt-luna",
+              "provider_id": "openai"
+            },
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 10
+          },
+          "wire.api": {
+            "from": "curated",
+            "value": "https://llm.example.com/v1"
+          },
+          "wire.family": "openai.chatgpt_responses"
+        },
+        "openai/gpt-6.1-sol": {
+          "capability.attachment": true,
+          "capability.input_modalities": [
+            "image",
+            "pdf",
+            "text"
+          ],
+          "capability.reasoning_options": [
+            {
+              "type": "effort",
+              "values": [
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max"
+              ]
+            }
+          ],
+          "capability.tool_call": true,
+          "existence": "present",
+          "limit.context": 200000,
+          "limit.output": 20000,
+          "model.canonical_id": "openai/gpt-6.1-sol",
+          "model.lineage": "gpt",
+          "model.status": null,
+          "quality.elo": 1800,
+          "quality.eq": 1700,
+          "rate.cache_read": {
+            "currency": "USD",
+            "exponent": 0,
+            "inherited_from": {
+              "basis": "quota_proxy",
+              "family": "gpt-sol",
+              "provider_id": "openai"
+            },
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 10
+          },
+          "rate.cache_write": {
+            "state": "billed_as",
+            "key": "rate.input"
+          },
+          "rate.input": {
+            "currency": "USD",
+            "exponent": 0,
+            "inherited_from": {
+              "basis": "quota_proxy",
+              "family": "gpt-sol",
+              "provider_id": "openai"
+            },
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 10
+          },
+          "rate.output": {
+            "currency": "USD",
+            "exponent": 0,
+            "inherited_from": {
+              "basis": "quota_proxy",
+              "family": "gpt-sol",
+              "provider_id": "openai"
+            },
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 10
+          },
+          "wire.api": {
+            "from": "curated",
+            "value": "https://llm.example.com/v1"
+          },
+          "wire.family": "openai.chatgpt_responses"
+        },
+        "openai/gpt-6.1-terra": {
+          "capability.attachment": true,
+          "capability.input_modalities": [
+            "image",
+            "pdf",
+            "text"
+          ],
+          "capability.reasoning_options": [
+            {
+              "type": "effort",
+              "values": [
+                "none",
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max"
+              ]
+            }
+          ],
+          "capability.tool_call": true,
+          "existence": "present",
+          "limit.context": 200000,
+          "limit.output": 20000,
+          "model.canonical_id": "openai/gpt-6.1-terra",
+          "model.lineage": "gpt",
+          "model.status": null,
+          "quality.elo": 1800,
+          "quality.eq": 1700,
+          "rate.cache_read": {
+            "currency": "USD",
+            "exponent": 0,
+            "inherited_from": {
+              "basis": "quota_proxy",
+              "family": "gpt-terra",
+              "provider_id": "openai"
+            },
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 10
+          },
+          "rate.cache_write": {
+            "state": "billed_as",
+            "key": "rate.input"
+          },
+          "rate.input": {
+            "currency": "USD",
+            "exponent": 0,
+            "inherited_from": {
+              "basis": "quota_proxy",
+              "family": "gpt-terra",
+              "provider_id": "openai"
+            },
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 10
+          },
+          "rate.output": {
+            "currency": "USD",
+            "exponent": 0,
+            "inherited_from": {
+              "basis": "quota_proxy",
+              "family": "gpt-terra",
+              "provider_id": "openai"
+            },
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 10
+          },
+          "wire.api": {
+            "from": "curated",
+            "value": "https://llm.example.com/v1"
+          },
+          "wire.family": "openai.chatgpt_responses"
+        }
+      }
+    },
+    {
+      "plane": {
+        "provider_id": "opencode",
+        "auth_method": "apikey",
+        "kind": "upstream"
+      },
+      "models": {
+        "opencode/deepseek-v4.1-flash": {
+          "capability.attachment": true,
+          "capability.input_modalities": [
+            "image",
+            "text"
+          ],
+          "capability.reasoning_options": [
+            {
+              "type": "toggle"
+            },
+            {
+              "type": "effort",
+              "values": [
+                "low",
+                "high",
+                "max"
+              ]
+            }
+          ],
+          "capability.tool_call": true,
+          "existence": "present",
+          "limit.context": 200000,
+          "limit.output": 20000,
+          "model.canonical_id": "deepseek/deepseek-v4.1-flash-1017",
+          "model.lineage": "deepseek",
+          "model.status": null,
+          "quality.elo": 1800,
+          "quality.eq": 1700,
+          "rate.cache_read": {
+            "currency": "USD",
+            "exponent": 0,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 10
+          },
+          "rate.input": {
+            "currency": "USD",
+            "exponent": 0,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 10
+          },
+          "rate.output": {
+            "currency": "USD",
+            "exponent": 0,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 10
+          },
+          "wire.api": {
+            "from": "model",
+            "value": "https://llm.example.com/v1"
+          },
+          "wire.family": "openai.chat_completions"
+        },
+        "opencode/gpt-6.1-sol": {
+          "capability.attachment": true,
+          "capability.input_modalities": [
+            "image",
+            "pdf",
+            "text"
+          ],
+          "capability.reasoning_options": [
+            {
+              "type": "effort",
+              "values": [
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max"
+              ]
+            }
+          ],
+          "capability.tool_call": true,
+          "existence": "present",
+          "limit.context": 200000,
+          "limit.output": 20000,
+          "model.canonical_id": "openai/gpt-6.1-sol",
+          "model.lineage": "gpt",
+          "model.status": null,
+          "quality.elo": 1800,
+          "quality.eq": 1700,
+          "rate.cache_read": {
+            "currency": "USD",
+            "exponent": 0,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 10
+          },
+          "rate.cache_write": {
+            "currency": "USD",
+            "exponent": 0,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 10
+          },
+          "rate.input": {
+            "currency": "USD",
+            "exponent": 0,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 10
+          },
+          "rate.output": {
+            "currency": "USD",
+            "exponent": 0,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 10
+          },
+          "wire.api": {
+            "from": "model",
+            "value": "https://llm.example.com/v1"
+          },
+          "wire.family": "openai.responses"
+        },
+        "opencode/muse-spark-1.3": {
+          "capability.attachment": true,
+          "capability.input_modalities": [
+            "audio",
+            "image",
+            "pdf",
+            "text",
+            "video"
+          ],
+          "capability.reasoning_options": [
+            {
+              "type": "effort",
+              "values": [
+                "minimal",
+                "low",
+                "medium",
+                "high",
+                "xhigh"
+              ]
+            }
+          ],
+          "capability.tool_call": true,
+          "existence": "present",
+          "limit.context": 200000,
+          "limit.output": 20000,
+          "model.canonical_id": "meta/muse-spark-1.3",
+          "model.lineage": "llama",
+          "model.status": null,
+          "quality.elo": 1800,
+          "quality.eq": 1700,
+          "rate.cache_read": {
+            "currency": "USD",
+            "exponent": 0,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 10
+          },
+          "rate.input": {
+            "currency": "USD",
+            "exponent": 0,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 10
+          },
+          "rate.output": {
+            "currency": "USD",
+            "exponent": 0,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 10
+          },
+          "wire.api": {
+            "from": "model",
+            "value": "https://llm.example.com/v1"
+          },
+          "wire.family": "openai.responses"
+        },
+        "opencode/muse-wonder-1.0": {
+          "capability.attachment": true,
+          "capability.input_modalities": [
+            "audio",
+            "image",
+            "pdf",
+            "text",
+            "video"
+          ],
+          "capability.reasoning_options": [
+            {
+              "type": "effort",
+              "values": [
+                "minimal",
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max"
+              ]
+            }
+          ],
+          "capability.tool_call": true,
+          "existence": "present",
+          "limit.context": 200000,
+          "limit.output": 20000,
+          "model.canonical_id": "meta/muse-wonder-1.0",
+          "model.lineage": "llama",
+          "model.status": null,
+          "quality.elo": 1800,
+          "quality.eq": 1700,
+          "rate.cache_read": {
+            "currency": "USD",
+            "exponent": 0,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 10
+          },
+          "rate.input": {
+            "currency": "USD",
+            "exponent": 0,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 10
+          },
+          "rate.output": {
+            "currency": "USD",
+            "exponent": 0,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 10
+          },
+          "wire.api": {
+            "from": "model",
+            "value": "https://llm.example.com/v1"
+          },
+          "wire.family": "openai.responses"
+        },
+        "opencode/grok-4.7": {
+          "capability.attachment": true,
+          "capability.input_modalities": [
+            "image",
+            "pdf",
+            "text"
+          ],
+          "capability.reasoning_options": [
+            {
+              "type": "effort",
+              "values": [
+                "low",
+                "medium",
+                "high",
+                "xhigh"
+              ]
+            }
+          ],
+          "capability.tool_call": true,
+          "existence": "present",
+          "limit.context": 200000,
+          "limit.output": 20000,
+          "model.canonical_id": "xai/grok-4.7",
+          "model.lineage": "grok",
+          "model.status": null,
+          "quality.elo": 1800,
+          "quality.eq": 1700,
+          "rate.cache_read": {
+            "currency": "USD",
+            "exponent": 0,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 10
+          },
+          "rate.input": {
+            "currency": "USD",
+            "exponent": 0,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 10
+          },
+          "rate.output": {
+            "currency": "USD",
+            "exponent": 0,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 10
+          },
+          "wire.api": {
+            "from": "model",
+            "value": "https://llm.example.com/v1"
+          },
+          "wire.family": "openai.responses"
+        }
+      }
+    },
+    {
+      "plane": {
+        "provider_id": "xai",
+        "auth_method": "apikey",
+        "kind": "upstream"
+      },
+      "models": {
+        "xai/grok-4.7": {
+          "capability.attachment": true,
+          "capability.input_modalities": [
+            "image",
+            "pdf",
+            "text"
+          ],
+          "capability.reasoning_options": [
+            {
+              "type": "effort",
+              "values": [
+                "low",
+                "medium",
+                "high",
+                "xhigh"
+              ]
+            }
+          ],
+          "capability.tool_call": true,
+          "existence": "present",
+          "limit.context": 200000,
+          "limit.output": 20000,
+          "model.canonical_id": "xai/grok-4.7",
+          "model.lineage": "grok",
+          "model.status": null,
+          "quality.elo": 1800,
+          "quality.eq": 1700,
+          "rate.cache_read": {
+            "currency": "USD",
+            "exponent": 0,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 10
+          },
+          "rate.cache_write": {
+            "state": "billed_as",
+            "key": "rate.input"
+          },
+          "rate.input": {
+            "currency": "USD",
+            "exponent": 0,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 10
+          },
+          "rate.output": {
+            "currency": "USD",
+            "exponent": 0,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 10
+          },
+          "wire.api": {
+            "from": "curated",
+            "value": "https://llm.example.com/v1"
+          },
+          "wire.family": "openai.responses"
+        }
+      }
+    }
+  ]
+}

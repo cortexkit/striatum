@@ -3,7 +3,7 @@ use super::*;
 pub(super) fn configure_harness(
     harness: Arc<Harness>,
     provider: &str,
-    converted_live: bool,
+    converted_legacy: bool,
     version: Option<u32>,
 ) -> (Arc<Harness>, BrocaCredentials) {
     let fact = account_fact(provider);
@@ -66,9 +66,9 @@ pub(super) fn configure_harness(
     );
     harness.set_credentials(credentials.clone());
     harness.edit_config(|config| {
-        if converted_live {
+        if converted_legacy {
             *config = crate::test_config::convert_archived(include_str!(
-                "../../../fixtures/routing-config-live-2026-10-24.jsonc"
+                "../../../fixtures/synthetic-routing-config.jsonc"
             ));
         }
         config["runners"] = json!([{"module":RUNNER,"via_vault":true}]);

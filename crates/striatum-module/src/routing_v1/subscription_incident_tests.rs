@@ -25,20 +25,20 @@ const WORKER: &str = "prefrontal.mason";
 
 fn pi_fixture() -> Value {
     serde_json::from_str(include_str!(
-        "../../fixtures/pi-mason-subscription-reserve.json"
+        "../../fixtures/synthetic-pi-worker-subscription-reserve.json"
     ))
     .unwrap()
 }
 
-fn october_fixture() -> Value {
+fn head_reserve_fixture() -> Value {
     serde_json::from_str(include_str!(
-        "../../fixtures/claude-head-reserve-2026-10-17.json"
+        "../../fixtures/synthetic-claude-head-reserve.json"
     ))
     .unwrap()
 }
 
 fn model_fact(api: bool) -> ModelFact {
-    // Captured account readings are priced against this fixed task vector:
+    // The fixture's account readings are priced against this fixed task vector:
     // 1,000 output and 1,000 cached-read tokens, with no fresh input or reasoning.
     let method = if api { "apikey" } else { "oauth" };
     let mut fact: ModelFact = serde_json::from_value(json!({
@@ -85,7 +85,7 @@ fn setup(fixture: &Value, api: bool) -> (Arc<Harness>, impl Drop, SubscriptionPo
     let mut state = AccountQuotaState::default();
     let mut identities = Vec::new();
     for (index, account) in fixture["accounts"].as_array().unwrap().iter().enumerate() {
-        let account_id = format!("anonymous-{index}");
+        let account_id = format!("test-account-{index}");
         let credential = format!("fixture:{index}");
         identities.push(RosterIdentity {
             refresh_adapter: "anthropic".into(),
@@ -110,8 +110,10 @@ fn setup(fixture: &Value, api: bool) -> (Arc<Harness>, impl Drop, SubscriptionPo
         grants: Vec::new(),
         identities,
     });
-    let prices =
-        serde_json::from_str(include_str!("../../fixtures/fusiform-plan-prices.json")).unwrap();
+    let prices = serde_json::from_str(include_str!(
+        "../../fixtures/synthetic-fusiform-plan-prices.json"
+    ))
+    .unwrap();
     let mut pools = crate::subscription_economics::test_account_pools(&state, &prices, now);
     let pool = pools.get_mut("anthropic").unwrap();
     pool.keep_free_percent = fixture["keep_free_percent"].as_f64().unwrap();
@@ -256,7 +258,7 @@ async fn pi_masons_share_corrected_incident_subscription_admission_with_opencode
             )
             .await;
             let pricing = subscription(&reply);
-            assert_eq!(pricing["availablePoints"], 166.0, "{reply:?}");
+            assert_eq!(pricing["availablePoints"], 185.0, "{reply:?}");
             selections.push((reply.1["result"]["route"].clone(), pricing.clone()));
         }
         assert_eq!(selections[0], selections[1]);
@@ -299,7 +301,7 @@ async fn incident_subscription_heads_keep_access_and_subscription_pricing() {
         assert!(harness.operator_config().is_head_agent("head"));
         assert!(!harness.operator_config().is_head_agent(WORKER));
         let reply = select(&harness, Some(host), "head", json!({"iq":85,"eq":15})).await;
-        assert_eq!(subscription(&reply)["availablePoints"], 232.0);
+        assert_eq!(subscription(&reply)["availablePoints"], 255.0);
     }
 
     // Every account is below the live 30% margin, not exhausted. The same
@@ -322,7 +324,7 @@ async fn incident_subscription_heads_keep_access_and_subscription_pricing() {
 async fn incident_subscription_workers_get_fixed_margin_subscription_pricing() {
     let fixture = pi_fixture();
     let _clock = crate::InjectedClock::set(fixture["now_ms"].as_u64().unwrap());
-    for (margin, expected) in [(20.0, 166.0), (30.0, 136.0)] {
+    for (margin, expected) in [(20.0, 185.0), (30.0, 155.0)] {
         for host in ["pi", "opencode"] {
             let mut fixture = fixture.clone();
             fixture["keep_free_percent"] = json!(margin);
@@ -346,7 +348,7 @@ async fn incident_api_plane_is_still_metered_not_subscription_reserved() {
         // includes the reserve, while the API-key plane below must be metered.
         let (harness, _pools, _) = setup(&fixture, false);
         let oauth = select(&harness, Some("pi"), WORKER, json!({"iq":85,"eq":15})).await;
-        assert_eq!(subscription(&oauth)["availablePoints"], 166.0);
+        assert_eq!(subscription(&oauth)["availablePoints"], 185.0);
     }
     let (harness, _pools, _) = setup(&fixture, true);
     let api = select(&harness, Some("pi"), WORKER, json!({"iq":85,"eq":15})).await;
@@ -368,10 +370,10 @@ async fn incident_api_plane_is_still_metered_not_subscription_reserved() {
 }
 
 #[tokio::test]
-async fn october_17_iq85_worker_can_use_all_live_quota_above_fixed_margin() {
-    let fixture = october_fixture();
+async fn iq85_worker_can_use_all_live_quota_above_fixed_margin() {
+    let fixture = head_reserve_fixture();
     let _clock = crate::InjectedClock::set(fixture["now_ms"].as_u64().unwrap());
-    for (margin, expected) in [(0.0, 256.0), (10.0, 223.0), (20.0, 193.0), (30.0, 163.0)] {
+    for (margin, expected) in [(0.0, 245.0), (10.0, 210.0), (20.0, 180.0), (30.0, 150.0)] {
         for host in [Some("pi"), Some("opencode"), None] {
             let mut fixture = fixture.clone();
             fixture["keep_free_percent"] = json!(margin);
@@ -405,7 +407,7 @@ fn iq85_worker_is_refused_only_when_every_live_account_is_at_margin() {
     };
     use striatum_core::{ModelRequirements, ModelRouteStateSnapshot};
 
-    let fixture = october_fixture();
+    let fixture = head_reserve_fixture();
     let _clock = crate::InjectedClock::set(fixture["now_ms"].as_u64().unwrap());
     for (margin, used) in [(0.0, 100.0), (20.0, 80.0), (30.0, 70.0)] {
         let mut fixture = fixture.clone();
@@ -414,9 +416,8 @@ fn iq85_worker_is_refused_only_when_every_live_account_is_at_margin() {
             account["used_percent"] = json!(used);
         }
         let (_harness, _pools, pool) = setup(&fixture, false);
-        // This pins the original live-only selector contract: captured saved
-        // resets exist, but allow_banked is false. The separate real-v1 test
-        // pins the module's emergency-pricing policy instead of faking it here.
+        // The live-only selector ignores saved resets. A separate route.select
+        // test checks the module's emergency pricing when it allows those resets.
         assert!(!pool.allow_banked);
         let input = SelectModelRouteInput {
             target_agent: WORKER.into(),
@@ -502,8 +503,8 @@ fn install_profiles(fact: &ModelFact, now: i64) {
 }
 
 #[tokio::test]
-async fn october_17_v1_emergency_answer_prices_one_saved_reset() {
-    let mut fixture = october_fixture();
+async fn v1_emergency_answer_prices_one_saved_reset() {
+    let mut fixture = head_reserve_fixture();
     let _clock = crate::InjectedClock::set(fixture["now_ms"].as_u64().unwrap());
     fixture["keep_free_percent"] = json!(30.0);
     for account in fixture["accounts"].as_array_mut().unwrap() {
@@ -519,8 +520,8 @@ async fn october_17_v1_emergency_answer_prices_one_saved_reset() {
     assert_eq!(pricing["keepFreePercent"], 30.0);
     let task_price = &reply.1["result"]["detail"]["score"]["objective"]["taskPricing"];
     assert_eq!(task_price["listCostUsd"], 0.02025);
-    assert_eq!(task_price["pressure"], 30.50845742562898);
-    assert_eq!(task_price["finalCostUsd"], 0.6177962628689868);
+    assert_eq!(task_price["pressure"], 29.15451895043731);
+    assert_eq!(task_price["finalCostUsd"], 0.5903790087463555);
     // resolve_price_rates omits the public quote for unmeasured subscription
     // value (price_rates.rs:74-80); the unchanged fixture also has no input rate.
     assert!(reply.1["result"].get("price").is_none());

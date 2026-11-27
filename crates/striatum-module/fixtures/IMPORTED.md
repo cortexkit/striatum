@@ -20,24 +20,28 @@ folders are routing-produced samples; these are frozen consumer inputs.
 | `test-vectors/diagnostics-findings-v1/request-empty.json` | `85e09268d9303b5e1863c341c3577ea77ecbea4d46eaafc7419c513109b41680` |
 | `test-vectors/diagnostics-findings-v1/request-window.json` | `01e32754c10783ceb1f1b9f2a61a0376888e772106de75b139d863bc55130042` |
 | `test-vectors/diagnostics-findings-v1/request-max-window.json` | `f5b7c7eadac60e9eb0d41a9235ac95d53c21e095a384cec521a653c5cbb8f43e` |
-| `test-vectors/diagnostics-findings-v1/reply-routing-findings.json` | `3556a3361cdf1b7cbba7cb30516a9e15452fa62a1329822b5630b4604037d33d` |
 | `test-vectors/diagnostics-findings-v1/reply-routing-unscored-admissible-model.json` | `2004f223e3b8393ce9a74cebbeab9bc67118f8416b7368287458c3ebd88b7771` |
 | `crates/prefrontal-core-module/fixtures/routing-wire/catalog-seed.json` | `248b2303db08ab319b6d3c25dc1f31fef8360e69dab367be0eb1cb3a3cb38284` |
 | `crates/prefrontal-core-module/fixtures/routing-wire/states.json` | `7764f333ede371a21628f8b241d8ad21eb133c4ed90e654d9f8d3b60281018ef` |
 | `crates/prefrontal-core-module/fixtures/routing-wire/panels.json` | `460ffaf99610412ea664e2a599c152cad5d63e024b7e500484f3b098b36b8540` |
 | `test-vectors/broca-request-invalid-v1/run_status.request_invalid_openai.json` | `cb03a7ce9d9fa35ff201b6efc4ce3824ab1bdd18da3594bd5c130c8878a86f25` |
 
-## Captured daemon catalog
+## Synthetic replacements
 
-`2026-11-10-daemon-catalog.json` is trimmed to only the voice module's complete
-module entry, copied verbatim from the `ck --json catalog` capture supplied on
-10 November 2026, around 13:06 UTC. The original source artifact had SHA-256
-`2e15ab501a348b95e60d827394cd3b52fcc9ecb1609fc2e085af3c26917b36e9`.
-The entry is wrapped in a full `catalog.list` reply envelope with fixture
-generation 1 and an empty daemon-operation list (`subc_ops`). The engine
-regression decodes that reply through the pinned catalog client's actual reply
-type before replacing routing's catalog and selecting both voice-module
-transcription engines. No other module entries are retained.
+- `synthetic-routing-config.jsonc`: synthetic legacy `model_routing`/`account_selection` JSONC settings for converter and account-class tests.
+- `synthetic-head-choices-broca-inputs.json`: synthetic catalog, billing-plane, settings, runner-tier, and vault inputs that reproduce the published `route.head_choices` reply.
+- `synthetic-insula-usage-claude.json`: synthetic Insula `usage.get` reply with five accounts and short, weekly, and per-model windows.
+- `synthetic-claude-head-reserve.json`: synthetic weekly quota and saved resets for worker admission at the head reserve.
+- `synthetic-pi-worker-subscription-reserve.json`: synthetic weekly quota and worker requirements for comparing `route.select` across harnesses.
+- `synthetic-routing-reserve-outage.json`: synthetic Insula usage entries and a competing provider wall for pooled reserve pricing.
+- `synthetic-astrocyte-account-multiplier-report-v2.json`: synthetic `spend.multiplier.report` v2 with five account-joined plans.
+- `synthetic-astrocyte-account-multiplier-report-v2.README.md`: notes on the synthetic account-joined report cases.
+- `synthetic-astrocyte-credential-multiplier-report-v2.json`: synthetic `spend.multiplier.report` v2 with seven plans, including two credential-only joins.
+- `synthetic-astrocyte-credential-multiplier-report-v2.README.md`: notes on the synthetic credential and account join cases.
+- `synthetic-fusiform-plan-prices.json`: synthetic `plan.prices` reply with priced, unpriced, and measured quota-value rows.
+- `synthetic-daemon-catalog.json`: synthetic `catalog.list` reply with a `media-provider/v1` slot and two transcription engines.
+- `broca-output-cap-harness-1124/synthetic-unsplit-routing-slot.json`: synthetic `routing/v1` slot for the single-harness case.
+- `contracts/diagnostics-findings-v1/reply-routing-findings.json`: imported diagnostics reply with only its credential reference changed to a synthetic one (SHA-256 `3ba5a1f519d40b87c3c78e91b68b4ce155f4c6ea89ea73c0a93a37daf2e40871`).
 
 ## Voice-module realtime dictation and voice-front declarations
 
@@ -84,17 +88,10 @@ The reader tests send the request bytes unchanged through routing's v1 handler.
 
 ## Token-relay capacity wait
 
-The token relay supplied the `route.account_for` bodies preserved here.
-`thalamus-capacity-wait-v1/` copies the bodies byte for byte, dropping the
-`route.account_for.` prefix from the filenames. The source `SHA256SUMS` has SHA-256
-`730b2a806ef90d1c03c7ca1a64bb9a73a4dc75fe5255bbcea06a4cb3392ab6d6`.
-The OpenCode 2.3.2 run recorded a capacity refusal and the same run re-asking
-after the reset with a fresh admission ID.
-
-| Imported path | SHA-256 |
-| --- | --- |
-| `thalamus-capacity-wait-v1/request.json` | `0ea3b76afb2aecfe170c73fc4c90418ef89aabbc69107d02bb4e4b26c23647da` |
-| `thalamus-capacity-wait-v1/re-ask.json` | `ebb7e14ab2bb4c0b4e48cca501ced65628f51164010f1a038cd89eb0227d796c` |
+`thalamus-capacity-wait-v1/request.json` and `thalamus-capacity-wait-v1/re-ask.json`
+are imported `route.account_for` params with synthetic admission IDs.
+The [README](thalamus-capacity-wait-v1/README.md) describes the retry case;
+`thalamus-capacity-wait-v1/SHA256SUMS` pins the updated bodies.
 
 ## Per-kind and caller-local media grades
 
@@ -168,21 +165,13 @@ with no account identity. SHA-256:
 
 ## Worker-runner split output-cap harness
 
-`broca-output-cap-harness-1124/` preserves both supplied files byte for byte.
-`routing-slot.json` is the exact proposed `routing/v1` role declaration slot
-supplied by the worker runner. `current-live-routing-slot.json` was captured from
-`modules[broca].role_declarations["routing/v1"]` in `ck --json catalog` at
-23:28 UTC on 24 November 2026. The baseline was re-serialized as compact JSON;
-its value matches what the daemon served, but its bytes are not the worker runner's
-original serialization.
-
-Both source files were checked against the supplied byte counts and SHA-256
-prefixes before import.
+`broca-output-cap-harness-1124/routing-slot.json` preserves the exact proposed
+`routing/v1` role declaration slot supplied by the worker runner. The source
+byte count and SHA-256 prefix were checked before import.
 
 | Imported path | Bytes | SHA-256 |
 | --- | ---: | --- |
 | `broca-output-cap-harness-1124/routing-slot.json` | 2191 | `168755640c483cbd479e915a103a8f335d39f0d4cc8ab4579da1140c6d6b9987` |
-| `broca-output-cap-harness-1124/current-live-routing-slot.json` | 1277 | `6c54624ca04c67c6a6d295849837ccbff28ac0cc9fe840f0298cc51a46a1fa5d` |
 
 ## Worker-runner completion workload declaration
 

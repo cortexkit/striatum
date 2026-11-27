@@ -30,27 +30,14 @@ that replay uses a different catalog and model set.
 - `harness-narrowed.json`: `harness-runner` hosts `opencode2` and `claude-code`, defaults to `opencode2`, and reaches both OpenAI and Anthropic at runner level. The request selects `claude-code`, whose `harness_limits` allow only the `anthropic.messages`/`oauth` pair and explicit provider `anthropic`, so only `anthropic/claude` is listed.
 - `harness-runner-wide.json`: the same runner with `harness: "opencode2"`. It has no harness-specific limits, so both Anthropic and OpenAI models are listed.
 - `harness-unavailable.json`: the same runner with `harness: "pi"`, which it does not host. The refusal pair captures `no_route` with `detail.reason: "harness_unavailable"`.
-- `broca-live-catalog.json`: a phone picker sample with 25 models, generated from a frozen snapshot of 14 Nov 2026, the worker runner's real runner declaration and tier capabilities, and a redacted credential roster. It includes subscription and per-token entries, pin-only models, and fast tiers.
+- `broca-live-catalog.json`: a phone picker sample with 25 models, including subscription and per-token entries, pin-only models, and fast tiers.
 - `SHA256SUMS`: SHA-256 hashes of the eleven captured pairs (ten replies and one refusal).
 
-The independent frozen inputs are in `crates/striatum-module/fixtures/head-choices-broca-live-inputs-20261114.json`.
-They contain the selected stored model rows, relevant catalog and billing-plane facts,
-policy, runner facts and a reduced roster with credential and account IDs replaced by
-stable placeholders. No credential secrets are recorded. The catalog and billing-plane
-facts were read at version `1794680117849`, after the stored rows and the reference
-picker answer at version `1794678317842`; all 25 generated model entries match that
-earlier answer field for field (provider, model, billing, pin-only, variants, default
-variant and service tiers). The 208-model reference response was captured from live
-routing for the comparison and is not published as a fixture. GPT-6.1 Sol and Terra
-are included because the reference picker did not list GPT-6 Sol or Terra. The model
-set, provider policy and credential roster are
-subsets, and the fixture keeps only facts needed by routing; other consumers' policy
-and non-head harness consumer settings are omitted. Google billing-plane reads were
-not served, so those plane pages are absent. Plan rates come from the checked-in
-`service-tier-v1/fusiform-served-payloads.json` `plan.prices — every curated row`
-case, notably OpenAI `pro_100`, `pro_200` and `pro_500`, rather than a fresh plan
-read. These reductions and the newer catalog version are the fixture's differences
-from the live inputs.
+The published Broca sample was first produced from live picker inputs. The test
+now reproduces it byte-for-byte using
+`crates/striatum-module/fixtures/synthetic-head-choices-broca-inputs.json`.
+The synthetic inputs retain the published catalog version and model identities
+so the same wire reply can be checked without the live configuration or roster.
 
 Regenerate from the worktree root. When using CortexKit's `bash` tool with
 `runon` for a remote build, set its `return_paths` argument to all eleven JSON

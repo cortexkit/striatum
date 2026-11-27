@@ -1,13 +1,12 @@
 {
   "about": [
-    "Conversion-equivalence baseline for the routing policy rebuild. The input is the owner's scrubbed live routing config (routing-config-live-2026-10-24.jsonc, pinned by sha256 below) plus every other input a selection reads, frozen here: the Fusiform catalog rows, the Fusiform plan-price providers, the Claustrum vault listing (every llm-provider row carries auth_method), the Insula quota reading, OpenCode's auth.json (provider auth types only, no secrets), the host's available-models list and the clock.",
-    "Only the config is a capture. The other inputs are a synthesized frozen world shaped like the live system on 2026-10-24: the providers, models, accounts and windows the config names, with invented scores, prices and usage. They are inputs, not evidence about live routing.",
-    "baseline_tests.rs runs today's selection on each request below, each from its own empty store, and checks the answer against `expected`: the route key, variant, runner and refusal code. For a legacy route.select the runner is the answer's `selected.harness` (null when routing names none) and the refusal code is the error frame's `code`, else the result's `pin_rejected`. For a routing/v1 select they are the answer's `route` and `runner.module`, and the error's `code`.",
+    "Archived conversion-equivalence cases for the routing policy rebuild. The baseline test pins the synthetic archived settings example by SHA-256 and checks that the stored expectations cover every request and slot-pin case.",
+    "The preserved selection cases use invented scores, prices and usage. The vault listing gives each llm-provider row an auth_method.",
     "The `synthesizer` request is two steps, as core runs them: route.select_panel reports the configured synthesizer pin in `policy.pins.synthesizer`, and core then admits that pin with a pinned route.select."
   ],
   "config": {
-    "file": "routing-config-live-2026-10-24.jsonc",
-    "sha256": "9447e7e8b5803b1b231ea57e50ab04ac65c0ac7eeb6e488d4a7322bb17262ed1"
+    "file": "synthetic-routing-config.jsonc",
+    "sha256": "dae2d634de847148f4876d31e06608c493781d45e1de129d7af47166f1103c6a"
   },
   "clock_ms": 1792843200000,
   "auth_json": {

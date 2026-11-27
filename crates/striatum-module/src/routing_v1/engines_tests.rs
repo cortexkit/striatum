@@ -117,10 +117,8 @@ async fn daemon_catalog_round_trip_selects_both_colliculus_transcription_engines
     ) -> T {
         serde_json::from_value(wire).unwrap()
     }
-    let snapshot: Value = serde_json::from_str(include_str!(
-        "../../fixtures/2026-11-10-daemon-catalog.json"
-    ))
-    .unwrap();
+    let snapshot: Value =
+        serde_json::from_str(include_str!("../../fixtures/synthetic-daemon-catalog.json")).unwrap();
     assert_eq!(snapshot["op"], "catalog.list");
     let catalog = decode(
         |consumer| async move { consumer.catalog_list().await },
@@ -169,13 +167,21 @@ async fn daemon_catalog_round_trip_selects_both_colliculus_transcription_engines
     assert_eq!(
         identities,
         vec![
-            ("openai", "gpt-transcribe", false),
-            ("google", "gemini-3.8-flash", false),
+            ("openai", "test-short-transcription", false),
+            ("google", "test-long-transcription", false),
         ]
     );
     for (requirements, provider, model) in [
-        (json!({"format":"audio/mp4"}), "openai", "gpt-transcribe"),
-        (json!({"duration_ms":1500001}), "google", "gemini-3.8-flash"),
+        (
+            json!({"format":"audio/mp4"}),
+            "openai",
+            "test-short-transcription",
+        ),
+        (
+            json!({"duration_ms":600001}),
+            "google",
+            "test-long-transcription",
+        ),
     ] {
         let mut params = request.clone();
         params["requirements"] = requirements;

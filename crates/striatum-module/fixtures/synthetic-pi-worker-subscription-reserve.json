@@ -1,0 +1,28 @@
+{
+  "source": "Synthetic worker requirements and weekly Claude quota around a fixed reserve.",
+  "clock_normalization": "The fixture clock and fetched_at are fixed one minute apart.",
+  "now_ms": 1800000000000,
+  "fetched_at": "2027-01-15T07:59:00Z",
+  "keep_free_percent": 20.0,
+  "accounts": [
+    {"used_percent": 20.0, "resets_at": "2027-01-19T20:00:00Z"},
+    {"used_percent": 25.0, "resets_at": "2027-01-19T19:00:00Z"},
+    {"used_percent": 10.0, "resets_at": "2027-01-20T18:00:00Z"},
+    {"used_percent": 100.0, "resets_at": "2027-01-18T04:00:00Z"},
+    {"used_percent": 90.0, "resets_at": "2027-01-18T14:00:00Z"}
+  ],
+  "expected_plan": {
+    "tier": "max_20x",
+    "accountCount": 5,
+    "headroomPoints": 255.0,
+    "availablePoints": 185.0,
+    "keepFreePoints": 70.0,
+    "shortWalledAccountCount": 0,
+    "bankedResetsApplied": 0
+  },
+  "decisions": [
+    {"id": "test-worker-1", "project": "test-project-a", "requirements": {"iq": 85.0, "eq": 15.0}},
+    {"id": "test-worker-2", "project": "test-project-b", "requirements": {"iq": 70.0, "eq": 35.0}},
+    {"id": "test-worker-3", "project": "test-project-b", "requirements": {"iq": 70.0, "eq": 40.0}}
+  ]
+}

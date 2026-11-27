@@ -1,0 +1,16 @@
+{
+  "source_decision": "test-reserve-outage-decision",
+  "now_ms": 1800000000000,
+  "observed_at_ms": 1799999980000,
+  "xai_wall_until_ms": 1800432000000,
+  "accounts": [
+    {"tier":"max_20x","entry":{"provider":"claude","apiProvider":"anthropic","account":"test-claude-1","fetchedAt":"2027-01-15T07:52:00Z","usage":{"primary":{"usedPercent":10.0,"windowMinutes":300,"resetsAt":"2027-01-15T10:20:00Z"},"secondary":{"usedPercent":20.0,"windowMinutes":10080,"resetsAt":"2027-01-20T20:00:00Z"}}}},
+    {"tier":"max_20x","entry":{"provider":"claude","apiProvider":"anthropic","account":"test-claude-2","fetchedAt":"2027-01-15T07:59:00Z","usage":{"primary":{"usedPercent":5.0,"windowMinutes":300,"resetsAt":"2027-01-15T10:40:00Z"},"secondary":{"usedPercent":20.0,"windowMinutes":10080,"resetsAt":"2027-01-20T19:00:00Z"}},"savedResets":{"availableCount":1}}},
+    {"tier":"max_20x","entry":{"provider":"claude","apiProvider":"anthropic","account":"test-claude-3","fetchedAt":"2027-01-15T07:58:00Z","usage":{"primary":{"usedPercent":15.0,"windowMinutes":300,"resetsAt":"2027-01-15T11:30:00Z"},"secondary":{"usedPercent":10.0,"windowMinutes":10080,"resetsAt":"2027-01-21T18:00:00Z"}},"savedResets":{"availableCount":1}}},
+    {"tier":"max_20x","entry":{"provider":"claude","apiProvider":"anthropic","account":"test-claude-4","fetchedAt":"2027-01-15T07:56:00Z","usage":{"primary":{"usedPercent":20.0,"windowMinutes":300,"resetsAt":"2027-01-15T09:40:00Z"},"secondary":{"usedPercent":80.0,"windowMinutes":10080,"resetsAt":"2027-01-18T04:00:00Z"}},"savedResets":{"availableCount":1}}},
+    {"tier":"max_20x","entry":{"provider":"claude","apiProvider":"anthropic","account":"test-claude-5","fetchedAt":"2027-01-15T07:57:00Z","usage":{"primary":{"usedPercent":15.0,"windowMinutes":300,"resetsAt":"2027-01-15T09:50:00Z"},"secondary":{"usedPercent":75.0,"windowMinutes":10080,"resetsAt":"2027-01-18T14:00:00Z"}},"savedResets":{"availableCount":1}}},
+    {"tier":"pro_200","entry":{"provider":"codex","apiProvider":"openai","account":"test-codex-pro-a","fetchedAt":"2027-01-15T07:59:40Z","usage":{"primary":{"usedPercent":100.0,"windowMinutes":10080,"resetsAt":"2027-01-18T03:30:00Z"}},"savedResets":{"availableCount":1}}},
+    {"tier":"pro_200","entry":{"provider":"codex","apiProvider":"openai","account":"test-codex-pro-b","fetchedAt":"2027-01-15T07:59:30Z","usage":{"primary":{"usedPercent":100.0,"windowMinutes":10080,"resetsAt":"2027-01-18T03:20:00Z"}},"savedResets":{"availableCount":2}}},
+    {"tier":"pro_100","entry":{"provider":"codex","apiProvider":"openai","account":"test-codex-lite","fetchedAt":"2027-01-15T07:59:20Z","usage":{"primary":{"usedPercent":20.0,"windowMinutes":10080,"resetsAt":"2027-01-22T02:00:00Z"}},"savedResets":{"availableCount":0}}}
+  ]
+}
