@@ -1,0 +1,4 @@
+# Check every file out byte for byte as committed. Fixtures, samples and
+# generated files are compared by digest, so Windows line-ending conversion
+# (core.autocrlf) must never rewrite them.
+* -text

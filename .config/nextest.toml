@@ -17,3 +17,10 @@ test-group = "daemon"
 [[profile.default.overrides]]
 filter = 'package(=striatum-module) and binary(=it) and test(/^both_modules_e2e::/)'
 slow-timeout = { period = "240s", terminate-after = 3, grace-period = "60s" }
+
+# The block-table parity test replays the production fixture through both
+# implementations; on a two- or three-core hosted CI runner it takes about three
+# minutes, past the default limit.
+[[profile.default.overrides]]
+filter = 'package(=striatum-module) and test(=account_selection::block_parity_tests::blocks_parity_production_fixture)'
+slow-timeout = { period = "240s", terminate-after = 3, grace-period = "60s" }
